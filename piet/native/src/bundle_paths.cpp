@@ -3,6 +3,7 @@
 
 #include <climits>
 #include <cstdlib>
+#include <filesystem>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -93,6 +94,20 @@ std::optional<std::string> bundleResourcesDir() {
   std::string contentsDir = dir.substr(0, dir.size() - std::string("/MacOS").size());
   return contentsDir + "/Resources";
 #endif
+}
+
+std::optional<std::string> devTreeRoot() {
+  auto exe = executablePath();
+  if (!exe) return std::nullopt;
+  auto root = std::filesystem::u8path(*exe).parent_path()  // build/
+                  .parent_path()                         // native/
+                  .parent_path()                         // piet/
+                  .parent_path();                        // checkout/
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(root / "piet/frontend/index.html", ec)) {
+    return std::nullopt;
+  }
+  return root.u8string();
 }
 
 }  // namespace piet

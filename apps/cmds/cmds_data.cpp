@@ -354,7 +354,7 @@ int cmd_eval(const std::vector<std::string>& a) {
                 if (!egen_fn(fnm, ef)) { std::fprintf(stderr, "--egen unknown fn '%s'\n", fnm.c_str()); return 2; }
                 // B4/W6: rank's three tie rules are OPTIONS, so they are resolved here
                 // rather than spelled as separate function names (Stata spells them
-                // `egen r = rank(x), track|field|unique`). Oracle milfpins_oracle_b/_c.
+                // `egen r = rank(x), track|field|unique`). Oracle private_oracle_b/_c.
                 if (ef == Frame::EgenFn::Rank) {
                     const bool trk = has_word(opts, "track"), fld = has_word(opts, "field"),
                                unq = has_word(opts, "unique");

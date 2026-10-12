@@ -637,7 +637,7 @@ ojson runAppend(const std::string& filepathArg, SessionState& session,
 
   if (genVar.has_value()) {
     // B5-D10 (measured B4REC|append|generate|0|, tests/eval/golden/aer_b4/
-    // milfpins_oracle_r.log:96-97): src marks which side each row came from —
+    // private_oracle_r.log:96-97): src marks which side each row came from —
     // 0 for the nMaster original master rows, 1 for the nUsing rows appended
     // from `using`. Same setcol --new mechanism winsor uses for its genName
     // column (handlers_aer_abbrev.cpp), applied to the head the append above
@@ -888,7 +888,7 @@ ojson runMerge(const std::string& mergeType, const std::vector<std::string>& key
         "bad_input");
   }
   // Stata: `generate()` RENAMES the marker; `nogenerate` suppresses it. Asking
-  // for both is contradictory (oracle milfpins_oracle_h.log — with
+  // for both is contradictory (oracle private_oracle_h.log — with
   // `generate(mm)` the name `_merge` is r(111), i.e. generate() does not add a
   // second column, it moves the one).
   if (generateOpt.has_value() && nogenerate) {

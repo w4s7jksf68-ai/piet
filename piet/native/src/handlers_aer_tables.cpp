@@ -150,7 +150,7 @@ const piet::eval::OptVocab& kVocabEstout = piet::eval::registerOptVocab(
       "title", "note",
       // B4-W5: the discriminating pair the oracle itself identified. `estout
       // nonumbers` alone produced a file byte-identical to the plain arm
-      // (milfpins_oracle_t2.do's own header says so), because estout's DEFAULT
+      // (private_oracle_t2.do's own header says so), because estout's DEFAULT
       // header is the model NAME -- so the arm that separates them is
       // `numbers` vs `nonumbers`, e_numbers.txt vs e_numbers_off.txt. Before
       // this both spellings were unknown options and answered rc 198.
@@ -3369,7 +3369,7 @@ ojson runEstout(const eval::ParsedCommand& parsed, SessionState& session) {
 // parentheses, how many digits it carries, which rows exist and in what order,
 // and the legend -- and that contract is now pinned to real StataBE output:
 // tests/eval/golden/aer_b4/tables/t_*.txt|tex, 16 arms captured 2026-09-09 by
-// milfpins_oracle_t.do / _t2.do against the installed esttab 2.1.4 + estout
+// private_oracle_t.do / _t2.do against the installed esttab 2.1.4 + estout
 // 3.33. Where this file and that capture disagree, the capture is right.
 //
 // The defaults the capture REFUTED (all four were live in this build, all four
@@ -3392,7 +3392,7 @@ ojson runEstout(const eval::ParsedCommand& parsed, SessionState& session) {
 // and coefplot.json, which are outside this task's write manifest. The FILE
 // writer is the surface the 27 captured arms measure and the surface the AER
 // corpus writes; the screen block's divergence is named in the W5 report as a
-// re-pin request, not fixed here behind MILF's back.
+// re-pin request, not fixed here behind project's back.
 // ===========================================================================
 
 namespace {
@@ -4120,7 +4120,7 @@ ojson writeEsttabFile(const ojson& esttabBlock, const std::string& path,
   }
 
   // ---- beta: b * sd(x)/sd(y) over e(sample) -------------------------------
-  // The receipt (milf-coord/plans/b4-receipts-20260909/esttab-beta) settles the
+  // The receipt (private-notes/plans/b4-receipts-20260909/esttab-beta) settles the
   // owner and the formula: `esttab, beta` calls `estadd beta, replace`, and
   // estadd.ado:434/440/441 forms b * r(sd of x) / r(sd of y) from two
   // `summarize`s that both carry `if e(sample)`. Its REFUTE.md kills the N-vs-N-1

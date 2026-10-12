@@ -4,9 +4,19 @@ PIET is a local desktop interface for econometric analysis. CoBrA is its C++
 computation engine. The application accepts a subset of Stata-style commands
 and reads and writes supported data formats without requiring Stata at runtime.
 
-**Source beta, 2026-10-12.** This release is for evaluation and bug reporting.
+**PIET 1.0 Beta 1.** This release is for evaluation and bug reporting.
 Compatibility is incomplete. Validate statistical results independently before
-using them in research or decisions. No signed installer is included.
+using them in research or decisions.
+
+## Download for macOS
+
+[Download PIET 1.0 Beta 1 for Apple Silicon (.dmg)](https://github.com/w4s7jksf68-ai/piet/releases/download/v1.0.0-beta.1/PIET-1.0.0-beta.1-macos-arm64.dmg)
+and drag **PIET.app** to Applications. This build is ad-hoc signed, but is not
+Apple Developer ID signed or notarized. macOS may block the first launch; use
+[Apple's Open Anyway instructions](https://support.apple.com/102445) if you
+trust this download. The app requires macOS 13.3 or newer; only macOS 26.6.2
+on Apple Silicon was tested. See the [release page](https://github.com/w4s7jksf68-ai/piet/releases/tag/v1.0.0-beta.1)
+for the SHA-256 checksum and corresponding source.
 
 ## Build on macOS
 
@@ -48,8 +58,8 @@ system programs with your user permissions.
   an explicit error. Existing business-calendar reading remains available.
 - The test suite covers a bounded set of numerical and data-operation checks.
   It is not a certification of every accepted command or of full Stata parity.
-- Internal version strings are inherited from the development snapshot.
-  The public Git tag identifies this release; see [release notes](RELEASE_NOTES.md).
+- PIET reports `1.0.0-beta.1`. CoBrA reports its own engine version `0.41.0`.
+  The public Git tag identifies the exact release; see [release notes](RELEASE_NOTES.md).
 
 ## License and acknowledgments
 

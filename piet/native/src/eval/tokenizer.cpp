@@ -230,7 +230,7 @@ const std::regex& reWeight() {
   // even with the short forms first — but ordering longest-first is still the
   // correct general rule for alternation (no reliance on backtracking to
   // recover the right capture), and it's what a future engine/flag swap needs
-  // to stay correct. MILF Step-1 D3: previously ONLY fw/pw/iw/aw matched, so
+  // to stay correct. project Step-1 D3: previously ONLY fw/pw/iw/aw matched, so
   // `[fweight=w]` silently fell through as an unmatched weight qualifier
   // (garbage varlist bug) — this was a real latent gap, not a style nit.
   static const std::regex r(
@@ -598,7 +598,7 @@ bool searchUnquoted(const std::string& s, const std::regex& re, std::smatch& out
 namespace {
 
 // B4/W1: Stata accepts ONE `if`/`in` qualifier AFTER a command's options.
-// Measured on StataBE 19.5 (tests/eval/golden/aer_b4/milfpins_rc.log, oracle
+// Measured on StataBE 19.5 (private oracle record, oracle
 // records `summarize|trailing_if` and `summarize|trailing_in`):
 //
 //   summarize price, detail, if mpg<30   -> rc 0, N=67
@@ -825,7 +825,7 @@ ParsedCommand tokenize(const std::string& line) {
   // for whichever weight TYPES a command's own registry row declares
   // (registry.cpp's WeightPolicy field, reached via registry::findByName()).
   //
-  // P3 weights wave (MILF-owned engine work taught cobra real weighted
+  // P3 weights wave (project-owned engine work taught cobra real weighted
   // estimation on a wider surface): this used to be a single blanket rule
   // ("fw/fweight only, on a narrow 7-command allow-list; aw/pw/iw rejected
   // for EVERY command, zero exceptions") — that law is retired. The allow-

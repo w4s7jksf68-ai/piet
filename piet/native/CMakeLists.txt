@@ -234,7 +234,7 @@ target_link_libraries(piet_settings INTERFACE Iconv::Iconv)
 #     hand-synced copy — the 2.0.1 contract_a Info.plist drift bug class);
 #   - `piet_native --selftest`'s version-single-source leg asserts
 #     compiled tuple == /version route == packaged Info.plist ==
-#     milf-coord/releases/CURRENT (per-artifact SKIP where not applicable).
+#     private-notes/releases/CURRENT (per-artifact SKIP where not applicable).
 # Do NOT introduce another hardcoded piet version string anywhere in
 # piet/native/ or piet/packaging/ — derive from the binary instead.
 # (piet/pyproject.toml is EXCLUDED: frozen at 1.16.0, the deprecated Python

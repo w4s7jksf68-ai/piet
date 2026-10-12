@@ -71,7 +71,7 @@ namespace {
 // measured minimum row for either spelling, so only the EXACT literal
 // "clear"/"replace" resolve here — no abbreviation at all. That costs
 // nothing measured: all 92 census occurrences spell the option out in full
-// (milf-coord/plans/aer-scope1/lexgaps-12.json, command="use" option="replace",
+// (private-notes/plans/aer-scope1/lexgaps-12.json, command="use" option="replace",
 // every one of the 92 `uses[].text` entries matches `,\s*replace` verbatim).
 const piet::eval::OptVocab& kVocabUse = piet::eval::registerOptVocab(
     {"use"}, {{"clear", "replace"},
@@ -104,7 +104,7 @@ const piet::eval::OptVocab& kVocabDestring = piet::eval::registerOptVocab(
 // runTostring's renderer has no reversibility gate to relax, so accepting the
 // token changes nothing observable; without this a legal script died at r(198)
 // (measured B4REC|tostring|replace_force|0| — tests/eval/golden/aer_b4/
-// milfpins_oracle_r.log:29). `g` is Stata's abbreviation of `generate`; it
+// private_oracle_r.log:29). `g` is Stata's abbreviation of `generate`; it
 // cannot resolve via the unique-prefix rule because `gen`/`generate` are BOTH
 // already-registered literal spellings that `g` prefixes ambiguously, so it is
 // declared instead (BUG-430 aliases mechanism, kVocabPredict precedent above).
@@ -167,7 +167,7 @@ const piet::eval::OptVocab& kVocabFrget = piet::eval::registerOptVocab(
 // a modifier — `duplicates drop VARLIST` requires it precisely because dropping
 // on a narrowed key discards rows that differ elsewhere, and Stata makes you
 // say so. It changes no value: `duplicates drop foreign, force` on
-// `sysuse auto` is rc 0 with _N 74 -> 2 (milfpins_oracle_g.log:250-256), the
+// `sysuse auto` is rc 0 with _N 74 -> 2 (private_oracle_g.log:250-256), the
 // same rows this build's varlist path already keeps. So it is accepted and
 // read as the acknowledgement it is, rather than rejected as unknown.
 const piet::eval::OptVocab& kVocabDuplicates = piet::eval::registerOptVocab(
@@ -288,7 +288,7 @@ const piet::eval::OptVocab& kVocabCodebook = piet::eval::registerOptVocab(
 // renderer sizes its name column to the longest name present
 // (console.js:formatDescribe, nameW = Math.max(13, ...v.name.length)) -- PIET
 // never abbreviates, so `fullnames` is satisfied by construction. Measured
-// B4REC|describe|fullname|0| (tests/eval/golden/aer_b4/milfpins_oracle_r.log:
+// B4REC|describe|fullname|0| (tests/eval/golden/aer_b4/private_oracle_r.log:
 // 130-131) and the in-tree StataBE rendered table at tests/eval/golden/
 // f16_tw_transport_oracle.log:43,85 (`describe, fullnames`). short/simple/
 // numbers/detail stay unimplemented -- those DO change what prints.
@@ -301,7 +301,7 @@ const piet::eval::OptVocab& kVocabDescribe = piet::eval::registerOptVocab(
 // are none" and "nobody has looked".
 // B4-W3b: the GROUP form's case options (29 corpus uses of `rename _all,
 // lower` / `rename *, upper`). Measured rc 0 on StataBE 19.5
-// (milfpins_oracle_g.log:101-105), which also shows the note Stata prints when
+// (private_oracle_g.log:101-105), which also shows the note Stata prints when
 // nothing moves: "(all newnames==oldnames)".
 const piet::eval::OptVocab& kVocabRename = piet::eval::registerOptVocab(
     {"rename"}, {{"lower", "upper"},
@@ -343,8 +343,8 @@ const piet::eval::OptVocab& kVocabRecode = piet::eval::registerOptVocab(
 // validated-no-op class as noobs/clean just above: the grid draws no
 // every-N-rows rule either way, so accepting and discarding the count changes
 // nothing observable). Measured B4REC|list|sep(0)|0| (tests/eval/golden/
-// aer_b4/milfpins_oracle_r.log:143-144) and the in-tree StataBE rendered
-// table at milfpins_oracle_h.log:94 / milfpins_oracle_i.log:126 (`list ...,
+// aer_b4/private_oracle_r.log:143-144) and the in-tree StataBE rendered
+// table at private_oracle_h.log:94 / private_oracle_i.log:126 (`list ...,
 // sep(0) noobs`). `sep` is a prefix of BOTH `separator` and `sepby`, so the
 // unique-prefix rule alone leaves it ambiguous -> r(198) even after this
 // move; the aliases row below is the only mechanism that can carry it
@@ -373,7 +373,7 @@ const piet::eval::OptVocab& kVocabList = piet::eval::registerOptVocab(
 // unimplemented into known so the wholesale-redefine spelling itself is
 // accepted (B4REC|label_define|<redefine_no_replace>|110| and
 // B4REC|label_define|replace|0|, tests/eval/golden/aer_b4/
-// milfpins_oracle_r.log:60-66). KNOWN NARROWING: runLabelDefine re-parses
+// private_oracle_r.log:60-66). KNOWN NARROWING: runLabelDefine re-parses
 // the RAW option tail by substring match (same as the pre-existing add/modify
 // scan), so an ABBREVIATED `repl`/`repla`/... reaches this net (now resolved
 // to "replace" by the dispatcher's prefix rule) but is invisible to the raw
@@ -521,7 +521,7 @@ const piet::eval::OptVocab& kVocabSummarize = piet::eval::registerOptVocab(
 // the three remaining unimplemented names are the arm's OWN reject message,
 // not a guess.
 // B5-D9: `emptyok` accepted as a validated no-op. Measured
-// B4REC|save|replace_emptyok|0| (tests/eval/golden/aer_b4/milfpins_oracle_r.log
+// B4REC|save|replace_emptyok|0| (tests/eval/golden/aer_b4/private_oracle_r.log
 // :90-93) on `clear` + `set obs 0` + `save F, replace emptyok`. runSetObs's
 // zero-data-in-memory branch (handlers_m3.cpp:runSetObs) already loads a real
 // {n_rows:0, columns:[]} hbin at that point, so runSaveData's only gate
@@ -1161,9 +1161,8 @@ std::string joinVarlist(const std::vector<std::string>& varlist) {
 // piet/packaging/sample/synthetic_panel.csv otherwise (see main.cpp:957-968).
 // This mirrors that exact resolution order rather than inventing a second
 // convention. main.cpp is out of this workstream's file manifest, so the
-// existence check and the dev-tree __FILE__-relative anchor (main.cpp's own
-// repoRelative(), main.cpp:212-217) are duplicated locally here — small,
-// single-purpose, not worth a shared header for two call sites.
+// existence check is local; the dev-tree root is shared with main.cpp via
+// bundle_paths.h so public binaries do not retain a build-machine path.
 bool fileExistsLocal(const std::string& path) {
   if (path.empty()) return false;
   std::ifstream f(cecon::to_native_path(path));
@@ -1171,10 +1170,9 @@ bool fileExistsLocal(const std::string& path) {
 }
 
 std::string devTreeSyntheticSampleCsv() {
-  std::string thisFile = __FILE__;  // .../piet/native/src/dispatcher.cpp
-  auto pos = thisFile.rfind("/piet/native/src/dispatcher.cpp");
-  std::string root = (pos == std::string::npos) ? "../.." : thisFile.substr(0, pos);
-  return root + "/piet/packaging/sample/synthetic_panel.csv";
+  auto root = devTreeRoot();
+  return root ? *root + "/piet/packaging/sample/synthetic_panel.csv"
+              : "piet/packaging/sample/synthetic_panel.csv";
 }
 
 // bysort.py's needs_bygen: `_n` or `_N` as a whole identifier token anywhere
@@ -2066,7 +2064,7 @@ OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::s
     size_t floorLen;  // shortest ACCEPTED abbreviation; == strlen(full) => none
   };
   static const OptFloor kOptFloors[] = {
-      // P0-A, the destructive row. milf-pins/oracle_p.log:23-27 `export
+      // P0-A, the destructive row. private-oracle/oracle_p.log:23-27 `export
       // delimited using "p_a.csv", re` -> r(198) "option re not allowed";
       // :29-33 `, rep` -> r(198); :16-21 the full `, replace` -> rc 0. So
       // `replace` on export takes NO abbreviation.
@@ -2457,13 +2455,13 @@ nlohmann::ordered_json runTabulateGenerate(const std::string& stub,
     }
     const std::string cmp =
         numericLevel ? (srcVar + "==" + lvl) : (srcVar + "==\"" + lvl + "\"");
-    // The missing rule (oracle milfpins_oracle_g.log:170-176) lives here.
+    // The missing rule (oracle private_oracle_g.log:170-176) lives here.
     const std::string expr =
         nm + " = cond(missing(" + srcVar + "), ., " + cmp + ")";
     ojson r = piet::handlers::runGen(expr, std::nullopt, session);
     if (r.is_object() && r.value("type", std::string()) == "error") return r;
     // Stata makes these `byte`, formats them %8.0g, and labels them with the
-    // literal spelling `rep78== 1.0000` (milfpins_shapes.log:31-36 — the
+    // literal spelling `rep78== 1.0000` (private_shapes.log:31-36 — the
     // level rendered `%7.4f` — "1.0000" is 6 characters right-aligned into a
     // width-7 field, which is the single leading space the oracle shows). The
     // label is carried so `describe` and
@@ -5669,7 +5667,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
     // r(N)/r(mean)/r(min)/r(max)/r(sum)/r(sum_w) are published, but r(sd)
     // (and the derived r(Var)/r(median)/percentiles/skewness/kurtosis) are
     // NOT: BUG-476, measured StataBE 19.5
-    // (tests/eval/golden/aer_b4/milfpins_oracle_r.log, batch R,
+    // (tests/eval/golden/aer_b4/private_oracle_r.log, batch R,
     // `B4VAL|mean|+1.81541bacf914cX+00c|sd_is_missing|+1.0000000000000X+3ff`
     // — mean published, r(sd) is Stata's `.`). PIET's runSummarize still
     // computes the full stats unconditionally (a superset of what meanonly
@@ -5722,7 +5720,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
     // qualifier honoured, never dropped). BS-090 (BETA Phase G): `in` is now
     // legal here too (registry.cpp's allowInRange), composed with `if` via
     // AND inside runSummarize/applyIfAndInFilter.
-    // MILF Step-1 D3 / P3 weights wave: `parsed.weightVar` only survives the
+    // project Step-1 D3 / P3 weights wave: `parsed.weightVar` only survives the
     // tokenizer's guard for this branch when weightType is fw/fweight/aw/
     // aweight (registry.cpp's summarize row is AweightFweight) — any other
     // weight type on summarize was already rejected upstream. Which cobra
@@ -6287,7 +6285,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
     // prefix runRegress's catch clause adds (matches the 2 Eval
     // M2-ratification carve-out cells byte-for-byte — see handlers.cpp).
     // `reghdfe` IS `feols --fe` under the hood (cobra has no separate
-    // reghdfe estimator — MILF-verified bit-for-bit against the Stata
+    // reghdfe estimator — project-verified bit-for-bit against the Stata
     // oracle); it is routed through the exact same runRegress path as
     // regress/reg/r/feols, with only the display "estimator" label
     // differing (handlers.cpp's stataCmd param).
@@ -7347,7 +7345,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
 
   if (cmd == "collapse") {
     const int64_t collapseNBefore = rowsBeforeForRN(session);
-    // MILF Step-1 D3: `parsed.weightVar` only survives the tokenizer's guard
+    // project Step-1 D3: `parsed.weightVar` only survives the tokenizer's guard
     // here when weightType is fw/fweight (collapse is on the fweight
     // allow-list) — any other weight type was already rejected upstream.
     ojson collapseBlk = ojson(handlers::runCollapse(parsed.raw, parsed.ifExpr, session,
@@ -9000,7 +8998,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
       tabIfDs = std::make_unique<Datastore>(fr.dataPath);
       ds = tabIfDs.get();
     }
-    // MILF Step-1 D3: `parsed.weightVar` only survives the tokenizer's guard
+    // project Step-1 D3: `parsed.weightVar` only survives the tokenizer's guard
     // here when weightType is fw/fweight (tabulate/tab/tab1/tab2 are on the
     // fweight allow-list) — any other weight type was already rejected
     // upstream. The `if`-prefilter above (when present) already carries the
@@ -9107,7 +9105,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
     //
     // THE RULE THAT DECIDES THIS, and the reason an rc-only test cannot see
     // it: the dummies are MISSING where the source is missing, not 0. Measured
-    // (StataBE 19.5, tests/eval/golden/aer_b4/milfpins_oracle_g.log:170-176,
+    // (StataBE 19.5, tests/eval/golden/aer_b4/private_oracle_g.log:170-176,
     // `sysuse auto` + `tabulate rep78, generate(rs)`):
     //     summarize rs1, meanonly  ->  r(N) 69, NOT 74
     //     r(mean) = +1.dae6076b981dbX-006  (= 2/69, the 5 missing rep78 rows
@@ -9273,7 +9271,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
                                                parsed.ifExpr, tsSave || tsNoTotal, tsNoTotal));
     // ------------------------------------------------------------------
     // B4-W3b `save`: the r()-class matrices. Measured (StataBE 19.5,
-    // milfpins_oracle_g.log:189-220, `sysuse auto` +
+    // private_oracle_g.log:189-220, `sysuse auto` +
     // `tabstat price mpg, by(foreign) stat(mean sd n) nototal save`):
     //   r(Stat1)[3,2] and r(Stat2)[3,2] — one matrix PER GROUP, in the by-
     //     variable's own ascending order;
@@ -9680,7 +9678,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
   // ------------------------------------------------------------------
   // BETA campaign Phase D batch D4 (time-series wirings): BS-077 newey,
   // BS-078 prais, BS-079 dfuller/pperron, BS-080 wntestq, BS-081 tsfill.
-  // Oracle: milf-coord/plans/BETA-20260712-campaign/probes/
+  // Oracle: private-notes/plans/BETA-20260712-campaign/probes/
   // d45-oracle-stata.log, sections D4a-D4f.
 
   if (cmd == "newey") {
@@ -9908,7 +9906,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
     // than an error. B5-D7: `not` is now accepted (kVocabDs.known) and
     // implemented as the complement of the varlist against every variable in
     // the dataset — runKeep's own complement idiom (handlers_m3.cpp). Measured
-    // B4REC|ds|not|0| (tests/eval/golden/aer_b4/milfpins_oracle_r.log:163-164).
+    // B4REC|ds|not|0| (tests/eval/golden/aer_b4/private_oracle_r.log:163-164).
     // Bound to the REGISTERED vocabulary below (kVocabDs), not an inline
     // literal set — this arm used to carry its own duplicate copy of
     // kVocabDs.known/unimplemented, so the census and the arm could drift

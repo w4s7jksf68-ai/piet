@@ -30,7 +30,7 @@ struct CobraRunResult {
 
 // Resolves the cobra binary path. Order (mirrors config.py's documented
 // order, Art 7 provenance): $COBRA_BIN env var (if it exists on disk) >
-// the pinned Art 7 reference, milf-coord/releases/engine/current/cobra >
+// the pinned Art 7 reference, private-notes/releases/engine/current/cobra >
 // bare `cobra` on $PATH. Never resolves to an op-cobra dev build.
 std::string resolveCobraBin();
 

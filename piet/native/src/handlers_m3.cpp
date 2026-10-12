@@ -133,7 +133,7 @@ bool cloneOrCopyFile(const std::string& src, const std::string& dst) {
   // sgetc/sputc virtual-call loop, ~5.5 ns/byte and *user*-CPU bound, which
   // measured 1.20-1.30 s on the 164 MB reference corpus against 0.35 s for the
   // 1 MB buffered loop below (3.5×, sha256-identical output — see
-  // milf-coord/plans/GATE23-stage0-evidence/l5-iosave/). Only the cross-volume
+  // private-notes/plans/GATE23-stage0-evidence/l5-iosave/). Only the cross-volume
   // / non-APFS preserve snapshot reaches here (the clone above takes the
   // same-volume case), so this is the slowest path getting the 3.5×.
   {
@@ -3767,7 +3767,7 @@ ojson runLabelDefine(const std::string& rawLine, SessionState& session) {
   auto existingIt = session.labelDefs.find(lblname);
   bool hasOpts = addOpt || modifyOpt || replaceOpt;
   // BUG-475 (measured StataBE 19.5, B4REC|label_define|<redefine_no_replace>|110|,
-  // tests/eval/golden/aer_b4/milfpins_oracle_r.log:57-61): redefining an
+  // tests/eval/golden/aer_b4/private_oracle_r.log:57-61): redefining an
   // EXISTING label with none of add/modify/replace is refused verbatim
   // "label <name> already defined" (log:58), which coarseRc's "already
   // defined" rule (eval/errors.cpp) maps to r(110). Must return BEFORE any

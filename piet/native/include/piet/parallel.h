@@ -1,7 +1,7 @@
 // Group-level parallel execution — `parallel[, workers(N)] { … }`.
 //
 // PLEVEL-IMPL-WAVE arc ① (SKELETON). Design authority =
-// milf-coord/plans/FLOOR-20260721-campaign/PLEVEL-DESIGN-brief.md; the User
+// private-notes/plans/FLOOR-20260721-campaign/PLEVEL-DESIGN-brief.md; the User
 // rulings this file implements are PENDING-USER #14 (RESOLVED block) + SE-062:
 //   · syntax = §2.3 option **B** (a real block command, not the `*! piet`
 //     comment directive of option A — A is a later surface on top of this same

@@ -2,7 +2,7 @@
 
 // Shared surface for the apps/cmds/*.cpp command-handler translation units.
 // This file was factored out of the former monolithic apps/cecon_cli.cpp
-// (pure code motion — MILF Step-1 W0 / WP-00): the top-of-file includes, the
+// (pure code motion — project Step-1 W0 / WP-00): the top-of-file includes, the
 // json alias, and declarations for the ~35 helpers (plus a handful of
 // cross-file estimator loaders) that used to live in one big anonymous
 // namespace. Splitting the command bodies across multiple .cpp files means

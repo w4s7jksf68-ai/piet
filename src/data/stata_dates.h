@@ -110,7 +110,7 @@ inline double stata_date_part(double t, DatePart part) {
 // Every constant below was MEASURED against StataNow 19.5 BE rather than
 // recalled -- tests/validate/b3_funcs_oracle.{do,json} is the capture, and
 // the five prose prescriptions it overturned are written up in
-// milf-coord/plans/ONESHOT-AER-SCOPE2-PLAN-20260907.md section 7.7.
+// private-notes/plans/ONESHOT-AER-SCOPE2-PLAN-20260907.md section 7.7.
 //
 // The scales, with the oracle key that pins each:
 //   %tm  months  since 1960m1  == 0   (ym.2020.3   -> 722)

@@ -737,7 +737,7 @@ ojson runKdensity(Datastore& ds, const std::vector<std::string>& varlist,
   } else {
     // Item 6 (User ruling 2026-09-09) — UNMEASURED beyond this ONE cell: the
     // only in-repo Stata capture of kdensity's grid size under generate()
-    // is tests/eval/golden/aer_b4/milfpins_oracle_p.log:64-71 (one
+    // is tests/eval/golden/aer_b4/private_oracle_p.log:64-71 (one
     // 74-observation fixture, `B4VAL|kx_N|50|kx_mean|...`), giving
     // n=min(N,50)=50 on that fixture. The GENERAL claim "Stata's kdensity
     // default n is min(N,50)" is NOT captured beyond this one cell — do

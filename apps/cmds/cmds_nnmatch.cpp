@@ -7,7 +7,7 @@ namespace cecon::cli {
 
 // `cobra nnmatch` — the engine half of Stata's `teffects nnmatch (y mvarlist)
 // (tvar)`. Design and every measured rule: src/estimators/nnmatch.{h,cpp} and
-// milf-coord/plans/teffects-nnmatch-20260908/.
+// private-notes/plans/teffects-nnmatch-20260908/.
 //
 // Factor terms arrive BY NAME through --fv and are expanded inside the kernel,
 // never as columns minted into the caller's data: Stata leaves no `_I*` behind

@@ -313,7 +313,7 @@ ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usin
 // (estimation_m4.cpp, same file as those D4 estimators — this one lives
 // here instead because it is a data-mutation verb like gsort/order/recode
 // above, not an estimation command). Oracle D4f
-// (milf-coord/plans/BETA-20260712-campaign/probes/d45-oracle-stata.log):
+// (private-notes/plans/BETA-20260712-campaign/probes/d45-oracle-stata.log):
 // after `drop if mod(t,7)==0` (48 of 336 rows dropped — INCLUDING t=336
 // itself, since 336 is itself a multiple of 7), `tsfill` restores the full
 // grid from the SURVIVING min/max t, i.e. 1..335 (not 1..336 — tsfill only
@@ -2181,7 +2181,7 @@ ojson runImportExcel(const std::string& pathArg,
     sheet = xlsx::read(path, ro);
   } catch (const xlsx::SheetNotFound& e) {
     // Stata's own code and message, both captured (aer_b4
-    // milfpins_oracle_g.log:136-139: `worksheet NoSuchSheet not found`, r(601)).
+    // private_oracle_g.log:136-139: `worksheet NoSuchSheet not found`, r(601)).
     // The rc travels as an explicit `reason`, because coarseRc's file/directory
     // rule would otherwise never see a message that says "worksheet".
     return eval::errorBlock("engine_error", e.what(), std::nullopt, std::nullopt, std::nullopt,

@@ -2443,7 +2443,7 @@ void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
             fn == EgenFn::RankUnique) {
             // The four egen rank() flavours, all off ONE ascending stable sort of the
             // group's non-missing values. Missing input => missing rank in every one.
-            // Oracle milfpins_oracle_b.log / _c.log on 10,10,20,30,30,30,40 (+3 missing):
+            // Oracle private_oracle_b.log / _c.log on 10,10,20,30,30,30,40 (+3 missing):
             //   default    10 -> 1.5   30 -> 5     mean/midrank over the ranks spanned
             //   track      10 -> 1     30 -> 4     minimum rank, shared by every tied
             //                                      member (oracle_c: obs1 == obs2 == 1)
@@ -2518,7 +2518,7 @@ void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
                 break;
             // egenmore `var` — the SAME sum-of-squares as Sd without the root, so the
             // two can never disagree about the divisor or the singleton rule. Oracle
-            // milfpins_oracle_c.log: var(r) == summarize's r(Var)
+            // private_oracle_c.log: var(r) == summarize's r(Var)
             // == %21x +1.0124924924925X+007 == 900/7.
             case EgenFn::Var:
                 if (cnt >= 2) {
@@ -2690,7 +2690,7 @@ void Frame::egen_seq(const std::string& out, const std::vector<std::string>& by_
 // (Stata's `. > any number`), so it is the largest candidate for maxmode and never the
 // smallest for minmode — reproduced below by sorting NaN to the end.
 //
-// Oracle milfpins_oracle_b.log. On t = 1,1,2,2 and six missings, whose modes TIE:
+// Oracle private_oracle_b.log. On t = 1,1,2,2 and six missings, whose modes TIE:
 //   default -> missing everywhere · maxmode -> 2 · minmode -> 1 · missing -> `.` itself
 //              wins with frequency 6, so the answer is missing.
 // On m = 1,1,2,2,3,3,3,4,4,. (a unique mode) -> 3.
@@ -2784,7 +2784,7 @@ void Frame::egen_mode(const std::string& out, const std::string& expr,
 
 // egen nvals(varlist) [, by() missing] — egenmore, ACCEPTED-NAMED (see frame.h).
 // The number of DISTINCT values, or of distinct combinations for a multi-variable
-// varlist. Oracle milfpins_oracle_c.log: nvals(r) = 4 over 10,10,20,30,30,30,40;
+// varlist. Oracle private_oracle_c.log: nvals(r) = 4 over 10,10,20,30,30,30,40;
 // the egen-six capture's nvals(g v) = 5 is the varlist form, and nvals(s) = 5 shows
 // it counts a string variable's distinct values too (a factor here).
 void Frame::egen_nvals(const std::string& out, const std::vector<std::string>& vars,
@@ -2861,7 +2861,7 @@ void Frame::egen_nvals(const std::string& out, const std::vector<std::string>& v
 
 // ---- Stata's %w.0g, and string()/strofreal() on top of it (B4/W7) ----------
 // Contract, the cell-by-cell derivation and the one UNPINNED edge are documented at
-// the declaration in frame.h. Oracle: tests/eval/golden/aer_b4/milfpins_oracle_g2.log.
+// the declaration in frame.h. Oracle: tests/eval/golden/aer_b4/private_oracle_g2.log.
 std::string stata_format_g(double v, int width) {
     if (std::isnan(v)) return ".";          // g2 `missing` cell: string(.) = "."
     if (width < 7) width = 7;               // below w7 the budget degenerates; no cell pins it

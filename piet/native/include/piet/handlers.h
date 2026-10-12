@@ -71,7 +71,7 @@ nlohmann::ordered_json runDescribe(const std::optional<std::vector<std::string>>
 // so the numeric path (cobra --summarize) and the factor/fallback path both
 // see the restricted sample uniformly (Doctrine ①: the qualifier reaches the
 // engine, never silently dropped).
-// `weightVar` (MILF Step-1 D3): when set (tokenizer only lets this through for
+// `weightVar` (project Step-1 D3): when set (tokenizer only lets this through for
 // `[fw=]`/`[fweight=]`), forwarded as `--fweight weightVar` to the cobra call.
 // gate-①: if a weight is set and the cobra call fails, the native numpyStats
 // fallback is skipped and the cobra error is returned instead — an unweighted
@@ -141,7 +141,7 @@ nlohmann::ordered_json runXtset(const std::string& ivar, const std::optional<std
 // rejecting — and leaving the ts context UNSET — when delta is narrower
 // than the true data spacing, matching real Stata).
 // B4-W3b: `tsFmt` is the PERIOD option's display format (`tsset t, quarterly`
-// -> "%tq"). Measured (StataBE 19.5, milfpins_oracle_g.log:257-273, `clear` +
+// -> "%tq"). Measured (StataBE 19.5, private_oracle_g.log:257-273, `clear` +
 // `set obs 8` + `gen t = _n` + `tsset t, quarterly`): rc 0, r(tsfmt) "%tq",
 // AND `describe t` shows the format on the VARIABLE — the period option is not
 // only an r()-class fact, it formats the column, which is why this reaches
@@ -829,7 +829,7 @@ nlohmann::ordered_json runClonevar(const std::string& newvar, const std::string&
                                     const std::optional<std::string>& ifExpr = std::nullopt);
 
 // `collapse (stat) varlist [(stat) varlist...] [, by(g1 g2)] [if COND] [in RANGE]`.
-// `weightVar` (MILF Step-1 D3): when set (tokenizer only admits this for
+// `weightVar` (project Step-1 D3): when set (tokenizer only admits this for
 // `[fw=]`/`[fweight=]`), forwarded as `--fweight weightVar` to cobra's
 // `collapse` alongside `--by` — cobra does the actual Σw math and rejects
 // unsupported combinations (e.g. weighted median/p##) itself. `inRange`
@@ -1066,7 +1066,7 @@ nlohmann::ordered_json runIsid(const std::vector<std::string>& varlist, SessionS
 //   `cross using FILE`       — Cartesian product (master wins a shared name)
 //   `contract varlist`       — distinct combinations + `_freq`
 // B4-W3b: `generate(newvar)` marks each row 0 (an original) or 1 (a copy the
-// expansion added). Measured (StataBE 19.5, milfpins_oracle_g.log:227-233,
+// expansion added). Measured (StataBE 19.5, private_oracle_g.log:227-233,
 // `sysuse auto` + `expand 2, generate(dupflag)`): _N 74 -> 148, dupflag[1]==0,
 // and `tabulate dupflag` is 74 "Original observation" / 74 "Duplicated
 // observation" — i.e. the copies are APPENDED, which cobra's own expand does
@@ -1118,7 +1118,7 @@ nlohmann::ordered_json runWinsor2(SessionState& session, const std::vector<std::
 // `tabulate`/`tab`/`tab1`/`tab2` VARLIST [, chi2 sum(V)|summarize(V)] — C++
 // port of tabulate.py's run_tabulate (oneway/twoway freq, tab1/tab2, the
 // summarize()-mode per-category mean/sd/N table).
-// `weightVar` (MILF Step-1 D3): when set (tokenizer only admits this for
+// `weightVar` (project Step-1 D3): when set (tokenizer only admits this for
 // `[fw=]`/`[fweight=]` on tabulate/tab/tab1/tab2), PIET reads/validates it
 // itself (no cobra call underlies native tabulate) and weights every cell
 // freq by Σw; missing-weight rows are dropped, non-integer weights error.
@@ -1457,7 +1457,7 @@ nlohmann::ordered_json runEstat(const std::string& subcmd,
 
 // -- BETA campaign Phase D batch D4/D5: time-series + post-estimation/diag/
 // misc wirings (BS-077/078/079/080/081/085/021/082/086/083/084/087). Oracle:
-// milf-coord/plans/BETA-20260712-campaign/probes/d45-oracle-stata.log
+// private-notes/plans/BETA-20260712-campaign/probes/d45-oracle-stata.log
 // (StataBE 19.5 on piet/packaging/sample/fatalities.csv, `gen high=(beertax
 // >.5)` + `encode state, gen(snum)` + `gen t=_n` + `tsset t`; sections
 // D4a-D4f, D5a-D5g). See each handler's own .cpp header comment

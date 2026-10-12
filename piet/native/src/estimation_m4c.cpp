@@ -920,7 +920,7 @@ void postEstimationBlockM4(SessionState& session, const ojson& block, const std:
 
 // AER-B4 margins-dydx-OLS (2026-09-09) — `margins, dydx(x)` AFTER A PLAIN OLS FIT.
 //
-// Oracle: tests/eval/golden/aer_b4/milfpins_oracle_r.do:75-79 (log lines
+// Oracle: tests/eval/golden/aer_b4/private_oracle_r.do:75-79 (log lines
 // 199-224) fits `quietly regress price mpg weight` and asks for
 // `margins, dydx(mpg) post`. Stata answers rc 0 with
 //   dy/dx -49.51222  std. err. 86.15604  t -0.57  P>|t| 0.567
@@ -1442,7 +1442,7 @@ ojson runMargins(const std::vector<std::pair<std::string, eval::OptValue>>& opts
     // placeholder, not a real regression spec) — both need the SAME reject
     // rather than falling to the ELSE branch's silent AME computation.
     // AER-B4 margins-dydx-OLS (2026-09-09) closes the half of this reject the oracle
-    // contradicts. tests/eval/golden/aer_b4/milfpins_oracle_r.do:75-79 fits
+    // contradicts. tests/eval/golden/aer_b4/private_oracle_r.do:75-79 fits
     // `quietly regress price mpg weight` then `margins, dydx(mpg) post` and
     // Stata answers rc 0 — PIET refused the combination outright. The fix is
     // NOT to drop feols/regress from kLinearCmds and let this branch's engine
@@ -3329,7 +3329,7 @@ ojson runEstat(const std::string& subcmdIn, const std::vector<std::string>& rawV
 // ===========================================================================
 // BETA campaign Phase D batch D4/D5: time-series + post-estimation/diag/misc
 // wirings (BS-077/078/079/080/081/085/021/082/086/083/084/087). Oracle:
-// milf-coord/plans/BETA-20260712-campaign/probes/d45-oracle-stata.log
+// private-notes/plans/BETA-20260712-campaign/probes/d45-oracle-stata.log
 // (StataBE 19.5 on piet/packaging/sample/fatalities.csv, `gen high=(beertax
 // >.5)` + `encode state, gen(snum)` + `gen t=_n` + `tsset t`; sections
 // D4a-D4f, D5a-D5g). durbinalt's fix (BS-021) and the endogenous/overid/

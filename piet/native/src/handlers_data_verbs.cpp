@@ -265,7 +265,7 @@ ojson runSaveData(const std::string& filepathArg, bool replace, SessionState& se
   // removed.
   //
   // The same shape carries the L5-IOSAVE perf half for free (§L5 DIAG in
-  // milf-coord/plans/GATE23-stage0-RUN.md): `dst << src.rdbuf()` is a
+  // private-notes/plans/GATE23-stage0-RUN.md): `dst << src.rdbuf()` is a
   // byte-at-a-time streambuf loop, ~5.5 ns/byte and *user*-CPU bound (0.91 user
   // / 0.22 sys on the 164 MB reference corpus = ~1.10 s, ~95% of the probe
   // wall). A same-volume `clonefile(2)` into the temp is O(1) (1.10 s →
@@ -631,7 +631,7 @@ ojson runSaveData(const std::string& filepathArg, bool replace, SessionState& se
   // — and it bought no wall at all (paired median −0.2%), because a native
   // .hbin open is an mmap + header parse with no whole-file hash, so the work
   // removed was already cheap and the added stash/unstash trips ate it.
-  // Reverted on MILF adjudication (2026-08-06, precedent A4): against zero
+  // Reverted on project adjudication (2026-08-06, precedent A4): against zero
   // measured gain it was carrying a memo, an invalidation contract, and a
   // silent-wrong-answer hazard. The counter stayed, because knowing how often
   // a session re-reads its own output is worth knowing either way.
@@ -1018,7 +1018,7 @@ ojson runCollapse(const std::string& rawLine, const std::optional<std::string>& 
     raw = trim(head) + tail;
   }
 
-  // MILF Step-1 D3: the `[fw=w]` weight clause also sits in the pre-comma head
+  // project Step-1 D3: the `[fw=w]` weight clause also sits in the pre-comma head
   // and (like the `if` above) would otherwise leak into cobra's --stat argument
   // ("engine error: no column: w]"). The weight is already threaded to cobra via
   // --fweight below, so strip the clause from the stat head here. Gated on
@@ -1144,7 +1144,7 @@ ojson runCollapse(const std::string& rawLine, const std::optional<std::string>& 
     args.push_back("--by");
     args.push_back(byCsv);
   }
-  // MILF Step-1 D3: forward the frequency weight to cobra's collapse. cobra
+  // project Step-1 D3: forward the frequency weight to cobra's collapse. cobra
   // owns the Σw math (and rejects what it doesn't support, e.g. weighted
   // median/p## — PIET does not pre-empt that here, it just passes through).
   if (weightVar.has_value() && !weightVar->empty()) {

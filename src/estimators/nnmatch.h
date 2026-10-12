@@ -8,7 +8,7 @@ namespace cecon {
 // `teffects nnmatch` — Abadie–Imbens nearest-neighbour matching (StataCorp
 // [CAUSAL]). Method identity, and every rule below, was measured against live
 // StataBE 19.5 BEFORE this file existed:
-//   milf-coord/plans/teffects-nnmatch-20260908/REPORT.md   (14 fixtures, 2,800 rows)
+//   private-notes/plans/teffects-nnmatch-20260908/REPORT.md   (14 fixtures, 2,800 rows)
 //   .../REFUTE-0.md + refute-0/                            (the H2 match-set rule)
 //   .../REFUTE-1.md                                        (source/anchor audit)
 //   tests/eval/golden/aer_estim2_oracle.log INFO|nn_*      (rmcoll, `if`, rc's)

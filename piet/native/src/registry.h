@@ -8,7 +8,7 @@
 // built by hand against dispatcher.cpp:809-2203 (the routing table),
 // eval/tokenizer.cpp:507-519/529-539 (the weight/`in` allow-lists), and
 // dispatcher.cpp:596-678 (the by/bysort gate) — see
-// milf-coord/plans/BETA-20260712-campaign/A0-anchor-map.md for the full
+// private-notes/plans/BETA-20260712-campaign/A0-anchor-map.md for the full
 // scouting trail this transcription is built from.
 //
 // Consumers:
@@ -70,7 +70,7 @@ enum class Family {
 // gate EXACTLY: each row names the ONE allow-set the engine actually accepts
 // for that command; the gate rejects any spelling outside that row's set,
 // naming the command AND (for a non-None row) the allowed set in its reject
-// message. This is a per-command field now (P3 weights wave, MILF-owned
+// message. This is a per-command field now (P3 weights wave, project-owned
 // engine work) — the pre-P3 law ("fw/fweight only, a narrow allow-list;
 // aw/pw/iw rejected everywhere, no exceptions") is retired; None is still a
 // real, common case (most commands), just no longer the ONLY non-FweightOnly

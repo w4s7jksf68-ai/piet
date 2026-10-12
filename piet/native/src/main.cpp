@@ -129,14 +129,11 @@ std::string readFileOrDie(const std::string& path) {
   return ss.str();
 }
 
-// Resolves a path relative to this source file's known repo-tree location
-// (__FILE__ gives a build-time-stable anchor back to the repo without
-// hardcoding a machine path — works for any dev checkout location).
+// Resolve dev files from the running executable, independent of the caller's
+// working directory and without embedding the builder's checkout path.
 std::string repoRelative(const std::string& suffix) {
-  std::string thisFile = __FILE__;  // .../piet/native/src/main.cpp
-  auto pos = thisFile.rfind("/piet/native/src/main.cpp");
-  std::string root = (pos == std::string::npos) ? "../.." : thisFile.substr(0, pos);
-  return root + suffix;
+  auto root = piet::devTreeRoot();
+  return root ? *root + suffix : suffix;
 }
 
 bool fileExists(const std::string& path) {
@@ -144,7 +141,7 @@ bool fileExists(const std::string& path) {
 }
 
 // M5 GA: resolves piet/frontend/index.html — bundled Resources/frontend/
-// FIRST when running from inside a packaged .app, dev-tree __FILE__-relative
+// FIRST when running from inside a packaged .app, dev-tree executable-relative
 // path otherwise. Mirrors resolveCobraBin()'s bundle-first order
 // (cobra_runner.cpp) so both halves of "what does a packaged .app load"
 // (the UI bundle, the engine binary) resolve the same way for the same
@@ -157,10 +154,9 @@ bool fileExists(const std::string& path) {
 // Resources/frontend/index.html is missing (a packaging-script regression —
 // see the Windows "resources\ runtime layer" canary bug this same
 // stabilization wave already fixed once for the cobra binary) must NOT
-// silently fall through to the dev-tree repoRelative() path: that path is
-// derived from this SOURCE FILE's build-time __FILE__ location, which on a
-// shipped .app is some OTHER machine's checkout and essentially never
-// exists — navigating a file:// URL that resolves to nothing leaves a blank
+// silently fall through to the dev-tree repoRelative() path: on a shipped
+// .app that checkout path will normally not exist — navigating a file:// URL
+// that resolves to nothing leaves a blank
 // window with no diagnostic (exactly the ERR_NAME_NOT_RESOLVED-shaped
 // failure mode). So: try the packaged path first; if that's not there, try
 // the dev-tree path as a best-effort fallback (covers running a freshly

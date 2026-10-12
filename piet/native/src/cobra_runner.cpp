@@ -75,7 +75,7 @@ std::string resolveCobraBin() {
   // (PIET.app/Contents/MacOS/piet_native), prefer the cobra binary bundled
   // alongside it at Contents/Resources/cobra over the dev-tree Art 7 pin. A
   // packaged .app must be self-contained and reproducible off the machine
-  // that built it — the dev pin path (milf-coord/releases/engine/current/
+  // that built it — the dev pin path (private-notes/releases/engine/current/
   // cobra) is a worktree-relative dev convenience that won't exist on a
   // machine that only has the .app installed. bundleResourcesDir() returns
   // std::nullopt for any non-bundled invocation (dev build run in place,

@@ -745,7 +745,7 @@ ojson runUse(const std::string& filepathArg, SessionState& session) {
   // 2.0 core does NOT replicate this bug — session.cwd is intentionally
   // left untouched here. This is a KNOWN, pre-authorized divergence from
   // the frozen piet2 corpus's `use`-into-tempdir-adjacent cells; Eval
-  // regenerates the affected corpus cells to reflect the fix (MILF-routed).
+  // regenerates the affected corpus cells to reflect the fix (project-routed).
   session.invalidateDatastore();
   Datastore* ds = session.datastore();
   // BUG-198 (load half): a native .hbin states its own display formats and
@@ -1844,7 +1844,7 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
       // (tests/eval/golden/aer_b4/b5_absorb_class.log:32-36,
       // b5_misc_pins.log:29-51 incl. the cluster()/vce()/if combinations,
       // and the `ab()` abbreviation at
-      // tests/eval/golden/aer_b4/milfpins_oracle_p.log:103-107, same
+      // tests/eval/golden/aer_b4/private_oracle_p.log:103-107, same
       // message and rc). `feols`/`reghdfe`/`areg` share this handler and DO
       // have it (b5_absorb_class.log:80-99 areg rc 0, :125-151 reghdfe rc 0;
       // freeze_extra.do:41 `feols y x1 x2, absorb(id)`) — gate on the Stata

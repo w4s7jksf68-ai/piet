@@ -1,6 +1,6 @@
 // M0 -- the native Mata statement subset. Grammar, scope and the namespace rule
 // are in piet/mata_subset.h; the design is SPEC.md §5.3 / D2 / D3 of
-// milf-coord/plans/autonomy/scope-ge2/ml-getmata. Oracle:
+// private-notes/plans/autonomy/scope-ge2/ml-getmata. Oracle:
 // tests/eval/golden/aer_w2/w2c_ml_getmata.{do,log} families (8) and (9).
 //
 // Two phases per line, and the split is the point: every statement of a line

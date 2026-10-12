@@ -1714,7 +1714,7 @@ ojson runBoottest(const eval::ParsedCommand& parsed, SessionState& session) {
 // ===========================================================================
 // tobit (BS-069, BETA D2 batch): `tobit depvar indepvars [if], ll[(#)]
 // ul[(#)] [level(#)]` -> `cobra tobit --ll/--ul`. Oracle:
-// milf-coord/plans/BETA-20260712-campaign/probes/d2-oracle-stata.log
+// private-notes/plans/BETA-20260712-campaign/probes/d2-oracle-stata.log
 // (D2a: ul(15000), D2b: ll(11000)) — both coefficients AND the reported
 // variance/uncensored/censored counts match cobra's `tobit` byte-for-byte
 // (live-verified against this exact engine build, no convention gap here
@@ -2472,7 +2472,7 @@ ojson runMediate(const eval::ParsedCommand& parsed, SessionState& session) {
 // ===========================================================================
 // poisson / ppmlhdfe / fepois / nbreg / xtpoisson / xtlogit / drdid (BETA D3
 // batch, panel/count wirings: BS-073/074/075/076). Oracle (poisson-family,
-// nbreg, xtpoisson, xtlogit): milf-coord/plans/BETA-20260712-campaign/
+// nbreg, xtpoisson, xtlogit): private-notes/plans/BETA-20260712-campaign/
 // probes/d3-oracle-stata.log (StataBE 19.5 on piet/packaging/sample/
 // fatalities.csv, `gen cnt=round(spirits*3)` + `encode state, gen(snum)` +
 // `xtset snum year`; sections D3a-D3g). Oracle (drdid): tests/validate/

@@ -2411,12 +2411,12 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
     for (int64_t j = 0; j < nu; ++j) if (!u_matched[j]) plan.push_back({-1, j, 2});
 
     // ---- UPDATE merge: reclassify the matched rows into 3/4/5 -----------------
-    // Oracle milfpins_oracle_i.log (`merge 1:1 id using ..., update`, one overlapping
+    // Oracle private_oracle_i.log (`merge 1:1 id using ..., update`, one overlapping
     // variable x): 1 master-only, 1 using-only, 1 "not updated" (3), 2 "missing
     // updated" (4), 2 "nonmissing conflict" (5).
     //
     // The code is per ROW, over ALL overlapping variables at once — NOT per variable.
-    // milfpins_oracle_h.log is the falsifier that settled it: the same fixture plus a
+    // private_oracle_h.log is the falsifier that settled it: the same fixture plus a
     // str3 marker that differs in every matched row put ALL FIVE matches at code 5
     // (n3=0, n4=0, n5=5) while x2/x4 were still FILLED from the using (20 and 40).
     // So the classification is a row-level max over the variables, and the data
@@ -2718,7 +2718,7 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
     if (!opts.nogenerate) {
         std::vector<double> merge_col(nout);
         for (int64_t r = 0; r < nout; ++r) merge_col[r] = static_cast<double>(filtered[r].merge_code);
-        // generate(newvar) RENAMES the marker — oracle milfpins_oracle_h.log has
+        // generate(newvar) RENAMES the marker — oracle private_oracle_h.log has
         // `confirm variable _merge` at r(111) after generate(mm), so `_merge` must
         // not also exist.
         out.append_f64_column(opts.generate.empty() ? std::string("_merge") : opts.generate,

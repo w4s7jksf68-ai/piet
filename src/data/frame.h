@@ -735,7 +735,7 @@ public:
     //            p supplied via the `pctile_p` argument (default 50).
     //   Iqr    = p75 - p25 (Stata pctile method) broadcast to the group.
     //
-    // B4/W6 rank family and `var`. Oracle tests/eval/golden/aer_b4/milfpins_oracle_b.log
+    // B4/W6 rank family and `var`. Oracle tests/eval/golden/aer_b4/private_oracle_b.log
     // and _c.log, on r = 10,10,20,30,30,30,40,.,.,. — a fixture built with heavy ties
     // BECAUSE batch A's (price, rep78) had none, which made track==default and
     // maxmode==default and so proved nothing:
@@ -764,7 +764,7 @@ public:
                  StoreType st = StoreType::Double);
 
     // egen mode: `egen out = mode(x) [, by(g) minmode|maxmode|nummode(#) missing]`.
-    // Oracle milfpins_oracle_b.log on t = 1,1,2,2 + six missings (a deliberate TIE):
+    // Oracle private_oracle_b.log on t = 1,1,2,2 + six missings (a deliberate TIE):
     //   default            -> MISSING for every row (Stata also warns)
     //   maxmode / minmode  -> the largest / smallest of the tied modes (2 / 1)
     //   missing            -> `.` counts as a value; here it wins with 6 and the
@@ -1303,13 +1303,13 @@ struct MergeOpts {
     // W6 / B4 paper 034 (`merge ..., update [replace]`, ~45 uses). An UPDATE merge:
     // overlapping non-key variables are no longer silently dropped from the using
     // side — they feed the master's column, and the marker gains codes 4 and 5.
-    // Oracle: tests/eval/golden/aer_b4/milfpins_oracle_i.log (clean fixture) and
-    // milfpins_oracle_h.log (the same test with a marker variable that conflicts in
+    // Oracle: tests/eval/golden/aer_b4/private_oracle_i.log (clean fixture) and
+    // private_oracle_h.log (the same test with a marker variable that conflicts in
     // every row, which is what proves the code is per ROW, not per variable).
     bool update = false;            // fill master's MISSING cells from the using
     bool replace = false;           // ... and overwrite nonmissing conflicts too (implies update)
     // `generate(newvar)`: the marker's name. Empty = Stata's default `_merge`.
-    // Oracle milfpins_oracle_h.log:`generate` — after generate(mm), `confirm variable
+    // Oracle private_oracle_h.log:`generate` — after generate(mm), `confirm variable
     // _merge` is r(111): the option RENAMES the marker, it does not add a second one.
     std::string generate;
 };
@@ -1383,7 +1383,7 @@ void set_rng_coords(long long seed, long long stream);
 // numeric field. cobra had no %g renderer anywhere, which is why W6 declined to land
 // concat instead of guessing one.
 //
-// The rule below is read off tests/eval/golden/aer_b4/milfpins_oracle_g2.log
+// The rule below is read off tests/eval/golden/aer_b4/private_oracle_g2.log
 // (21 values x {default, %9.0g, %10.0g, %12.0g} = 84 cells), NOT off any prose:
 //   * the DEFAULT is exactly %9.0g — every `default` cell equals its `w9` cell.
 //   * the width sets a significant-digit budget S = w-2: 7 at w9, 8 at w10, 10 at

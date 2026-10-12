@@ -103,7 +103,7 @@ BridgeResult summarize(SessionState& session, const std::string& body);
 
 // "legal.notices" (WI-5, legal remediation 2026-07-08) — app-shell service
 // route (no SessionState; same classification as "dialog.open": a shell
-// facility, not a Boundary-B kernel endpoint — MILF classifies at merge).
+// facility, not a Boundary-B kernel endpoint — project classifies at merge).
 // Returns { text: string, source: "bundle"|"dev" }: the
 // THIRD_PARTY_NOTICES.txt generated into the packaged bundle's Resources/
 // by package_native_app.sh, or (dev runs) the same content concatenated

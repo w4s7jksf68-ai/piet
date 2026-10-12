@@ -70,7 +70,7 @@ std::string weightPolicyToString(WeightPolicy w) {
 //                  `--keepif` predicate on that column). Every OTHER row
 //                  stays false: still-legal-but-unimplemented Stata forms
 //                  (BS-090's own scope cap) or genuinely out of scope.
-//   weight       = P3 weights wave (MILF-owned engine work taught cobra real
+//   weight       = P3 weights wave (project-owned engine work taught cobra real
 //                  weighted estimation): per-command allow-set, no longer a
 //                  single blanket list. AllWeights on regress/reg/r/feols/
 //                  reghdfe (cobra's feols accepts all four types, honest-
@@ -109,7 +109,7 @@ std::string weightPolicyToString(WeightPolicy w) {
 // table is plans/BUG105-ABBREV-SOURCING-20260731.md §3 (30 commands × every
 // prefix = 190 `capture noisily` attempts, plus 32 `which` identity calls to
 // separate "some command ran" from "THAT command ran"); the oracle scripts are
-// kept at milf-coord/plans/instruments/bug105-abbrev-oracle/.
+// kept at private-notes/plans/instruments/bug105-abbrev-oracle/.
 //
 // Three standing rules this table now encodes, all measurement-derived:
 //   1. NO computed prefix rule. Stata's accepted set is non-contiguous
@@ -1124,7 +1124,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // r(min_date_td)=21930). allowIf was false here until the 2026-09-09
       // review: descriptive-only (BUGLOG:1404 — no enforcement site reads it),
       // but `--dump-registry` does, and that export is what
-      // milf-coord/plans/aer-scope1/registry-*.json is built from.
+      // private-notes/plans/aer-scope1/registry-*.json is built from.
       // NAMED DIVERGENCE 4: `bcal create ..., generate(nv)` writes nv as f64
       // where Stata makes it a `long` (oracle i_type = long, i_fmt = %tbi_gen;
       // re-measured 2026-09-09, cap2.log `describe bz3` -> `long %tbg2`). This
@@ -1477,7 +1477,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // ONLY the `nnmatch` estimator: Abadie-Imbens nearest-neighbour matching
       // (StataCorp [CAUSAL]), the last statistical blocker of paper 076. Landed
       // after its match-set rule was measured AND the first candidate rule was
-      // refuted: milf-coord/plans/teffects-nnmatch-20260908/{REPORT,REFUTE-0,
+      // refuted: private-notes/plans/teffects-nnmatch-20260908/{REPORT,REFUTE-0,
       // REFUTE-1}.md (14 + 15 live-Stata runs, every gen() id in order).
       // ra/ipw/ipwra/aipw/psmatch are DIFFERENT estimators and stay named
       // refusals in the handler (`refused:teffects_<sub>_unimplemented`).
@@ -1501,7 +1501,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // ---- AER scope 2, bundle B2 (2026-09-08): `oaxaca` leaves E3 ----------
       // Ben Jann's Blinder-Oaxaca decomposition, `pooled` twofold ONLY (the
       // corpus form, paper 034). Landed after -- not before -- its inference was
-      // pinned: milf-coord/plans/oaxaca-se-20260908/REPORT.md (12 live-Stata
+      // pinned: private-notes/plans/oaxaca-se-20260908/REPORT.md (12 live-Stata
       // fixtures, all 120 SEs and every e(V)/e(V0) entry to 3.8e-14, 48 wrong
       // constructions rejected). The threefold default is a NAMED refusal in
       // the handler. allowIf: the handler forwards the qualifier as --keepif.

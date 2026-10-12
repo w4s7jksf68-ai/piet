@@ -229,7 +229,7 @@ std::string labelFor(const GroupCol& gc, double v) {
 
 // Sorted-unique category (value, label) pairs among valid rows.
 // `weightValid`, when non-null, further restricts to rows where
-// (*weightValid)[i] is true (MILF Step-1 D3: excludes fweight-missing rows
+// (*weightValid)[i] is true (project Step-1 D3: excludes fweight-missing rows
 // from the category set entirely, not just from the cell counts — a category
 // that only occurs in weight-missing rows must not appear in the table at
 // all, mirroring Stata's implicit `if !missing(weightvar)`). Defaulted to
@@ -248,7 +248,7 @@ std::vector<std::pair<double, std::string>> uniqueCats(
   return out;
 }
 
-// MILF Step-1 D3: parallel weight-array read alongside GroupCol/readGroupCol.
+// project Step-1 D3: parallel weight-array read alongside GroupCol/readGroupCol.
 // A weight column is plain numeric (Stata errors on a string/factor weight
 // var), so this is deliberately simpler than GroupCol — no factor/levels
 // branch. `outW` is resized to ds.nRows(); NaN marks a missing weight (caller
@@ -297,7 +297,7 @@ std::optional<ojson> readFweightCol(Datastore& ds, const std::string& weightVar,
 
 // `weight`, when non-null, is a Σw-sized-to-nRows fweight array (NaN =
 // missing -> row dropped): each cell's freq becomes Σw of its rows instead of
-// a plain row count (MILF Step-1 D3). Defaulted to nullptr so the unweighted
+// a plain row count (project Step-1 D3). Defaulted to nullptr so the unweighted
 // call sites are byte-identical to before this change.
 //
 // `sortByFreq` (B5-D-TAB-SORT, one-way ONLY — real Stata's `sort` option
@@ -618,7 +618,7 @@ ojson runTabulate(Datastore& ds, const std::vector<std::string>& varlist, bool c
                    const std::string& cmd, const std::optional<std::string>& sumvar,
                    const std::optional<std::string>& weightVar, bool includeMissing,
                    bool sortByFreq) {
-  // MILF Step-1 D3: native tabulate has no cobra call, so — unlike
+  // project Step-1 D3: native tabulate has no cobra call, so — unlike
   // summarize/collapse — PIET must read, validate, and apply the fweight
   // itself. Read once up front; `weightPtr` (non-null only on success) is
   // threaded into every branch below that computes a frequency table.

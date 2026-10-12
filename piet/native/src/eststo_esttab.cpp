@@ -332,7 +332,7 @@ LastModel lastModelFromJson(const ojson& m) {
 bool fileExistsEt(const std::string& path) { return cecon::native_exists(path); }
 
 // Stata's `estimates save` appends `.ster` when the name carries no suffix
-// (oracle milfpins_oracle_g.log:284 — `estimates save "b4g_est", replace`
+// (oracle private_oracle_g.log:284 — `estimates save "b4g_est", replace`
 // answers "(note: file b4g_est.ster not found) / file b4g_est.ster saved").
 // Only a suffix on the LAST path component counts, so `dir.v2/est` still gets
 // one.
@@ -508,7 +508,7 @@ ojson runEststoDirNames(const std::vector<std::string>& namelist, SessionState& 
 // ===========================================================================
 // B4-W3b / BUG-470: estimates save / estimates use
 //
-// Stata runs all four links at rc 0 (oracle milfpins_oracle_g.log:283-298):
+// Stata runs all four links at rc 0 (oracle private_oracle_g.log:283-298):
 //   estimates save "b4g_est", replace -> 0
 //   estimates use  "b4g_est"          -> 0
 //   e(cmd)==regress, e(depvar)==price   <- the RESTORE puts e() back

@@ -19,7 +19,7 @@
 // specs came back wrong. Every correction that survived that review is carried
 // at its own site below, with the measurement that forced it, so that a later
 // reader cannot quietly "simplify" it back. The record is
-// milf-coord/plans/ERRATA-AER-H-SPECS-20260904.md.
+// private-notes/plans/ERRATA-AER-H-SPECS-20260904.md.
 //
 // The engine-backed half of E2 (tsfilter hp, lpoly, lowess, pca) refuses
 // honestly here until the cobra subcommands land: the handler ASKS the engine
@@ -1812,7 +1812,7 @@ ojson runXiPrefix(const std::vector<std::string>& terms,
 // ONLY the twofold `pooled` decomposition is computed, because that is the form
 // the twelve-paper corpus writes (034: `... sch2-sch531, by(parentedex) relax
 // noisily pooled`) and the only form whose inference was VERIFIED before this
-// handler existed: milf-coord/plans/oaxaca-se-20260908/REPORT.md reproduces all
+// handler existed: private-notes/plans/oaxaca-se-20260908/REPORT.md reproduces all
 // 120 SEs and every e(V)/e(V0) entry of 12 live-Stata fixtures to 3.8e-14, and
 // 48 deliberately wrong constructions fail. The threefold DEFAULT (no `pooled`)
 // is a NAMED refusal, not a silent fall-through to the twofold numbers: Stata
@@ -2012,7 +2012,7 @@ ojson runOaxaca(const eval::ParsedCommand& parsed, SessionState& session) {
 // tests/eval/golden/aer_estim2_oracle.log), and their ORDER inside a tie is
 // Stata's, not ours. Gate ① still wants e(b)/e(V) exact, and it gets them.
 //
-// Method identity: milf-coord/plans/teffects-nnmatch-20260908/REPORT.md as
+// Method identity: private-notes/plans/teffects-nnmatch-20260908/REPORT.md as
 // CORRECTED by REFUTE-0.md. The kernel comment in src/estimators/nnmatch.cpp
 // carries the H2 rule and its named divergence; this handler owns only the
 // surface: parsing, option honesty, e() posting, and gen().
@@ -2317,7 +2317,7 @@ ojson runTeffects(const std::string& sub, const eval::ParsedCommand& parsed,
   session.eval.setEScalar("k_robust", static_cast<double>(raw.value("k_robust", 2)));
   session.eval.setEScalar("dtolerance", raw.value("dtolerance", 1.4901161193847656e-8));
   // e(level) is deliberately NOT posted: the full `ereturn list` capture of
-  // all 14 oracle fixtures (milf-coord/plans/teffects-nnmatch-20260908/
+  // all 14 oracle fixtures (private-notes/plans/teffects-nnmatch-20260908/
   // oracle.txt SCALARS) has no `level`, and `display e(level)` after
   // `teffects nnmatch ..., level(90)` prints `.`
   // (aer_estim2_oracle.log INFO|nn_level|l90_e_level). Posting it was an

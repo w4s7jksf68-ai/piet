@@ -46,7 +46,7 @@ struct Sheet {
 
 // AER scope-2 W3a: `import excel ..., sheet("NoSuchSheet")` is r(601) in Stata,
 // with the message `worksheet NoSuchSheet not found` (captured, aer_b4
-// milfpins_oracle_g.log:136-139). A distinct exception type so the Stata
+// private_oracle_g.log:136-139). A distinct exception type so the Stata
 // surface answers that code from a TYPE rather than by matching on the text of
 // a generic runtime_error.
 struct SheetNotFound : std::runtime_error {
