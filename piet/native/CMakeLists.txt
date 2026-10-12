@@ -249,7 +249,7 @@ target_link_libraries(piet_settings INTERFACE Iconv::Iconv)
 # — the RC strings, the manifest assemblyIdentity, and the Inno installer's
 # AppVersion all trace back to PIET_VERSION_VALUE here. Editing these three
 # lines is still the one and only version bump.
-set(PIET_VERSION_VALUE    "B.15.0")
+set(PIET_VERSION_VALUE    "1.0.0-beta.1")
 set(PIET_CONTRACT_A_VALUE "1.25.0")
 set(PIET_CONTRACT_B_VALUE "2.9.0")
 target_compile_definitions(piet_settings INTERFACE
@@ -345,6 +345,13 @@ elseif(WIN32)
     set(PIET_WIN_VERSION_MINOR "${CMAKE_MATCH_1}")
     set(PIET_WIN_VERSION_PATCH "${CMAKE_MATCH_2}")
     set(PIET_WIN_VERSION_BUILD 0)
+  elseif(PIET_VERSION_VALUE MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)-beta\\.([0-9]+)$")
+    # Windows requires numeric resources; preserve the complete beta string
+    # in the string table and use its serial for the fourth numeric field.
+    set(PIET_WIN_VERSION_MAJOR "${CMAKE_MATCH_1}")
+    set(PIET_WIN_VERSION_MINOR "${CMAKE_MATCH_2}")
+    set(PIET_WIN_VERSION_PATCH "${CMAKE_MATCH_3}")
+    set(PIET_WIN_VERSION_BUILD "${CMAKE_MATCH_4}")
   elseif(PIET_VERSION_VALUE MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
     set(PIET_WIN_VERSION_MAJOR "${CMAKE_MATCH_1}")
     set(PIET_WIN_VERSION_MINOR "${CMAKE_MATCH_2}")
@@ -353,7 +360,7 @@ elseif(WIN32)
   else()
     message(FATAL_ERROR
       "PIET_VERSION_VALUE ('${PIET_VERSION_VALUE}') is not a supported release "
-      "version: expected B.X.Y, A.X.Y, or X.Y.Z. Extend the mapping in "
+      "version: expected B.X.Y, A.X.Y, X.Y.Z, or X.Y.Z-beta.N. Extend the mapping in "
       "piet/native/CMakeLists.txt's WIN32 branch when the version axis changes.")
   endif()
 

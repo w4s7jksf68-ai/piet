@@ -1901,7 +1901,7 @@ async function openAbout() {
     try {
       const v = await client.version();
       verEl.textContent = (v && v.piet_version)
-        ? `PIET ${v.piet_version} · engine CoBrA ${v.cobra_version}`
+        ? `PIET ${v.piet_version.replace(/^(\d+)\.(\d+)\.0-beta\.(\d+)$/, '$1.$2 Beta $3')} · Powered by CoBrA ${v.cobra_version}`
         : 'PIET (no kernel connected)';
     } catch {
       verEl.textContent = 'PIET (no kernel connected)';
