@@ -1,0 +1,28 @@
+PIET — Legal Notices
+====================
+
+PIET / CoBrA
+Copyright (C) 2026 M.K. Kim
+
+This program is free software, licensed under the GNU General Public License,
+version 3 or later. The full license text ships beside this application as
+LICENSE.txt; the complete notices file is NOTICE.txt. You may redistribute and
+modify this program under those terms. It comes with ABSOLUTELY NO WARRANTY.
+
+PIET is not affiliated with, endorsed by, or sponsored by StataCorp LLC.
+"Stata" is a registered trademark of StataCorp LLC. PIET is an independently
+developed educational tool that implements compatible command syntax and
+file formats.
+
+PIET also accepts command names introduced by independent community-authored
+Stata packages (reghdfe, csdid, rdrobust, esttab, and others — the full list is
+in NOTICE.txt section 2). These compatibility names do not install the original packages.
+See THIRD_PARTY_NOTICES.txt for included third-party components. Those names are accepted only while the
+"external-library compatibility names" setting is enabled.
+
+Statistical output carries no warranty of accuracy or fitness for any purpose;
+verify any result independently before relying on it. See NOTICE.txt section 3.
+
+This application bundles the third-party components listed below, and adapts
+code from the projects listed in the "Adopted code" section. Each component's
+license text is reproduced verbatim as required by its terms.

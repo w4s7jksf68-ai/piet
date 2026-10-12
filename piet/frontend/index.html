@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<!-- data-mode set here — before first paint — so there is zero FOUC.
+     localStorage-persisted; defaults to Boring. -->
+<html lang="en" data-mode="boring">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PIET</title>
+  <link rel="stylesheet" href="css/piet.css">
+  <!-- Persist mode + theme choices across reloads — runs before first paint -->
+  <script>
+    (function () {
+      let m = localStorage.getItem('piet-mode');
+      if (m === 'mondrian') m = 'destijl';        // back-compat shim (old value)
+      else if (m === 'simple') m = 'boring';      // back-compat shim (old value)
+      if (m === 'boring' || m === 'destijl') document.documentElement.dataset.mode = m;
+      // D5 (mockup UIUX-P8-mockup-v3-pipboy.html §1a/§5): "Follow system
+      // appearance" — OFF by default (absent = OFF, same idiom as every other
+      // localStorage-only display setting), so a fresh install's Boring-Light
+      // default stays byte-stable. ON overrides the persisted 'piet-theme'
+      // choice with the OS's current prefers-color-scheme, before first paint
+      // (no native code — matchMedia is a webview-standard API). A live
+      // matchMedia 'change' listener (app.js, registered in init()) keeps it
+      // following after boot; a manual Light/Dark click turns this back OFF
+      // (toggleTheme()).
+      const followSystem = localStorage.getItem('piet-theme-follow-system') === '1';
+      if (followSystem && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.documentElement.dataset.theme = 'dark';
+      } else if (!followSystem) {
+        const t = localStorage.getItem('piet-theme');
+        if (t === 'dark') document.documentElement.dataset.theme = 'dark';
+      }
+      // 2.2.0 item D: editor/results font size (display setting). 'medium' is
+      // the default (no attribute → the base --fs-mono tokens); applied here
+      // before first paint so there is zero FOUC, same idiom as mode/theme.
+      const fz = localStorage.getItem('piet-font-size');
+      if (fz === 'small' || fz === 'large') document.documentElement.dataset.fontsize = fz;
+    })();
+  </script>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ── Toolbar (row 1) ────────────────────────────────────────────────── -->
+  <header id="toolbar" role="banner">
+    <!-- Maker's mark: Mondrian mini-composition (hidden in Boring mode via CSS) -->
+    <span class="toolbar-mark" aria-hidden="true">
+      <svg viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
+        <!-- Mondrian maker's-mark: black rules + one block each of the three primaries -->
+        <rect width="18" height="18" fill="#faf9f8"/>
+        <!-- black grid rules -->
+        <rect x="0"  y="0"  width="2"  height="18" fill="#1a1a1a"/>
+        <rect x="0"  y="0"  width="18" height="2"  fill="#1a1a1a"/>
+        <rect x="0"  y="11" width="18" height="2"  fill="#1a1a1a"/>
+        <rect x="11" y="0"  width="2"  height="18" fill="#1a1a1a"/>
+        <!-- composition blocks -->
+        <rect x="2"  y="2"  width="9"  height="9"  fill="#d42a1c"/>  <!-- red -->
+        <rect x="13" y="2"  width="5"  height="9"  fill="#1850a8"/>  <!-- blue -->
+        <rect x="2"  y="13" width="9"  height="5"  fill="#f4c20d"/>  <!-- yellow -->
+      </svg>
+    </span>
+
+    <span class="toolbar-wordmark" aria-label="PIET">PIET</span>
+
+    <span class="toolbar-file" id="toolbar-filename">&nbsp;</span>
+
+    <!-- 2.2.0 item A (User-directed): the SURFACES group (Results / Do-file
+         Editor / Graphics view tabs) now sits on the LEFT of the structural
+         divider and the ACTIONS group (File ▾ / Data ▾ / Run .do) on the
+         RIGHT — a straight swap of the two UX-047 groups around the divider;
+         each group's INTERNAL order is unchanged. The divider itself (III-5,
+         --rule/--rule-color token line) and the active-tab styling are kept.
+         About/Settings and the mode/theme toggles stay at the far right. -->
+
+    <!-- LEFT group: view tabs (segmented; active = surface currently showing).
+         data-action="doedit"/"graphics" are KEPT verbatim — the ui-smoke
+         driver (main.cpp) and app.js's init() both select on these. data-view
+         is the tab-active lookup key used by app.js's syncViewTabs(). The
+         Split/Reset controls (2.2.0 item C) live WITH the view tabs they
+         govern, AFTER the three tabs so the tabs' internal order is unchanged. -->
+    <nav class="toolbar-views" aria-label="View">
+      <a href="#" class="view-tab active" data-view="results">Results</a>
+      <a href="#" class="view-tab" data-view="doedit" data-action="doedit">Do-file Editor</a>
+      <a href="#" class="view-tab" data-view="graphics" data-action="graphics">Graphics</a>
+      <!-- 2.2.0 item C: split-view layout. Split toggle docks Do-file Editor /
+           Graphics beside Results as side-by-side columns (tab-docking — in
+           split mode the view tabs become additive column toggles). Reset
+           layout (one click, shown only while split is active — III-6: no
+           orphaned chrome) restores the default single-view tabs and clears
+           the persisted layout. -->
+      <button id="split-toggle" class="toolbar-mini-btn" type="button"
+              aria-pressed="false" title="Split the view into side-by-side columns">⊟ Split</button>
+      <!-- N5 (P8.1-W2): layout variant — 'columns' (default, side-by-side) vs
+           'stack' (both docked surfaces stacked vertically in one right-hand
+           compound column). B21-3 (User dogfood 07-16): visible for the
+           whole splitOn lifetime, not just once both Do-file Editor and
+           Graphics are docked — short of that it renders [disabled] with a
+           title explaining what to dock, so the control is discoverable
+           instead of appearing only once you already know it exists.
+           app.js's syncSplitLayout() owns [hidden]/[disabled]/title/label;
+           setSplitVariant() owns [aria-pressed]. -->
+      <button id="layout-variant-toggle" class="toolbar-mini-btn" type="button" hidden disabled
+              aria-pressed="false" title="Dock both Do-file Editor and Graphics (their view tabs) to stack them">⬓ Stack</button>
+      <button id="reset-layout" class="toolbar-mini-btn" type="button" hidden
+              title="Restore the default single-view layout">Reset layout</button>
+    </nav>
+
+    <!-- Structural divider: token-drawn only (--rule/--rule-color), thin grey
+         in Boring, bold black in De Stijl, auto by mode/theme. -->
+    <span class="toolbar-group-divider" aria-hidden="true"></span>
+
+    <!-- RIGHT group: actions (text links, no buttons/icons) -->
+    <nav class="toolbar-menu toolbar-actions" aria-label="Actions">
+      <!-- BUG-046: File was a single link masquerading as a menu, with no way
+           to open a .do file into the editor without also running it. Now a
+           real dropdown (same click-toggle .open idiom as Data ▾ below). -->
+      <div class="menu-dropdown">
+        <a href="#" tabindex="0">
+          <span class="menu-data-cap"></span>File ▾
+        </a>
+        <div class="menu-dropdown-content">
+          <a href="#" data-action="open" title="Open a dataset (⌘O)">Open Data…</a>
+          <a href="#" data-action="do-open">Open do-file…</a>
+          <!-- U3: one click loads the bundled sample — data-run reuses
+               app.js's existing generic "[data-run] -> runCommand()" wiring
+               (init(), same mechanism as the Data ▾ items below), no new JS. -->
+          <a href="#" data-run="sysuse synthetic_panel">Open sample dataset</a>
+          <!-- B3 (P8-S6): Recent files — last ~8 opened data/do files,
+               persisted in localStorage (app.js's trackRecentFile/
+               renderRecentFiles). Hidden as a whole group until there is at
+               least one entry (III-6: no orphaned chrome); populated
+               client-side only, no new bridge route. -->
+          <div class="menu-recent-group" id="file-menu-recent-group" hidden>
+            <div class="menu-dropdown-sep" role="separator"></div>
+            <div class="menu-recent-label">Recent</div>
+            <div id="file-menu-recent"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="menu-dropdown">
+        <a href="#" tabindex="0">
+          <span class="menu-data-cap"></span>Data ▾
+        </a>
+        <div class="menu-dropdown-content">
+          <a href="#" data-run="browse">Data Browser (browse)</a>
+          <a href="#" data-run="edit">Data Editor (edit)</a>
+        </div>
+      </div>
+
+      <a href="#" data-action="do">Run .do</a>
+    </nav>
+
+    <!-- FAR RIGHT: meta controls (About / Settings + mode/theme toggles) -->
+    <a href="#" class="toolbar-about" data-action="about">About</a>
+    <!-- 2.2.0 item D: Settings panel entry (opens #settings-overlay). -->
+    <a href="#" class="toolbar-about" data-action="settings" title="Settings (⌘,)">Settings</a>
+    <!-- BUG-114: labels are set live by app.js's syncThemeButtons() (called
+         early in init()) — these are just non-empty placeholders so there's
+         no flash of blank buttons before that runs. -->
+    <button class="toolbar-mode-btn" id="mode-toggle" aria-label="Toggle style mode">add style?</button>
+    <button id="theme-toggle" aria-label="Toggle dark mode">Light</button>
+  </header>
+
+  <!-- ── Variables panel (col 1, row 3) ─────────────────────────────────── -->
+  <aside id="pane-vars" aria-label="Variables">
+    <div class="pane-header pane-header-vars">Variables</div>
+
+    <div id="var-list-wrap">
+      <!-- Variable editor grid injected by panels.js:initPanels() -->
+    </div>
+
+    <!-- Properties sub-panel (selected variable info) -->
+    <div id="properties" aria-label="Variable properties"></div>
+  </aside>
+
+  <!-- ── Results console (col 3, row 3) ─────────────────────────────────── -->
+  <main id="pane-console" aria-label="Results console">
+    <!-- 2.2.0 item C: #results-surface groups the Results-native children
+         (header + console + cmd bar) so they can become ONE flex column in
+         split-view layout. In the default single-view layout it is
+         display:contents (generates no box) — its children flow in
+         #pane-console's flex column EXACTLY as before, so this is a no-op for
+         every non-split state and the console DOM the ui-smoke/DOM gates assert
+         on is byte-unchanged. The console overlays stay siblings of this
+         wrapper (see below). -->
+    <div id="results-surface">
+    <div class="pane-header">
+      Results
+      <div class="console-toolbar" style="margin-left:auto">
+        <!-- B2 (P8-S6): Save Results — serializes #console-body to a plain-text
+             .log and triggers a client-side download (app.js's onSaveResults,
+             same Blob→URL.createObjectURL→a.download idiom as the PNG graph
+             export and the esttab CSV export). Confirmation is a status-bar
+             flash (W10: no modal), not a dialog. -->
+        <button class="btn-save-results" id="btn-save-results" title="Save the results log to a text file">Save Results…</button>
+        <button class="btn-clear" id="btn-clear" title="Clear console">× clear</button>
+      </div>
+    </div>
+
+    <!-- B11: ⌘F find bar, Results surface — FIND-ONLY (the log below is
+         immutable, no replace here). Hidden by default (R1: not persistent
+         chrome); summoned only by find.js's openFind() on Cmd/Ctrl+F. Sits
+         between the pane header and #console-wrap so it never scrolls with
+         the log. See piet/frontend/js/find.js. -->
+    <div id="find-bar-results" class="find-bar" data-surface="results" hidden>
+      <input type="text" id="find-input-results" class="find-q" aria-label="Find in results"
+             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Find">
+      <span class="find-cnt" id="find-cnt-results">0/0</span>
+      <button type="button" class="find-btn find-nav" id="find-prev-results" title="Previous match (Shift+Enter)">&lsaquo;</button>
+      <button type="button" class="find-btn find-nav" id="find-next-results" title="Next match (Enter)">&rsaquo;</button>
+      <button type="button" class="find-btn find-aa" id="find-case-results" title="Match case" aria-pressed="false">Aa</button>
+      <button type="button" class="find-btn find-close" id="find-close-results" title="Close (Esc)">&times;</button>
+    </div>
+
+    <div id="console-wrap">
+      <!-- Empty-state: Mondrian composition SVG (z-index 1; buried by first output) -->
+      <div id="console-empty" aria-hidden="true">
+        <svg class="empty-svg" viewBox="0 0 240 160" xmlns="http://www.w3.org/2000/svg">
+          <!-- Mondrian "Composition with Red, Blue and Yellow" silhouette -->
+          <rect width="240" height="160" fill="#faf9f8"/>
+          <!-- thick black rules -->
+          <rect x="0"   y="0"   width="4"   height="160" fill="#1a1a1a"/>
+          <rect x="0"   y="0"   width="240" height="4"   fill="#1a1a1a"/>
+          <rect x="0"   y="156" width="240" height="4"   fill="#1a1a1a"/>
+          <rect x="236" y="0"   width="4"   height="160" fill="#1a1a1a"/>
+          <rect x="0"   y="100" width="240" height="4"   fill="#1a1a1a"/>
+          <rect x="160" y="0"   width="4"   height="104" fill="#1a1a1a"/>
+          <rect x="60"  y="100" width="4"   height="60"  fill="#1a1a1a"/>
+          <!-- composition blocks -->
+          <rect x="4"   y="4"   width="156" height="96"  fill="#d42a1c"/>  <!-- red -->
+          <rect x="164" y="4"   width="72"  height="96"  fill="#1850a8"/>  <!-- blue -->
+          <rect x="4"   y="104" width="56"  height="52"  fill="#f4c20d"/>  <!-- yellow -->
+          <!-- white cells (breathing room) -->
+          <rect x="64"  y="104" width="172" height="52"  fill="#faf9f8"/>
+        </svg>
+        <div class="empty-text">. Try sysuse synthetic_panel, then regress fatal beertax unemp, robust — or File ▾ &gt; Open sample dataset</div>
+      </div>
+
+      <!-- Append-only block log (z-index 2) -->
+      <div id="console-body" role="log" aria-live="polite" aria-label="Command output"></div>
+    </div>
+
+    <!-- Jump-to-latest pill -->
+    <button id="jump-pill" title="Jump to latest output" hidden>↓ latest</button>
+
+    <!-- B1 (1.16.0): run-progress liveness strip — shown only while a do-run is
+         in flight; polls GET /api/run_progress ~1s. Slim, single-line. -->
+    <div id="run-progress" role="status" aria-live="polite" hidden>
+      <span class="rp-glyph" aria-hidden="true">▶</span>
+      <span class="rp-text" id="rp-text">running</span>
+      <button id="rp-cancel" type="button" title="Cancel the running do-file">Cancel</button>
+    </div>
+
+    <!-- Command input bar -->
+    <div id="cmd-bar">
+      <span class="cmd-prompt" aria-hidden="true">.</span>
+      <input id="cmd-input"
+             type="text"
+             autocomplete="off"
+             autocorrect="off"
+             autocapitalize="off"
+             spellcheck="false"
+             aria-label="Command input"
+             placeholder="regress fatal beertax unemp, robust">
+      <button id="btn-run" type="button" title="Run command (Enter)">Run</button>
+    </div>
+    </div><!-- /#results-surface (2.2.0 item C) -->
+
+    <!-- B4 (P8-S7): split-column ratio drag — a draggable divider between
+         Results and whichever second column follows it (a real docked
+         surface, or the F10 placeholder right below). DOM order matters
+         here: it sits directly after #results-surface and before every
+         console-overlay, so in the split flex row it lands exactly between
+         Results and the next in-flow column regardless of which surface (or
+         neither) is docked. Hidden outside split mode (piet.css §12c);
+         app.js's initSplitResizer() wires the drag, applySplitRatio()/
+         syncSplitLayout() own the hidden/--split-ratio state. -->
+    <div id="split-resizer" class="pane-resizer" role="separator" aria-hidden="true" hidden></div>
+
+    <!-- F10 (P8-S7): honest "waiting for a second view" placeholder — shown
+         only while Split is ON and nothing is docked yet, so the Split
+         toggle's ON state always reads as visibly split instead of a silent
+         full-width Results with no explanation (the reported bug). Same
+         column geometry as a docked overlay; app.js's syncSplitLayout()
+         (folded into syncViewTabs()) owns the hidden state. -->
+    <div id="split-placeholder" class="split-placeholder" hidden>
+      Split view is on — open <strong>Do-file Editor</strong> or <strong>Graphics</strong>
+      (the view tabs, left) to fill this column.
+    </div>
+
+    <!-- Design decision 5 (W2 overlay relocation): the four console overlays now
+         live INSIDE #pane-console (which is already position:relative — see
+         piet.css §5/§12b) instead of body-level siblings with hand-tuned
+         top/left/right/bottom pixel offsets that went stale on pane resize
+         (audit A2-03/A3-02). Each gets class="console-overlay" (inset:0,
+         opacity/transform transition owned by WS-C1); app.js's OVERLAYS
+         registry + closeAllOverlays() manage `.open` visibility.
+
+         Exception: #browser-overlay. grid.js (WS-F2, frozen to WS-F1) owns
+         this container's className via VirtualizedGrid._build()
+         (`container.className = 'browser-overlay'`, which overwrites
+         `console-overlay` on construction) and its show()/hide() toggle the
+         `hidden` DOM property directly — not `.open`. So this one KEEPS the
+         `hidden` attribute (dropping it would show an empty grid shell
+         before any data is browsed); visibility stays driven from app.js via
+         grid.show()/grid.hide(), same as before. -->
+    <div id="browser-overlay" class="console-overlay" hidden></div>
+
+    <!-- N5 (P8.1-W2): #docked-stack wraps the two DOCKABLE surfaces (+ the
+         divider between them) so BOTH can become one right-hand compound
+         column, stacked vertically, instead of two side-by-side row columns
+         (app.js's setSplitVariant()/piet.css §12c-stack). display:contents
+         by default (the 'columns' variant, and every non-split state) — the
+         three children flow as DIRECT flex-row items of #pane-console
+         exactly as before this wrapper existed, same pass-through idiom as
+         #results-surface above. getElementById() lookups for doedit-overlay/
+         split-resizer-2/graphics-overlay are unaffected by the extra
+         nesting (id lookups are document-wide, not scope-limited). -->
+    <div id="docked-stack">
+    <!-- Do-file editor overlay (console-overlay; visibility = .open class). -->
+    <div id="doedit-overlay" class="console-overlay">
+      <!-- UX-047: the Back button was removed (III-6 redundant control) — the
+           Results view tab now generalizes it. Escape still closes (A2-05,
+           document-level handler over the OVERLAYS registry, unchanged). -->
+      <div class="doedit-bar">
+        <!-- N5.2: click-swap arm/resolve gesture lives on the title SPAN
+             only (app.js's _onDockedTitleClick()) — the sibling buttons
+             below keep their own click behavior untouched. -->
+        <span class="doedit-title" id="doedit-title">Do-file Editor</span>
+        <span class="doedit-actions">
+          <!-- Opt-in paste auto-run preference (follow-up to design decision 4).
+               Persisted as localStorage 'piet-paste-autorun' ('1'/'0', absent =
+               OFF); wired by app.js. OFF (default): multi-line paste loads this
+               editor. ON: it runs immediately as a do-string block. -->
+          <label class="doedit-paste-pref" id="paste-autorun-label"
+                 title="When on, pasting multiple lines into the command box runs them at once instead of opening this editor"><input
+                 type="checkbox" id="paste-autorun-toggle"> Run pasted blocks immediately</label>
+          <button id="doedit-clear" class="doedit-btn">Clear</button>
+          <!-- A6 (P8.1-T2): Stata's Execute-selection parity as its own explicit
+               button (⇧⌘D already runs the highlighted range — see doedit-text's
+               keydown handler in app.js — this is the discoverable click path). -->
+          <button id="doedit-run-selection" class="doedit-btn"
+                  title="Run the highlighted lines — or the whole buffer if nothing is selected (⇧⌘D)">▶ Run selection</button>
+          <button id="doedit-run" class="doedit-btn doedit-run" title="Run the whole buffer (⌘↩)">▶ Run</button>
+        </span>
+      </div>
+      <!-- B11+B12: ⌘F find bar, do-file editor surface — FIND + REPLACE
+           (B12 "선택한 것 다같이 바꾸기"). Hidden by default; summoned by
+           find.js's openFind() on Cmd/Ctrl+F while this overlay is open. See
+           piet/frontend/js/find.js. -->
+      <div id="find-bar-doedit" class="find-bar" data-surface="doedit" hidden>
+        <input type="text" id="find-input-doedit" class="find-q" aria-label="Find in do-file"
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Find">
+        <span class="find-cnt" id="find-cnt-doedit">0/0</span>
+        <button type="button" class="find-btn find-nav" id="find-prev-doedit" title="Previous match (Shift+Enter)">&lsaquo;</button>
+        <button type="button" class="find-btn find-nav" id="find-next-doedit" title="Next match (Enter)">&rsaquo;</button>
+        <button type="button" class="find-btn find-aa" id="find-case-doedit" title="Match case" aria-pressed="false">Aa</button>
+        <input type="text" id="find-replace-doedit" class="find-rep" aria-label="Replace with"
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Replace">
+        <button type="button" class="find-btn find-go" id="find-replace-one-doedit">Replace</button>
+        <button type="button" class="find-btn find-go" id="find-replace-all-doedit">Replace all</button>
+        <button type="button" class="find-btn find-close" id="find-close-doedit" title="Close (Esc)">&times;</button>
+      </div>
+      <textarea id="doedit-text" class="doedit-text" spellcheck="false" autocomplete="off"
+                autocapitalize="off" autocorrect="off"
+                placeholder="* Write Stata commands here, then ▶ Run (Cmd/Ctrl+Enter).&#10;summarize fatal&#10;gen fatal_rate = fatal/pop*10000&#10;regress fatal_rate beertax unemp, robust"></textarea>
+    </div>
+
+    <!-- BUG-113: second split divider — Do-file Editor ↔ Graphics, shown only
+         when BOTH are docked columns AND the 'columns' variant (piet.css
+         §12c; app.js's syncSplitLayout()/initSplitResizer2() own visibility/
+         drag — N5: hidden outright in 'stack', no meaningful horizontal drag
+         once they're vertically stacked). Source position mirrors #split-
+         resizer's rationale: directly between the two elements it separates
+         — app.js's swapDockedOrder() keeps it sandwiched here through a
+         click-swap too. -->
+    <div id="split-resizer-2" class="pane-resizer" role="separator" aria-hidden="true" hidden></div>
+
+    <!-- Graphics gallery overlay (WS4) (console-overlay; visibility = .open class). -->
+    <div id="graphics-overlay" class="console-overlay">
+      <!-- UX-047: Back button removed (III-6) — Results view tab generalizes it. -->
+      <div class="doedit-bar">
+        <!-- N5.2: id added so app.js can arm/resolve click-swap on this title
+             too (mirrors #doedit-title just above). -->
+        <span class="doedit-title" id="graphics-title">Graphics</span>
+        <!-- B10 (P8-S7): full-view nav — shown only while a single graph is
+             open (app.js's renderGraphicsFullView() toggles [hidden]). The
+             gallery grid stays the default view (III-6: no orphaned chrome
+             the rest of the time). -->
+        <span class="doedit-actions" id="graphics-full-actions" hidden>
+          <button id="graphics-full-prev" class="doedit-btn" type="button" title="Previous graph (←)">&lsaquo; Prev</button>
+          <span id="graphics-full-pos" class="graphics-full-pos"></span>
+          <button id="graphics-full-next" class="doedit-btn" type="button" title="Next graph (→)">Next &rsaquo;</button>
+          <button id="graphics-full-back" class="doedit-btn" type="button">&lsaquo; Back to gallery</button>
+        </span>
+      </div>
+      <div id="graphics-gallery" class="graphics-gallery"></div>
+      <!-- B10: single-graph full view. Hidden by default (gallery is the
+           default surface); app.js moves the SAME renderGraph(block) output
+           the card already used here — no re-fetch. -->
+      <div id="graphics-full" class="graphics-full" hidden></div>
+    </div>
+    </div><!-- /#docked-stack (N5, P8.1-W2) -->
+
+    <!-- About / Legal overlay (WI-5 acknowledgements + WI-6 disclaimer)
+         (console-overlay; visibility = .open class). -->
+    <div id="about-overlay" class="console-overlay">
+      <!-- BUG-095 (P8.1-T1): ✕ reintroduced — About/Settings light no view tab,
+           so the UX-047/III-6 "view tabs generalize Back" removal never covered
+           them (User-confirmed exit trap, 07-12 dogfooding). -->
+      <div class="doedit-bar">
+        <span class="doedit-title">About PIET — Acknowledgements &amp; Legal</span>
+        <span class="doedit-actions">
+          <button id="about-close" class="doedit-btn" type="button" title="Close (Esc)" aria-label="Close About">&#x2715;</button>
+        </span>
+      </div>
+      <div id="about-body" class="about-body">
+        <p id="about-version" class="about-version"></p>
+        <p class="about-disclaimer">PIET is not affiliated with, endorsed by, or sponsored by
+          StataCorp LLC. 'Stata' is a registered trademark of StataCorp LLC. PIET is an
+          independently developed educational tool that implements compatible command syntax
+          and file formats.</p>
+        <h3 class="about-h">Known issues</h3>
+        <p class="about-disclaimer">If menus, result tabs, or the theme toggles stop responding, a
+          system-wide text-injection tool (e.g. Grammarly Desktop) may have altered the editor. Quit that
+          tool — or exempt PIET from it — and relaunch PIET to restore interactivity.</p>
+        <h3 class="about-h">Third-party notices</h3>
+        <pre id="about-notices" class="about-notices"></pre>
+      </div>
+    </div>
+
+    <!-- Settings overlay (2.2.0 item D) (console-overlay; visibility = .open
+         class). Two groups: engine/scratch settings persisted natively via the
+         settings.get/settings.set app-shell bridge routes (restart-to-apply
+         where noted), and display settings persisted in localStorage (apply
+         live). "Apply" writes the native group; the localStorage group applies
+         on change. -->
+    <div id="settings-overlay" class="console-overlay">
+      <div class="doedit-bar">
+        <span class="doedit-title">Settings</span>
+        <span class="doedit-actions">
+          <button id="settings-apply" class="doedit-btn doedit-run" type="button">Apply</button>
+          <!-- BUG-095 (P8.1-T1): visible exit — see About's note. -->
+          <button id="settings-close" class="doedit-btn" type="button" title="Close (Esc)" aria-label="Close Settings">&#x2715;</button>
+        </span>
+      </div>
+      <div id="settings-body" class="settings-body">
+        <p id="settings-sysinfo" class="settings-sysinfo"></p>
+
+        <h3 class="settings-h">Engine &amp; scratch <span class="settings-note">(persisted on this machine)</span></h3>
+
+        <div class="settings-row">
+          <label for="set-scratch-path">Scratch directory</label>
+          <input type="text" id="set-scratch-path" class="settings-input" spellcheck="false"
+                 autocomplete="off" placeholder="(default: $PIET_WORKDIR or /tmp)">
+          <span class="settings-hint">Where per-command scratch datasets are written. <em>Restart to apply.</em></span>
+        </div>
+
+        <div class="settings-row">
+          <label for="set-workdir">Default working directory</label>
+          <input type="text" id="set-workdir" class="settings-input" spellcheck="false"
+                 autocomplete="off" placeholder="(default: ~/Documents)">
+          <span class="settings-hint">Where relative <code>use</code>/<code>save</code> paths resolve. <em>Restart to apply.</em></span>
+        </div>
+
+        <!-- N1 (P8.1-W2, contract_B v2.4.0): "Export folder" — bound to the
+             native settings' default_export_dir. Empty (default) = ask every
+             time via a native Save panel; a real save (app.js's svgToPng()/
+             onSaveResults()) writes straight here with no dialog when set —
+             composeDefaultPath(). Applies immediately (no restart), unlike
+             scratch/working directory above, since it's only consulted at
+             the moment of a save click. -->
+        <div class="settings-row">
+          <label for="set-export-dir">Export folder</label>
+          <input type="text" id="set-export-dir" class="settings-input" spellcheck="false"
+                 autocomplete="off" placeholder="(empty = ask every time)">
+          <span class="settings-hint">Where PNG graph exports and Save Results write to. Empty = ask every time (a native Save panel).</span>
+        </div>
+
+        <div class="settings-row">
+          <label for="set-mem-budget">Memory budget</label>
+          <span class="settings-range-wrap">
+            <input type="range" id="set-mem-budget" class="settings-range" min="256" max="8192" step="128" value="2048">
+            <output id="set-mem-value" class="settings-range-out">2048 MB</output>
+          </span>
+          <!-- U12: names the real consumers (app.js's populateSettings() overwrites
+               this with the same wording plus the detected recommendation). -->
+          <span class="settings-hint" id="set-mem-recommended">Handed to the engine as its memory budget (bounds parallel scratch), caps the Results console's scrollback and graph gallery, and bounds the automatic parallel worker count (SPEC II-2).</span>
+        </div>
+
+        <div class="settings-row">
+          <label for="set-cores">Compute cores</label>
+          <select id="set-cores" class="settings-input settings-select">
+            <option value="0">Auto (all available)</option>
+          </select>
+          <span class="settings-hint">Total core budget: the engine's threads and BLAS pool follow it, and a parallel block divides it among its workers. Applies to the next command.</span>
+        </div>
+
+        <div class="settings-row">
+          <label for="set-provenance">Provenance hash</label>
+          <span class="settings-checkbox-wrap">
+            <input type="checkbox" id="set-provenance">
+          </span>
+          <span class="settings-hint">Provenance embeds a hash of your exact input data in each result (for reproducibility). Off by default to keep results lean; turn on before archiving results you'll need to reproduce.</span>
+        </div>
+
+        <!-- WS-B (extcompat): the durable half of the first-run choice. The
+             `set extcompat on|off` command moves the SESSION only, on purpose;
+             this checkbox (and the first-run dialog) are the two places that
+             persist it. Settings is also a notice surface (LEGAL-DISTRIBUTION
+             §2.7(c)) — hence the non-affiliation sentence in the hint. -->
+        <div class="settings-row">
+          <label for="set-extcompat">External-library compatibility names</label>
+          <span class="settings-checkbox-wrap">
+            <input type="checkbox" id="set-extcompat">
+          </span>
+          <span class="settings-hint">Accept the 17 command names introduced by independent,
+            community-authored Stata packages (<code>reghdfe</code>, <code>csdid</code>,
+            <code>esttab</code>, …). These names do not install the original packages; PIET is not
+            affiliated with their authors; the full list and attributions are under
+            <em>About &rsaquo; Third-party notices</em>. Off = PIET answers only to its own
+            command names. Applies to the next command.</span>
+        </div>
+
+        <h3 class="settings-h">Display <span class="settings-note">(applied immediately)</span></h3>
+
+        <div class="settings-row">
+          <label for="set-fontsize">Editor &amp; results font size</label>
+          <select id="set-fontsize" class="settings-input settings-select">
+            <option value="small">Small</option>
+            <option value="medium">Medium (default)</option>
+            <option value="large">Large</option>
+          </select>
+          <span class="settings-hint">Scales the monospace console, do-file editor, and data browser text.</span>
+        </div>
+
+        <div class="settings-row">
+          <label for="set-paste-autorun">Run pasted blocks immediately</label>
+          <span class="settings-checkbox-wrap">
+            <input type="checkbox" id="set-paste-autorun">
+          </span>
+          <span class="settings-hint">Mirror of the do-file editor's paste toggle: run a multi-line paste at once instead of loading the editor.</span>
+        </div>
+
+        <!-- B14(b): frontend-only quick-stats convenience for the Variables
+             panel's detail card (B13) — auto-dispatches `summarize` through
+             the same command path a typed command uses, echoed "(auto)" in
+             the log. Off by default; localStorage-only, same idiom as the
+             paste-autorun checkbox above (app.js's setAutoSummarize()). -->
+        <div class="settings-row">
+          <label for="set-auto-summarize">Auto-summarize on load</label>
+          <span class="settings-checkbox-wrap">
+            <input type="checkbox" id="set-auto-summarize">
+          </span>
+          <span class="settings-hint">Runs <code>summarize</code> automatically after a dataset loads, so the variable card's quick-stats are ready without typing it yourself. Off by default — keeps the log free of commands you didn't ask for.</span>
+        </div>
+
+        <!-- D5 (mockup UIUX-P8-mockup-v3-pipboy.html §1a/§5): Light/Dark follows
+             the OS's prefers-color-scheme instead of the manually-persisted
+             choice. Off by default (byte-stable Boring-Light on a fresh
+             install); localStorage-only, same idiom as auto-summarize above
+             (app.js's setFollowSystemTheme()). A manual Light/Dark toolbar
+             click turns this back off. -->
+        <div class="settings-row">
+          <label for="set-follow-system-theme">Follow system appearance</label>
+          <span class="settings-checkbox-wrap">
+            <input type="checkbox" id="set-follow-system-theme">
+          </span>
+          <span class="settings-hint">Light/Dark automatically tracks your OS setting. Clicking the toolbar's Light/Dark toggle switches to manual and turns this off.</span>
+        </div>
+
+        <p id="settings-status" class="settings-status" role="status" aria-live="polite"></p>
+      </div>
+    </div>
+
+    <!-- Request-dialog overlay (D9, BETA Phase F — native _request()): a
+         native do-file thread is BLOCKED mid-run waiting on this answer (see
+         app.js's initPietEventsBridge() 'piet-event' → detail.kind ===
+         "request_dialog" branch). Deliberately built OUTSIDE the OVERLAYS
+         registry (console-overlay; visibility = .open class, SAME shared
+         open/close transition as the other five) so Escape / closeAllOverlays()
+         / view-tab clicks can never dismiss it out from under the blocked
+         native thread — see openRequestDialog()'s doc comment in app.js for
+         the full edge-case rationale. z-index is pinned above every other
+         console-overlay (piet.css) so it stays the top layer no matter which
+         view/overlay was showing when the run paused. -->
+    <div id="request-overlay" class="console-overlay" role="dialog" aria-modal="true" aria-labelledby="request-title">
+      <div class="doedit-bar">
+        <span class="doedit-title" id="request-title">Do-file is waiting for input</span>
+      </div>
+      <div class="request-body">
+        <p class="request-hint" id="request-macro"></p>
+        <p class="request-prompt" id="request-prompt"></p>
+        <form id="request-form" class="request-form">
+          <input id="request-input" type="text" class="settings-input" required
+                 autocomplete="off" autocorrect="off" autocapitalize="off"
+                 spellcheck="false" aria-label="Your answer">
+          <div class="request-actions">
+            <button type="button" id="request-cancel-run" class="doedit-btn doedit-btn-danger">Cancel run</button>
+            <button type="submit" id="request-submit" class="doedit-btn doedit-run">Submit</button>
+          </div>
+        </form>
+        <p id="request-status" class="request-status" role="status" aria-live="polite"></p>
+      </div>
+    </div>
+
+    <!-- First-run consent overlay (WS-B, extcompat 2026-08-06). Shown once,
+         on the first launch that has no `extcompat_consent_at` in the native
+         settings store. macOS ships as a drag-install, so there is no
+         installer EULA step — this dialog IS the notice surface, alongside
+         Settings / About / NOTICE.txt / docs. It is deliberately the ONLY
+         place besides those where the non-affiliation text appears: command
+         output never carries it (LEGAL-DISTRIBUTION §2.7(c)).
+
+         Like #request-overlay it lives OUTSIDE the OVERLAYS registry, so
+         Escape / closeAllOverlays() / view-tab clicks cannot dismiss it
+         without a decision; z-index sits above #request-overlay because this
+         one is answered before the session is usable at all. It never appears
+         under gate/test isolation — settings.get computes `consent_required`
+         natively and returns false whenever $PIET_SETTINGS_FILE is set, which
+         is the test-mode auto-accept that keeps --ui-smoke and the DOM runner
+         from ever meeting a modal. -->
+    <div id="consent-overlay" class="console-overlay" role="dialog" aria-modal="true"
+         aria-labelledby="consent-title">
+      <div class="doedit-bar">
+        <span class="doedit-title" id="consent-title">Before you start</span>
+      </div>
+      <div class="consent-body">
+        <h3 class="consent-h">Independent implementation, no affiliation</h3>
+        <p>PIET is not affiliated with, endorsed by, or sponsored by StataCorp LLC.
+          &lsquo;Stata&rsquo; is a registered trademark of StataCorp LLC.</p>
+        <p>For the convenience of users migrating existing do-files, PIET also answers to a
+          number of command names introduced by independent, community-authored Stata
+          packages. These names do not install those packages. Implementations target
+          published methods and compatible behavior; results are not guaranteed to match the original
+          package, and any difference is PIET&rsquo;s responsibility, not the original
+          author&rsquo;s. The names are:</p>
+        <p class="consent-names"><code>reghdfe</code> <code>ivreghdfe</code>
+          <code>ppmlhdfe</code> <code>boottest</code> <code>csdid</code> <code>drdid</code>
+          <code>rdrobust</code> <code>rdplot</code> <code>rddensity</code>
+          <code>binscatter</code> <code>did_imputation</code> <code>eventstudyinteract</code>
+          <code>sdid</code> <code>winsor2</code> <code>esttab</code> <code>eststo</code>
+          <code>coefplot</code></p>
+
+        <h3 class="consent-h">Licence</h3>
+        <p>PIET and CoBrA are free software, licensed under the
+          <strong>GNU General Public License, version 3 or later</strong>. They come with
+          ABSOLUTELY NO WARRANTY — in particular, no computed result is warranted to be
+          accurate or fit for any purpose, and you are responsible for verifying any result
+          before relying on it. The full licence is in <code>LICENSE.txt</code>; the
+          attribution and third-party notices are in <code>NOTICE.txt</code> and under
+          <em>About &rsaquo; Third-party notices</em>.</p>
+
+        <label class="consent-choice" for="consent-extcompat">
+          <input type="checkbox" id="consent-extcompat" checked>
+          <span>Accept the <strong>external-library compatibility names</strong> listed above.
+            Leave this on to keep existing do-files working; turn it off and PIET answers only
+            to its own command names. You can change it later in Settings, or with
+            <code>set extcompat on|off</code>.</span>
+        </label>
+
+        <div class="consent-actions">
+          <button type="button" id="consent-continue" class="doedit-btn doedit-run">Continue</button>
+        </div>
+        <p id="consent-status" class="request-status" role="status" aria-live="polite"></p>
+      </div>
+    </div>
+  </main>
+
+  <!-- ── History panel (col 5, row 3) ───────────────────────────────────── -->
+  <aside id="pane-history" aria-label="Command history">
+    <div class="pane-header pane-header-history">History</div>
+    <ul id="hist-list" role="list" aria-label="Command history list"></ul>
+  </aside>
+
+  <!-- ── Status bar (row 5) ────────────────────────────────────────────── -->
+  <footer id="statusbar" role="contentinfo">
+    <!-- Mondrian 3-square chip (hidden in Boring mode) -->
+    <span id="status-chip" aria-hidden="true">
+      <span class="chip-red"></span>
+      <span class="chip-blue"></span>
+      <span class="chip-yellow"></span>
+    </span>
+
+    <span id="status-file">(no data)</span>
+    <span id="status-dims"></span>
+
+    <!-- B2 (P8-S6): transient status-bar flash (W10: no modal) — app.js's
+         flashStatus() shows a one-line confirmation (e.g. "Saved
+         piet-results-….log") then self-clears. Empty + hidden at rest. -->
+    <span id="status-flash" role="status" aria-live="polite" hidden></span>
+
+    <!-- Kernel status dot (far right) -->
+    <span class="kernel-dot dot-err" id="kernel-dot" title="kernel not reachable" aria-label="Kernel status"></span>
+  </footer>
+
+</div>
+
+<!-- Mock-mode persistent banner (shown by app.js when useMock === true) -->
+<div id="mock-banner" role="alert" hidden>MOCK MODE — kernel not connected; results are placeholders</div>
+
+<!-- Boot -->
+<script type="module">
+  import { init } from './js/app.js';
+  // BUG-114: the manual mode/theme label assignments that used to live here
+  // (including the A1-04 theme-toggle boot-resync fix) are relocated into
+  // app.js's syncThemeButtons() — ONE owner for both buttons instead of four
+  // uncoordinated sites. init() runs from this same script, so the
+  // boot-resync guarantee is preserved (syncThemeButtons() is called once
+  // early in init()).
+  init().catch(err => console.error('PIET init error:', err));
+</script>
+
+</body>
+</html>

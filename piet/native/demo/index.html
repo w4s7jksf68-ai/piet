@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PIET 2.0 — M0 walking skeleton</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 24px; background: #1e1e1e; color: #e0e0e0; }
+  h1 { font-size: 18px; }
+  h2 { font-size: 14px; color: #8ab4f8; margin-top: 28px; }
+  section { border: 1px solid #444; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+  button { background: #2d6cdf; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #3a7cef; }
+  button:disabled { background: #555; cursor: default; }
+  pre { background: #111; border: 1px solid #333; border-radius: 4px; padding: 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+  .ok { color: #7fdc7f; }
+  .err { color: #ff8080; }
+  progress { width: 100%; height: 18px; }
+  #progress-log { max-height: 160px; overflow-y: auto; }
+</style>
+</head>
+<body>
+  <h1>PIET 2.0 — M0 walking skeleton demo</h1>
+  <p>Proves: bridge echo roundtrip · progress push channel · cobra <code>version --json</code> subprocess roundtrip.</p>
+
+  <section>
+    <h2>1. Bridge echo</h2>
+    <button id="echo-btn">Send echo</button>
+    <pre id="echo-out">(not run yet)</pre>
+  </section>
+
+  <section>
+    <h2>2. Progress push channel (synthetic 5-step run)</h2>
+    <button id="progress-btn">Start synthetic run</button>
+    <progress id="progress-bar" value="0" max="5"></progress>
+    <pre id="progress-log">(not run yet)</pre>
+  </section>
+
+  <section>
+    <h2>3. cobra version --json roundtrip</h2>
+    <button id="cobra-btn">Fetch cobra version</button>
+    <pre id="cobra-out">(not run yet)</pre>
+  </section>
+
+<script>
+  const echoBtn = document.getElementById('echo-btn');
+  const echoOut = document.getElementById('echo-out');
+  echoBtn.addEventListener('click', async () => {
+    echoOut.textContent = '...';
+    try {
+      const result = await window.pietNative.request('echo', { msg: 'hello from JS', ts: Date.now() });
+      echoOut.textContent = JSON.stringify(result, null, 2);
+      echoOut.className = 'ok';
+    } catch (e) {
+      echoOut.textContent = 'ERROR: ' + JSON.stringify(e);
+      echoOut.className = 'err';
+    }
+  });
+
+  const progressBtn = document.getElementById('progress-btn');
+  const progressBar = document.getElementById('progress-bar');
+  const progressLog = document.getElementById('progress-log');
+  window.pietEvents.addEventListener('piet-event', (ev) => {
+    const tick = ev.detail;
+    progressLog.textContent += JSON.stringify(tick) + '\n';
+    progressLog.scrollTop = progressLog.scrollHeight;
+    if (typeof tick.current_line === 'number') progressBar.value = tick.current_line;
+    if (tick.running === false) progressBtn.disabled = false;
+  });
+  progressBtn.addEventListener('click', async () => {
+    progressLog.textContent = '';
+    progressBtn.disabled = true;
+    try {
+      await window.pietNative.request('progress.start', {});
+    } catch (e) {
+      progressLog.textContent += 'ERROR: ' + JSON.stringify(e) + '\n';
+      progressBtn.disabled = false;
+    }
+  });
+
+  const cobraBtn = document.getElementById('cobra-btn');
+  const cobraOut = document.getElementById('cobra-out');
+  cobraBtn.addEventListener('click', async () => {
+    cobraOut.textContent = '...';
+    try {
+      const result = await window.pietNative.request('cobra.version', {});
+      cobraOut.textContent = JSON.stringify(result, null, 2);
+      cobraOut.className = 'ok';
+    } catch (e) {
+      cobraOut.textContent = 'ERROR: ' + JSON.stringify(e);
+      cobraOut.className = 'err';
+    }
+  });
+</script>
+</body>
+</html>

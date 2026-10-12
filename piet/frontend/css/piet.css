@@ -1,0 +1,2637 @@
+/* piet.css — PIET De Stijl workbench
+   Two modes: [data-mode="boring"] (default) · [data-mode="destijl"]
+   Boring is set before first paint in <html data-mode="boring"> — no FOUC.
+*/
+
+/* ─── 1. Design tokens ────────────────────────────────────────────────────── */
+:root {
+  /* Neutrals */
+  --neutral-ground:   #f9f7f4;
+  --neutral-surface:  #ffffff;
+  --neutral-paper:    #faf9f8;
+  --neutral-ink:      #1a1a1a;
+  --neutral-text:     #333333;
+  --neutral-text-muted: #666666;
+  /* U10: was #999999 — ~2.7:1 on --neutral-paper, well under WCAG AA's 4.5:1
+     for the text usages this token has (.cmd-prompt, .cell-missing,
+     .cell-loading, .browser-gutter, .doedit-paste-pref). #707070 clears
+     4.5:1 against both --neutral-paper and --neutral-surface. */
+  --neutral-text-lighter: #707070;
+  --neutral-border:   #d4d0cc;
+  --neutral-border-strong: #a8a096;
+  --neutral-divider:  #e8e4de;
+  --neutral-hover:    #f0f0ee;  /* Boring #btn-run hover fill — was a phantom var() fallback */
+  --row-hover:        #eee;    /* A3-05: shared list/grid hover tint (var-row, hist-row) */
+
+  /* CoBrA semantic primaries — each has ONE meaning in content */
+  /* U10: was #d93b3b — ~3.9:1 for .err-msg on --color-error-light's tint,
+     under WCAG AA's 4.5:1. #c53030 clears 4.5:1 on both the tint and
+     --neutral-paper (dark mode repoints this separately, its tint/surfaces
+     are much darker — see the [data-theme="dark"] block). */
+  --primary-red:    #c53030;  /* error / stop */
+  --primary-blue:   #0d47a1;  /* active / reference / categorical */
+  --primary-yellow: #ffc107;  /* HALT bar (sole stop-the-world accent) */
+
+  --color-error:        var(--primary-red);
+  --color-error-light:  #faeaea;
+  --color-error-border: #e8a9a9;
+  --color-success:      #2e7d32;
+  --color-info-light:   #e6f1fb;
+  --focus-ring:         var(--primary-blue);
+
+  /* Graph role tokens (A3-01 fix) — .g-point/.g-bar/.g-whisker/#btn-run/etc.
+     used to read var(--mondrian-blue)/var(--mondrian-red) directly, which is
+     only DEFINED inside [data-mode="destijl"]; in Boring (the shipped-first
+     default) the var was invalid, so fills fell back to black (initial fill)
+     and strokes fell back to none (initial stroke — invisible lines). These
+     are always-defined so every mode/theme resolves cleanly.
+     Boring defaults = the hexes graph.js's SERIES_COLORS / the old
+     --mondrian-* literals already used; scoped below for destijl + dark. */
+  --graph-accent-1: #1850a8;  /* points / bars / whiskers */
+  --graph-accent-2: #d42a1c;  /* lines / treatlines */
+  /* GRAPH GAP (P8-S9): renderTwoway()'s multi-layer compositor (twoway/lfit/
+     qfit/rarea, graph.js readAccentColors()) reads THESE, separately from
+     --graph-accent-1/-2 — those are ALSO consumed by #btn-run's base fill,
+     .doedit-run, .find-go and .find-aa[aria-pressed] as a general "primary
+     action" color (see the note at .g-point/.g-bar's Pip-Boy override below),
+     so repointing --graph-accent-1/-2 directly for Pip-Boy would drag those
+     buttons along with it. Aliasing here means every mode/theme except the
+     Pip-Boy compound below is byte-identical to --graph-accent-1/-2 (same
+     var()-chain idiom as --focus-ring/--estimation-rule elsewhere in this
+     file — re-resolves per-element, not at declaration site). */
+  --graph-line-1: var(--graph-accent-1);
+  --graph-line-2: var(--graph-accent-2);
+  --series-1: #1850a8;
+  --series-2: #d42a1c;
+  --series-3: #2e7d32;
+  --series-4: #e65100;
+  --series-5: #6a1b9a;
+  --series-6: #00838f;
+  --series-7: #795548;
+  --series-8: #546e7a;
+
+  /* Motion (schema-frozen names — overlay open/close + micro-interactions) */
+  --dur-fast: 120ms;
+  --dur-med:  200ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Typography */
+  --font-mono: 'Menlo', 'Courier New', monospace;
+  --font-ui:   -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+  --fs-mono:   11px;
+  --fs-mono-sm:10px;
+  --fs-ui:     13px;
+  --fs-ui-sm:  11px;
+  /* U10: was a hardcoded `9px` magic number on .var-grid thead th only. */
+  --fs-micro:  9px;
+  --lh:        1.5;
+
+  /* Structure */
+  --rule:       2px;
+  --rule-color: var(--neutral-ink);
+  --radius-none: 0;
+  --radius-sm:   2px;
+
+  /* Spacing (8px scale) */
+  --s-xs: 4px;  --s-sm: 8px;  --s-md: 12px;  --s-lg: 16px;  --s-xl: 24px;
+  --grid-cell: 20px;
+
+  /* Layout */
+  --col-vars:    150px;
+  --col-history: 132px;
+  --row-toolbar: 32px;
+  --row-status:  24px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-fast: 0ms; --dur-med: 0ms; }
+}
+
+/* ─── 2. De Stijl mode ───────────────────────────────────────────────────── */
+[data-mode="destijl"] {
+  /* Decorative composition primaries — DEEPER/FLATTER than state tokens.
+     Saturated/present so the De Stijl frame reads clearly stronger than Boring. */
+  --mondrian-red:    #d42a1c;  /* maker's-mark + empty-state ONLY */
+  --mondrian-blue:   #1850a8;  /* maker's-mark, VARIABLES cap, empty-state */
+  --mondrian-yellow: #f4c20d;  /* maker's-mark, HISTORY cap, empty-state */
+
+  /* Bolder black skeleton — thicker grid rules between panes (De Stijl bars). */
+  --rule:       3px;
+  --rule-color: #111111;       /* near-true-black bars (stronger than --neutral-ink) */
+
+  /* Estimation block left rule: black → cobalt ("this is a result") */
+  --estimation-rule: var(--primary-blue);
+
+  /* C1 (P8-S9): running-state tokens (mockup §2/§4 `.ds` dialect — the state
+     grammar table's "실행 중 스트립" row: De Stijl-Light = a dark gold, NOT
+     the raw #F2C500 legend swatch, for legible text on a light strip; #run
+     is the mockup's own .ds{--run:#B58900;--runbg:#FFF6D8} pair). Deliberately
+     its own hue (not --primary-yellow, reserved for the mock-banner/err-stop
+     stop-the-world accent, nor --mondrian-yellow, the decorative HISTORY-cap
+     mark) so "running" reads as a third, distinct state next to "active"
+     blue and "error" red (§4: 3 hues, not 2) — mirrors the Pip-Boy pair
+     already defined in the dark compound below (§15b). */
+  --color-running:       #B58900;
+  --color-running-light: #FFF6D8;
+
+  /* Graph role tokens: De Stijl is strictly primaries + black/white, so the
+     8-series ramp cycles the triad instead of using free hues. */
+  --graph-accent-1: var(--mondrian-blue);
+  --graph-accent-2: var(--mondrian-red);
+  --series-1: var(--mondrian-blue);
+  --series-2: var(--mondrian-red);
+  --series-3: var(--mondrian-yellow);
+  --series-4: var(--mondrian-blue);
+  --series-5: var(--mondrian-red);
+  --series-6: var(--mondrian-yellow);
+  --series-7: var(--mondrian-blue);
+  --series-8: var(--mondrian-red);
+}
+
+/* ─── 3. Boring mode (default — plain Stata replica) ─────────────────────── */
+[data-mode="boring"] {
+  --neutral-ink:    #3a3a3a;   /* thin grey borders, NOT black De Stijl */
+  --rule-color:     #3a3a3a;
+  --neutral-ground: #ececec;   /* Stata grey */
+  --neutral-paper:  #f5f5f5;
+  --neutral-surface:#ffffff;
+  --estimation-rule: var(--neutral-divider); /* A2-07: thin neutral rule, not
+    fully transparent — the block-estimation/-graph padding-left needs a
+    visible (if quiet) line to explain the gap; no De Stijl color block */
+}
+
+/* ─── 4. Reset & base ────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  color: var(--neutral-text);
+  background: var(--neutral-ink); /* gap/ground shows through as black grid */
+}
+
+a { color: var(--primary-blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+button { cursor: pointer; border: none; background: none; font: inherit; }
+
+/* Generic display:none utility — replaces empty-state style.display mutation */
+.hidden { display: none; }
+
+/* ─── 5. App grid (the Mondrian skeleton) ───────────────────────────────── */
+#app {
+  display: grid;
+  grid-template-columns: var(--col-vars) var(--rule) 1fr var(--rule) var(--col-history);
+  grid-template-rows:    var(--row-toolbar) var(--rule) 1fr var(--rule) var(--row-status);
+  height: 100vh;
+  background: var(--neutral-ink); /* gaps show through as black lines */
+}
+
+/* Pane resize handles (injected by panes.js into col 2 / col 4) */
+.pane-resizer {
+  z-index: 10;
+  cursor: col-resize;
+  touch-action: none;
+  /* Extend hit-area 4px into each adjacent pane */
+  padding: 0 var(--s-xs);
+  margin:  0 calc(var(--s-xs) * -1);
+  box-sizing: content-box;
+}
+.pane-resizer:hover { background: rgba(13, 71, 161, 0.12); }
+
+/* Toolbar: row 1, all 5 cols */
+#toolbar {
+  grid-column: 1 / 6;
+  grid-row: 1;
+  background: var(--neutral-paper);
+  display: flex;
+  align-items: center;
+  padding: 0 var(--s-sm);
+  gap: var(--s-sm);
+  overflow: visible;
+  position: relative;
+}
+
+/* Variables pane: row 3, col 1 */
+#pane-vars {
+  grid-column: 1;
+  grid-row: 3;
+  background: var(--neutral-paper);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Console (center spine): row 3, col 3 */
+#pane-console {
+  grid-column: 3;
+  grid-row: 3;
+  background: var(--neutral-surface);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+/* History pane: row 3, col 5 */
+#pane-history {
+  grid-column: 5;
+  grid-row: 3;
+  background: var(--neutral-paper);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Status bar: row 5, all 5 cols */
+#statusbar {
+  grid-column: 1 / 6;
+  grid-row: 5;
+  background: var(--neutral-paper);
+  display: flex;
+  align-items: center;
+  padding: 0 var(--s-sm);
+  gap: var(--s-sm);
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  overflow: hidden;
+}
+
+/* Mock-mode persistent banner */
+#mock-banner {
+  position: fixed;
+  bottom: var(--row-status);
+  left: 0; right: 0;
+  z-index: 200;
+  background: var(--primary-yellow);
+  color: var(--neutral-ink);
+  text-align: center;
+  padding: 3px var(--s-sm);
+  font: 700 var(--fs-ui-sm)/1.4 var(--font-ui);
+  letter-spacing: 0.06em;
+  border-bottom: 2px solid var(--neutral-ink);
+}
+
+/* ─── 6. Toolbar ─────────────────────────────────────────────────────────── */
+.toolbar-mark {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.toolbar-wordmark {
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  color: var(--neutral-ink);
+  flex-shrink: 0;
+}
+
+.toolbar-file {
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 var(--s-xs);
+}
+
+.toolbar-menu {
+  display: flex;
+  gap: var(--s-md);
+  flex-shrink: 0;
+  /* 2.2.0 item A: margin-left:auto REMOVED. The right-hand cluster
+     (views │ divider │ actions │ meta) is right-aligned by .toolbar-file's
+     flex:1 grow (which consumes all free space before this group). With the
+     A swap the actions group is no longer the cluster leader, so an auto
+     margin here would absorb the free space itself and shove actions+meta to
+     the far right — separating them from the divider. Dropping it keeps the
+     whole cluster tight against the divider (uniform --s-sm toolbar gaps). */
+}
+
+.toolbar-menu a {
+  font-size: var(--fs-ui-sm);
+  color: var(--primary-blue);
+  white-space: nowrap;
+  position: relative;
+}
+
+/* UX-047 + 2.2.0 item A: structural divider between the SURFACES group
+   (.toolbar-views — Results/Do-file Editor/Graphics, now on the LEFT) and the
+   ACTIONS group (.toolbar-actions — File ▾/Data ▾/Run .do, now on the RIGHT).
+   The 2.2.0 A swap only reordered the two groups around this divider; the
+   divider itself is unchanged. Token-drawn only (--rule/--rule-color — the
+   SAME pair #btn-run's left border and the pane-divider grid lines use), so it
+   is thin grey in Boring and bold black in De Stijl automatically, and
+   repoints correctly in dark mode (--rule-color is redefined there) with zero
+   extra rules. SPEC III-5: the line itself expresses the surfaces-vs-actions
+   boundary — no new color literals. */
+.toolbar-group-divider {
+  align-self: stretch;
+  width: var(--rule);
+  background: var(--rule-color);
+  flex-shrink: 0;
+}
+
+/* 2.2.0 item C: Split / Reset-layout mini-buttons — quiet secondary controls
+   sitting with the view tabs they govern. Same muted look as .toolbar-mode-btn
+   (a bordered chip), one step smaller. aria-pressed drives the active fill on
+   #split-toggle so the toggle state is visible (III-3/III-6: honest state). */
+.toolbar-mini-btn {
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  padding: 1px var(--s-xs);
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.toolbar-mini-btn:hover:not(:disabled) { border-color: var(--neutral-border-strong); }
+.toolbar-mini-btn[hidden] { display: none; }
+/* B21-3 (User dogfood 07-16): #layout-variant-toggle is now visible whenever
+   split is on, even before both panes are docked — disabled (not absent) is
+   what communicates "not yet available" for that in-between state. Same
+   0.5-opacity/default-cursor idiom every other disabled control in this file
+   already uses (#rp-cancel/#btn-run/.doedit-run/.doedit-btn-danger). */
+.toolbar-mini-btn:disabled { opacity: 0.5; cursor: default; }
+#split-toggle[aria-pressed="true"] {
+  color: var(--neutral-text);
+  font-weight: 600;
+  border-color: var(--rule-color);
+}
+
+/* UX-047: view tabs (segmented) — Results / Do-file Editor / Graphics. Active
+   state (app.js:syncViewTabs) mirrors which surface is currently showing;
+   underline reuses the same --rule/--rule-color pair as the group divider
+   above so the two read as one visual language. --neutral-hover was NOT
+   used here — it has no dark-mode override (would read as a near-white chip
+   on a dark toolbar), whereas --rule-color is repointed correctly in every
+   mode/theme combination. */
+.toolbar-views {
+  display: flex;
+  gap: var(--s-md);
+  flex-shrink: 0;
+}
+
+.view-tab {
+  font-size: var(--fs-ui-sm);
+  color: var(--primary-blue);
+  white-space: nowrap;
+  border-bottom: var(--rule) solid transparent;
+}
+.view-tab:hover { text-decoration: underline; }
+.view-tab.active {
+  color: var(--neutral-text);
+  font-weight: 600;
+  border-bottom-color: var(--rule-color);
+}
+/* C1 (P8-S9): De Stijl active-tab plane — mockup §2/§4 `.tab.on` is blue in
+   the Light dialect (#1E4BD8), not neutral-black; Boring keeps the neutral
+   bold+black-underline cue above (weight already carries the non-color
+   signal there — T3: style is decorative, not the honesty-state exception
+   error/running get). The Pip-Boy compound below (§15b) already overrides
+   this to phosphor+glow and wins on specificity regardless of source order. */
+[data-mode="destijl"] .view-tab.active {
+  color: var(--primary-blue);
+  border-bottom-color: var(--primary-blue);
+}
+
+/* UX-047: About relocated out of the action menu to sit with the meta
+   controls (mode/theme toggles) at the far right — same look as a plain
+   toolbar-menu link, just no longer a descendant of .toolbar-menu. */
+.toolbar-about {
+  font-size: var(--fs-ui-sm);
+  color: var(--primary-blue);
+  white-space: nowrap;
+}
+.toolbar-about:hover { text-decoration: underline; }
+
+.toolbar-mode-btn {
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  padding: 2px var(--s-xs);
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+}
+.toolbar-mode-btn:hover { border-color: var(--neutral-border-strong); }
+
+/* A7 (P8.1-T5): a brief color/background transition on the main structural
+   surfaces when mode or theme flips (app.js's beginThemeFade(), called from
+   toggleMode/toggleTheme/applySystemTheme) — a scoped list, NOT `*` (perf),
+   so the recolor reads as a soft crossfade instead of a hard cut. Gated on
+   prefers-reduced-motion the same way as the rest of the app's motion. */
+@media (prefers-reduced-motion: no-preference) {
+  html.theme-fade, html.theme-fade #app, html.theme-fade #toolbar,
+  html.theme-fade #pane-console, html.theme-fade #pane-vars,
+  html.theme-fade #pane-history, html.theme-fade #statusbar {
+    transition: background-color 160ms ease, color 160ms ease;
+  }
+}
+
+/* Mondrian maker's-mark: small SVG composition top-left */
+.toolbar-mark svg { display: block; }
+/* A2-01: Boring mode must show no De Stijl color blocks — hide the mark
+   (mirrors #console-empty .empty-svg / #status-chip Boring-hiding pattern) */
+[data-mode="boring"] .toolbar-mark { display: none; }
+
+/* De Stijl: small blue cap on the dropdown label */
+[data-mode="destijl"] .menu-data-cap {
+  display: inline-block; width: 6px; height: 6px;
+  background: var(--mondrian-blue); margin-right: 3px; vertical-align: middle;
+}
+[data-mode="boring"] .menu-data-cap { display: none; }
+
+/* Statistics dropdown — flex so the wrapped <a> shares the toolbar baseline with
+   sibling plain links. .toolbar-menu is display:flex; a bare position:relative
+   wrapper falls to the flex cross-axis default and the inline-block .menu-data-cap's
+   vertical-align:middle is inert in flex → the "Data ▾" item sat off-baseline. */
+.menu-dropdown { position: relative; display: flex; align-items: center; }
+.menu-dropdown > a { display: flex; align-items: center; }
+.menu-dropdown-content {
+  display: none;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  background: var(--neutral-surface);
+  border: 1px solid var(--neutral-border);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+  min-width: 140px;
+  z-index: 100;
+}
+/* Click-toggle ONLY (A2-04): app.js owns open/close via the .open class.
+   The old :hover/:focus-within openers fought the JS toggle — the menu
+   opened on hover, then a click-to-close appeared to do nothing while the
+   pointer still hovered. One mechanism, one owner. */
+.menu-dropdown.open .menu-dropdown-content { display: block; }
+
+.menu-dropdown-content a {
+  display: block;
+  padding: var(--s-xs) var(--s-sm);
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text);
+  white-space: nowrap;
+}
+.menu-dropdown-content a:hover { background: var(--color-info-light); color: var(--primary-blue); }
+
+/* B3 (P8-S6): Recent files group inside File ▾ — a thin separator + small-caps
+   label above the dynamically-populated entry list (app.js's
+   renderRecentFiles()). Entries reuse .menu-dropdown-content a above; only the
+   truncation is added here since a real path can run long. */
+.menu-dropdown-sep { border-top: 1px solid var(--neutral-divider); margin: var(--s-xs) 0; }
+.menu-recent-label {
+  padding: 2px var(--s-sm) 0;
+  font-size: var(--fs-micro);
+  color: var(--neutral-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.menu-recent-item {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Discoverability fix (III-6-compatible): the Recent group now stays visible
+   even when empty (app.js's renderRecentFiles()), showing this honest
+   placeholder row instead of hiding the whole group. Not an <a> (nothing to
+   click), so it needs its own copy of .menu-dropdown-content a's block/
+   padding/font-size — muted + cursor:default (no hover state) distinguish it
+   from the real, clickable entries above it. */
+.menu-recent-empty {
+  display: block;
+  padding: var(--s-xs) var(--s-sm);
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  cursor: default;
+}
+
+/* ─── 7. Pane headers ───────────────────────────────────────────────────── */
+.pane-header {
+  font-size: var(--fs-ui-sm);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--neutral-text-muted);
+  padding: var(--s-xs) var(--s-sm);
+  border-bottom: 1px solid var(--neutral-divider);
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  background: var(--neutral-paper);
+  flex-shrink: 0;
+  position: relative;
+}
+
+/* De Stijl: small blue cap on VARIABLES header, yellow on HISTORY */
+[data-mode="destijl"] .pane-header-vars::before {
+  content: '';
+  display: inline-block;
+  width: 8px; height: 8px;
+  background: var(--mondrian-blue);
+  flex-shrink: 0;
+}
+[data-mode="destijl"] .pane-header-history::before {
+  content: '';
+  display: inline-block;
+  width: 8px; height: 8px;
+  background: var(--mondrian-yellow);
+  flex-shrink: 0;
+}
+
+/* Cobalt hairline on the active pane title strip */
+#pane-console .pane-header {
+  border-top: 2px solid var(--primary-blue);
+  padding-top: 2px;
+}
+[data-mode="boring"] #pane-console .pane-header { border-top-color: var(--neutral-border); }
+
+/* ─── 8. Variables panel — Variable Editor grid ──────────────────────────── */
+#var-list-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Search / filter input */
+.var-search-wrap {
+  padding: 2px var(--s-xs);
+  border-bottom: 1px solid var(--neutral-divider);
+  flex-shrink: 0;
+}
+.var-search {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  padding: 1px var(--s-xs);
+  background: var(--neutral-surface);
+  color: var(--neutral-text);
+  outline: none;
+}
+.var-search:focus { border-color: var(--primary-blue); }
+
+/* Grid scroll container */
+.var-grid-scroll { flex: 1; overflow: auto; }
+
+/* Grid table */
+table.var-grid {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  table-layout: fixed;
+}
+
+.var-grid thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--neutral-paper);
+  border-bottom: 1px solid var(--neutral-border);
+  padding: 1px 3px;
+  font-weight: 600;
+  font-size: var(--fs-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--neutral-text-muted);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.var-grid thead th:hover { color: var(--neutral-text); }
+.vg-th-glyph { width: 14px; min-width: 14px; padding: 1px 2px; cursor: default !important; }
+.vg-th-name  { width: 52%; }
+.vg-th-label { width: 48%; }
+
+/* Grid rows */
+.var-grid tbody tr.var-row { cursor: default; }
+.var-grid tbody tr.var-row:hover { background: var(--row-hover); }
+.var-grid tbody tr.var-row.selected { background: var(--color-info-light); }
+
+/* Grid cells */
+.var-grid td {
+  padding: 1px 3px;
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vg-glyph {
+  width: 14px;
+  min-width: 14px;
+  text-align: center;
+  padding: 1px 1px;
+  font-size: var(--fs-mono-sm);
+}
+
+/* Editable cells — text cursor + hover hint */
+td[data-editable]:hover {
+  background: rgba(13,71,161,0.06);
+  cursor: text;
+}
+td.vg-cell-editing { padding: 0; overflow: visible; }
+td.vg-cell-editing input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  border: 1px solid var(--primary-blue);
+  border-radius: var(--radius-sm);
+  padding: 0 2px;
+  background: var(--neutral-surface);
+  color: var(--neutral-text);
+  outline: none;
+  display: block;
+}
+
+/* Reused glyph classes */
+.var-glyph { font-size: var(--fs-mono-sm); }
+.glyph-numeric { color: var(--neutral-text-muted); }
+.glyph-factor  { color: var(--primary-blue); }
+.vg-label { color: var(--neutral-text-muted); }
+
+/* A20: full label wraps instead of truncating with an ellipsis — overrides
+   the generic `.var-grid td` nowrap/ellipsis rule (higher specificity via
+   the extra `.var-grid` qualifier) for this cell only; row height grows to
+   fit. The Name column (.vg-name) is untouched. */
+.var-grid td.vg-label {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+/* Variable detail card (B13/B8/B14) — built by panels.js's _renderCard()
+   into the existing #properties container (bottom of the Variables pane,
+   below the grid — already flex-shrink:0). Collapsed/empty with no .vcard
+   class (nothing hovered/pinned); populated + bordered when panels.js adds
+   it. HOVER a row -> transient preview; CLICK -> pinned (survives
+   mouseleave) and inserts the variable's bare name at the cursor (B8).
+   Quick-stats (B14) read the passive summarize-result cache (varstats.js) —
+   a "summarize 캐시" chip when cached, else a hint to run summarize / enable
+   auto-summarize. Design ref: milf-coord/plans/
+   UIUX-P8-mockup-v3-pipboy.html §2 (.vcard). Tokens only, so light/dark and
+   Boring/De Stijl all resolve automatically — --primary-blue repoints to a
+   neutral dark-blue in Boring-Dark and to the Pip-Boy phosphor in
+   [data-theme="dark"][data-mode="destijl"] only (§15/§15b); --primary-red
+   repoints to a brighter dark-mode red universally (still semantic, not
+   style — shows in Boring too). */
+#properties {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  color: var(--neutral-text-muted);
+  line-height: 1.6;
+  flex-shrink: 0;
+}
+#properties.vcard {
+  padding: var(--s-xs) var(--s-sm);
+  border-top: 2px solid var(--primary-blue);
+  cursor: pointer;
+}
+[data-mode="boring"] #properties.vcard { border-top-color: var(--neutral-border); }
+
+.vc-head   { display: flex; align-items: baseline; gap: var(--s-xs); flex-wrap: wrap; }
+.vc-nm     { font-weight: 700; color: var(--neutral-ink); }
+.vc-ty     { color: var(--neutral-text-muted); }
+.vc-levels { color: var(--neutral-text-muted); margin-top: 2px; }
+.vc-lb {
+  margin: 3px 0 6px;
+  color: var(--neutral-text);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.vc-stats {
+  border-top: 1px solid var(--neutral-divider);
+  padding-top: 4px;
+  color: var(--neutral-text);
+}
+.vc-stats.vc-stats-hint {
+  color: var(--neutral-text-muted);
+  font-style: italic;
+  white-space: normal;
+}
+.vc-k { color: var(--neutral-text-muted); }
+.vc-src {
+  display: inline-block;
+  margin-top: 6px;
+  border: 1px solid var(--neutral-border);
+  color: var(--neutral-text-muted);
+  padding: 1px 6px;
+  font-size: var(--fs-micro);
+}
+.vc-missing { margin-top: 4px; color: var(--primary-red); }
+.vc-hint {
+  margin-top: 6px;
+  color: var(--primary-blue);
+  font-size: var(--fs-micro);
+}
+
+/* ─── 9. Console ─────────────────────────────────────────────────────────── */
+.console-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 2px var(--s-sm);
+  border-bottom: 1px solid var(--neutral-divider);
+  flex-shrink: 0;
+}
+
+.btn-clear {
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  padding: 1px var(--s-xs);
+}
+.btn-clear:hover { color: var(--neutral-text); }
+
+/* B2 (P8-S6): Save Results — same plain text-link styling as × clear (III-6:
+   no new visual language for a same-weight action), sits to its left. */
+.btn-save-results {
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  padding: 1px var(--s-xs);
+  margin-right: var(--s-sm);
+}
+.btn-save-results:hover { color: var(--neutral-text); }
+
+#console-wrap {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: auto;
+  position: relative;
+  background: var(--neutral-surface);
+}
+
+#console-body {
+  padding: var(--s-sm) var(--s-md);
+  min-height: 100%;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Empty-state: z-index 1; first output (z-index 2) buries it with no DOM change */
+#console-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 1;
+  padding: var(--s-xl);
+}
+/* The generic .hidden utility (0,1,0) loses to the #console-empty ID rule
+   (1,0,0) above — this same-specificity-plus-class override is what actually
+   hides the empty state (WS-F2 found hideEmpty() silently broken without it;
+   the classic partial-override trap). */
+#console-empty.hidden { display: none; }
+
+/* De Stijl: SVG composition fills the empty state */
+#console-empty .empty-svg   { max-width: 240px; max-height: 160px; opacity: 0.9; }
+#console-empty .empty-text  {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  color: var(--neutral-text-muted);
+  margin-top: var(--s-md);
+  text-align: center;
+}
+[data-mode="boring"] #console-empty .empty-svg { display: none; }
+
+/* Console blocks */
+.block {
+  position: relative;
+  z-index: 2;           /* buries the empty-state */
+  margin-bottom: var(--s-xs);
+}
+
+.block-echo {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  color: var(--neutral-text-muted);
+  line-height: var(--lh);
+}
+
+.block-estimation {
+  border-left: var(--rule) solid var(--estimation-rule, var(--neutral-ink));
+  padding-left: var(--s-md);
+  margin: var(--s-sm) 0;
+}
+
+/* C4 (P8-S9): live-coding anchor (console.js's appendBlock — only ONE
+   .block-active at a time, the newest estimation result). --estimation-rule
+   already colors EVERY estimation block's left rule (blue in De Stijl-Light,
+   phosphor in Pip-Boy — the token cascades automatically, see §1), so color
+   alone can't distinguish active from non-active here; a thicker rule is the
+   real signal (width-only override — no color repeated). This also doubles
+   as C2's redundant non-color channel (weight, not just hue). De Stijl only
+   — Boring stays inert per T3 (active is a pointing aid, not an honesty
+   state like error/running, so it never leaks into Boring). Generic
+   `.block-active` (not `.block-estimation.block-active`) so the class is a
+   plain, reusable state hook — it just has no visible effect on block types
+   that carry no border-left to begin with. */
+[data-mode="destijl"] .block-active { border-left-width: 4px; }
+
+.block-table {
+  margin: var(--s-sm) 0;
+}
+
+/* Estimates-table (esttab) action bar — replaces console.js's inline
+   cssText; current look preserved, tokens used where they map cleanly. */
+.esttab-actions {
+  margin-top: var(--s-xs);
+  display: flex;
+  gap: 6px;
+}
+.esttab-btn {
+  font-size: var(--fs-ui-sm);
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.block-mutation {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  color: var(--color-success);
+  line-height: var(--lh);
+}
+
+/* A2-06: plain-text display block (e.g. `display`/`list`) — matches the
+   console's other monospace text blocks (.block-echo/.block-mutation). */
+.block-display {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  color: var(--neutral-text);
+  line-height: var(--lh);
+  /* BUG-371: `inspect` is the first command to emit a MULTI-LINE display block,
+     and its columns are aligned with spaces. Without this the browser collapses
+     the runs and the table reads as one ragged line. `pre-wrap` rather than
+     `pre` so an over-long single-line display still wraps as it always did. */
+  white-space: pre-wrap;
+}
+
+/* B9 (P8-S7): plain-text note block (app.js intercepts `note <text>` / `* <text>`
+   client-side — console.js's renderNote()). Italic + muted, same "annotation,
+   not output" register as .err-hint below — the ONLY visual difference from
+   .block-display is this modifier (no '.' prompt is already true of both). */
+.block-note {
+  font-style: italic;
+  color: var(--neutral-text-muted);
+}
+
+.block-error {
+  background: var(--color-error-light);
+  border-left: 3px solid var(--color-error);
+  padding: var(--s-xs) var(--s-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  margin: var(--s-xs) 0;
+}
+.err-code { display: block; color: var(--neutral-text); opacity: 0.7; font-size: 0.85em; margin-bottom: 2px; }
+.err-msg  { color: var(--color-error); display: block; }
+.err-stop {
+  display: block;
+  margin-top: 2px;
+  color: var(--neutral-text);
+  border-left: 3px solid var(--primary-yellow);
+  padding-left: var(--s-xs);
+}
+.err-hint {
+  display: block;
+  margin-top: 3px;
+  color: var(--neutral-text-muted);
+  font-size: 0.9em;
+  font-style: italic;
+}
+
+.coeftable {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  line-height: var(--lh);
+  white-space: pre;
+  color: var(--neutral-text);
+}
+
+/* ─── Graph block (GraphResult → inline SVG) ─────────────────────────────── */
+.block-graph {
+  margin: var(--s-sm) 0;
+  border-left: var(--rule) solid var(--estimation-rule, var(--neutral-ink));
+  padding-left: var(--s-md);
+}
+.g-svg {
+  display: block;
+  width: 100%;
+  max-width: 560px;
+  height: auto;
+  background: var(--neutral-paper);
+  border: 1px solid var(--neutral-border);
+}
+.g-frame {
+  fill: none;
+  stroke: var(--neutral-border-strong);
+  stroke-width: 1;
+}
+.g-tick { stroke: var(--neutral-border-strong); stroke-width: 1; }
+.g-ticklabel {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  fill: var(--neutral-text-muted);
+}
+.g-axistitle {
+  font-family: var(--font-ui);
+  font-size: var(--fs-mono);
+  fill: var(--neutral-text);
+}
+.g-title {
+  font-family: var(--font-ui);
+  /* C7 (P8-S10): was a bare `12px` — the one sibling of .g-ticklabel/
+     .g-axistitle (both already token-driven) that hadn't been. --fs-ui is
+     the correct pairing (already used for font-family here, unlike
+     .g-axistitle's --fs-mono borrow) and keeps the existing 10<11<13
+     ticklabel<axistitle<title size hierarchy intact — 1px larger than the
+     old literal, not a restyle. */
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  fill: var(--neutral-text);
+}
+.g-point {
+  fill: var(--graph-accent-1);
+  fill-opacity: 0.7;
+  stroke: none;
+}
+.g-bar {
+  fill: var(--graph-accent-1);
+  fill-opacity: 0.78;
+  stroke: var(--neutral-paper);
+  stroke-width: 0.5;
+}
+.g-line {
+  stroke: var(--graph-accent-2);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+/* event-study (csdid estat event) */
+.g-zero { stroke: var(--neutral-text-muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.g-treatline { stroke: var(--graph-accent-2); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.6; }
+.g-whisker { stroke: var(--graph-accent-1); stroke-width: 1.2; }
+.g-caption {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  color: var(--neutral-text-muted);
+  margin-top: 2px;
+}
+[data-theme="dark"] .g-svg { background: var(--neutral-paper); }
+
+/* Pip-Boy (destijl × dark) graph recolor — pale-green marks on a dark plot
+   ground, per mockup §1/§2 (UIUX-P8-mockup-v3-pipboy.html). Deliberately
+   scoped to the .g-* CLASSES (not --graph-accent-1/-2 themselves — those
+   tokens are ALSO consumed by #btn-run's base fill, .doedit-run, .find-go
+   and .find-aa[aria-pressed] as a general "primary action" color; widening
+   them here would recolor those buttons to the softer data-mark green too).
+   Covers renderScatter/renderHistogram/renderLine/renderEventStudy (class-
+   based marks — includes the mockup's demoed `scatter fatal beertax`).
+   renderTwoway's multi-layer compositor (twoway/lfit/qfit/rarea) paints
+   inline fill/stroke read from --graph-line-1/-2 in JS (graph.js
+   readAccentColors()) — a DEDICATED alias pair (§1 tokens block) so this
+   compound can recolor those layers too without touching --graph-accent-1/-2
+   itself (still consumed unscoped by #btn-run/.doedit-run/.find-go/.find-aa).
+   The pale-green/phosphor hexes below are also the --graph-line-1/-2 Pip-Boy
+   values (§15b) — kept as literals in both places rather than a third alias
+   layer, same values either way. Multi-series scatter/xtline/tsline keep the
+   existing --series-1..8 dark categorical ramp untouched (D2: chart palette
+   is a separate system from theme accent). */
+[data-theme="dark"][data-mode="destijl"] .g-point,
+[data-theme="dark"][data-mode="destijl"] .g-bar,
+[data-theme="dark"][data-mode="destijl"] .g-whisker {
+  fill: #7DE59B;
+  stroke: #7DE59B;
+}
+[data-theme="dark"][data-mode="destijl"] .g-line,
+[data-theme="dark"][data-mode="destijl"] .g-treatline {
+  stroke: #4DFF88;
+}
+
+/* Jump-to-latest pill */
+#jump-pill {
+  position: sticky;
+  bottom: var(--s-sm);
+  margin: 0 auto;
+  display: block;
+  width: fit-content;
+  background: var(--primary-blue);
+  color: #fff;
+  font-size: var(--fs-ui-sm);
+  padding: 3px var(--s-sm);
+  border-radius: 12px;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+}
+#jump-pill[hidden] { display: none; }
+
+/* ─── 10. Command input ──────────────────────────────────────────────────── */
+/* B1 (1.16.0): run-progress liveness strip — slim single line above #cmd-bar,
+   shown only while a do-run is in flight. Mono text to match console output. */
+#run-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--s-sm);
+  height: 22px;
+  flex-shrink: 0;
+  padding: 0 var(--s-md);
+  border-top: var(--rule) solid var(--rule-color);
+  background: var(--color-info-light);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  color: var(--neutral-text);
+  overflow: hidden;
+  white-space: nowrap;
+}
+#run-progress[hidden] { display: none; }
+#run-progress .rp-glyph {
+  color: var(--primary-blue);
+  flex-shrink: 0;
+}
+#run-progress .rp-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#rp-cancel {
+  flex-shrink: 0;
+  padding: 1px var(--s-sm);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-sm);
+  font-weight: 600;
+  color: #fff;
+  background: var(--primary-red);
+  border: var(--rule) solid var(--rule-color);
+  border-radius: var(--radius-sm);
+  line-height: 1.3;
+}
+#rp-cancel:hover:not(:disabled) { filter: brightness(1.1); }
+#rp-cancel:active:not(:disabled) { filter: brightness(0.9); }
+#rp-cancel:disabled { opacity: 0.5; cursor: default; }
+[data-mode="boring"] #run-progress { background: var(--neutral-paper); }
+[data-mode="boring"] #rp-cancel {
+  color: var(--primary-red);
+  background: var(--neutral-surface);
+  border-color: var(--color-error-border);
+}
+
+/* C1 (P8-S9): De Stijl-Light running-strip plane — amber/gold (state grammar
+   §4 "실행 중 스트립"), distinct from the blue "active" plane above so a
+   do-run in flight reads as its own state, not a dimmer "active" (mockup's
+   3-hue rule). #rp-cancel is left alone — --primary-red already reads
+   correctly here with no override needed. The Pip-Boy compound (§15b) has
+   its own matching amber pair (--color-running/-light), defined separately
+   there since it's a different literal hue for the dark ground. */
+[data-mode="destijl"] #run-progress {
+  background: var(--color-running-light);
+  color: var(--color-running);
+  border-top-color: var(--color-running);
+}
+[data-mode="destijl"] #run-progress .rp-glyph { color: var(--color-running); }
+
+#cmd-bar {
+  display: flex;
+  align-items: center;
+  border-top: var(--rule) solid var(--rule-color);
+  background: var(--neutral-paper);
+  height: 34px;
+  flex-shrink: 0;
+}
+/* Replaces app.js's setBusy() per-input opacity mutation. Dimming comes from
+   the children's own :disabled rules (opacity 0.5) — the bar itself must NOT
+   also set opacity or the two multiply to 0.25 (W3 integration fix, WS-C1
+   handoff note). pointer-events makes the whole bar inert, not just the
+   disabled inputs. */
+#cmd-bar.busy {
+  pointer-events: none;
+}
+
+/* Busy-lock dimming for the surfaces setBusy() locks OUTSIDE the cmd bar
+   (WS-F1 toggles .busy on the File▸Open/Run-.do anchors and the variables
+   pane; A1-01/A1-02 race fixes). Same 0.5 the :disabled inputs use. */
+#toolbar .toolbar-menu a.busy,
+#var-list-wrap.busy {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.cmd-prompt {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  color: var(--neutral-text-lighter);
+  padding: 0 var(--s-xs) 0 var(--s-md);
+  user-select: none;
+  flex-shrink: 0;
+}
+
+#cmd-input {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--neutral-text);
+  height: 100%;
+  padding: 0;
+}
+#cmd-input:focus {
+  box-shadow: inset 0 0 0 2px var(--focus-ring);
+}
+#cmd-input:disabled { opacity: 0.5; }
+
+/* Run button — primary command action, mirrors Enter-to-submit */
+#btn-run {
+  flex-shrink: 0;
+  align-self: stretch;
+  margin: 0;
+  padding: 0 var(--s-md);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-sm);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #fff;
+  background: var(--graph-accent-1);
+  border: none;
+  border-left: var(--rule) solid var(--rule-color);
+  cursor: pointer;
+}
+#btn-run:hover:not(:disabled) { filter: brightness(1.12); }
+#btn-run:active:not(:disabled) { filter: brightness(0.92); }
+#btn-run:focus-visible { box-shadow: inset 0 0 0 2px var(--focus-ring); outline: none; }
+#btn-run:disabled { opacity: 0.5; cursor: default; }
+
+/* Boring mode: flatten to a neutral outlined button (no Mondrian color) */
+[data-mode="boring"] #btn-run {
+  color: var(--neutral-text);
+  background: var(--neutral-paper);
+  font-weight: 500;
+}
+[data-mode="boring"] #btn-run:hover:not(:disabled) { background: var(--neutral-hover); filter: none; }
+
+/* ─── 11. History panel ─────────────────────────────────────────────────── */
+#hist-list {
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  overflow-y: auto;
+  flex: 1;
+}
+
+.hist-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  padding: 1px var(--s-sm);
+  cursor: pointer;
+  line-height: 1.6;
+}
+.hist-row:hover { background: var(--row-hover); }
+
+.hist-mark {
+  flex-shrink: 0;
+  font-size: var(--fs-mono-sm);
+  width: 12px;
+}
+.mark-ok  { color: var(--color-success); }
+.mark-err { color: var(--color-error); }
+
+.hist-cmd {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--neutral-text);
+  flex: 1;
+  min-width: 0;
+}
+
+/* B6 (P8-S7): second verb, hover-revealed — "Send to Do-file Editor"
+   (panels.js's appendHistory()). Quiet + out of the way at rest (opacity:0,
+   still in the flex flow so nothing reflows on hover); shares the row's own
+   :hover so it appears together with the existing hover tint. Row click
+   (verb 1) still fires underneath — the button's own click handler stops
+   propagation so the two verbs never race. */
+.hist-send-btn {
+  flex-shrink: 0;
+  opacity: 0;
+  font-size: var(--fs-mono-sm);
+  padding: 0 4px;
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  color: var(--neutral-text-muted);
+  background: var(--neutral-paper);
+  cursor: pointer;
+}
+.hist-row:hover .hist-send-btn,
+.hist-send-btn:focus-visible {
+  opacity: 1;
+}
+.hist-send-btn:hover { border-color: var(--neutral-border-strong); color: var(--neutral-text); }
+
+/* ─── 12. Status bar ─────────────────────────────────────────────────────── */
+/* De Stijl: 3-square chip on the left */
+[data-mode="destijl"] #status-chip {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+[data-mode="destijl"] #status-chip span {
+  width: 8px; height: 8px;
+  display: inline-block;
+}
+/* A3-06: token-backed chip squares (index.html swaps its inline
+   background hexes for these classes at W3). Scoped to destijl — the chip
+   is display:none in Boring, and --mondrian-* only exists in this scope. */
+[data-mode="destijl"] #status-chip .chip-red    { background: var(--mondrian-red); }
+[data-mode="destijl"] #status-chip .chip-blue   { background: var(--mondrian-blue); }
+[data-mode="destijl"] #status-chip .chip-yellow { background: var(--mondrian-yellow); }
+[data-mode="boring"] #status-chip { display: none; }
+
+#status-file { font-weight: 500; color: var(--neutral-text); }
+
+/* B2 (P8-S6): transient status-bar flash (W10 — no modal). app.js's
+   flashStatus() toggles the hidden attribute; no animation, matches the
+   "less is more" restraint of the rest of the status bar. */
+#status-flash { color: var(--color-success); font-weight: 500; }
+
+.kernel-dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-left: auto;
+  box-sizing: border-box;
+  border: 2px solid transparent;
+}
+/* U10: filled (ok) vs hollow ring (err) — a SHAPE difference on top of the
+   color, so kernel status doesn't rely on red/green discrimination alone. */
+.dot-ok  { background: var(--color-success); border-color: var(--color-success); }
+.dot-err { background: var(--neutral-paper); border-color: var(--color-error); }
+
+/* ─── 12b. Console overlays (shared open/close transition) ───────────────
+   #browser-overlay / #doedit-overlay / #graphics-overlay / #about-overlay
+   move inside #pane-console (already position:relative, §5) and gain
+   class="console-overlay"; JS toggles .open instead of the hidden attr.
+   z-index 10 is a self-sufficient default above console content
+   (.block/.block-graph z-index:2, #console-empty z-index:1); the overlays'
+   own id-scoped rules below additionally pin z-index:50. */
+.console-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  opacity: 0;
+  transform: translateY(4px);
+  visibility: hidden;
+  transition: opacity var(--dur-med) var(--ease-standard),
+              transform var(--dur-med) var(--ease-standard),
+              visibility 0s var(--dur-med);
+}
+.console-overlay.open {
+  opacity: 1;
+  transform: none;
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+/* ─── 12c. Split-view layout (2.2.0 item C) ──────────────────────────────
+   #results-surface groups the Results-native children (header/console/cmd
+   bar); the console overlays are its siblings inside #pane-console. DEFAULT
+   (no .split): #results-surface is display:contents — no box, its children
+   flow in #pane-console's flex COLUMN exactly as before — and overlays are
+   absolute inset:0 (§12b), one surface at a time. Nothing here alters the
+   single-view layout the DOM/ui-smoke gates assert on.
+
+   SPLIT ON (#pane-console.split, toggled by app.js): #pane-console becomes a
+   flex ROW of surface columns. Results is always the leftmost column; each
+   DOCKED overlay (.docked) becomes an equal flex column to its right,
+   separated by the overlay's own token border (III-5 structural line). NO
+   floating windows (De Stijl orthogonal grid; SPEC III-1). An UNdocked
+   overlay opened in split (About) stays absolute inset:0 and covers the whole
+   area, unchanged. */
+#results-surface { display: contents; }
+
+#pane-console.split { flex-direction: row; }
+#pane-console.split #results-surface {
+  display: flex;
+  flex-direction: column;
+  /* B4 (P8-S7): fixed at the drag ratio (default 50%, --split-ratio is a
+     JS-set inline custom property on #pane-console — panes.js's --col-vars/
+     --col-history idiom) rather than flex:1 1 0 growing to fill — the
+     "second column" (a docked overlay, or the placeholder just below) always
+     takes the remainder, so the two stay in a fixed, draggable ratio. */
+  flex: 0 0 var(--split-ratio, 50%);
+  min-width: 0;
+  position: relative;   /* containing block for the sticky jump pill */
+}
+/* Specificity: `#pane-console.split .console-overlay.docked` (1 id + 3
+   classes) outranks each overlay's own `#doedit-overlay { position:absolute }`
+   (1 id) — so the docked-column geometry wins with no !important. */
+#pane-console.split .console-overlay.docked {
+  position: relative;
+  inset: auto;
+  flex: 1 1 0;
+  min-width: 0;
+  opacity: 1;
+  transform: none;
+  visibility: visible;
+  transition: none;     /* columns are structure, not a slide-in animation */
+}
+
+/* B4 (P8-S7): the ratio-drag divider. DOM-positioned (index.html) directly
+   after #results-surface and before every console-overlay, so in source
+   order it always lands right before whichever in-flow "second column"
+   follows (a .docked overlay, or #split-placeholder below) — no JS
+   positioning math needed, only [hidden] state (app.js's syncSplitLayout()).
+   Reuses .pane-resizer's hover chrome (§5); needs its own fixed width since
+   panes.js's two instances get theirs from CSS Grid track placement instead. */
+/* C1 (P8-S9): weighted asymmetric rule — the split divider is its OWN
+   weight (8px), distinct from the console spine / pane-resizer hairlines
+   elsewhere, per the De Stijl mockup's explicit rule-weight grammar
+   ("가중 비대칭 룰": console-spine rules stay thin; the split boundary is
+   the one thick, draggable one — UIUX-P8-mockup-destijl.html item ①/B4).
+   Applies to ALL modes (structural weight, not a De Stijl-only accent — the
+   mockup's rule-weight law isn't gated on Style like color state is). */
+#split-resizer { display: none; }
+#pane-console.split #split-resizer {
+  display: block;
+  flex: 0 0 auto;
+  width: 8px;
+  margin: 0 -4px;
+  position: relative;
+}
+#pane-console.split #split-resizer[hidden] { display: none; }
+#split-resizer.dragging { background: rgba(13, 71, 161, 0.12); }
+/* Pip-Boy only (§15b) — Boring-Dark falls back to the base rgba(13,71,161,…)
+   tint (a low-opacity navy overlay, already used everywhere else in dark
+   mode; not a branded accent). */
+[data-theme="dark"][data-mode="destijl"] #split-resizer.dragging { background: rgba(77,255,136,0.14); }
+
+/* BUG-113: second divider — Do-file Editor ↔ Graphics, docked column ↔
+   docked column. Same geometry/weight/tint as #split-resizer above (mirror,
+   not a new visual); only shown when BOTH docked columns are present
+   (app.js's syncSplitLayout()). */
+#split-resizer-2 { display: none; }
+#pane-console.split #split-resizer-2 {
+  display: block;
+  flex: 0 0 auto;
+  width: 8px;
+  margin: 0 -4px;
+  position: relative;
+}
+#pane-console.split #split-resizer-2[hidden] { display: none; }
+#split-resizer-2.dragging { background: rgba(13, 71, 161, 0.12); }
+[data-theme="dark"][data-mode="destijl"] #split-resizer-2.dragging { background: rgba(77,255,136,0.14); }
+
+/* BUG-113: weighted grow for the TWO-docked-column case — outranks the
+   generic `#pane-console.split .console-overlay.docked` rule above (2 ids +
+   2 classes beats 1 id + 3 classes, no !important needed) so a dragged
+   #split-resizer-2 ratio applies specifically between these two columns
+   while the generic 1 1 0 rule remains the single-docked-column fallback. */
+#pane-console.split #doedit-overlay.docked   { flex: var(--split-w1, 1) 1 0; }
+#pane-console.split #graphics-overlay.docked { flex: var(--split-w2, 1) 1 0; }
+
+/* F10 (P8-S7): "waiting for a second view" placeholder — the honest-state
+   fix. Shown only while split is ON and nothing is docked (app.js's
+   syncSplitLayout()), so the Split toggle's ON state is ALWAYS visibly split
+   instead of a silent full-width Results with no explanation. Same column
+   geometry as a docked overlay (flex:1 1 0); the border is the same III-5
+   structural line a docked overlay's own border draws. */
+#split-placeholder { display: none; }
+#pane-console.split #split-placeholder {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--s-lg);
+  color: var(--neutral-text-muted);
+  font-size: var(--fs-ui-sm);
+  border-left: var(--rule) solid var(--rule-color);
+  background: var(--neutral-paper);
+}
+#pane-console.split #split-placeholder[hidden] { display: none; }
+#split-placeholder strong { color: var(--neutral-text); font-weight: 600; }
+
+/* ─── 12c-stack. Split-view layout variant — 'stack' (N5, P8.1-W2) ──────
+   #docked-stack (index.html) wraps doedit-overlay + split-resizer-2 +
+   graphics-overlay. DEFAULT — including the 'columns' variant, and every
+   non-split state — is display:contents: no box, its children flow as
+   DIRECT flex-row items of #pane-console exactly as if the wrapper didn't
+   exist (same pass-through idiom as #results-surface, §12c above), so
+   'columns' stays byte-identical to pre-N5 CSS.
+
+   Stack variant (app.js's setSplitVariant() toggles #pane-console.split-
+   stack): the wrapper becomes the ROW's single second column — the SAME
+   flex:1 1 0 slot a lone docked overlay already occupied — and switches ITS
+   OWN direction to column, so doedit-overlay/graphics-overlay stack top-to-
+   bottom instead of side-by-side. Their existing weighted-grow rule
+   (`#pane-console.split #doedit-overlay.docked { flex: var(--split-w1,1) 1 0 }`
+   / graphics' w2 twin, §12c above — unchanged, still matches via descendant
+   selectors regardless of the extra nesting level) generalizes for free:
+   flex-grow ratios apply the same way along a column main axis as a row
+   one. Each already has a full 4-side `border` (§ do-file/graphics overlay
+   base rules) — that alone reads as the horizontal divider between stacked
+   panes, no extra rule needed. */
+#docked-stack { display: contents; }
+#pane-console.split-stack #docked-stack {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+#pane-console.split-stack #docked-stack .console-overlay.docked {
+  min-height: 0;   /* nested-flex gotcha: without this a stacked pane won't shrink to its share */
+}
+/* Stack mode never shows the columns-only weight divider — it separated the
+   two as ROW neighbors; there is no meaningful horizontal drag once they're
+   vertically stacked (app.js's syncSplitLayout() already gates [hidden] on
+   the variant too — this is belt-and-suspenders, matching the codebase's own
+   precedent of pairing a JS-owned [hidden] with a CSS backstop elsewhere). */
+#pane-console.split-stack #split-resizer-2 { display: none; }
+
+/* N5.2: click-swap arm cue — a docked pane's .doedit-bar while armed
+   (app.js's _armSwap()/_disarmSwap()), waiting for the OTHER docked pane's
+   title to be clicked. Dashed (vs. the solid rings used for real keyboard
+   focus elsewhere) so it reads as "waiting for a second click", not focus.
+   --focus-ring is already theme-aware (light/dark × Boring/De Stijl — see
+   its own definition + overrides) so this needs no new color. */
+.doedit-bar.swap-armed {
+  outline: 2px dashed var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* ─── 12d. Find bar (B11 ⌘F find / B12 replace) ──────────────────────────
+   piet/frontend/js/find.js. ONE shared visual (`.find-bar`), two instances:
+   #find-bar-results (Results surface, FIND-ONLY — the log is immutable) and
+   #find-bar-doedit (do-file editor surface, FIND+REPLACE — `.find-rep`/
+   `.find-go` only exist in that instance's markup). Hidden by default
+   ([hidden] — R1: not persistent chrome, summoned by Cmd/Ctrl+F only); JS
+   toggles the attribute + `.open`, mirroring the `.console-overlay` idiom
+   above. Uses existing tokens ONLY (--neutral-*/--primary-blue/--focus-ring)
+   so it themes with Boring/De Stijl × light/dark with no new colors —
+   mockup reference: UIUX-P8-mockup-v3-pipboy.html §2/§3 `.find`. */
+.find-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-xs);
+  padding: var(--s-xs) var(--s-sm);
+  border-bottom: 1px solid var(--neutral-divider);
+  background: var(--neutral-paper);
+  flex-shrink: 0;
+}
+.find-bar[hidden] { display: none; }
+
+.find-q, .find-rep {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  padding: 3px var(--s-xs);
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  background: var(--neutral-surface);
+  color: var(--neutral-text);
+  min-width: 150px;
+}
+.find-rep { min-width: 120px; }
+.find-q:focus, .find-rep:focus { outline: none; box-shadow: inset 0 0 0 2px var(--focus-ring); }
+
+.find-cnt {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  color: var(--neutral-text-muted);
+  min-width: 44px;
+}
+
+/* Nav/case/replace/close mirror the existing .doedit-btn chrome (border/
+   radius/color tokens) so no new button visual is introduced. */
+.find-btn {
+  font-size: var(--fs-ui-sm);
+  padding: 2px 8px;
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  color: var(--neutral-text);
+  background: var(--neutral-paper);
+  cursor: pointer;
+}
+.find-btn:hover { border-color: var(--neutral-border-strong); }
+.find-aa[aria-pressed="true"] {
+  color: #fff;
+  background: var(--graph-accent-1);
+  border-color: transparent;
+}
+.find-go {
+  color: #fff;
+  background: var(--graph-accent-1);
+  border-color: transparent;
+}
+.find-go:hover { filter: brightness(1.12); }
+.find-close { margin-left: auto; color: var(--neutral-text-muted); }
+
+/* Highlight-all + emphasize-current (Results surface only — the do-file
+   editor uses native textarea selection instead, see find.js). Unwrapped
+   byte-for-byte on close (find.js's _unwrapResults()) so the immutable log
+   is restored, never left with stray <mark> nodes. --primary-yellow is
+   reserved for the stop-the-world accent (mock-banner/err-stop) — deliberately
+   NOT reused here; --color-info-light/--primary-blue already carry the
+   "active/reference" meaning a find highlight needs. */
+mark.find-hit {
+  background: var(--color-info-light);
+  color: inherit;
+  border-radius: 1px;
+}
+mark.find-hit-current {
+  background: var(--primary-blue);
+  color: #fff;
+  box-shadow: 0 0 0 1px var(--rule-color);
+}
+
+/* ─── 13. Data browser overlay ──────────────────────────────────────────── */
+.browser-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  background: var(--neutral-surface);
+  display: flex;
+  flex-direction: column;
+  border: var(--rule) solid var(--rule-color);
+}
+/* [hidden] in the UA stylesheet is overridden by display:flex above — re-pin it */
+.browser-overlay[hidden] { display: none; }
+
+/* ─── Do-file editor overlay ────────────────────────────────────────────── */
+#doedit-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  background: var(--neutral-surface);
+  display: flex;
+  flex-direction: column;
+  border: var(--rule) solid var(--rule-color);
+}
+#doedit-overlay[hidden] { display: none; }
+
+/* Graphics gallery overlay (WS4) — mirrors #doedit-overlay layout. */
+#graphics-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  background: var(--neutral-surface);
+  display: flex;
+  flex-direction: column;
+  border: var(--rule) solid var(--rule-color);
+}
+#graphics-overlay[hidden] { display: none; }
+.graphics-gallery {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--s-md);
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: var(--s-md);
+  align-content: start;
+}
+.graphics-card {
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  background: var(--neutral-paper);
+  padding: var(--s-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-xs);
+  /* B10 (P8-S7): the card itself opens the full-size view (click, or
+     Enter/Space — app.js gives it tabIndex+role="button"). */
+  cursor: pointer;
+}
+.graphics-card:hover { border-color: var(--neutral-border-strong); }
+.graphics-card:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.graphics-card svg { width: 100%; height: auto; }
+.graphics-dl-btn {
+  align-self: flex-end;
+  font-size: var(--fs-ui-sm);
+  padding: 2px 10px;
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  color: var(--neutral-text);
+  background: var(--neutral-paper);
+  cursor: pointer;
+}
+.graphics-dl-btn:hover { border-color: var(--neutral-border-strong); }
+.graphics-empty {
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  padding: var(--s-md);
+}
+/* BUG-066: honest marker for thumbnails dropped by the gallery's byte/count
+   cap (console.js enforceGalleryCap) — the gallery's counterpart to the
+   console's "…older output trimmed" elision line. Spans the whole grid row so
+   it reads as a banner above the cards, not as one more card. */
+.graphics-elision {
+  grid-column: 1 / -1;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  padding: var(--s-xs) var(--s-md);
+}
+
+/* B10 (P8-S7): gallery ↔ full-size single-graph toggle. The gallery is the
+   DEFAULT surface (app.js's openGraphics() always rebuilds it); [hidden]
+   swaps to #graphics-full. Both need an explicit [hidden] override — their
+   own class already sets display:grid/flex, which otherwise outranks the UA
+   stylesheet's low-specificity `[hidden] { display:none }`. Same reasoning
+   applies to #graphics-full-actions, which reuses .doedit-actions'
+   display:flex (§ do-file editor bar) for its Prev/Next/Back chrome. */
+.graphics-gallery[hidden] { display: none; }
+#graphics-full-actions[hidden] { display: none; }
+.graphics-full {
+  flex: 1;
+  overflow: auto;
+  padding: var(--s-md);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+.graphics-full[hidden] { display: none; }
+/* .graphics-full-svg is the SAME .block.block-graph wrapper renderGraph()
+   always returns (app.js reuses it verbatim — no new rendering code); its
+   nested .g-svg carries its own max-width:560px (sized for a console-inline
+   graph, above) that would otherwise cap the full view at thumbnail size —
+   widen just that descendant instead of fighting the wrapper. */
+.graphics-full-svg { width: 100%; max-width: 900px; }
+.graphics-full-svg .g-svg { max-width: 900px; }
+.graphics-full-pos {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  color: var(--neutral-text-muted);
+  padding: 0 2px;
+}
+.doedit-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-sm);
+  padding: var(--s-xs) var(--s-sm);
+  border-bottom: 1px solid var(--neutral-divider);
+  background: var(--neutral-paper);
+  flex-shrink: 0;
+}
+.doedit-title {
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-sm);
+  font-weight: 600;
+  color: var(--neutral-text);
+}
+.doedit-actions { margin-left: auto; display: flex; gap: var(--s-xs); }
+/* Paste auto-run preference checkbox (WS-F1 addendum, User 2026-07-09) —
+   quiet secondary control: muted, small, vertically centered with the
+   Clear/Run buttons it sits beside. */
+.doedit-paste-pref {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-xs);
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-lighter);
+  user-select: none;
+}
+.doedit-btn {
+  font-size: var(--fs-ui-sm);
+  padding: 2px 10px;
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  color: var(--neutral-text);
+  background: var(--neutral-paper);
+  cursor: pointer;
+}
+.doedit-btn:hover { border-color: var(--neutral-border-strong); }
+.doedit-run {
+  color: #fff;
+  font-weight: 600;
+  background: var(--graph-accent-1);
+  border-color: transparent;
+}
+.doedit-run:hover:not(:disabled) { filter: brightness(1.12); border-color: transparent; }
+.doedit-run:disabled { opacity: 0.5; cursor: default; }
+.doedit-text {
+  flex: 1;
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  outline: none;
+  resize: none;
+  padding: var(--s-sm) var(--s-md);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  line-height: var(--lh);
+  color: var(--neutral-text);
+  background: var(--neutral-surface);
+  tab-size: 4;
+}
+
+.browser-bar {
+  display: flex;
+  align-items: center;
+  padding: var(--s-xs) var(--s-sm);
+  border-bottom: 1px solid var(--neutral-divider);
+  background: var(--neutral-paper);
+  flex-shrink: 0;
+}
+
+.browser-back {
+  font-size: var(--fs-ui-sm);
+  color: var(--primary-blue);
+  padding: 2px var(--s-xs);
+}
+.browser-back:hover { text-decoration: underline; }
+
+.browser-header {
+  background: var(--neutral-paper);
+  border-bottom: 1px solid var(--neutral-border);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.browser-header-row,
+.browser-row {
+  display: flex;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  border-bottom: 1px solid var(--neutral-divider);
+}
+
+.browser-body {
+  flex: 1;
+  overflow: auto;
+  position: relative;
+}
+
+.browser-spacer { width: 100%; }
+
+.browser-cell {
+  flex: 1;
+  padding: 1px var(--s-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 80px;
+  max-width: 180px;
+  height: 24px;
+  line-height: 22px;
+}
+
+.browser-gutter {
+  flex: 0 0 48px;
+  min-width: 48px;
+  max-width: 48px;
+  color: var(--neutral-text-lighter);
+  text-align: right;
+  border-right: 1px solid var(--neutral-divider);
+  user-select: none;
+}
+
+.browser-header-cell {
+  font-weight: 600;
+  color: var(--neutral-text);
+}
+
+.cell-numeric { text-align: right; }
+.col-factor   { color: var(--primary-blue); }
+.cell-missing { color: var(--neutral-text-lighter); }
+.cell-loading { color: var(--neutral-text-lighter); font-style: italic; }
+
+/* ─── Data editor (edit mode) ───────────────────────────────────────────── */
+.browser-mode {
+  margin-left: var(--s-sm);
+  font-family: var(--font-ui);
+  font-size: var(--fs-mono-sm);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--neutral-text-muted);
+  border: 1px solid var(--neutral-border);
+  user-select: none;
+}
+.browser-mode.mode-edit {
+  color: #fff;
+  background: var(--graph-accent-2);
+  border-color: transparent;
+}
+/* In edit mode, cells show they're clickable */
+.grid-editable .browser-row .browser-cell:not(.browser-gutter) { cursor: cell; }
+.grid-editable .browser-row .browser-cell:not(.browser-gutter):hover {
+  background: var(--color-info-light, #eef3fb);
+}
+.cell-input {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  border: none;
+  outline: 2px solid var(--graph-accent-1);
+  outline-offset: -2px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  padding: 0 var(--s-xs);
+  background: var(--neutral-paper);
+  color: var(--neutral-text);
+}
+
+/* ─── 14. Scrollbars (light styling) ────────────────────────────────────── */
+::-webkit-scrollbar       { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--neutral-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--neutral-border-strong); }
+
+/* ─── 14b. De Stijl chrome (stronger than Boring — FRAME ONLY) ───────────────
+   The flourish lives in the frame. Data surfaces (var grid, console body,
+   coeftable, editor, browser cells) stay neutral white at normal contrast. */
+
+/* Bolder primary caps on the pane headers — larger, squarer De Stijl blocks. */
+[data-mode="destijl"] .pane-header-vars::before,
+[data-mode="destijl"] .pane-header-history::before {
+  width: 11px; height: 11px;
+}
+/* Asymmetric De Stijl accent: a thick coloured underline on each pane cap,
+   tying the primary block to its header strip (blue for VARIABLES, yellow for HISTORY). */
+[data-mode="destijl"] .pane-header-vars {
+  border-bottom: 2px solid var(--mondrian-blue);
+}
+[data-mode="destijl"] .pane-header-history {
+  border-bottom: 2px solid var(--mondrian-yellow);
+}
+
+/* Console top-border: thicker, more present cobalt cap on the active title strip. */
+[data-mode="destijl"] #pane-console .pane-header {
+  border-top: 3px solid var(--mondrian-blue);
+  padding-top: 1px;
+}
+
+/* Asymmetric black bar: a heavier black rule on the console's LEFT edge only
+   (De Stijl uses unequal black bars — one side weightier than the other). */
+[data-mode="destijl"] #pane-console {
+  box-shadow: inset 3px 0 0 var(--rule-color);
+}
+
+/* Larger, more present 3-square status chip. */
+[data-mode="destijl"] #status-chip span {
+  width: 10px; height: 10px;
+}
+
+/* Status chip sits in a thin black-ruled cell — reinforce the De Stijl frame. */
+[data-mode="destijl"] #status-chip {
+  padding: 0 2px;
+  border-left: 2px solid var(--rule-color);
+  border-right: 2px solid var(--rule-color);
+  margin-right: var(--s-xs);
+}
+
+/* Maker's-mark: thin black frame so the mini-composition reads as a framed block. */
+[data-mode="destijl"] .toolbar-mark {
+  outline: 1px solid var(--rule-color);
+  outline-offset: 0;
+}
+
+/* Dropdown label cap: slightly larger blue block in De Stijl. */
+[data-mode="destijl"] .menu-data-cap {
+  width: 7px; height: 7px;
+}
+
+/* Empty-state composition: full opacity + a thin black frame around the canvas. */
+[data-mode="destijl"] #console-empty .empty-svg {
+  opacity: 1;
+  outline: 2px solid var(--rule-color);
+  outline-offset: 4px;
+}
+
+/* B21-4 (User dogfood 07-16, "목업에 나온대로 더 컬러풀하게" — mirror the
+   mockup, mockup UIUX-P8-mockup-v3-pipboy.html §1a/§2 `.pill.on` + the §4
+   state-grammar table's "활성" row): an ACTIVE toolbar toggle read no
+   differently from an inert one — both used --rule-color (near-black,
+   #111111), the same neutral every OTHER frame line already uses, so "on"
+   carried no color signal at all. The mockup's own on-pill
+   (`.pill.on{color:var(--phos);border-color:var(--phos)}`, its `.ds`
+   dialect's --phos being #1E4BD8 — this file's --mondrian-blue) is the
+   fix, reusing the SAME hue already carrying "active" everywhere else in
+   this section (.view-tab.active just above, #btn-run, .vcard border-top)
+   — not a new color family, just extending an existing one to a plane the
+   mockup shows it on but this file hadn't reached yet. No box-shadow: the
+   mockup's own .ds dialect sets --glow:none (glow is Pip-Boy-only, §15b) —
+   color+border alone carries the state here, matching every other
+   De Stijl-Light "active" cue in this file.
+   :not([data-theme="dark"]) is load-bearing, not decorative: every OTHER
+   De Stijl-Light-only decoration in this file stays out of Pip-Boy Dark via
+   a matching §15b counter-rule (§15b's systematic per-rule override
+   pattern — see e.g. #btn-run/.view-tab.active/.vcard above, each
+   re-pointed to phosphor green down there) — but THIS task's brief holds
+   §15b untouched, so a light-only guard substitutes for the counter-rule a
+   later Pip-Boy pass would otherwise add. Without it this literal blue
+   would leak into Pip-Boy Dark, which has its own green phosphor identity
+   for "active" (§15b) — the one thing this wave must not touch.
+   AA: --mondrian-blue #1850a8 on --neutral-paper #faf9f8 (the toolbar's own
+   background, where every button styled below actually sits) is 7.3:1 —
+   clears the 4.5:1 floor with margin. */
+[data-mode="destijl"]:not([data-theme="dark"]) #split-toggle[aria-pressed="true"],
+[data-mode="destijl"]:not([data-theme="dark"]) #layout-variant-toggle[aria-pressed="true"] {
+  color: var(--mondrian-blue);
+  font-weight: 600;
+  border-color: var(--mondrian-blue);
+}
+/* Being IN destijl mode ITSELF is "Style ON" — the mockup's own on-pill
+   example (§2's toolbar renders "Style ●" as the .pill.on instance in that
+   snapshot, not Split) is literally this control, so #mode-toggle («go
+   boring», the label that only shows once style IS on — B21-5/BUG-114)
+   gets the same on-pill treatment for as long as the mode it toggles is
+   active. */
+[data-mode="destijl"]:not([data-theme="dark"]) #mode-toggle {
+  color: var(--mondrian-blue);
+  border-color: var(--mondrian-blue);
+}
+
+/* ─── 15. Dark mode (data-theme="dark" — orthogonal to data-mode) ──────────
+   4-mode matrix (User 07-16, mockup UIUX-P8-mockup-v3-pipboy.html §1a): this
+   base block is now the NEUTRAL dark dialect shared by BOTH Boring-Dark and
+   the Pip-Boy dark that De Stijl mode layers on top of. It carries ONLY
+   neutral surfaces + the semantic error repoint (error stays a color in
+   Boring too — semantic ≠ style) and a dark-legible "standard link" blue.
+   NO green/phosphor accent lives here — that's the Pip-Boy dialect ONLY,
+   scoped to the [data-theme="dark"][data-mode="destijl"] compound in §15b
+   below, so Boring-Dark never leaks it (previously --accent-green/
+   --primary-blue/--focus-ring/--glow-btn-run were repointed to green
+   UNCONDITIONALLY here, which bled into Boring-Dark — every "accent CHROME"
+   rule that used them, plus a few bare rgba(57,211,83,…) literals scattered
+   nearby, has moved to §15b's compound selector so it only fires for
+   Style-ON + Dark). */
+[data-theme="dark"] {
+  --neutral-ground:         #1a1a1a;
+  --neutral-surface:        #222222;
+  --neutral-paper:          #1e1e1e;
+  --neutral-ink:            #c8c4be;   /* border/grid lines — lighter on dark */
+  --neutral-text:           #d4d0cc;   /* crisp light-neutral — NOT green */
+  --neutral-text-muted:     #888880;
+  /* U10: was #555550 — only ~2.2:1 against dark --neutral-paper (darker text
+     on an already-dark background is the wrong direction; needs to be
+     LIGHTER here, not darker like the light-mode fix). #8a8a8a clears 4.5:1
+     against --neutral-paper/--neutral-surface, fixing dark-mode .cell-missing
+     (data browser) and the other text usages of this token along with it. */
+  --neutral-text-lighter:   #8a8a8a;
+  --neutral-border:         #3a3836;
+  --neutral-border-strong:  #5a5852;
+  --neutral-divider:        #2a2826;
+  --color-error-light:      #2a1212;
+  --color-error-border:     #6e3030;
+  /* Boring-Dark neutral selection tint — was #103021 (green-tinted); that
+     value now lives ONLY in §15b's Pip-Boy compound. This dark desaturated
+     blue keeps the same "info/reference" family as --primary-blue below,
+     not a stray new grey. */
+  --color-info-light:       #17222c;
+  --row-hover:              #2a2826;   /* A3-05: dark variant of the shared hover tint */
+
+  /* Boring-Dark "standard link color" (mockup §1a: "무액센트 중립 · 링크
+     표준색" — no-accent neutral, but plain links still read as links). Root's
+     #0d47a1 is ~2.0:1 against dark grounds (fails AA outright — dark text on
+     a dark bg is the wrong direction); #5b9bd5 clears 5.9:1 on --neutral-
+     ground / 5.6:1 on --neutral-paper. Reuses the SAME hue --graph-accent-1
+     already picked for dark-mode charts below — one blue family, not two. */
+  --primary-blue:           #5b9bd5;
+  /* --focus-ring has no override here — root's `--focus-ring: var(--primary-
+     blue)` chain already resolves it per-element, so it correctly tracks
+     THIS neutral blue in Boring-Dark and the Pip-Boy phosphor in §15b
+     without a separate declaration (custom-property var() substitution
+     re-resolves at point of use, not at declaration site). */
+  /* U10: the root --primary-red (#c53030, darkened for the LIGHT tint) reads
+     only ~3.2:1 against dark mode's much-darker surfaces/tint
+     (--color-error-light #2a1212 etc.) — repoint brighter here, same
+     reasoning as --primary-blue above. Clears 4.5:1 on --neutral-paper,
+     --neutral-surface, and --color-error-light. Semantic — this repoint
+     applies in Boring-Dark too (§4 state grammar: error is never style-gated).
+     Pip-Boy further repoints to the mockup's exact #FF6B5E/#2A1512 in §15b. */
+  --primary-red:            #e56767;
+  --rule-color:             #c8c4be;   /* De Stijl rules stay neutral/visible */
+
+  /* Graph role tokens — lighter tints of the Boring hues for contrast on a
+     dark surface (SVG background stays var(--neutral-paper), now dark).
+     D2 (mockup): chart palette is a separate system from theme accent — even
+     Pip-Boy leaves this alone (its own recolor targets the .g-point/.g-bar/
+     .g-line/.g-whisker CLASSES directly, see the Graph block section above,
+     precisely so THESE tokens — also consumed by #btn-run's base fill,
+     .doedit-run, .find-go/.find-aa — don't get dragged along with it). */
+  --graph-accent-1: #5b9bd5;
+  --graph-accent-2: #ff6b57;
+  --series-1: #5b9bd5;
+  --series-2: #ff6b57;
+  --series-3: #5cb860;
+  --series-4: #ff9a52;
+  --series-5: #b072e0;
+  --series-6: #2fc4d4;
+  --series-7: #b08874;
+  --series-8: #91aab5;
+}
+
+/* Dark + De Stijl: lighten the blue/red triad slots for contrast on the dark
+   canvas; yellow slots (series-3/6) stay --mondrian-yellow, already bright
+   enough. Two-attribute selector always outranks the single-attribute
+   [data-theme="dark"] / [data-mode="destijl"] blocks above, regardless of
+   source order. */
+[data-theme="dark"][data-mode="destijl"] {
+  --graph-accent-1: #5b9bd5;
+  --graph-accent-2: #ff6b57;
+  --series-1: #5b9bd5;
+  --series-2: #ff6b57;
+  --series-4: #5b9bd5;
+  --series-5: #ff6b57;
+  --series-7: #5b9bd5;
+  --series-8: #ff6b57;
+  /* GRAPH GAP (P8-S9): --graph-accent-1/-2 deliberately stay the Boring-Dark
+     blue/red above (.find-go/.find-aa still read them directly — #btn-run/
+     .doedit-run already have their own phosphor override elsewhere in this
+     compound, and .g-point/.g-bar/.g-line/.g-whisker have their own literal
+     override above §Graph-block, so neither is affected either way). Only
+     renderTwoway's JS-painted layers (twoway/lfit/qfit/rarea) read THESE —
+     same pale-green/phosphor hexes as the .g-* recolor, so a twoway plot
+     matches a scatter/line plot's Pip-Boy palette. */
+  --graph-line-1: #7DE59B;
+  --graph-line-2: #4DFF88;
+}
+
+/* Dark: swap toolbar/pane bg since --neutral-ink is now light */
+[data-theme="dark"] html,
+[data-theme="dark"] body {
+  background: var(--neutral-ground);
+}
+[data-theme="dark"] #app {
+  background: var(--neutral-border);  /* gap lines: dark grey (not white) */
+}
+
+/* Dark: var-row / hist-row hover now share --row-hover (A3-05); the base
+   rules already read var(--row-hover), so no per-selector override needed. */
+
+/* Dark: coeftable text stays crisp light-neutral — NO glow, NO green tint,
+   in EITHER dark dialect (Boring-Dark or Pip-Boy: table numbers are body
+   data, never state chrome — glow discipline, mockup §4 last row). */
+[data-theme="dark"] .coeftable { color: var(--neutral-text); }
+
+/* #jump-pill / mark.find-hit-current fill --primary-blue's background with a
+   white foreground (tuned for the LIGHT-mode blue #0d47a1 — 4.6:1 white-on-
+   fill there). Boring-Dark's new --primary-blue (#5b9bd5, chosen above for
+   5.9:1 as FOREGROUND text) only clears ~3.0:1 as a background fill with
+   white text — repoint to the darkest neutral ink instead (5.9:1). Scoped to
+   Boring-Dark specifically; Pip-Boy has its own dark-ink fix in §15b (its
+   phosphor fill is far brighter still — ~1.3:1 with white). */
+[data-theme="dark"][data-mode="boring"] #jump-pill,
+[data-theme="dark"][data-mode="boring"] mark.find-hit-current {
+  color: var(--neutral-ground);
+}
+
+/* ─── 15b. Pip-Boy dark — [data-theme="dark"][data-mode="destijl"] ─────────
+   Style×Dark per mockup §1/§1a/§4 (UIUX-P8-mockup-v3-pipboy.html). Every
+   token/rule below is scoped to THIS compound selector only, so none of it
+   reaches Boring-Dark (§15 above stays the neutral dialect) or De Stijl-Light
+   (unscoped [data-mode="destijl"] block, unchanged). Compound (2 attrs)
+   always outranks either single-attribute block regardless of source order.
+
+   Glow discipline (mockup's own §1 note, restated): a soft phosphor
+   text-shadow/box-shadow ONLY on elements that CARRY state — active tab cap,
+   active block's left rule (inherited automatically below, not re-stated),
+   Run button, kernel dot, find-current match, variable-card top rule. NEVER
+   on body text, table numbers, echo lines, or error text (red already reads
+   without help). NO scanlines/flicker/CRT curvature (mockup D4 — rejected as
+   non-data ink). */
+[data-theme="dark"][data-mode="destijl"] {
+  --neutral-ground:         #0A0F0B;
+  --neutral-surface:        #101812;
+  --neutral-paper:          #0D130E;
+  --neutral-ink:            #22331f;   /* structural rule/grid tone — dim, not bright */
+  --neutral-text:           #C2E3C4;   /* 13.9:1 on ground / 13.0:1 on surface — no glow */
+  --neutral-text-muted:     #7FA884;   /* "dim" — 7.2:1 on ground / 7.0:1 on --neutral-paper */
+  --neutral-text-lighter:   #7FA884;   /* mockup has one muted tier, not two — collapse */
+  --neutral-border:         #1C2A1E;   /* "grid" — faint component borders */
+  --neutral-border-strong:  #2E9B58;   /* "phosdim" — hover/emphasis borders, graph axis+ticks */
+  --neutral-divider:        #1C2A1E;
+  --color-error-light:      #2A1512;
+  --color-error-border:     #FF4B3B;   /* mockup "errline" */
+  --color-info-light:       #103021;   /* restored here — was the pre-4-mode dark value,
+                                           now correctly scoped to Pip-Boy only */
+  --row-hover:              #16241a;
+  --primary-red:            #FF6B5E;   /* 6.2:1 on --color-error-light */
+  --rule-color:             #22331f;   /* "line" — quiet chrome dividers; state-carrying
+                                           borders (active tab, vcard top rule, run button)
+                                           are set explicitly below, not via --rule-color */
+  /* NEW tokens (mockup §1/§4 "running" state — amber, deliberately distinct
+     from the active/phosphor green so the two states stay hue-distinguishable,
+     not just positional). Named apart from the root --primary-yellow (that
+     one's reserved for the mock-banner/err-stop "stop-the-world" accent —
+     same reasoning mark.find-hit-current's comment already gives). This
+     Pip-Boy pair is its own literal (not an alias of §2's De Stijl-Light
+     --color-running) since the two dialects use different literal hues for
+     their own ground — Boring stays untouched either way (touching it
+     universally would break Boring-Light/-Dark byte-stability, T3 aside). */
+  --color-running:          #FFC145;   /* mockup "run" */
+  --color-running-light:    #241C0B;   /* mockup "runbg" — 10.4:1 */
+
+  --accent-green:           #4DFF88;   /* mockup "phosphor" */
+  --primary-blue:           var(--accent-green);  /* active/reference → phosphor here only */
+  --focus-ring:             var(--accent-green);
+  --glow-btn-run:           0 0 7px rgba(77,255,136,.40);   /* mockup --glow */
+  --glow-text:              0 0 4px rgba(77,255,136,.55);   /* mockup --glowS, NEW token —
+                                                                 tighter glow for small-text
+                                                                 state anchors (prompt glyph,
+                                                                 active tab, find-current) */
+}
+
+/* Active view tab (Results/Do-file Editor/Graphics) — Boring keeps
+   --rule-color/--neutral-text (non-color+bold cue, §6); De Stijl-Light is
+   now blue (§6, C1); Pip-Boy promotes it to the phosphor cap + glow the
+   mockup's `.tab.on` shows (§2), matching "active" state grammar (§4 row 1).
+   Wins over both single-attribute rules on specificity regardless of
+   source order. */
+[data-theme="dark"][data-mode="destijl"] .view-tab.active {
+  color: var(--accent-green);
+  border-bottom-color: var(--accent-green);
+  text-shadow: var(--glow-text);
+}
+
+/* Selected / active rows — phosphor tint + edge + slight glow (background
+   already resolves via --color-info-light above; this layers the edge+glow). */
+[data-theme="dark"][data-mode="destijl"] .var-grid tbody tr.var-row.selected {
+  background: var(--color-info-light);
+  box-shadow: inset 2px 0 0 var(--accent-green), 0 0 4px rgba(77,255,136,.18);
+}
+
+/* Variable-editor edit-cell hover — phosphor-tinted */
+[data-theme="dark"][data-mode="destijl"] td[data-editable]:hover { background: rgba(77,255,136,.10); }
+
+/* Data-editor (edit mode) cell hover — phosphor-tinted */
+[data-theme="dark"][data-mode="destijl"] .grid-editable .browser-row .browser-cell:not(.browser-gutter):hover {
+  background: rgba(77,255,136,.10);
+}
+
+/* Cell-input outline — --graph-accent-1 doesn't auto-follow to phosphor; repoint */
+[data-theme="dark"][data-mode="destijl"] .cell-input { outline-color: var(--accent-green); }
+
+/* Kernel dot (connected/OK) — brightened to phosphor + glow here (elsewhere
+   it stays the universal --color-success "healthy" green, unchanged —
+   Pip-Boy alone gets the terminal "life sign" treatment the mockup's `.kdot`
+   demos). Explicit list item: "kernel dot". */
+[data-theme="dark"][data-mode="destijl"] #kernel-dot.dot-ok {
+  background: var(--accent-green);
+  border-color: var(--accent-green);
+  box-shadow: var(--glow-btn-run);
+}
+
+/* Run button — phosphor + glow. Explicit list item: "Run button". */
+[data-theme="dark"][data-mode="destijl"] #btn-run {
+  color: #0c1f12;
+  background: var(--accent-green);
+  box-shadow: var(--glow-btn-run);
+}
+[data-theme="dark"][data-mode="destijl"] #btn-run:hover:not(:disabled) {
+  background: var(--accent-green);
+  box-shadow: 0 0 9px rgba(77,255,136,.6);
+}
+
+/* Focus rings on accent inputs — soft phosphor box-shadow glow */
+[data-theme="dark"][data-mode="destijl"] #cmd-input:focus { box-shadow: inset 0 0 0 2px var(--focus-ring), 0 0 6px rgba(77,255,136,.35); }
+/* box-shadow doesn't merge across rules — re-declare the ambient run-button
+   glow (--glow-btn-run, same token as the base rule) alongside the focus
+   ring so focusing #btn-run doesn't drop it. */
+[data-theme="dark"][data-mode="destijl"] #btn-run:focus-visible { box-shadow: inset 0 0 0 2px var(--focus-ring), var(--glow-btn-run); }
+[data-theme="dark"][data-mode="destijl"] .var-search:focus { box-shadow: 0 0 5px rgba(77,255,136,.3); }
+
+/* Console top-border cap — faint phosphor glow on the active title strip */
+[data-theme="dark"][data-mode="destijl"] #pane-console .pane-header { box-shadow: 0 -1px 5px rgba(77,255,136,.22); }
+
+/* C4 (P8-S9): live-coding anchor, Pip-Boy only — soft phosphor side-glow on
+   the single active block, reusing the SAME ambient token every other glow
+   anchor here does (--glow-btn-run — kernel dot, Run button). De Stijl-Light
+   has no glow at all (mockup `.ds{--glow:none}` — the width bump above is
+   its only cue); glow discipline (§15b header note): state-carrying
+   elements only, never body/table text. */
+[data-theme="dark"][data-mode="destijl"] .block-active { box-shadow: var(--glow-btn-run); }
+
+/* Pane-header caps (VARIABLES blue cap, HISTORY yellow cap) — De Stijl only.
+   In Pip-Boy, give the caps a faint phosphor glow so the accent reads. */
+[data-theme="dark"][data-mode="destijl"] .pane-header-vars::before,
+[data-theme="dark"][data-mode="destijl"] .pane-header-history::before {
+  box-shadow: 0 0 4px rgba(77,255,136,.5);
+}
+
+/* The "." command prompt glyph — phosphor text + subtle glow */
+[data-theme="dark"][data-mode="destijl"] .cmd-prompt { color: var(--accent-green); text-shadow: var(--glow-text); }
+
+/* B2 (P8-S6): status-bar flash — repoint to the Pip-Boy phosphor (matches
+   the kernel-dot "healthy system" register above); Boring-Dark/De Stijl-Light
+   fall back to the universal --color-success green, untouched. */
+[data-theme="dark"][data-mode="destijl"] #status-flash { color: var(--accent-green); }
+
+/* Empty-state prompt glyph line keeps neutral muted text (it's a hint, not chrome) */
+
+/* Pane resizer hover — phosphor-tinted */
+[data-theme="dark"][data-mode="destijl"] .pane-resizer:hover { background: rgba(77,255,136,.14); }
+
+/* Do-file editor Run button — phosphor accent (--graph-accent-1 won't auto-follow) */
+[data-theme="dark"][data-mode="destijl"] .doedit-run { background: var(--accent-green); color: #0c1f12; }
+[data-theme="dark"][data-mode="destijl"] .doedit-run:hover:not(:disabled) { background: var(--accent-green); }
+
+/* Variable-card top rule — border-top color already resolves to phosphor via
+   --primary-blue (§8, #properties.vcard); this layers the mockup's
+   `.pb .vcard` ambient glow underneath. Explicit list item: "card top-rule". */
+[data-theme="dark"][data-mode="destijl"] #properties.vcard {
+  box-shadow: 0 -1px 10px rgba(77,255,136,.15);
+}
+
+/* ⌘F current match — background already resolves to phosphor via
+   --primary-blue (§12d, mark.find-hit-current), but that rule's `color: #fff`
+   was tuned for a BLUE fill (Boring-Dark/De Stijl-Light) — white-on-phosphor
+   is ~1.3:1 (illegible). Repoint to the same dark ink #btn-run/.doedit-run
+   already use on phosphor (13.1:1) and layer the glow. Explicit list item:
+   "find-current". */
+[data-theme="dark"][data-mode="destijl"] mark.find-hit-current {
+  color: #0c1f12;
+  box-shadow: 0 0 0 1px var(--rule-color), var(--glow-text);
+}
+
+/* Jump-to-latest pill — same white-on-phosphor illegibility as
+   mark.find-hit-current above (#jump-pill's base `color: #fff` was tuned for
+   a blue fill); repoint to the same dark ink. Not itself a "state-carrying"
+   glow anchor (not in the mockup's allowed list), just a contrast fix that
+   --primary-blue's Pip-Boy repoint makes necessary. */
+[data-theme="dark"][data-mode="destijl"] #jump-pill { color: #0c1f12; }
+
+/* De Stijl's white-on-red Cancel buttons (#rp-cancel/.doedit-btn-danger —
+   Boring already avoids this via its own flatten override) — white text on
+   the LIGHT-mode red (#c53030) is fine, but Pip-Boy's brighter mockup-spec
+   red (#FF6B5E, needed for the error-TEXT 6.2:1 target above) drops white
+   text to ~2.8:1. Same dark-ink fix as jump-pill/find-hit-current. */
+[data-theme="dark"][data-mode="destijl"] #rp-cancel,
+[data-theme="dark"][data-mode="destijl"] .doedit-btn-danger {
+  color: #0c1f12;
+}
+
+/* Run-progress liveness strip — amber (mockup §2 `.runstrip`), distinct from
+   the active/phosphor green above so "running" reads as its own state, not a
+   dimmer "active" (§4 state grammar: 3 hues, not 2). #rp-cancel is left
+   alone — it already resolves to the Pip-Boy red via --primary-red (§10),
+   matching the mockup's red-bordered Cancel exactly with no extra rule. */
+[data-theme="dark"][data-mode="destijl"] #run-progress {
+  background: var(--color-running-light);
+  color: var(--color-running);
+  border-top-color: var(--color-running);
+}
+[data-theme="dark"][data-mode="destijl"] #run-progress .rp-glyph {
+  color: var(--color-running);
+}
+
+/* Dark mode button in toolbar */
+#theme-toggle {
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  padding: 2px var(--s-xs);
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+}
+#theme-toggle:hover { border-color: var(--neutral-border-strong); }
+
+/* ── About / Legal overlay (WI-5 acknowledgements + WI-6 disclaimer) ─────────
+   Mirrors #doedit-overlay / #graphics-overlay layout. */
+#about-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  background: var(--neutral-surface);
+  display: flex;
+  flex-direction: column;
+  border: var(--rule) solid var(--rule-color);
+}
+#about-overlay[hidden] { display: none; }
+.about-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--s-md);
+}
+.about-version {
+  font-weight: 600;
+  margin: 0 0 var(--s-sm);
+}
+.about-disclaimer {
+  max-width: 70ch;
+  margin: 0 0 var(--s-md);
+  color: var(--neutral-text);
+}
+.about-h {
+  font-size: var(--fs-ui-sm);
+  font-weight: 600;
+  color: var(--neutral-text-muted);
+  margin: 0 0 var(--s-xs);
+}
+.about-notices {
+  font-size: var(--fs-mono);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  background: var(--neutral-paper);
+  padding: var(--s-sm);
+  margin: 0;
+}
+
+/* ─── Font-size scale (2.2.0 item D — a Display setting) ──────────────────
+   One knob, many effects: every data/console/editor/browser surface reads the
+   --fs-mono/--fs-mono-sm/--fs-ui/--fs-ui-sm/--fs-micro tokens, so rescaling
+   them here rescales the whole workbench text uniformly. 'medium' is the
+   default (base tokens in §1, no attribute — so a default session's rendered
+   DOM is byte-unchanged). Set on <html data-fontsize> before first paint
+   (index.html) and by the Settings panel live. */
+:root[data-fontsize="small"] {
+  --fs-mono: 10px; --fs-mono-sm: 9px; --fs-ui: 12px; --fs-ui-sm: 10px; --fs-micro: 8px;
+}
+:root[data-fontsize="large"] {
+  --fs-mono: 13px; --fs-mono-sm: 12px; --fs-ui: 15px; --fs-ui-sm: 13px; --fs-micro: 11px;
+}
+
+/* ─── Settings overlay (2.2.0 item D) — mirrors #doedit / #about overlay layout ── */
+#settings-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  background: var(--neutral-surface);
+  display: flex;
+  flex-direction: column;
+  border: var(--rule) solid var(--rule-color);
+}
+#settings-overlay[hidden] { display: none; }
+.settings-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--s-md) var(--s-lg);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  color: var(--neutral-text);
+}
+.settings-sysinfo {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  color: var(--neutral-text-muted);
+  margin: 0 0 var(--s-md);
+}
+.settings-h {
+  font-size: var(--fs-ui);
+  font-weight: 700;
+  color: var(--neutral-text);
+  margin: var(--s-lg) 0 var(--s-sm);
+  padding-bottom: 2px;
+  border-bottom: var(--rule) solid var(--rule-color);
+}
+.settings-note {
+  font-weight: 400;
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+}
+.settings-row {
+  display: grid;
+  grid-template-columns: 190px minmax(180px, 340px);
+  gap: 3px var(--s-md);
+  margin-bottom: var(--s-md);
+  align-items: center;
+}
+.settings-row > label {
+  color: var(--neutral-text);
+  align-self: center;
+}
+.settings-hint {
+  grid-column: 2;
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+}
+.settings-hint code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+}
+.settings-input {
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  padding: 3px var(--s-xs);
+  border: 1px solid var(--neutral-border);
+  border-radius: var(--radius-sm);
+  background: var(--neutral-surface);
+  color: var(--neutral-text);
+  width: 100%;
+  box-sizing: border-box;
+}
+.settings-input:focus { outline: none; box-shadow: inset 0 0 0 2px var(--focus-ring); }
+.settings-range-wrap { display: flex; align-items: center; gap: var(--s-sm); }
+.settings-range { flex: 1; min-width: 0; accent-color: var(--primary-blue); }
+.settings-range-out {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  color: var(--neutral-text);
+  min-width: 68px;
+  text-align: right;
+}
+.settings-checkbox-wrap { display: flex; align-items: center; }
+.settings-status {
+  margin: var(--s-lg) 0 0;
+  min-height: 1.3em;
+  font-size: var(--fs-ui-sm);
+  color: var(--color-success);
+}
+
+/* ─── Request-dialog overlay (D9, BETA Phase F — native _request()) ─────────
+   Mirrors #doedit/#about/#settings overlay layout (same .console-overlay
+   base + .doedit-bar header), but z-index:100 (vs their 50) — this one must
+   paint ABOVE every other console-overlay, since a native do-run thread can
+   pause mid-run regardless of which view/overlay happened to be open at the
+   time (see index.html's comment on #request-overlay and app.js's
+   openRequestDialog()). Deliberately NOT part of the OVERLAYS registry, so
+   it is unaffected by closeAllOverlays()/Escape/view-tab clicks. */
+#request-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  background: var(--neutral-surface);
+  display: flex;
+  flex-direction: column;
+  border: var(--rule) solid var(--rule-color);
+}
+.request-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--s-md) var(--s-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-sm);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  color: var(--neutral-text);
+}
+.request-hint {
+  margin: 0;
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+}
+.request-prompt {
+  margin: 0 0 var(--s-xs);
+  font-weight: 600;
+  max-width: 70ch;
+  white-space: pre-wrap;
+}
+.request-form {
+  display: flex;
+  align-items: center;
+  gap: var(--s-sm);
+  max-width: 480px;
+}
+.request-form .settings-input { flex: 1; }
+.request-actions { display: flex; gap: var(--s-xs); flex-shrink: 0; }
+.request-status {
+  margin: var(--s-xs) 0 0;
+  min-height: 1.3em;
+  font-size: var(--fs-ui-sm);
+  color: var(--color-error);
+}
+/* ─── First-run consent overlay (WS-B, extcompat 2026-08-06) ────────────────
+   Same .console-overlay base + .doedit-bar header as every other overlay, so
+   nothing new is invented for a surface the user sees exactly once. z-index
+   101 — one above #request-overlay, because this dialog is answered before a
+   session exists at all and must never end up underneath anything. Like that
+   overlay it is outside the OVERLAYS registry (no Escape dismissal). */
+#consent-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 101;
+  background: var(--neutral-surface);
+  display: flex;
+  flex-direction: column;
+  border: var(--rule) solid var(--rule-color);
+}
+.consent-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--s-md) var(--s-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-sm);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  color: var(--neutral-text);
+}
+.consent-body p { margin: 0; max-width: 78ch; line-height: 1.5; }
+.consent-h {
+  margin: var(--s-sm) 0 0;
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.consent-h:first-child { margin-top: 0; }
+.consent-names {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-xs);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-sm);
+}
+.consent-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-sm);
+  margin-top: var(--s-sm);
+  padding: var(--s-sm);
+  max-width: 78ch;
+  border: var(--rule) solid var(--rule-color);
+  line-height: 1.5;
+  cursor: pointer;
+}
+.consent-choice input { margin-top: 0.2em; flex-shrink: 0; }
+.consent-actions {
+  display: flex;
+  gap: var(--s-xs);
+  margin-top: var(--s-sm);
+}
+
+/* Danger variant of .doedit-btn (Cancel run) — same red convention as
+   #rp-cancel (the existing run-progress-strip cancel button). */
+.doedit-btn-danger {
+  color: #fff;
+  background: var(--primary-red);
+  border-color: transparent;
+}
+.doedit-btn-danger:hover:not(:disabled) { filter: brightness(1.1); border-color: transparent; }
+.doedit-btn-danger:disabled { opacity: 0.5; cursor: default; }
+[data-mode="boring"] .doedit-btn-danger {
+  color: var(--primary-red);
+  background: var(--neutral-surface);
+  border-color: var(--color-error-border);
+}
+
+/* ─── 16. P8.1 Lane-β appendix (operator-applied at integration — Lane β owns
+   no CSS file; rules delivered via its report per the 2-lane file manifest) ── */
+
+/* T3 (P8.1): output fold/unfold — pseudo-elements only, textContent stays byte-identical */
+.block-folded { display: none; }
+.block-fold-head { cursor: pointer; }
+.block-fold-head:hover::before { content: '▾ '; color: var(--neutral-text-muted); }
+.block-fold-head.fold-closed::before { content: '▸ '; color: var(--neutral-text-muted); }
+.block-fold-head.fold-closed::after {
+  content: ' (' attr(data-fold-count) ' hidden)';
+  color: var(--neutral-text-muted);
+  font-style: italic;
+}
+
+/* A10 (P8.1): hover-revealed generalized "Copy table" bar */
+.block-copy-bar { opacity: 0; }
+.block:hover .block-copy-bar, .block-copy-bar:focus-within { opacity: 1; }
+
+/* T4 (P8.1): Do-file Editor line-number gutter */
+#doedit-editor-row {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+  min-height: 0;
+}
+#doedit-gutter {
+  flex-shrink: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+  padding: var(--s-sm) var(--s-xs) var(--s-sm) 0;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  line-height: var(--lh);
+  color: var(--neutral-text-muted);
+  background: var(--neutral-paper);
+  border-right: 1px solid var(--neutral-border);
+  user-select: none;
+}
+#doedit-gutter .gutter-line { display: block; padding: 0 var(--s-xs); }
+#doedit-gutter .gutter-err-line {
+  color: var(--neutral-text);
+  font-weight: 600;
+  background: var(--neutral-surface);
+}
+#doedit-editor-row .doedit-text { flex: 1; }
+
+/* A9 (P8.1): history filter */
+.hist-row.hist-hidden { display: none; }
+.hist-filter-toggle {
+  margin-left: auto;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: var(--fs-ui-sm);
+  color: var(--neutral-text-muted);
+  padding: 0 2px;
+}
+.hist-filter-toggle:hover { color: var(--neutral-text); }
+.hist-filter-row[hidden] { display: none; }
+
+/* T3 (P8.1, UX-054 안2-lite): ⌥↑/↓ navigation anchor — its own class, not C4's
+   .block-active (single-owner invariant, see app.js's keyboard handler note).
+   Inset bar on the group head, --focus-ring so it themes in all 4 modes. */
+#console-body .block-nav-anchor { box-shadow: inset 3px 0 0 var(--focus-ring); }

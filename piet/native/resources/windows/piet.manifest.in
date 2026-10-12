@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  PIET native - Win32 application (side-by-side) manifest.
+
+  Template. CMake's WIN32 branch (piet/native/CMakeLists.txt) runs this
+  through configure_file(@ONLY) into ${CMAKE_CURRENT_BINARY_DIR}/
+  windows_resources/piet.manifest and the generated piet.rc embeds the
+  result as resource "1 24" (CREATEPROCESS_MANIFEST_RESOURCE_ID /
+  RT_MANIFEST). Nothing reads this file at runtime - it lives inside the PE.
+
+  Substituted placeholders used below - named here WITHOUT their @
+  delimiters, because configure_file substitutes inside comments too:
+  PIET_WIN_VERSION_MAJOR / _MINOR / _PATCH / _BUILD, all set in the WIN32
+  branch of piet/native/CMakeLists.txt and derived from the single
+  PIET_VERSION_VALUE.
+
+  MUST stay valid UTF-8 WITHOUT a byte-order mark: the loader parses the
+  manifest as XML and a BOM in front of the <?xml declaration is a
+  side-by-side configuration error (STATUS_SXS_CANT_GEN_ACTCTX, "the
+  application has failed to start"), which is a launch failure with no
+  useful message. Keep this file ASCII so the question cannot arise.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1"
+          xmlns:asmv3="urn:schemas-microsoft-com:asm.v3"
+          manifestVersion="1.0">
+
+  <assemblyIdentity
+      type="win32"
+      name="PIET"
+      version="@PIET_WIN_VERSION_MAJOR@.@PIET_WIN_VERSION_MINOR@.@PIET_WIN_VERSION_PATCH@.@PIET_WIN_VERSION_BUILD@"
+      processorArchitecture="amd64"/>
+
+  <!-- asInvoker: PIET is a per-user desktop app and never needs elevation.
+       Requesting anything higher would put a UAC prompt in front of every
+       launch and (worse) break drag-and-drop from a non-elevated Explorer
+       into an elevated window - the UIPI boundary silently drops the drop,
+       which is exactly the Windows file-drop path this port exists for. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 AND Windows 11 share this single compatibility GUID
+           (Microsoft never minted a separate Windows 11 id). Declaring it is
+           what makes the OS report the real version to the process instead
+           of the Windows 8 compatibility shim, and it is a prerequisite for
+           the 2016/2019 windowsSettings below being honoured. -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <asmv3:application>
+    <asmv3:windowsSettings>
+      <!-- DPI: dpiAwareness (1607+) is the one the modern loader reads;
+           dpiAware (8.1..1511) is the legacy fallback for older builds.
+           Both are declared so a mixed fleet gets per-monitor scaling
+           instead of a bitmap-stretched blurry WebView2 surface. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2,PerMonitor</dpiAwareness>
+      <!-- longPathAware (1607+): opts this process out of the MAX_PATH (260
+           char) limit for the Win32 file APIs, provided the machine policy
+           LongPathsEnabled is also on. Deep project trees under a user's
+           OneDrive/Documents blow past 260 easily. -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <!-- activeCodePage (1903+): THE hard gate for this port. It makes the
+           process' ANSI codepage UTF-8, so the narrow CRT/Win32 *A entry
+           points that cobra.exe's argv, temp paths, and every std::string
+           path in piet/native travel through round-trip non-ASCII
+           correctly. Without it a Korean (CP949) username or path turns
+           into mojibake or ERROR_FILE_NOT_FOUND the moment a UTF-8
+           std::string is handed to a narrow API. -->
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+
+</assembly>

@@ -1,0 +1,129 @@
+PIET / CoBrA — NOTICES
+======================
+
+Copyright (C) 2026 M.K. Kim
+Licensed under the GNU General Public License, version 3 or later (see
+LICENSE.txt). Nothing in this file modifies, limits, or adds conditions to
+that license; these are informational notices and requests.
+
+
+1. NO AFFILIATION WITH StataCorp
+--------------------------------
+PIET and CoBrA are not affiliated with, endorsed by, or sponsored by StataCorp
+LLC. "Stata" is a registered trademark of StataCorp LLC. PIET is an
+independently developed educational tool that implements compatible command
+syntax and file formats for interoperability; that compatibility does not imply
+any sponsorship, endorsement, or affiliation.
+
+
+2. COMMUNITY-PACKAGE COMPATIBILITY NAMES
+----------------------------------------
+For the convenience of users migrating existing do-files, PIET accepts a number
+of command names that were introduced by independent, community-authored Stata
+packages. These compatibility names do not include or install the original packages.
+Implementations in this repository target published methods and compatible behavior; results are not guaranteed to match the original package,
+and any difference is PIET's responsibility, not the original author's.
+
+The names, and the authors who introduced them, are:
+
+  reghdfe, ivreghdfe, ppmlhdfe  Sergio Correia (+ Paulo Guimaraes, Tom Zylkin)
+  boottest                      David Roodman
+  csdid, drdid                  Fernando Rios-Avila; Brantly Callaway,
+                                Pedro H. C. Sant'Anna
+  rdrobust, rdplot, rddensity   Sebastian Calonico, Matias D. Cattaneo,
+                                Max H. Farrell, Rocio Titiunik (+ Michael Jansson)
+  binscatter                    Michael Stepner
+  did_imputation                Kirill Borusyak
+  eventstudyinteract            Liyang Sun
+  sdid                          Damian Clarke, Daniel Pailanir
+  winsor2                       Yujun Lian
+  winsor                        Nicholas J. Cox
+  gcollapse, gegen, gisid       Mauricio Caceres Bravo
+  gduplicates, glevelsof        Mauricio Caceres Bravo
+  greshape, gquantiles, gstats  Mauricio Caceres Bravo
+  fcollapse, fmerge             Sergio Correia
+  esttab, eststo                Ben Jann
+  coefplot                      Ben Jann
+  estadd, estpost, estout       Ben Jann
+  texdoc, erepost               Ben Jann
+  mat2txt                       Ben Jann, M Blasnik
+  outreg2                       Roy Wada, based on outreg by
+                                John Luke Gallup
+  frmttable                     John Luke Gallup
+  texsave, regsave              Julian Reif
+  tabout                        Ian Watson
+  parmest                       Roger Newson
+  unique                        Michael Hills, Tony Brady
+  distinct, missings, labmask   Nicholas J. Cox
+  tolower                       Nicholas J. Cox
+  strdist                       Michael D Barker, Felix Pöge
+  oaxaca                        Ben Jann
+  parallel                      George G. Vega Yon, Brian Quistorff
+  renvars                       Nicholas J. Cox, Jeroen Weesie
+  tsspell                       Nicholas J. Cox
+  mdesc                         Rose Anne Medeiros, Dan Blanchette
+  renvarlab                     Joseph Canner
+  splitvallabels                Nicholas Winter, Ben Jann
+  filelist                      Robert Picard
+  carryforward                  David Kantor
+  rangestat                     Robert Picard, Nicholas J. Cox,
+                                Roberto Ferrer
+  gunique                       Mauricio Caceres Bravo
+  grc1leg2                      Mead Over
+  grc1leg                       Vince Wiggins (StataCorp)
+  grstyle                       Ben Jann
+  geodist, geonear              Robert Picard
+  cdfplot                       Adrian Mander
+  event_plot                    Kirill Borusyak
+  ivreg2                        Christopher F. Baum, Mark E. Schaffer,
+                                Steven Stillman
+  xtivreg2                      Mark E. Schaffer
+  feols                         name shared with the fixest R package
+                                (Laurent Berge)
+
+These names are used in a purely nominative sense — to identify the command
+syntax a user already knows. They are accepted only while the
+"external-library compatibility names" setting is enabled; you can turn it off
+at any time with `set extcompat off`, after which PIET responds only to its own
+native command names.
+
+If you are the author of one of these packages and would prefer that PIET not
+accept your command name, please contact us at the address in section 5 and we
+will remove it.
+
+
+3. NUMERICAL AND STATISTICAL OUTPUT
+-----------------------------------
+PIET performs statistical and econometric computation. Beyond the warranty
+disclaimer in sections 15-16 of the GPL, please note specifically: no
+coefficient, standard error, test statistic, p-value, or any other output is
+warranted to be accurate, complete, or fit for any research, academic,
+commercial, or other purpose. You are responsible for independently verifying
+any result before relying on it, publishing it, or making a decision with it.
+This software is not a substitute for professional statistical, econometric, or
+research-methodology judgment.
+
+
+4. CITATION REQUESTS (requests, not license conditions)
+-------------------------------------------------------
+If you use an estimator in published or for-credit academic work, please cite
+the method's original authors. The application prints the relevant reference
+with the estimators that have one; implementation headers identify further
+method references. THIRD_PARTY_NOTICES.txt lists bundled code licenses.
+
+If you use the tool itself, a citation is appreciated:
+
+    Kim, M.K. 2026. "PIET: a Stata-syntax-compatible econometrics tool."
+    https://github.com/w4s7jksf68-ai/piet
+
+
+5. THIRD-PARTY COMPONENTS AND CONTACT
+-------------------------------------
+PIET bundles third-party open-source components and, where noted, code adapted
+from other open-source projects. Every such component, its license, and its
+required notice is listed in THIRD_PARTY_NOTICES.txt, which ships inside the
+application bundle and is generated from piet/packaging/licenses/ in the source
+tree. On Windows, the Microsoft Edge WebView2 Runtime is provided under
+Microsoft's own distribution terms, not under this project's license.
+
+Contact: https://github.com/w4s7jksf68-ai/piet/issues

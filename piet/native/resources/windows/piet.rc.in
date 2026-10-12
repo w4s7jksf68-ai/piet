@@ -1,0 +1,101 @@
+/* PIET native - Windows resource script (TEMPLATE).
+ *
+ * piet/native/CMakeLists.txt's WIN32 branch runs this through
+ * configure_file(... @ONLY) into
+ *   ${CMAKE_CURRENT_BINARY_DIR}/windows_resources/piet.rc
+ * and adds the result to target_sources(piet_native). The resource compiler
+ * is windres under MinGW-w64 (docker/windows-toolchain.cmake sets
+ * CMAKE_RC_COMPILER); MSVC's rc.exe accepts the same script.
+ *
+ * Substituted placeholders consumed below (every one is set in that same
+ * WIN32 branch - keep the two files in sync). Written here WITHOUT their @
+ * delimiters on purpose: configure_file substitutes inside comments too, and
+ * an undefined name would silently expand to nothing.
+ *   PIET_WINDOWS_ICON_RESOURCE   whole ICON statement, or a comment when
+ *                                branding/PIET.ico is absent
+ *   PIET_WINDOWS_MANIFEST_PATH   configured piet.manifest, absolute path,
+ *                                forward slashes
+ *   PIET_WIN_VERSION_MAJOR / _MINOR / _PATCH / _BUILD   integers
+ *   PIET_VERSION_VALUE           e.g. "B.7.1"
+ *   PIET_CONTRACT_A_VALUE / PIET_CONTRACT_B_VALUE
+ *
+ * ASCII ONLY, deliberately. windres feeds the script through the C
+ * preprocessor and then parses the remaining bytes in the script's codepage;
+ * non-ASCII in a comment or a VALUE string is the classic silent corruption
+ * (or outright parse error) in an .rc. Every human-visible string below is
+ * plain ASCII English.
+ */
+
+#include <windows.h>
+
+#include "resource.h"
+
+/* ---- Application icon ------------------------------------------------
+ * Substituted as a complete statement, so an absent branding/PIET.ico
+ * degrades to a comment (with a loud message(WARNING) at configure time)
+ * instead of windres failing on a missing file. See the CMake branch.
+ */
+@PIET_WINDOWS_ICON_RESOURCE@
+
+/* ---- Application manifest --------------------------------------------
+ * "1 24" is CREATEPROCESS_MANIFEST_RESOURCE_ID (1) of type RT_MANIFEST
+ * (24). Written numerically ON PURPOSE: the symbolic spellings live in
+ * winuser.h behind MAKEINTRESOURCE(), which expands to a C cast expression
+ * and is NOT a token the resource parser accepts in the type position -
+ * `1 RT_MANIFEST "..."` therefore depends on which SDK/mingw header happens
+ * to hide that macro from RC_INVOKED. The numbers are what actually lands in
+ * the resource directory and they are identical for windres and rc.exe.
+ *
+ * Id 1 is correct for an EXE. A DLL would use 2
+ * (ISOLATIONAWARE_MANIFEST_RESOURCE_ID); piet_native is an executable, so
+ * 1 it is.
+ */
+1 24 "@PIET_WINDOWS_MANIFEST_PATH@"
+
+/* ---- Version information ---------------------------------------------
+ * SINGLE VERSION SOURCE (see the CMakeLists.txt header): every string here
+ * is substituted from PIET_VERSION_VALUE / PIET_CONTRACT_*_VALUE, the same
+ * CMake variables that produce the compiled PIET_VERSION_STRING macro. No
+ * hand-synced copy of a version exists in this file.
+ *
+ * FILEVERSION/PRODUCTVERSION are the binary VS_FIXEDFILEINFO fields and MUST
+ * be exactly four comma-separated integers (0-65535). PIET's release axis is
+ * "B.7.1", which is not a numeric triple, so CMake maps it onto
+ * major.minor.patch.build (B -> 0) and keeps the human-readable "B.7.1" in
+ * the FileVersion/ProductVersion STRINGS below. piet/packaging/piet_setup.iss
+ * reads the ProductVersion string back out of the staged binary.
+ */
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    @PIET_WIN_VERSION_MAJOR@,@PIET_WIN_VERSION_MINOR@,@PIET_WIN_VERSION_PATCH@,@PIET_WIN_VERSION_BUILD@
+ PRODUCTVERSION @PIET_WIN_VERSION_MAJOR@,@PIET_WIN_VERSION_MINOR@,@PIET_WIN_VERSION_PATCH@,@PIET_WIN_VERSION_BUILD@
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    0x0L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    /* 0409 = US English, 04B0 = 1200 decimal = Unicode charset. This block
+       name and the VarFileInfo Translation pair below MUST agree, or the
+       shell's Details tab silently shows nothing. */
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "PIET\0"
+      VALUE "FileDescription",  "PIET econometrics workbench\0"
+      VALUE "FileVersion",      "@PIET_VERSION_VALUE@\0"
+      VALUE "InternalName",     "piet_native\0"
+      /* The staged/installed name, not the build output name:
+         piet/packaging/stage_native_windows.sh copies piet_native.exe to
+         PIET.exe, and OriginalFilename is meant to be the shipped one. */
+      VALUE "OriginalFilename", "PIET.exe\0"
+      VALUE "ProductName",      "PIET\0"
+      VALUE "ProductVersion",   "@PIET_VERSION_VALUE@\0"
+      VALUE "Comments",         "contract A @PIET_CONTRACT_A_VALUE@; contract B @PIET_CONTRACT_B_VALUE@\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
