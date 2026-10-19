@@ -48,7 +48,7 @@ You can open your own CSV or supported Stata dataset through the file menu.
 Run only scripts you trust: commands can read and write local files and invoke
 system programs with your user permissions.
 
-## Beta scope
+## Published Beta 1 scope
 
 - Desktop interface, native command processing, CoBrA computation engine.
 - Local build and self-contained public tests; no licensed reference software
@@ -60,6 +60,21 @@ system programs with your user permissions.
   It is not a certification of every accepted command or of full Stata parity.
 - PIET reports `1.0.0-beta.1`. CoBrA reports its own engine version `0.41.0`.
   The public Git tag identifies the exact release; see [release notes](RELEASE_NOTES.md).
+
+## Unreleased source changes
+
+The development source restores `egen concat()`, `egen cut()`, and `bcal create`
+with independent replacement implementations. These changes are not included in
+the Beta 1 download above. Labels used by `concat(), decode` and created by
+`cut(), label` are carried between the native interface and engine.
+
+The public tests use synthetic examples and do not require Stata. Their new
+validation results are pending; the historical results in [VALIDATION.md](VALIDATION.md)
+apply to the original source beta. See [the behavior and provenance record](docs/RESTORED_FUNCTIONS.md)
+for the implementation approach, verification command, and current limits.
+In particular, `bcal create, personal` and `generate()` combined with `if` or
+`in` remain unsupported. An extended calendar range must keep endpoints on
+weekdays represented in the source data and satisfy the maximum-gap limit.
 
 ## License and acknowledgments
 

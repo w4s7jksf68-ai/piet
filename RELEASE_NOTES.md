@@ -1,3 +1,25 @@
+# Unreleased
+
+- Restore `egen concat()`, `egen cut()`, and `bcal create` with three independent
+  algorithms written against public behavior specifications and small synthetic
+  black-box observations. No excluded private implementations or Stata ado
+  source were used for these replacements.
+- Add optional value-label transport for `concat(), decode` and `cut(), label`.
+- Add self-contained public regressions for strings, numeric formatting, interval
+  and quantile bins, labels, qualifiers, calendar omissions, and date conversion.
+  Local validation passes all 15 restored-function groups, the existing smoke
+  suite, CTest 3/3, and the 24-step native UI journey. No new packaged release is
+  declared here.
+- Reject malformed or duplicate options, preserve string and numeric storage
+  metadata, and reload generated calendars from the session working directory.
+- Calendar generation emits explicit omissions in the documented file grammar.
+  It does not promise byte-identical Stata serialization. `personal` and
+  `generate()` with qualifiers remain unsupported. Ranges may extend the observed
+  span; inferred nonbusiness weekdays and the maximum-gap limit still apply.
+
+See [RESTORED_FUNCTIONS.md](docs/RESTORED_FUNCTIONS.md) for sources, design, and limits.
+The Beta 1 download and its original release record below remain historical.
+
 # PIET 1.0 Beta 1 — v1.0.0-beta.1
 
 This adds an Apple Silicon DMG to the first public source snapshot of PIET + CoBrA.

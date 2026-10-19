@@ -40,7 +40,8 @@ const piet::eval::OptVocab& kVocabEgen = piet::eval::registerOptVocab(
     // The UNION across egen functions (BUG-233's rule): the dispatcher
     // canonicalizes an abbreviation against this set, and the per-function
     // check inside runEgen is what actually refuses a wrong pairing.
-    {"egen"}, {{"by", "missing", "p", "from", "f", "to", "t", "block", "b"}, {}});
+    {"egen"}, {{"by", "missing", "p", "from", "f", "to", "t", "block", "b",
+               "punct", "format", "decode", "maxlength", "at", "group", "icodes", "label"}, {}});
 }  // namespace
 
 namespace piet::handlers {
@@ -453,6 +454,7 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
   static const std::regex reRowFn(R"(^(\w+)\s*\(([^)]+)\)\s*$)");
   std::smatch m;
   std::string computedPath;
+  ojson generatedLabels = ojson::object();
   if (std::regex_match(rhs, m, reRowFn) && rowFuns().count(lower(m.str(1)))) {
     std::string fnName = m.str(1);
     std::string argsStr = trim(m.str(2));
@@ -503,12 +505,40 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
     // still be refused.
     else if (egenFnName == "seq")
       kEgenKnownOpts.insert({"from", "f", "to", "t", "block", "b"});
+    else if (egenFnName == "concat")
+      kEgenKnownOpts.insert({"punct", "p", "format", "f", "decode", "maxlength"});
+    else if (egenFnName == "cut")
+      kEgenKnownOpts.insert({"at", "group", "icodes", "label"});
     if (auto err = eval::rejectUnknownOptions(opts, kEgenKnownOpts)) {
       return *err;
     }
+    if (egenFnName == "concat" || egenFnName == "cut") {
+      std::set<std::string> seen;
+      for (const auto& [key, value] : opts) {
+        const std::string canonical = egenFnName == "concat" && key == "p" ? "punct"
+            : egenFnName == "concat" && key == "f" ? "format" : key;
+        if (!seen.insert(canonical).second)
+          return eval::unsupportedOption(key, "This option may only be specified once.");
+        if (key == "by")
+          return eval::unsupportedOption(key, "egen " + egenFnName + "() cannot be combined with by.");
+        const bool flag = key == "decode" || key == "icodes" || key == "label";
+        if (value.isBool != flag)
+          return eval::unsupportedOption(key, flag ? "Use this option without parentheses."
+                                                  : "This option requires parentheses.");
+        if (!flag && key != "punct" && key != "p" && trim(value.strValue).empty())
+          return eval::unsupportedOption(key, "This option requires a nonempty argument.");
+      }
+    }
     // The suffix carries every option EXCEPT by() (appended separately below),
     // so seq()'s f/t/b ride through verbatim to cobra's own parser.
-    std::string optsSuffix = buildOptsSuffix(opts, {"by"});
+    auto forwardedOpts = opts;
+    if (egenFnName == "concat") {
+      for (auto& [key, value] : forwardedOpts) {
+        (void)value;
+        if (key == "f") key = "format";
+      }
+    }
+    std::string optsSuffix = buildOptsSuffix(forwardedOpts, {"by"});
     std::string cobraExpr = expr + optsSuffix;
 
     if (!by.empty()) {
@@ -520,6 +550,22 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
         {"eval", "--data", egenDataPath, "--egen", cobraExpr, "--out", outPath},
         cobraExpr, session);  // BUG-369 follow-up: `egen m = mean(L.y)`
     storage::appendStoreTypeArg(args, storeType);  // BUG-471 T2
+    const bool decodedConcat = egenFnName == "concat" &&
+        std::any_of(opts.begin(), opts.end(), [](const auto& option) {
+          return option.first == "decode" && option.second.isBool && option.second.boolValue;
+        });
+    if (decodedConcat) {
+      ojson labelInput = ojson::object();
+      for (const auto& [var, labels] : session.valueLabels) {
+        ojson codes = ojson::object();
+        for (const auto& [code, text] : labels) codes[std::to_string(code)] = text;
+        labelInput[var] = std::move(codes);
+      }
+      if (!labelInput.empty()) {
+        args.push_back("--value-labels");
+        args.push_back(labelInput.dump());
+      }
+    }
     // BUG-471 T2 fix-up (F3): seq() is `gen byte` then a replace that widens
     // (_gseq.ado:42, :45-49), so its type follows the values it stored. The
     // computing call summarizes the new column after the egen (eval's
@@ -536,6 +582,12 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
       egenOut = runCobraJson(args);
     } catch (const CobraError& ce) {
       return egenStoreError(ce);
+    }
+    generatedLabels = egenOut.value("egen_value_labels", ojson::object());
+    if (seqTypeOut != nullptr && egenFnName == "cut") {
+      const ojson types = egenOut.value("egen_store_types", ojson::object());
+      if (types.contains(newvar) && types[newvar].is_string())
+        *seqTypeOut = types[newvar].get<std::string>();
     }
     if (seqSummary) {
       const ojson summ = egenOut.value("summarize", ojson::object()).value(newvar, ojson::object());
@@ -577,6 +629,17 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
   }
 
   session.load(finalPath);
+  if (generatedLabels.contains(newvar) && generatedLabels[newvar].is_object()) {
+    std::map<std::string, std::string> definition;
+    std::map<int, std::string> labels;
+    for (auto it = generatedLabels[newvar].begin(); it != generatedLabels[newvar].end(); ++it) {
+      definition[it.key()] = it.value().get<std::string>();
+      labels[std::stoi(it.key())] = it.value().get<std::string>();
+    }
+    session.labelDefs[newvar] = std::move(definition);
+    session.varLblname[newvar] = newvar;
+    session.valueLabels[newvar] = std::move(labels);
+  }
   return mutationResult(session, "egen",
                         newvar.empty() ? std::vector<std::string>{} : std::vector<std::string>{newvar});
 }

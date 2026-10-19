@@ -2898,6 +2898,8 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
   const bool isCreate = sub == "create";
   if (!isCheck && !isDescribe && !isDir && !isLoad && !isCreate)
     return utilErrorRc(sub + " invalid bcal subcommand", 198);
+  if (!isCreate && (parsed.ifExpr.has_value() || parsed.inRange.has_value()))
+    return utilErrorRc("bcal " + sub + ": if/in qualifiers are not allowed", 101);
 
   // --- the option net, NARROWED to the resolved sub-command ----------------
   // Each set below is that sub-command's own `syntax` line in bcal.ado, and
@@ -2929,6 +2931,18 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
     const std::unordered_set<std::string>& unimpl =
         isDir ? kDirUnimpl : kVocabBcal.unimplemented;
     if (auto e = eval::rejectUnknownOptions(parsed.opts, known, unimpl)) return ojson(*e);
+    if (isCreate) {
+      std::set<std::string> seen;
+      for (const auto& [key, value] : parsed.opts) {
+        if (!seen.insert(key).second)
+          return utilErrorRc("bcal create: duplicate option " + key, 198);
+        const bool flag = key == "replace" || key == "personal";
+        if (value.isBool != flag)
+          return utilErrorRc("bcal create: invalid syntax for option " + key, 198);
+        if (!flag && key != "purpose" && trimOf(value.strValue).empty())
+          return utilErrorRc("bcal create: option " + key + " requires an argument", 198);
+      }
+    }
   }
 
   bcal::setSearchDir(bcalCwd(session));
@@ -3083,6 +3097,8 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
   // --- create --------------------------------------------------------------
   if (parsed.varlist.size() < 2)
     return utilErrorRc("bcal create: name of business calendar file expected", 198);
+  if (parsed.varlist.size() > 2)
+    return utilErrorRc("bcal create: only one calendar filename is allowed", 198);
   const std::string spec = parsed.varlist[1];
 
   // parse_pathname (bcal.ado:1183-1231): split path / calname / suffix.
@@ -3148,21 +3164,10 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
     if (v < 1) return utilErrorRc("maxgap() should be at least 1", 198);
     iopts.maxgap = v;
   }
-  // range()/centerdate() are read under the option's OWN dateformat, exactly
-  // as bcal.ado does (parse_range/parse_centerdate take it as an argument).
-  // ONE date reader for the whole command, and it is the .stbcal parser's --
-  // a second, hand-written `date(tok, "YMD")` here is exactly how the option
-  // half and the file half of a dateformat drift apart. The token is handed
-  // to `parseStbcal` inside a minimal two-line calendar whose range STARTS at
-  // it; a token that parses comes back as `cal.lo`.
+  // Options and calendar files share one date grammar. Parse just the token;
+  // building a calendar through year 9999 here would allocate millions of days.
   auto readDate = [&](const std::string& tok, std::int64_t* out) -> bool {
-    bcal::ParseResult pr = bcal::parseStbcal(
-        "dateformat " + iopts.dateformat + "\nrange " + tok + " 9999dec31\ncenterdate " + tok +
-            "\n",
-        "probe");
-    if (!pr.ok) return false;
-    *out = pr.cal.lo;
-    return true;
+    return bcal::parseDailyDate(tok, iopts.dateformat, out);
   };
   if (auto rg = optStr(parsed.opts, "range")) {
     const std::vector<std::string> parts = splitWs(trimOf(*rg));
@@ -3312,6 +3317,8 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
     out << "\n    First date in range() occurs before first business date in dataset.\n";
   if (ind.trailNote)
     out << "\n    Second date in range() occurs after last business date in dataset.\n";
+  if (ind.fractionalNote)
+    out << "\n    " << fromVar << " contains noninteger dates; daily dates use their floor.\n";
 
   ojson blocks = ojson::array();
   if (genVar.has_value()) {
@@ -3338,6 +3345,8 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
       return *err;
     session.load(outPath);
     session.varMeta[newvar].format = "%tb" + calname;
+    session.varMeta[newvar].stataType = "long";
+    session.implicitFloatVars.erase(newvar);
     session.userFormattedVars.insert(newvar);
     out << "\n    Variable " << newvar << " created; it contains business dates in %tb" << calname
         << " format.\n";

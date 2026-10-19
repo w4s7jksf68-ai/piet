@@ -58,7 +58,7 @@ const std::map<std::string, std::vector<OptSpec>>& options_table() {
   {"durbinalt", {{"--data",true}, {"--format",true}, {"--keepif",true}, {"--lags",true}, {"--no-provenance",false}, {"--nomiss0",false}, {"--out",true}, {"--robust",false}, {"--small",false}, {"--tidy",false}, {"--x",true}, {"--y",true}}},
   {"dwatson", {{"--data",true}, {"--format",true}, {"--keepif",true}, {"--no-provenance",false}, {"--out",true}, {"--tidy",false}, {"--x",true}, {"--y",true}}},
   {"encode", {{"--data",true}, {"--format",true}, {"--gen",true}, {"--keepif",true}, {"--no-provenance",false}, {"--out",true}, {"--tidy",false}, {"--var",true}}},
-  {"eval", {{"--data",true}, {"--detail",false}, {"--format",true}, {"--fweight",true}, {"--gen-mask",true}, {"--gen-strict",false}, {"--rng-seed",true}, {"--rng-stream",true}, {"--store-type",true}, {"--tsfmt",true}, {"--no-provenance",false}, {"--out",true}, {"--tidy",false}}},
+  {"eval", {{"--data",true}, {"--detail",false}, {"--format",true}, {"--fweight",true}, {"--gen-mask",true}, {"--gen-strict",false}, {"--rng-seed",true}, {"--rng-stream",true}, {"--store-type",true}, {"--tsfmt",true}, {"--value-labels",true}, {"--no-provenance",false}, {"--out",true}, {"--tidy",false}}},
   // export-dta writes a .dta rather than an .hbin, so its --out is a Stata file path;
   // --in-meta is the symmetric counterpart of import-dta's --out-meta (both take a
   // value). The three globals ride along for the same reason as every other verb.

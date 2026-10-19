@@ -1109,11 +1109,6 @@ const std::vector<CommandSpec>& commandRegistry() {
       // whole adopath (BASE;SITE;.;PERSONAL;PLUS) and `bcal dir` walks it;
       // PIET models no sysdir, so the search directory is the session cwd
       // alone and `personal` is refused by name.
-      // NAMED DIVERGENCE 2 (allowInRange=false below): bcal.ado:237 is
-      // `syntax [if] [in] , from(string)`, so Stata accepts `bcal create NAME
-      // in 1/10, from(v)`; PIET refuses it r(198) "bcal does not support the
-      // `in` row-range qualifier". The refusal is honest and is the engine-wide
-      // state for `in` (260 of 299 rows), not a bcal-specific gap.
       // NAMED DIVERGENCE 3: `bcal create NAME if <expr>, from(v) generate(nv)`
       // — the `if`+`generate()` COMBINATION — is refused r(198) where Stata is
       // rc 0 and writes the new column with MISSING on the excluded rows
@@ -1125,19 +1120,12 @@ const std::vector<CommandSpec>& commandRegistry() {
       // review: descriptive-only (BUGLOG:1404 — no enforcement site reads it),
       // but `--dump-registry` does, and that export is what
       // private-notes/plans/aer-scope1/registry-*.json is built from.
-      // NAMED DIVERGENCE 4: `bcal create ..., generate(nv)` writes nv as f64
-      // where Stata makes it a `long` (oracle i_type = long, i_fmt = %tbi_gen;
-      // re-measured 2026-09-09, cap2.log `describe bz3` -> `long %tbg2`). This
-      // is the D1 class widened, NOT a bcal-specific gap: every writeColumn
-      // call site in handlers_aer_util.cpp writes "f64", because this build has
-      // no Stata storage types on the gen path. It is NOT in BUGLOG because
-      // there is no honest probe surface for it -- PIET's `confirm long
-      // variable x` answers rc 0 for an f64 column, so a probe asserting the
-      // type would be a false GREEN.
+      // Calendar creation accepts if/in; the handler rejects qualifiers on
+      // other subcommands and records generated business indices as long.
       // (r(fn) used to be a fifth divergence -- `bcal describe`/`bcal dir` post
       // an ABSOLUTE machine path where Stata posts `./NAME.stbcal`. FIXED in
       // the 2026-09-09 review pass; see setDescribeR.)
-      {"bcal", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {}, "runBcal"},
+      {"bcal", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runBcal"},
       {"twoway__histogram_gen", {}, Family::Graph, false, false, WeightPolicy::None, false, {},
        "refused:stata_internal"},
       // `frames` is Stata's plural spelling of `frame`; `reset` is the one

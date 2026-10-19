@@ -11693,7 +11693,7 @@ nlohmann::ordered_json dispatch(const std::string& rawCmd, SessionState& session
   // cache is name-keyed and survives the cd (review 2026-09-09; see bcal.h for
   // the measurement table). Two sessions in one process are kept apart by
   // SessionState::resetProcessCaches(), not by this string.
-  if (depth == 0) {
+  if (depth == 1) {
     // bcal::searchDirFor, NOT a second copy of the rule: an unset session.cwd
     // must mean the same directory here as it does in the handler's bcalCwd,
     // or install() after `bcal create` keys the cache on one string while
