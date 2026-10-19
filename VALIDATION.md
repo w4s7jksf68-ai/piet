@@ -16,7 +16,8 @@ test logs, or third-party datasets.
 | Real native WebView UI smoke | 24 steps, GREEN |
 | Gitleaks 8.30.1 source scan | No leaks found |
 
-Restored-function checks cover formatting, decoded labels, ties, floating-point
+Restored-function checks cover formatting, decoded labels and UTF-8 byte limits,
+ties, floating-point
 boundaries, storage metadata, DTA roundtrips, malformed options, selection,
 calendar omissions and extensions, fresh-process reload, and replacement-cache
 refresh. A direct engine check also rejected nine malformed label/option

@@ -2974,8 +2974,15 @@ void Frame::egen_concat(const std::string& out, const std::vector<std::string>& 
                         if (label != variable->second.end()) decoded = &label->second;
                     }
                 }
-                if (decoded != nullptr) {
-                    joined.append(*decoded, 0, static_cast<size_t>(co.maxlength ? co.maxlength : 32000));
+                size_t labelBytes = decoded == nullptr ? 0 : std::min(
+                    decoded->size(), static_cast<size_t>(co.maxlength ? co.maxlength : 32000));
+                // Keep the byte limit at a UTF-8 boundary; an empty prefix uses
+                // the numeric fallback, just as an empty or absent label does.
+                while (decoded != nullptr && labelBytes > 0 && labelBytes < decoded->size() &&
+                       (static_cast<unsigned char>((*decoded)[labelBytes]) & 0xC0) == 0x80)
+                    --labelBytes;
+                if (labelBytes > 0) {
+                    joined.append(*decoded, 0, labelBytes);
                 } else {
                     joined += std::isnan(value) ? missing_text(missing_kind(value))
                                                : stata_string_of(value, co.format);

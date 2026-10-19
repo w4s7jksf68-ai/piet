@@ -106,6 +106,17 @@ def test_concat(folder):
     assert_column(rows, 'selected', ['', '|2', '', 'A B|1', 'a,b|2', ''])
     assert_column(rows, 'formatted', ['12.00|Alpha', '-3.00|', '.|Omega', '0.00|A B', '123.50|a,b', '.|'])
     assert_column(rows, 'decoded', ['Alpha|nort', '|sout', 'Omega|3', 'A B|nort', 'a,b|sout', '|3'])
+    # The byte limit must stop before a partial UTF-8 character. If no whole
+    # character fits, the observed decode behavior falls back to the code.
+    write_csv(folder, ['code'], [[1], [2]], filename='unicode.csv')
+    run(['import delimited using unicode.csv, clear',
+         'label define unicode_labels 1 "서울" 2 "éclair"',
+         'label values code unicode_labels',
+         'egen four = concat(code), decode maxlength(4)',
+         'egen one = concat(code), decode maxlength(1)', export('unicode-result.csv')], folder)
+    rows = read_csv(folder, 'unicode-result.csv')
+    assert_column(rows, 'four', ['서', 'écl'])
+    assert_column(rows, 'one', ['1', '2'])
 
 
 def test_cut(folder):

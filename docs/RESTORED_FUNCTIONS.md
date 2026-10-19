@@ -31,7 +31,9 @@ credited civil-date arithmetic listed in `THIRD_PARTY_NOTICES.txt`.
 - `concat()` walks each selected row and joins fields in the requested order.
   Strings pass through unchanged; numeric fields use the existing public
   formatter or an attached value label under `decode`. `punct()` separates
-  fields, and `maxlength()` limits decoded labels. Validation completes before
+  fields, and `maxlength()` limits decoded labels by bytes while preserving whole
+  UTF-8 characters. If no character fits, the numeric code is used. Validation
+  completes before
   the new string column is installed.
 - `cut()` assigns values to ordered intervals or to cutpoints calculated from
   the sorted selected sample. Ties stay together. The result contains interval

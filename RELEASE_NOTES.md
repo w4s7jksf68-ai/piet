@@ -12,6 +12,8 @@
   declared here.
 - Reject malformed or duplicate options, preserve string and numeric storage
   metadata, and reload generated calendars from the session working directory.
+- Clip decoded labels at complete UTF-8 character boundaries under `maxlength()`;
+  use the numeric code if no character fits the byte limit.
 - Calendar generation emits explicit omissions in the documented file grammar.
   It does not promise byte-identical Stata serialization. `personal` and
   `generate()` with qualifiers remain unsupported. Ranges may extend the observed
