@@ -1105,26 +1105,10 @@ const std::vector<CommandSpec>& commandRegistry() {
        "accept-note (graph-editor recording; appearance only)"},
       {"error", {}, Family::Meta, false, false, WeightPolicy::None, false, {},
        "runErrorCode (engineError carrying reason=r(#))"},
-      // AER scope-2 B2-3. NAMED DIVERGENCE 1: Stata resolves a .stbcal over the
-      // whole adopath (BASE;SITE;.;PERSONAL;PLUS) and `bcal dir` walks it;
-      // PIET models no sysdir, so the search directory is the session cwd
-      // alone and `personal` is refused by name.
-      // NAMED DIVERGENCE 3: `bcal create NAME if <expr>, from(v) generate(nv)`
-      // — the `if`+`generate()` COMBINATION — is refused r(198) where Stata is
-      // rc 0 and writes the new column with MISSING on the excluded rows
-      // (oracle i2_rc/i2_bz2_missing/i3_rc, bcal-20260908/capture.do:451-462;
-      // re-measured rc 0 this review). Filed BUG-465. Plain `if` without
-      // generate() IS wired, which is why allowIf is true below (measured:
-      // `bcal create ifcal if bd > td(15jan2020), from(bd) replace` rc 0,
-      // r(min_date_td)=21930). allowIf was false here until the 2026-09-09
-      // review: descriptive-only (BUGLOG:1404 — no enforcement site reads it),
-      // but `--dump-registry` does, and that export is what
-      // private-notes/plans/aer-scope1/registry-*.json is built from.
       // Calendar creation accepts if/in; the handler rejects qualifiers on
-      // other subcommands and records generated business indices as long.
-      // (r(fn) used to be a fifth divergence -- `bcal describe`/`bcal dir` post
-      // an ABSOLUTE machine path where Stata posts `./NAME.stbcal`. FIXED in
-      // the 2026-09-09 review pass; see setDescribeR.)
+      // other subcommands and records generated business indices as long,
+      // with missing values outside the selected sample. Personal calendars
+      // use sysdir PERSONAL and can be found again in subsequent sessions.
       {"bcal", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runBcal"},
       {"twoway__histogram_gen", {}, Family::Graph, false, false, WeightPolicy::None, false, {},
        "refused:stata_internal"},

@@ -30,6 +30,8 @@
 #include <vector>
 
 #include "piet/bundle_paths.h"
+#include "piet/bcal.h"
+#include "piet/calendar_paths.h"
 #include "piet/eval/errors.h"
 #include "piet/strutil.h"
 #include "io/win_compat.h"  // cecon::to_native_path / env_utf8 (BUG-050/051)
@@ -390,6 +392,12 @@ const char* const kShellAllowlistText =
     "to PIET file operations.";
 
 }  // namespace
+
+void configureCalendarSearch(SessionState& session) {
+  seedSysdir(session);
+  bcal::setSearchDir(bcal::searchDirFor(session.cwd.value_or(std::string())));
+  bcal::setPersonalDir(resolveUserPath(session, session.sysdir.at("PERSONAL")));
+}
 
 // ---------------------------------------------------------------------------
 // shell
@@ -1022,6 +1030,7 @@ nlohmann::ordered_json runSysdir(const std::string& raw, const std::vector<std::
   // are deliberately left unexpanded.
   const std::string resolved = resolveUserPath(session, pathArg);
   session.sysdir[name] = resolved;
+  if (name == "PERSONAL") configureCalendarSearch(session);
   // As written, not as resolved -- same reproducible-golden reason as adopath
   // above; bare `sysdir` reports the resolved directory that was recorded.
   return displayBlock("(sysdir set " + name + " " + pathArg +

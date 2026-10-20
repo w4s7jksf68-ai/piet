@@ -904,6 +904,10 @@ std::map<std::string, std::shared_ptr<const BusinessCalendar>>& cacheStorage() {
   static std::map<std::string, std::shared_ptr<const BusinessCalendar>> m;
   return m;
 }
+std::string& personalDirStorage() {
+  static std::string dir;
+  return dir;
+}
 // Stata's cache is keyed by NAME ALONE, measured both directions (this
 // review, /private/tmp/fix-bcal/st/cap.log): create `cdcal` in the cwd, then
 // `cd sub` -> bofd is still 1 (B_in_sub), and after a `bcal create cdcal` in
@@ -924,6 +928,8 @@ std::string joinDir(const std::string& dir, const std::string& file) {
 
 void setSearchDir(std::string dir) { searchDirStorage() = std::move(dir); }
 const std::string& searchDir() { return searchDirStorage(); }
+void setPersonalDir(std::string dir) { personalDirStorage() = std::move(dir); }
+const std::string& personalDir() { return personalDirStorage(); }
 void clearCache() { cacheStorage().clear(); }
 
 std::string calNameFromFormat(const std::string& spec) {
@@ -952,7 +958,7 @@ void install(const std::string& name, std::shared_ptr<const BusinessCalendar> ca
 
 std::shared_ptr<const BusinessCalendar> loadFile(const std::string& name, const std::string& path,
                                                  StbcalError* errOut) {
-  std::ifstream in(path, std::ios::binary);
+  std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
   if (!in) {
     if (errOut) {
       errOut->rc = 601;
@@ -973,7 +979,8 @@ std::shared_ptr<const BusinessCalendar> loadFile(const std::string& name, const 
   return sp;
 }
 
-std::shared_ptr<const BusinessCalendar> lookup(const std::string& nameIn) {
+std::shared_ptr<const BusinessCalendar> lookup(const std::string& nameIn, bool forceReload,
+                                                StbcalError* errOut) {
   std::string name = nameIn;
   // A leading %tb (with or without a width) names the same calendar.
   if (!name.empty() && name[0] == '%') {
@@ -990,9 +997,14 @@ std::shared_ptr<const BusinessCalendar> lookup(const std::string& nameIn) {
   if (!isValidCalName(name)) return nullptr;
   auto& cache = cacheStorage();
   auto it = cache.find(cacheKey(name));
-  if (it != cache.end()) return it->second;
+  if (!forceReload && it != cache.end()) return it->second;
   StbcalError err;
-  return loadFile(name, joinDir(searchDirStorage(), name + ".stbcal"), &err);
+  auto loaded = loadFile(name, joinDir(searchDirStorage(), name + ".stbcal"), &err);
+  if (!loaded && err.rc == 601 && !personalDirStorage().empty() &&
+      personalDirStorage() != searchDirStorage())
+    loaded = loadFile(name, joinDir(personalDirStorage(), name + ".stbcal"), &err);
+  if (!loaded && errOut != nullptr) *errOut = err;
+  return loaded;
 }
 
 }  // namespace piet::bcal

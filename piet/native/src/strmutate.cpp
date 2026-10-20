@@ -1309,6 +1309,7 @@ CountResult countRowsIf(SessionState& session, const std::string& ifExpr,
     if (m) ++cnt;
   }
   r.n = cnt;
+  r.selected = std::move(er.mask);
   return r;
 }
 

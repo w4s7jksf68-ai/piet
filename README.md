@@ -68,13 +68,15 @@ with independent replacement implementations. These changes are not included in
 the Beta 1 download above. Labels used by `concat(), decode` and created by
 `cut(), label` are carried between the native interface and engine.
 
-The public tests use synthetic examples and do not require Stata. Their new
-validation results are pending; the historical results in [VALIDATION.md](VALIDATION.md)
-apply to the original source beta. See [the behavior and provenance record](docs/RESTORED_FUNCTIONS.md)
+The public tests use synthetic examples and do not require Stata. Current and
+historical results are recorded separately in [VALIDATION.md](VALIDATION.md).
+See [the behavior and provenance record](docs/RESTORED_FUNCTIONS.md)
 for the implementation approach, verification command, and current limits.
-In particular, `bcal create, personal` and `generate()` combined with `if` or
-`in` remain unsupported. An extended calendar range must keep endpoints on
-weekdays represented in the source data and satisfy the maximum-gap limit.
+`bcal create, personal` writes to the existing `sysdir PERSONAL` directory
+(by default `~/ado/personal/`). Calendars are searched in the working directory
+and PERSONAL directory. `generate()` also supports `if` and `in`, preserving all
+rows and setting excluded observations to missing. An extended range keeps endpoints on
+weekdays represented in the source data and satisfies the maximum-gap limit.
 
 ## License and acknowledgments
 

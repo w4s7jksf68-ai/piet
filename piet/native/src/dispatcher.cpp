@@ -2,6 +2,7 @@
 #include "piet/translate.h"
 
 #include "piet/bcal.h"  // AER scope-2 B2-3: the calendar search directory follows session.cwd
+#include "piet/calendar_paths.h"
 
 #include <algorithm>
 #include <cctype>
@@ -11698,7 +11699,7 @@ nlohmann::ordered_json dispatch(const std::string& rawCmd, SessionState& session
     // must mean the same directory here as it does in the handler's bcalCwd,
     // or install() after `bcal create` keys the cache on one string while
     // lookup() reads it under another (review finding, non-blocking 3).
-    bcal::setSearchDir(bcal::searchDirFor(session.cwd.value_or(std::string())));
+    handlers::configureCalendarSearch(session);
   }
   nlohmann::ordered_json result;
   try {

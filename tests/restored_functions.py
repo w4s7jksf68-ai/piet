@@ -30,11 +30,13 @@ def errors(blocks):
     return [block for block in blocks if block.get('type') == 'error']
 
 
-def run(cmds, folder, failures=()):
+def run(cmds, folder, failures=(), env_overrides=None):
     """Run an isolated native session and check each command's error status."""
     env = dict(os.environ, COBRA_BIN=str(ENGINE),
                PIET_SETTINGS_FILE=str(folder / 'settings.json'),
                CECON_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
+    if env_overrides:
+        env.update(env_overrides)
     req = {'kind': 'dispatch', 'cmds': cmds,
            'workdir': str(folder), 'cwd': str(folder)}
     proc = subprocess.run([str(APP), '--run-block'], input=json.dumps(req),
@@ -370,6 +372,145 @@ def test_calendar_excludemissing(folder):
     assert_column(rows, 'anyb', [0, None, None, None, 1])
 
 
+def test_calendar_generate_qualifiers(folder):
+    # Unsorted duplicate dates distinguish the selection mask from simply
+    # converting every date that happens to appear in the induced calendar.
+    source = [[0, 1, 'keep'], [1, 1, 'keep'], [2, 0, 'drop'], [3, 1, 'keep'],
+              [1, 0, 'drop'], [2, 1, 'keep'], [4, 1, 'keep'], [3, 1, 'keep']]
+    write_csv(folder, ['d', 'flag', 'category', '__piet_bcal_sample'],
+              [row + ['untouched'] for row in source])
+    run(['import delimited using input.csv, clear',
+         'bcal create selected if flag in 2/7, from(d) generate(b)',
+         'bcal create bystring if category == "keep" in 2/7, from(d) generate(s)',
+         'bcal create byrange in -4/l, from(d) generate(r)',
+         'bcal create byrow if _n >= 2 in 2/7, from(d) generate(p)',
+         'format b s r p %12.0g', export()], folder)
+    rows = read_csv(folder)
+    assert_column(rows, 'd', [row[0] for row in source])
+    assert_column(rows, 'category', [row[2] for row in source])
+    assert_column(rows, '__piet_bcal_sample', ['untouched'] * len(source))
+    assert_column(rows, 'b', [None, 0, None, 2, None, 1, 3, None])
+    assert_column(rows, 's', [None, 0, None, 2, None, 1, 3, None])
+    assert_column(rows, 'r', [None, None, None, None, 0, 1, 3, 2])
+    assert_column(rows, 'p', [None, 0, 1, 2, 0, 1, 3, None])
+
+    write_csv(folder, ['d', 'a'], [[0, 1], [1, 1], [1, ''], [2, 1], [3, 1]],
+              filename='duplicate.csv')
+    run(['import delimited using duplicate.csv, clear',
+         'bcal create excluded if _n > 0 in f/l, from(d) excludemissing(a) generate(b)',
+         'format b %12.0g', export('duplicate-result.csv')], folder)
+    assert_column(read_csv(folder, 'duplicate-result.csv'), 'b', [0, 1, None, 2, 3])
+    write_csv(folder, ['d'], [[0], [1], [2], [3]], filename='extended-missing.csv')
+    run(['import delimited using extended-missing.csv, clear',
+         'generate flag = .a', 'replace flag = .b in 2', 'replace flag = 1 in 3',
+         'bcal create extended if flag == .a, from(d) generate(b)',
+         'format b %12.0g', export('extended-result.csv')], folder)
+    assert_column(read_csv(folder, 'extended-result.csv'), 'b', [0, None, None, 1])
+    write_csv(folder, ['day', 'flag'], [[0, 1], [1, 0], [2, 1], [3, 1], [4, 0]],
+              filename='timeseries.csv')
+    run(['import delimited using timeseries.csv, clear', 'tsset day',
+         'bcal create bylag if L.flag == 1 in 2/5, from(day) generate(b)',
+         'format b %12.0g', export('timeseries-result.csv')], folder)
+    assert_column(read_csv(folder, 'timeseries-result.csv'), 'b', [None, 0, None, 1, 2])
+    invalid = ['bcal create invalid if no_such_var, from(d) generate(never)',
+               'bcal create invalid in 0/3, from(d) generate(never)',
+               'bcal create invalid if 0, from(d) generate(never)']
+    cmds = ['import delimited using input.csv, clear', export('before.csv')]
+    run(cmds + invalid + [export('after.csv')], folder,
+        failures=range(len(cmds), len(cmds) + len(invalid)))
+    assert read_csv(folder, 'before.csv') == read_csv(folder, 'after.csv')
+    assert not (folder / 'invalid.stbcal').exists()
+
+
+def test_calendar_personal(folder):
+    personal = folder / '개인 달력'
+    personal.mkdir()
+    elsewhere = folder / 'elsewhere'
+    elsewhere.mkdir()
+    env = {'HOME': str(folder / 'fake-home')}
+    setting = f'sysdir set PERSONAL "{personal}"'
+    write_csv(folder, ['d'], [[0], [1], [4]])
+    cmds = ['import delimited using input.csv, clear', setting,
+            'bcal create pcal, from(d) personal generate(b)',
+            'bcal describe pcal', 'display r(fn)', 'bcal dir pcal',
+            'bcal load pcal', 'bcal check b', 'format b %12.0g', export()]
+    lists = run(cmds, folder, env_overrides=env)
+    path = personal / 'pcal.stbcal'
+    assert path.is_file() and not (folder / 'pcal.stbcal').exists()
+    assert str(path) in json.dumps(lists[cmds.index('display r(fn)')], ensure_ascii=False)
+    assert str(path) in json.dumps(lists[cmds.index('bcal dir pcal')], ensure_ascii=False)
+    assert_column(read_csv(folder), 'b', [0, 1, 2])
+
+    original = path.read_bytes()
+    cmds = ['import delimited using input.csv, clear', setting,
+            'bcal create pcal, from(d) personal',
+            'bcal create ./pathcal, from(d) personal',
+            f'sysdir set PERSONAL "{folder / "missing"}"',
+            'bcal create missingcal, from(d) personal']
+    run(cmds, folder, failures=(2, 3, 5), env_overrides=env)
+    assert path.read_bytes() == original
+    assert not (folder / 'pathcal.stbcal').exists() and not (folder / 'missing').exists()
+
+    # Cwd wins in a fresh session. An explicit reload after cd must bypass the
+    # already-loaded cwd calendar and read the personal file instead.
+    run(['import delimited using input.csv, clear', setting,
+         'bcal create pcal, from(d) centerdate(1960jan02)',
+         'generate cwdmap = bofd("pcal", d)',
+         'cd elsewhere', 'bcal load pcal',
+         'generate personalmap = bofd("pcal", d)', export()], folder, env_overrides=env)
+    rows = read_csv(elsewhere)
+    assert_column(rows, 'cwdmap', [-1, 0, 1])
+    assert_column(rows, 'personalmap', [0, 1, 2])
+    run(['import delimited using ../input.csv, clear', setting,
+         'generate b = bofd("pcal", d)',
+         'generate roundtrip = dofb(b, "pcal")', export()], elsewhere, env_overrides=env)
+    rows = read_csv(elsewhere)
+    assert_column(rows, 'b', [0, 1, 2])
+    assert_column(rows, 'roundtrip', [0, 1, 4])
+    run(['import delimited using input.csv, clear', setting,
+         'generate b = bofd("pcal", d)', export()], folder, env_overrides=env)
+    assert_column(read_csv(folder), 'b', [-1, 0, 1])
+
+    # An invalid first match is an error, not permission to load a different
+    # calendar with the same name from PERSONAL.
+    (folder / 'badcal.stbcal').write_text('invalid calendar\n')
+    (personal / 'badcal.stbcal').write_bytes(original)
+    run(['import delimited using input.csv, clear', setting,
+         'bcal load badcal', 'generate b = bofd("badcal", d)', export()],
+        folder, failures=(2,), env_overrides=env)
+    assert_column(read_csv(folder), 'b', [None, None, None])
+
+
+def test_calendar_personal_default(folder):
+    home = folder / 'home'
+    personal = home / 'ado' / 'personal'
+    personal.mkdir(parents=True)
+    env = {'HOME': str(home)}
+    write_csv(folder, ['d', 'flag'], [[0, 1], [1, 1], [4, 1], [5, 0]])
+    run(['import delimited using input.csv, clear',
+         'bcal create defaultper if flag in f/3, from(d) personal generate(b)',
+         'format b %12.0g', export()], folder, env_overrides=env)
+    assert (personal / 'defaultper.stbcal').is_file()
+    assert_column(read_csv(folder), 'b', [0, 1, 2, None])
+    elsewhere = folder / 'elsewhere'
+    elsewhere.mkdir()
+    run(['import delimited using ../input.csv, clear',
+         'generate b = bofd("defaultper", d)', export()], elsewhere, env_overrides=env)
+    assert_column(read_csv(elsewhere), 'b', [0, 1, 2, None])
+    listed = run(['bcal dir defaultper'], personal, env_overrides=env)
+    assert '1 calendar file found' in json.dumps(listed)
+    alternate = folder / 'alternate personal'
+    alternate.mkdir()
+    (alternate / 'programcal.stbcal').write_bytes((personal / 'defaultper.stbcal').read_bytes())
+    (elsewhere / 'personal.do').write_text(
+        f'sysdir set PERSONAL "{alternate}"\n'
+        'import delimited using ../input.csv, clear\n'
+        'generate b = bofd("programcal", d)\n'
+        'export delimited using program.csv, replace nolabel\n')
+    run(['do personal.do'], elsewhere, env_overrides=env)
+    assert_column(read_csv(elsewhere, 'program.csv'), 'b', [0, 1, 2, None])
+
+
 def test_calendar_errors(folder):
     calendar_input(folder)
     run(['import delimited using input.csv, clear',
@@ -465,6 +606,8 @@ def main():
               test_calendar, test_calendar_replace_cache, test_calendar_dateformat,
               test_calendar_extension,
               test_calendar_qualifiers, test_calendar_excludemissing,
+              test_calendar_generate_qualifiers, test_calendar_personal,
+              test_calendar_personal_default,
               test_calendar_errors, test_calendar_maxgap,
               test_calendar_fractional_and_invalid_dates]
     with tempfile.TemporaryDirectory(prefix='piet-restored-functions-') as temp:

@@ -7,7 +7,7 @@
 - Add optional value-label transport for `concat(), decode` and `cut(), label`.
 - Add self-contained public regressions for strings, numeric formatting, interval
   and quantile bins, labels, qualifiers, calendar omissions, and date conversion.
-  Local validation passes all 15 restored-function groups, the existing smoke
+  Local validation passes all 18 restored-function groups, the existing smoke
   suite, CTest 3/3, and the 24-step native UI journey. No new packaged release is
   declared here.
 - Reject malformed or duplicate options, preserve string and numeric storage
@@ -15,8 +15,10 @@
 - Clip decoded labels at complete UTF-8 character boundaries under `maxlength()`;
   use the numeric code if no character fits the byte limit.
 - Calendar generation emits explicit omissions in the documented file grammar.
-  It does not promise byte-identical Stata serialization. `personal` and
-  `generate()` with qualifiers remain unsupported. Ranges may extend the observed
+  It does not promise byte-identical Stata serialization. Personal calendars use
+  the configured PERSONAL directory and can be loaded from another working
+  directory or a fresh session. `generate()` accepts `if`/`in` while preserving
+  original row order and missing values outside the sample. Ranges may extend the observed
   span; inferred nonbusiness weekdays and the maximum-gap limit still apply.
 
 See [RESTORED_FUNCTIONS.md](docs/RESTORED_FUNCTIONS.md) for sources, design, and limits.

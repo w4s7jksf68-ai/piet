@@ -64,9 +64,22 @@ other numlist shorthands are rejected. Calendar creation uses `from()` after `if
 `in`, and `excludemissing()` selection, with the documented date-order choices,
 purpose, center, and maximum-gap options.
 
-`bcal create, personal` remains unsupported. `generate()` combined with `if` or
-`in` remains unsupported because this build cannot map the filtered data back to
-the original rows. Explicit calendar ranges cannot truncate the observed span.
+`bcal create, personal` saves into the existing `sysdir PERSONAL` directory,
+whose default is `~/ado/personal/`. An explicit pathname cannot be combined with
+`personal`; a missing PERSONAL directory is an error. Loading, describing,
+checking, listing, and business-date conversion search the working directory
+first, then PERSONAL. Other `adopath` entries are not searched by this loader.
+Custom `sysdir set PERSONAL` settings are session scoped; reapply them in a new
+session, or use the default personal directory.
+The name cache survives a working-directory or PERSONAL change until an explicit
+`bcal load` or replacement refreshes it.
+
+`generate()` supports `if` and `in`. The existing numeric engine and evaluator
+for string conditions supply a full-length selection mask, preserving original row order
+and the dataset. Numeric conditions retain extended-missing-value semantics.
+Rows excluded by the qualifiers or `excludemissing()` receive missing generated
+values even if another included row has the same date. Explicit calendar ranges
+cannot truncate the observed span.
 Extended endpoints must fall on weekdays represented in the original business
 dates; an endpoint on an inferred nonbusiness weekday produces a reader error.
 Intervening absent dates are holidays, and the extended gaps count toward
@@ -90,6 +103,6 @@ python3 tests/restored_functions.py
 The suite creates synthetic strings, interval and tied-group examples, calendar
 dates, and expected answers locally. It checks qualifiers, labels, error paths,
 calendar regeneration, omissions, and date conversion. It requires no Stata
-installation. All 15 regression groups passed. See `VALIDATION.md` for the
+installation. All 18 regression groups passed. See `VALIDATION.md` for the
 recorded build, existing-test, UI, and source-scan results; a passing
 bounded suite does not establish full command compatibility or legal clearance.

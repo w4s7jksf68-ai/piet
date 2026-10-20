@@ -116,6 +116,8 @@ InduceResult induceFromDates(const std::vector<double>& values, const InduceOpts
 // directory sitting in the key.
 void setSearchDir(std::string dir);
 const std::string& searchDir();
+void setPersonalDir(std::string dir);
+const std::string& personalDir();
 void clearCache();
 
 // The calendar-NAME rule, and the ONE place it lives. A calendar name is a
@@ -143,12 +145,17 @@ bool isValidCalName(const std::string& name);
 // expression surface reads it under another (review finding, non-blocking 3).
 std::string searchDirFor(const std::string& sessionCwd);
 
-// The one loader every surface goes through. `name` may carry a leading
+// The one loader every surface goes through: cwd first, then PERSONAL.
+// forceReload bypasses the name cache and reports the first matching file's
+// parse error rather than falling through to a same-named personal calendar.
+// `name` may carry a leading
 // "%tb"; a ".stbcal" SUFFIX is rejected (measured: `bofd("a_wk.stbcal", d)`
 // is missing); a name outside isValidCalName() is rejected too. Returns
 // nullptr for "not found, unreadable, or not a legal calendar name", which
 // every expression caller turns into Stata missing with rc 0.
-std::shared_ptr<const BusinessCalendar> lookup(const std::string& name);
+std::shared_ptr<const BusinessCalendar> lookup(const std::string& name,
+                                                bool forceReload = false,
+                                                StbcalError* errOut = nullptr);
 
 // `bcal load` / `bcal create ..., replace` refresh: parse the file at `path`
 // under `name` and install it, replacing any cached entry. `errOut` carries

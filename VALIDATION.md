@@ -11,7 +11,7 @@ test logs, or third-party datasets.
 |---|---|
 | CoBrA and PIET native Release builds | PASS |
 | Existing CTest determinism and thread-budget tests | 3/3 PASS |
-| Restored-function regression groups | 15/15 PASS |
+| Restored-function regression groups | 18/18 PASS |
 | Existing independent OLS/SE, DTA roundtrip, unknown-command smoke | PASS |
 | Real native WebView UI smoke | 24 steps, GREEN |
 | Gitleaks 8.30.1 source scan | No leaks found |
@@ -20,7 +20,10 @@ Restored-function checks cover formatting, decoded labels and UTF-8 byte limits,
 ties, floating-point
 boundaries, storage metadata, DTA roundtrips, malformed options, selection,
 calendar omissions and extensions, fresh-process reload, and replacement-cache
-refresh. A direct engine check also rejected nine malformed label/option
+refresh. New calendar cases cover numeric/string row selection, duplicate dates,
+excluded observations, default/custom PERSONAL paths, fresh-session discovery,
+cwd precedence, forced reload, and invalid-file shadowing. A direct engine check
+also rejected nine malformed label/option
 requests without persisting an output dataset.
 
 Build and run the public checks with `sh scripts/build-macos.sh`. To run only the
