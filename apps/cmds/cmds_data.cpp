@@ -82,6 +82,157 @@ const std::vector<EgenFnInfo>& egen_function_table() {
     return T;
 }
 
+namespace {
+int egen_integer(const std::string& raw, const std::string& context) {
+    const std::string text = trimx(raw);
+    size_t start = !text.empty() && (text[0] == '+' || text[0] == '-') ? 1 : 0;
+    if (start == text.size() ||
+        !std::all_of(text.begin() + static_cast<std::ptrdiff_t>(start), text.end(),
+                     [](unsigned char c) { return std::isdigit(c); }))
+        throw EngineError("bad_input", context + ": integer required");
+    try {
+        const long long value = std::stoll(text);
+        if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max())
+            throw std::out_of_range("integer");
+        return static_cast<int>(value);
+    } catch (const std::exception&) {
+        throw EngineError("bad_input", context + ": integer out of range");
+    }
+}
+
+// Parse the two restored functions' own option grammars, including quoted
+// punctuation and nested numlist ranges; never search for option substrings.
+std::map<std::string, std::string> restored_egen_options(const std::string& text,
+                                                       bool concat) {
+    const std::unordered_set<std::string> arguments = concat
+        ? std::unordered_set<std::string>{"punct", "format", "maxlength", "by"}
+        : std::unordered_set<std::string>{"at", "group", "by"};
+    const std::unordered_set<std::string> flags = concat
+        ? std::unordered_set<std::string>{"decode"}
+        : std::unordered_set<std::string>{"icodes", "label"};
+    std::map<std::string, std::string> result;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        while (pos < text.size() && (std::isspace(static_cast<unsigned char>(text[pos])) || text[pos] == ',')) ++pos;
+        if (pos == text.size()) break;
+        const size_t nameStart = pos;
+        while (pos < text.size() && (std::isalnum(static_cast<unsigned char>(text[pos])) || text[pos] == '_')) ++pos;
+        if (pos == nameStart) throw EngineError("bad_input", "egen: malformed option suffix");
+        std::string name = text.substr(nameStart, pos - nameStart);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (concat && name == "p") name = "punct";
+        if (!arguments.count(name) && !flags.count(name))
+            throw EngineError("bad_input", "egen " + std::string(concat ? "concat" : "cut") +
+                                          "(): option '" + name + "' is not allowed");
+        const size_t nameEnd = pos;
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+        const bool hasArgument = pos < text.size() && text[pos] == '(';
+        if (!hasArgument) pos = nameEnd;
+        std::string body;
+        if (hasArgument) {
+            const size_t bodyStart = ++pos;
+            int depth = 1;
+            char quote = 0;
+            for (; pos < text.size() && depth != 0; ++pos) {
+                const char c = text[pos];
+                if (quote) { if (c == quote) quote = 0; }
+                else if (c == '\'' || c == '"') quote = c;
+                else if (c == '(') ++depth;
+                else if (c == ')') --depth;
+            }
+            if (depth != 0 || quote) throw EngineError("bad_input", "egen: unclosed option argument");
+            body = text.substr(bodyStart, pos - bodyStart - 1);
+        }
+        if (arguments.count(name) != static_cast<size_t>(hasArgument))
+            throw EngineError("bad_input", "egen: option '" + name + "' has invalid syntax");
+        if (!result.emplace(name, std::move(body)).second)
+            throw EngineError("bad_input", "egen: duplicate option '" + name + "'");
+        if (pos < text.size() && !std::isspace(static_cast<unsigned char>(text[pos])) && text[pos] != ',')
+            throw EngineError("bad_input", "egen: options must be separated by spaces");
+    }
+    return result;
+}
+
+// Public numlist syntax: explicit finite numbers and from(step)to sequences.
+std::vector<double> cut_numlist(const std::string& text) {
+    std::vector<double> values;
+    size_t pos = 0;
+    auto skipSpace = [&] {
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    };
+    auto number = [&](int* decimalPlaces = nullptr) {
+        skipSpace();
+        const size_t numberStart = pos;
+        const char* first = text.c_str() + pos;
+        char* last = nullptr;
+        const long double value = std::strtold(first, &last);
+        if (last == first || !std::isfinite(value))
+            throw EngineError("bad_input", "egen cut(): at() requires finite numeric edges");
+        pos = static_cast<size_t>(last - text.c_str());
+        const std::string token = text.substr(numberStart, pos - numberStart);
+        for (unsigned char c : token)
+            if (!std::isdigit(c) && c != '+' && c != '-' && c != '.' && c != 'e' && c != 'E')
+                throw EngineError("bad_input", "egen cut(): invalid at() numeric token");
+        if (decimalPlaces != nullptr) {
+            const size_t exponentPos = token.find_first_of("eE");
+            const size_t decimalPos = token.find('.');
+            const int exponent = exponentPos == std::string::npos ? 0
+                : egen_integer(token.substr(exponentPos + 1), "egen cut() at() exponent");
+            if (exponent < -10000 || exponent > 10000)
+                throw EngineError("bad_input", "egen cut(): at() exponent is out of range");
+            const size_t mantissaEnd = exponentPos == std::string::npos ? token.size() : exponentPos;
+            *decimalPlaces = (decimalPos == std::string::npos ? 0
+                : static_cast<int>(mantissaEnd - decimalPos - 1)) - exponent;
+        }
+        return value;
+    };
+    auto append = [&](double value) {
+        if (values.size() == 1600)
+            throw EngineError("bad_input", "egen cut(): at() exceeds 1600 edges");
+        values.push_back(value);
+    };
+    while (true) {
+        skipSpace();
+        if (pos == text.size()) break;
+        int firstPlaces = 0, stepPlaces = 0;
+        const long double first = number(&firstPlaces);
+        const size_t afterNumber = pos;
+        skipSpace();
+        if (pos < text.size() && text[pos] == '(') {
+            ++pos;
+            const long double step = number(&stepPlaces);
+            skipSpace();
+            if (pos == text.size() || text[pos++] != ')')
+                throw EngineError("bad_input", "egen cut(): malformed at() range");
+            const long double end = number();
+            if (step <= 0.0 || end < first)
+                throw EngineError("bad_input", "egen cut(): at() ranges must increase with a positive step");
+            const long double span = (end - first) / step;
+            if (!std::isfinite(span) || span > 1599.0 + 1e-10)
+                throw EngineError("bad_input", "egen cut(): at() exceeds 1600 edges");
+            const size_t count = static_cast<size_t>(std::floor(span + 1e-12L * std::max(1.0L, span))) + 1;
+            const long double scale = std::pow(10.0L, std::max(firstPlaces, stepPlaces));
+            for (size_t k = 0; k < count; ++k) {
+                long double value = first + static_cast<long double>(k) * step;
+                // Keep decimal steps on their stated grid, so 0(.1)1 includes
+                // the same double .3 as the explicit edge .3 on every platform.
+                const long double scaled = value * scale;
+                if (scale > 0 && std::isfinite(scaled) && std::fabs(scaled) <= 0x1p53L)
+                    value = std::round(scaled) / scale;
+                append(static_cast<double>(value));
+            }
+            if (pos < text.size() && !std::isspace(static_cast<unsigned char>(text[pos])))
+                throw EngineError("bad_input", "egen cut(): malformed at() range suffix");
+        } else {
+            append(static_cast<double>(first));
+            if (pos < text.size() && pos == afterNumber)
+                throw EngineError("bad_input", "egen cut(): invalid at() numeric token");
+        }
+    }
+    return values;
+}
+}  // namespace
+
 // cobra eval — Stata-style data prep, applied in command-line order so dependent
 // transforms work (e.g. an egen that references a column made by an earlier bygen).
 int cmd_eval(const std::vector<std::string>& a) {
@@ -95,7 +246,7 @@ int cmd_eval(const std::vector<std::string>& a) {
             "    | --gen \"o=expr\" [--gen-strict, reject if o already exists] | --egen \"o=fn(expr), by(g..)\"\n"
             "        (fn over expr: max min mean median sum count sd rank std iqr | pctile(x),p(#))\n"
             "        (fn over varlist: tag(v..) group(v..)[,missing] | seq()[,by(g..)] — running 1..N)\n"
-            "        (fn over varlist: concat(v..)[,punct(s) format(%%fmt) maxlength(#)] — text result)\n"
+            "        (fn over varlist: concat(v..)[,punct(s) format(%%fmt) decode maxlength(#)] — text result)\n"
             "    | --rowegen \"o=rowfn(v1,v2,..)\" (rowmean rowsd rowtotal rowmax rowmin rowmiss rownonmiss)\n"
             "    | --mkspline \"stub=var, cubic [, nknots(5)] [, knots(v1,v2,..)]\" (restricted cubic spline basis)\n"
             "    | --bygen \"o=expr, by(g..), sort(t..)\" | --winsor \"o=src,plo,phi\"\n"
@@ -126,6 +277,27 @@ int cmd_eval(const std::vector<std::string>& a) {
     const bool analytic_w = !aweight.empty();
     const std::string& sumw = analytic_w ? aweight : fweight;
     std::vector<std::string> summvars;
+    std::map<std::string, std::map<int, std::string>> valueLabels;
+    const std::string labelsText = opt(a, "--value-labels");
+    if (has(a, "--value-labels")) {
+        const json labels = json::parse(labelsText, nullptr, false);
+        if (!labels.is_object())
+            throw EngineError("bad_input", "eval: --value-labels must be an object of variable-to-label objects");
+        for (auto variable = labels.begin(); variable != labels.end(); ++variable) {
+            if (variable.key().empty() || !variable.value().is_object())
+                throw EngineError("bad_input", "eval: --value-labels entries require a variable name and label object");
+            auto& codes = valueLabels[variable.key()];
+            for (auto label = variable.value().begin(); label != variable.value().end(); ++label) {
+                if (!label.value().is_string())
+                    throw EngineError("bad_input", "eval: --value-labels label texts must be strings");
+                const int code = egen_integer(label.key(), "eval --value-labels code");
+                if (!codes.emplace(code, label.value().get<std::string>()).second)
+                    throw EngineError("bad_input", "eval: --value-labels contains duplicate numeric codes");
+            }
+        }
+    }
+    json egenValueLabels = json::object();
+    json egenStoreTypes = json::object();
 
     auto egen_fn = [](const std::string& f, Frame::EgenFn& o) -> bool {
         for (const EgenExprSpec& s : EGEN_EXPR) if (f == s.name) { o = s.fn; return true; }
@@ -216,11 +388,16 @@ int cmd_eval(const std::vector<std::string>& a) {
             fr.generate(trimx(v.substr(0, eq)), v.substr(eq + 1), genStrict, genMask, storeType); ++i;
         } else if (f == "--egen") {
             size_t eq = find_assign(v);
+            if (eq == std::string::npos)
+                throw EngineError("bad_input", "egen: expected output=function(arguments)");
             std::string outn = trimx(v.substr(0, eq)), rhs = trimx(v.substr(eq + 1));
             size_t fp = rhs.find('(');
+            if (fp == std::string::npos)
+                throw EngineError("bad_input", "egen: function arguments require parentheses");
             std::string fnm = trimx(rhs.substr(0, fp));
             int depth = 1; size_t p = fp + 1, st = p;
             for (; p < rhs.size() && depth > 0; ++p) { if (rhs[p] == '(') ++depth; else if (rhs[p] == ')') --depth; }
+            if (depth != 0) throw EngineError("bad_input", "egen: unclosed function arguments");
             std::string inner = rhs.substr(st, p - 1 - st);
             std::string opts = rhs.substr(p);  // tail after the inner ')': options like , by(..) p(..)
             std::vector<std::string> by = split_vars(paren_arg(opts, "by"));
@@ -257,71 +434,57 @@ int cmd_eval(const std::vector<std::string>& a) {
             } else if (fnm == "nvals") {
                 fr.egen_nvals(outn, split_vars(inner), by, has_word(opts, "missing"), storeType); ++i;
             } else if (fnm == "concat") {
-                // Stata refuses a `by` prefix on concat() with r(190) as well —
-                // _gconcat.ado:18-20 calls the same _egennoby that _gcut does.
-                if (!by.empty())
-                    throw EngineError("bad_input",
-                        "egen concat(): may not be combined with by");
+                const auto parsed = restored_egen_options(opts, true);
+                if (parsed.count("by"))
+                    throw EngineError("bad_input", "egen concat(): may not be combined with by");
                 Frame::ConcatOpts co;
-                // punct("_") / format(%9.2f) arrive with their quotes when the caller
-                // wrote any; strip ONE matching pair, never trim the content itself —
-                // a separator of "  " is a legitimate two-space separator.
                 auto unquote = [](std::string s) {
+                    s = trimx(s);
                     if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') ||
                                           (s.front() == '\'' && s.back() == '\'')))
                         s = s.substr(1, s.size() - 2);
                     return s;
                 };
-                co.punct = unquote(paren_arg(opts, "punct"));
-                co.format = trimx(unquote(paren_arg(opts, "format")));
-                co.decode = has_word(opts, "decode");
-                // Only the long spelling is read. paren_arg does a plain substring
-                // find, so a bare `length(` probe would also match inside
-                // `maxlength(` (the mkspline knots/nknots hazard above) — concat has
-                // no `length()` option, so there is nothing to disambiguate and
-                // nothing that could be read twice.
-                std::string ml = trimx(paren_arg(opts, "maxlength"));
-                if (!ml.empty()) {
-                    // Stata's own check is `confirm integer n` then a range test, and a
-                    // non-integer takes the SAME exit-198 branch (_gconcat.ado:35-39) —
-                    // so "12abc" must be rejected, not silently read as 12.
-                    bool ok = true;
-                    for (size_t q = 0; q < ml.size(); ++q)
-                        if (!std::isdigit(static_cast<unsigned char>(ml[q])) &&
-                            !(q == 0 && (ml[q] == '-' || ml[q] == '+'))) ok = false;
-                    long parsed = 0;
-                    if (ok) { try { parsed = std::stol(ml); } catch (const std::exception&) { ok = false; } }
-                    if (!ok || parsed < 1 || parsed > 32000)
-                        throw EngineError("bad_input", "egen concat(): invalid maxlength( )");
-                    co.maxlength = static_cast<int>(parsed);
+                if (auto option = parsed.find("punct"); option != parsed.end()) co.punct = unquote(option->second);
+                if (auto option = parsed.find("format"); option != parsed.end()) {
+                    co.format = trimx(unquote(option->second));
+                    if (co.format.empty()) throw EngineError("bad_input", "egen concat(): format() cannot be empty");
                 }
-                // Text result: --store-type (a numeric storage type) does not reach it.
+                co.decode = parsed.count("decode") != 0;
+                co.valueLabels = valueLabels;
+                if (auto option = parsed.find("maxlength"); option != parsed.end()) {
+                    co.maxlength = egen_integer(option->second, "egen concat() maxlength()");
+                    if (co.maxlength < 1 || co.maxlength > 32000)
+                        throw EngineError("bad_input", "egen concat(): maxlength() must be between 1 and 32000");
+                }
                 fr.egen_concat(outn, split_vars(inner), co); ++i;
             } else if (fnm == "cut") {
-                // Stata refuses a `by` prefix on cut() with r(190) (_gcut.ado's
-                // _egennoby) — captured in egen-six as `c7_by_prefix` rc 190.
-                if (!by.empty())
-                    throw EngineError("bad_input", "egen cut(): may not be combined with by");
+                const auto parsed = restored_egen_options(opts, false);
+                if (parsed.count("by")) throw EngineError("bad_input", "egen cut(): may not be combined with by");
                 Frame::CutOpts co;
-                std::string at = paren_arg(opts, "at");
-                if (!at.empty()) {
-                    // Stata numlist accepts a `from(step)to` range — `at(0(.1)1)`. NOT
-                    // supported here on purpose: the egen-six capture shows Stata's own
-                    // answer for that form is the FLOAT-rounded bin (d = 0.29999999999
-                    // lands in [0.3,0.4), icode 3, not 2), and a double-precision
-                    // expansion of the range would silently disagree. Refuse until a
-                    // capture pins where the rounding happens.
-                    if (at.find('(') != std::string::npos)
-                        throw EngineError("bad_input",
-                            "egen cut(): at() numlist ranges like 0(.1)1 are not supported — "
-                            "list the edges explicitly");
-                    for (const auto& t : split_vars(at)) co.at.push_back(std::stod(t));
+                if (parsed.count("at") == parsed.count("group"))
+                    throw EngineError("bad_input", "egen cut(): specify exactly one of at() or group()");
+                if (auto option = parsed.find("at"); option != parsed.end()) {
+                    co.at = cut_numlist(option->second);
+                    if (co.at.empty()) throw EngineError("bad_input", "egen cut(): at() cannot be empty");
                 }
-                std::string gp = paren_arg(opts, "group");
-                if (!gp.empty()) co.group = std::stoi(trimx(gp));
-                co.icodes = has_word(opts, "icodes");
-                co.label = has_word(opts, "label");
-                fr.egen_cut(outn, trimx(inner), co, storeType); ++i;
+                if (auto option = parsed.find("group"); option != parsed.end())
+                    co.group = egen_integer(option->second, "egen cut() group()");
+                co.icodes = parsed.count("icodes") != 0;
+                co.label = parsed.count("label") != 0;
+                std::map<int, std::string> labels;
+                StoreType storedType;
+                fr.egen_cut(outn, trimx(inner), co, storeType, &labels, &storedType);
+                const char* storedName = storedType == StoreType::Byte ? "byte"
+                    : storedType == StoreType::Int ? "int" : storedType == StoreType::Long ? "long"
+                    : storedType == StoreType::Float ? "float" : "double";
+                egenStoreTypes[outn] = storedName;
+                if (co.label) {
+                    json encoded = json::object();
+                    for (const auto& label : labels) encoded[std::to_string(label.first)] = label.second;
+                    egenValueLabels[outn] = std::move(encoded);
+                }
+                ++i;
             } else if (varlist_egen && fnm == "tag") {
                 // _gtag.ado ignores the requested type: --store-type does not reach it.
                 fr.egen_tag(outn, split_vars(inner)); ++i;
@@ -523,6 +686,8 @@ int cmd_eval(const std::vector<std::string>& a) {
     if (!commit_frame(std::move(fr), out) && !out.empty())
         std::fprintf(stderr, "wrote %s\n", out.c_str());
     if (!summ.empty()) log["summarize"] = summ;
+    if (!egenValueLabels.empty()) log["egen_value_labels"] = std::move(egenValueLabels);
+    if (!egenStoreTypes.empty()) log["egen_store_types"] = std::move(egenStoreTypes);
     emit(log, "");
     return 0;
 }

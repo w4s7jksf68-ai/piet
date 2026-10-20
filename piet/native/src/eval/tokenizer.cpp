@@ -376,11 +376,36 @@ std::vector<std::pair<std::string, OptValue>> parseOpts(const std::string& optSt
       int depth = 1;
       ++i;
       size_t vstart = i;
+      bool quoted = false;
+      int compound = 0;
       while (i < n && depth > 0) {
-        if (s[i] == '(') ++depth;
+        if (compound) {
+          if (i + 1 < n && s[i] == '`' && s[i + 1] == '"') {
+            ++compound;
+            i += 2;
+          } else if (i + 1 < n && s[i] == '"' && s[i + 1] == '\'') {
+            --compound;
+            i += 2;
+          } else ++i;
+          continue;
+        }
+        if (quoted) {
+          if (s[i] == '"') quoted = false;
+          ++i;
+          continue;
+        }
+        if (i + 1 < n && s[i] == '`' && s[i + 1] == '"') {
+          compound = 1;
+          i += 2;
+          continue;
+        }
+        if (s[i] == '"') quoted = true;
+        else if (s[i] == '(') ++depth;
         else if (s[i] == ')') --depth;
         ++i;
       }
+      if (depth || quoted || compound)
+        throw TokenizerError(errorBlock("syntax_error", "unclosed option argument", key));
       std::string val = strip(s.substr(vstart, (i - 1) - vstart));
       opts.emplace_back(key, OptValue::ofString(val));
     } else {

@@ -76,22 +76,11 @@ def main():
                 assert math.isclose(actual[name]['se'], se, rel_tol=2e-6, abs_tol=2e-6), (name,actual[name],se)
         assert (folder/'roundtrip.dta').stat().st_size > 100
         print('PASS: synthetic sample, OLS coefficients/SE against independent reference, DTA roundtrip')
-        for cmd in ['egen withheld = concat(fatal beertax)',
-                    'egen withheld = cut(fatal)',
-                    'bcal create withheld, from(year) replace']:
-            blocks = run(['sysuse synthetic_panel',cmd],folder)
-            assert not errors(blocks[0]), blocks[0]
-            failure = errors(blocks[1])
-            assert failure and 'provenance review' in json.dumps(failure), blocks[1]
-            assert not (folder/'withheld.stbcal').exists()
-        # The native option parser can reject at() before entering the withheld
-        # cut implementation; the valid syntax must still never compute output.
-        cut = run(['sysuse synthetic_panel', 'egen withheld = cut(fatal), at(0 1 2 10)'], folder)
-        assert errors(cut[-1]), cut
-        print('PASS: all three withheld features reject explicitly; no calendar written')
         blocks = run(['sysuse synthetic_panel','definitely_not_a_command'],folder)
         assert errors(blocks[-1]), blocks
         print('PASS: unknown command rejected')
+    from restored_functions import main as restored_checks
+    restored_checks()
     print('Public smoke checks passed. Coverage is limited to the cases above.')
 
 

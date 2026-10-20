@@ -23,6 +23,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "piet/session_state.h"
 #include "vendor/nlohmann/json.hpp"
@@ -50,17 +51,19 @@ nlohmann::ordered_json runStringReplace(SessionState& session, const std::string
 // condition is true. Sets `ok=false` on an un-evaluatable condition (message
 // carried in `errMsg`). `inRange` (BS-090, BETA Phase G): an optional `in
 // a/b` row-range, ANDed into the SAME per-row mask this already builds
-// (Doctrine ①: this path is only reachable when `if` references a
-// string/factor column, and dispatcher.cpp's caller must never silently
+// (count/filter use this for string/factor conditions; calendar creation also
+// reuses its full-length mask for numeric conditions). Callers must never silently
 // drop a co-occurring `in` just because the `if` half took the row-wise
-// detour — negative()/malformed forms set `ok=false` the same way an
+// detour — malformed/out-of-range forms set `ok=false` the same way an
 // un-evaluatable `if` expression does, `errMsg` carries the same wording
-// family as piet::handlers::inRangeRejectError).
+// family as piet::handlers::inRangeRejectError.
 struct CountResult {
   bool ok = true;
   bool inRangeError = false;  // true iff a failing `ok=false` is the `in` bound, not `if`
   long long n = 0;
   std::string errMsg;
+  // Full-length sample mask, in original row order, when ok is true.
+  std::vector<bool> selected;
 };
 CountResult countRowsIf(SessionState& session, const std::string& ifExpr,
                         const std::optional<std::string>& inRange = std::nullopt);

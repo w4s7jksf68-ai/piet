@@ -112,6 +112,7 @@
 
 #include "io/win_compat.h"  // cecon::to_native_path / native_unlink
 #include "piet/bcal.h"  // AER scope-2 B2-3: business calendars
+#include "piet/calendar_paths.h"
 #include "piet/stata_format.h"  // piet::fmt::renderTd -- the describe table date column
 #include "piet/cobra_runner.h"
 #include "piet/column_fetch.h"
@@ -128,6 +129,8 @@
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
 #include "piet/strutil.h"
+#include "piet/strmutate.h"
+#include "piet/translate.h"
 
 // ---------------------------------------------------------------------------
 // OPTION VOCABULARIES -- namespace scope, before any dispatch (defect class 3).
@@ -2688,18 +2691,10 @@ ojson runTsspell(const eval::ParsedCommand& parsed, SessionState& session) {
 // bcal -- Stata business calendars ([D] bcal)
 // ===========================================================================
 //
-// AER scope-2 B2-3, the blocker of paper 066. The rules live in
-// piet/bcal.{h,cpp}, whose header carries the authority note (the create
-// branch's primary text is /Applications/StataNow/ado/base/b/bcal.ado, not the
-// manual). This handler is the WIRING: option parse, the read of the from()
-// column, the file write, the cache refresh, the describe table and r().
-//
-// NAMED DIVERGENCE (D2/D3/D4): Stata searches BASE;SITE;.;PERSONAL;PLUS for a
-// .stbcal and `bcal dir` walks the same path. PIET models no sysdir, so the
-// search directory is the session's cwd alone: `bofd("simple", ...)` -- the one
-// calendar StataBE ships, in BASE -- is missing here unless the file is in the
-// working directory, `bcal dir` lists the cwd, and `personal` is refused by
-// name rather than writing somewhere PIET cannot then find.
+// Independent induction and file parsing live in piet/bcal.{h,cpp}; this
+// handler connects options, sample selection, file writing, cache refresh and
+// returned metadata. Reads search the working directory and configured PERSONAL
+// directory; other adopath entries are outside this loader's current scope.
 
 namespace {
 
@@ -2807,16 +2802,12 @@ std::string describeTable(const bcal::BusinessCalendar& c) {
 }
 
 void setDescribeR(SessionState& session, const bcal::BusinessCalendar& c, bool withCounts) {
-  // r(fn) is a PRESENTATION string, not the path we opened. Stata posts the
-  // adopath-relative name it found -- `./a_wk.stbcal` for a calendar in the
-  // cwd (measured 2026-09-09: D_desc_r_fn / D_dir_fn = `./a_wk.stbcal`, while
-  // `bcal create`'s own r(fn) is the bare `a_wk.stbcal`, D_create_r_fn).
-  // `c.fn` is the ABSOLUTE path this build opened, and posting it leaked a
-  // machine path into a user-visible return: a do-file that echoes r(fn)
-  // printed `/private/tmp/.../a_wk.stbcal` (review 2026-09-09, non-blocking 3).
-  // The cwd is the only directory PIET searches, so `./NAME.stbcal` is the
-  // right answer for every calendar this build can resolve.
-  session.eval.rStrings.set("fn", "./" + c.name + ".stbcal");
+  // Cwd files use relative presentation; personal calendars report the path
+  // that was actually loaded, so the return value names an accessible file.
+  const auto file = std::filesystem::u8path(c.fn);
+  const auto cwd = std::filesystem::u8path(bcal::searchDir()).lexically_normal();
+  session.eval.rStrings.set("fn", file.parent_path().lexically_normal() == cwd
+                                      ? "./" + c.name + ".stbcal" : c.fn);
   session.eval.rStrings.set("purpose", c.purpose);
   session.eval.rStrings.set("name", c.name);
   session.eval.rValues.set("max_date_tb", static_cast<double>(c.maxTb));
@@ -2832,7 +2823,7 @@ void setDescribeR(SessionState& session, const bcal::BusinessCalendar& c, bool w
   session.eval.rValues.set("included_year", round1(d.inclYear));
 }
 
-// The session's cwd, which is the ONLY directory PIET looks in. The
+// The session's cwd, the first directory PIET looks in. The
 // derivation is bcal::searchDirFor and NOT a second copy of it: dispatcher.cpp
 // sets the same search directory at depth 0, and if the two disagreed about
 // what an unset session.cwd means, one of them would RESOLVE `NAME.stbcal`
@@ -2845,7 +2836,7 @@ std::string bcalCwd(SessionState& session) {
   return bcal::searchDirFor(session.cwd.value_or(std::string()));
 }
 
-// Read `NAME.stbcal` from the cwd (through the cache), for describe/load.
+// Resolve `NAME.stbcal` in the cwd or PERSONAL directory, for describe/load.
 std::shared_ptr<const bcal::BusinessCalendar> bcalFind(SessionState& session,
                                                        const std::string& nameIn, bool forceReload,
                                                        bcal::StbcalError* err) {
@@ -2866,11 +2857,7 @@ std::shared_ptr<const bcal::BusinessCalendar> bcalFind(SessionState& session,
     }
     return nullptr;
   }
-  if (!forceReload) {
-    if (auto hit = bcal::lookup(name)) return hit;
-  }
-  const std::string path = resolveUserPath(session, name + ".stbcal");
-  return bcal::loadFile(name, path, err);
+  return bcal::lookup(name, forceReload, err);
 }
 
 }  // namespace
@@ -2898,6 +2885,8 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
   const bool isCreate = sub == "create";
   if (!isCheck && !isDescribe && !isDir && !isLoad && !isCreate)
     return utilErrorRc(sub + " invalid bcal subcommand", 198);
+  if (!isCreate && (parsed.ifExpr.has_value() || parsed.inRange.has_value()))
+    return utilErrorRc("bcal " + sub + ": if/in qualifiers are not allowed", 101);
 
   // --- the option net, NARROWED to the resolved sub-command ----------------
   // Each set below is that sub-command's own `syntax` line in bcal.ado, and
@@ -2929,9 +2918,21 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
     const std::unordered_set<std::string>& unimpl =
         isDir ? kDirUnimpl : kVocabBcal.unimplemented;
     if (auto e = eval::rejectUnknownOptions(parsed.opts, known, unimpl)) return ojson(*e);
+    if (isCreate) {
+      std::set<std::string> seen;
+      for (const auto& [key, value] : parsed.opts) {
+        if (!seen.insert(key).second)
+          return utilErrorRc("bcal create: duplicate option " + key, 198);
+        const bool flag = key == "replace" || key == "personal";
+        if (value.isBool != flag)
+          return utilErrorRc("bcal create: invalid syntax for option " + key, 198);
+        if (!flag && key != "purpose" && trimOf(value.strValue).empty())
+          return utilErrorRc("bcal create: option " + key + " requires an argument", 198);
+      }
+    }
   }
 
-  bcal::setSearchDir(bcalCwd(session));
+  configureCalendarSearch(session);
 
   // --- describe / load -----------------------------------------------------
   if (isDescribe || isLoad) {
@@ -2950,7 +2951,7 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
       if (err.rc == 601)
         return utilErrorRc("bcal " + std::string(isLoad ? "load" : "describe") + ": calendar " +
                                asked + " not found (" + bcal::calNameFromFormat(asked) +
-                               ".stbcal is not in the working directory)",
+                               ".stbcal is not in the working or PERSONAL directory)",
                            601);
       return utilErrorRc("bcal: " + asked + ".stbcal is not a valid calendar file -- " +
                              err.message,
@@ -2988,18 +2989,23 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
     };
     std::vector<std::pair<std::string, std::string>> found;  // name, path
     std::error_code ec;
-    const std::string dir = bcalCwd(session);
-    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-      if (!it->is_regular_file()) continue;
-      const std::string fn = it->path().filename().u8string();
-      if (fn.size() <= 7 || fn.compare(fn.size() - 7, 7, ".stbcal") != 0) continue;
-      const std::string nm = fn.substr(0, fn.size() - 7);
-      if (!globMatch(pattern, nm)) continue;
-      // Presentation form, exactly as in setDescribeR above: Stata's `bcal dir`
-      // prints and posts `./NAME.stbcal` for a calendar in the cwd (measured,
-      // cap2.log D_dir_fn) -- an absolute path is what it prints only for a
-      // calendar found elsewhere on the adopath, which PIET has none of.
-      found.emplace_back(nm, "./" + fn);
+    std::vector<std::string> directories = {bcalCwd(session)};
+    const bool sameDirectory = !bcal::personalDir().empty() &&
+        std::filesystem::equivalent(std::filesystem::u8path(bcal::personalDir()),
+                                    std::filesystem::u8path(directories.front()), ec);
+    if (!bcal::personalDir().empty() && !sameDirectory)
+      directories.push_back(bcal::personalDir());
+    for (size_t index = 0; index < directories.size(); ++index) {
+      ec.clear();
+      for (std::filesystem::directory_iterator it(std::filesystem::u8path(directories[index]), ec), end;
+           !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file()) continue;
+        const std::string fn = it->path().filename().u8string();
+        if (fn.size() <= 7 || fn.compare(fn.size() - 7, 7, ".stbcal") != 0) continue;
+        const std::string nm = fn.substr(0, fn.size() - 7);
+        if (!globMatch(pattern, nm)) continue;
+        found.emplace_back(nm, index == 0 ? "./" + fn : it->path().u8string());
+      }
     }
     std::sort(found.begin(), found.end());
     std::ostringstream o;
@@ -3083,6 +3089,8 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
   // --- create --------------------------------------------------------------
   if (parsed.varlist.size() < 2)
     return utilErrorRc("bcal create: name of business calendar file expected", 198);
+  if (parsed.varlist.size() > 2)
+    return utilErrorRc("bcal create: only one calendar filename is allowed", 198);
   const std::string spec = parsed.varlist[1];
 
   // parse_pathname (bcal.ado:1183-1231): split path / calname / suffix.
@@ -3098,6 +3106,8 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
     suffix = calname.substr(dot);
     calname = calname.substr(0, dot);
   }
+  if (hasFlag(parsed.opts, "personal") && !path.empty())
+    return utilErrorRc("personal cannot be combined with a filename path", 198);
   if (!path.empty()) {
     std::error_code ec;
     if (!std::filesystem::is_directory(resolveUserPath(session, path), ec))
@@ -3110,12 +3120,13 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!suffix.empty() && suffix != ".stbcal" && suffix != ".")
     return utilErrorRc("extension " + suffix + " in calendar file not allowed", 198);
 
-  if (hasFlag(parsed.opts, "personal"))
-    return ojson(eval::unsupportedOption(
-        "personal",
-        "`bcal create, personal' writes into Stata's PERSONAL ado directory. PIET models no "
-        "sysdir, so a calendar written there could never be found again; write it into the "
-        "working directory instead (drop the option)."));
+  if (hasFlag(parsed.opts, "personal")) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(std::filesystem::u8path(bcal::personalDir()), ec))
+      return utilErrorRc("PERSONAL directory does not exist", 198);
+    path = bcal::personalDir();
+    if (!path.empty() && path.back() != '/' && path.back() != '\\') path += '/';
+  }
 
   const std::optional<std::string> fromOpt = optStr(parsed.opts, "from");
   if (!fromOpt.has_value() || trimOf(*fromOpt).empty())
@@ -3148,21 +3159,10 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
     if (v < 1) return utilErrorRc("maxgap() should be at least 1", 198);
     iopts.maxgap = v;
   }
-  // range()/centerdate() are read under the option's OWN dateformat, exactly
-  // as bcal.ado does (parse_range/parse_centerdate take it as an argument).
-  // ONE date reader for the whole command, and it is the .stbcal parser's --
-  // a second, hand-written `date(tok, "YMD")` here is exactly how the option
-  // half and the file half of a dateformat drift apart. The token is handed
-  // to `parseStbcal` inside a minimal two-line calendar whose range STARTS at
-  // it; a token that parses comes back as `cal.lo`.
+  // Options and calendar files share one date grammar. Parse just the token;
+  // building a calendar through year 9999 here would allocate millions of days.
   auto readDate = [&](const std::string& tok, std::int64_t* out) -> bool {
-    bcal::ParseResult pr = bcal::parseStbcal(
-        "dateformat " + iopts.dateformat + "\nrange " + tok + " 9999dec31\ncenterdate " + tok +
-            "\n",
-        "probe");
-    if (!pr.ok) return false;
-    *out = pr.cal.lo;
-    return true;
+    return bcal::parseDailyDate(tok, iopts.dateformat, out);
   };
   if (auto rg = optStr(parsed.opts, "range")) {
     const std::vector<std::string> parts = splitWs(trimOf(*rg));
@@ -3207,22 +3207,9 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
   const std::optional<std::string> genVar = optStrAny(parsed.opts, {"generate", "gen"});
   const bool haveQualifier = (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
                              (parsed.inRange.has_value() && !parsed.inRange->empty());
-  if (genVar.has_value() && haveQualifier) {
-    // generate() writes a column as long as the dataset with MISSING on the
-    // excluded rows; `applyIfAndInFilter` hands back a filtered FRAME, not a
-    // mask, so this build cannot map those rows back. Refused by name rather
-    // than writing a short or misaligned column.
-    ojson q = refuseQualifiers(
-        parsed, "`bcal create, generate()' writes a column as long as the dataset, and this "
-                "build cannot map a filtered sample back onto the original rows. Run the create "
-                "without generate() and then `gen long V = bofd(\"" + calname + "\", " + fromVar +
-                    ")' yourself.");
-    if (!q.is_null()) return q;
-  }
-
   std::vector<std::string> readCols = {fromVar};
   for (const auto& v : exclVars) readCols.push_back(v);
-  ReadScope scope(session, parsed, readCols, "bcal create", /*honourQualifiers=*/true);
+  ReadScope scope(session, parsed, readCols, "bcal create", /*honourQualifiers=*/false);
   if (scope.failed())
     return scope.error().is_null() ? utilError("bcal create: could not read the data", "data_io")
                                    : scope.error();
@@ -3234,6 +3221,60 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
     return utilErrorRc(fromVar + " has non-numeric values", 198);
 
   const int64_t n = ds.nRows();
+  std::vector<bool> selected;
+  if (haveQualifier && strmutate::needsStringCount(session, parsed.ifExpr)) {
+    auto selection = strmutate::countRowsIf(session, parsed.ifExpr.value_or("1"), parsed.inRange);
+    if (!selection.ok) {
+      if (selection.inRangeError) {
+        InRangeFilterResult failure;
+        failure.ok = false;
+        failure.refusal = selection.errMsg;
+        return inRangeRejectError(failure, parsed.inRange.value_or(""), "bcal create");
+      }
+      return utilErrorRc("bcal create: " + selection.errMsg, 198);
+    }
+    selected = std::move(selection.selected);
+    if (selected.size() != static_cast<size_t>(n))
+      return utilError("bcal create: sample mask does not match the dataset", "internal");
+  } else if (haveQualifier) {
+    // Numeric conditions use the engine, retaining its extended-missing and
+    // time-series semantics. The scratch result preserves every original row.
+    std::string predicate = "((" + parsed.ifExpr.value_or("1") + ")!=0)";
+    if (parsed.inRange.has_value()) {
+      const auto bounds = parseInRangeBounds(*parsed.inRange, n);
+      if (!bounds.ok) {
+        InRangeFilterResult failure;
+        failure.ok = false;
+        failure.refusal = bounds.refusal;
+        return inRangeRejectError(failure, *parsed.inRange, "bcal create");
+      }
+      predicate += " & (_n>=" + std::to_string(bounds.a) + " & _n<=" +
+                   std::to_string(bounds.b) + ")";
+    }
+    std::string marker = "__piet_bcal_sample";
+    const std::string samplePath = nextPath(session.workdir(), "bcal_sample");
+    session.noteProjectionScratch(samplePath);
+    try {
+      SessionState::ResidentSuspend statelessSample(session);
+      session.ensureMaterializedHead();
+      while (session.datastore()->has(marker)) marker += '_';
+      runCobraJson(translate::injectTsContextForExpr(
+          {"eval", "--data", *session.currentHbin(), "--bygen", marker + "=" + predicate,
+           "--out", samplePath}, predicate, session));
+      Datastore sample(samplePath);
+      if (sample.nRows() != n)
+        return utilError("bcal create: sample mask does not match the dataset", "internal");
+      const double* mask = sample.col(marker).f64();
+      selected.resize(static_cast<size_t>(n));
+      for (int64_t row = 0; row < n; ++row)
+        selected[static_cast<size_t>(row)] = mask[row] != 0;
+    } catch (const CobraError& error) {
+      return utilError(cobraErrorMessage(error), error.code);
+    } catch (const std::exception& error) {
+      return utilError("bcal create: could not read the sample -- " + std::string(error.what()),
+                       "data_io");
+    }
+  }
   const double* fromCol = ds.col(fromVar).f64();
   std::vector<ColView> exclViews;
   for (const auto& v : exclVars) exclViews.push_back(viewOf(ds, v));
@@ -3241,6 +3282,7 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
   std::vector<char> included(static_cast<size_t>(n), 0);
   values.reserve(static_cast<size_t>(n));
   for (int64_t i = 0; i < n; ++i) {
+    if (!selected.empty() && !selected[static_cast<size_t>(i)]) continue;
     if (!exclViews.empty()) {
       bool keep = exclAny;
       for (const auto& v : exclViews) {
@@ -3312,6 +3354,8 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
     out << "\n    First date in range() occurs before first business date in dataset.\n";
   if (ind.trailNote)
     out << "\n    Second date in range() occurs after last business date in dataset.\n";
+  if (ind.fractionalNote)
+    out << "\n    " << fromVar << " contains noninteger dates; daily dates use their floor.\n";
 
   ojson blocks = ojson::array();
   if (genVar.has_value()) {
@@ -3338,6 +3382,8 @@ ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
       return *err;
     session.load(outPath);
     session.varMeta[newvar].format = "%tb" + calname;
+    session.varMeta[newvar].stataType = "long";
+    session.implicitFloatVars.erase(newvar);
     session.userFormattedVars.insert(newvar);
     out << "\n    Variable " << newvar << " created; it contains business dates in %tb" << calname
         << " format.\n";

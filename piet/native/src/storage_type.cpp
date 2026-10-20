@@ -208,13 +208,25 @@ std::string egenFunctionName(const std::string& rhs) {
 }
 
 bool egenIgnoresStoreType(const std::string& fn) {
-  return fn == "tag" || fn == "seq" || fn == "mode";
+  return fn == "tag" || fn == "seq" || fn == "mode" || fn == "concat";
 }
 
 bool recordEgenFixedType(SessionState& session, const std::string& newvar,
                          const std::string& rhs, const std::string& seqType) {
   const std::string fn = egenFunctionName(rhs);
+  if (fn == "cut" && !seqType.empty() && !newvar.empty()) {
+    session.implicitFloatVars.erase(newvar);
+    session.varMeta[newvar].stataType = seqType;
+    return true;
+  }
   if (!egenIgnoresStoreType(fn) || newvar.empty()) return false;
+  if (fn == "concat") {
+    // The string column's actual width determines its type. A numeric default
+    // or declaration must not disguise it as a numeric column in describe.
+    session.implicitFloatVars.erase(newvar);
+    session.varMeta[newvar].stataType.reset();
+    return true;
+  }
   if (fn == "tag" || fn == "seq") {
     session.implicitFloatVars.erase(newvar);
     // seq: `gen byte` widened by its replace (_gseq.ado:42, :45-49) to

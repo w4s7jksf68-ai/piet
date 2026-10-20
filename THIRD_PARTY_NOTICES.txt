@@ -112,6 +112,13 @@ code. Stata EULA section 2.5 does not provide a general redistribution grant for
 an independent GPL application: https://www.stata.com/order/end-user-license-agreement/19eula2025.pdf
 This is a release-scope decision, not a legal opinion on all interoperability.
 
+The current unreleased source replaces those three withheld functions with
+independent project-authored algorithms. Public manuals and newly constructed
+synthetic black-box outputs informed behavior; Stata ado source, the excluded
+private implementations, and private reference logs were not used or included.
+The behavior, sources, and limits are recorded in docs/RESTORED_FUNCTIONS.md.
+The original Beta 1 release remains unchanged.
+
 Engine nlohmann/json v3.11.3 license:
 MIT License 
 

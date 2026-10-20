@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -796,27 +797,29 @@ public:
                     const std::vector<std::string>& by_cols, bool missing_as_value = false,
                     StoreType st = StoreType::Double);
 
-    // Public beta: interface retained; implementation unavailable pending provenance review.
+    // Row-wise string concatenation; numeric value labels are optional caller metadata.
     struct ConcatOpts {
-        std::string punct;    // separator appended after every field ("" = none)
+        std::string punct;    // separator between fields ("" = none)
         std::string format;   // Stata %fmt for NUMERIC inputs ("" = string()'s %9.0g)
-        int maxlength = 0;    // 0 = not given
-        bool decode = false;  // refused: cobra has no value-label decode
+        int maxlength = 0;    // decoded-label byte limit; 0 = default 32000
+        bool decode = false;
+        std::map<std::string, std::map<int, std::string>> valueLabels;
     };
     void egen_concat(const std::string& out, const std::vector<std::string>& vars,
                      const ConcatOpts& co);
 
-    // Public beta: unavailable pending provenance review.
+    // Interval grouping; group() keeps equal input values in the same group.
     struct CutOpts {
         std::vector<double> at;   // explicit edges (ascending, >= 2)
         int group = 0;            // 0 = not given
         bool icodes = false, label = false;
     };
-    // `st` reaches the numeric result only; the `label` form is a factor (codes).
-    // Under Byte/Int/Long, integer results are stored exact (Stata's replace widens)
-    // and a non-integer cut point throws bad_input.
+    // `label` implies integer codes; optional metadata preserves the numeric result.
+    // Integer storage requests widen when needed; storedTypeOut reports that choice.
     void egen_cut(const std::string& out, const std::string& var, const CutOpts& co,
-                  StoreType st = StoreType::Double);
+                  StoreType st = StoreType::Double,
+                  std::map<int, std::string>* labelsOut = nullptr,
+                  StoreType* storedTypeOut = nullptr);
 
     // egen tag: `egen out = tag(varlist)` — 1 on the FIRST observation (in the data's
     // current order) of each distinct combination of varlist, 0 on the rest, and
@@ -1259,8 +1262,7 @@ private:
     void set_or_replace(const std::string& name, std::vector<double> v,
                         StoreType st = StoreType::Double);
     // Factor twin of set_or_replace: same replace-in-place-or-append and the same
-    // sort-claim invalidation, for the egen functions whose result is text
-    // (cut ,label — the level string IS Stata's value label).
+    // sort-claim invalidation, for text results such as egen concat().
     void set_or_replace_factor(const std::string& name, std::vector<int32_t> codes,
                                std::vector<std::string> levels);
     void reindex();

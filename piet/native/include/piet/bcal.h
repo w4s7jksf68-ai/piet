@@ -1,7 +1,6 @@
 #ifndef PIET_NATIVE_BCAL_H
 #define PIET_NATIVE_BCAL_H
-// Business calendar reader and date-index operations.
-// Calendar induction is unavailable in this public beta pending provenance review.
+// Business calendar reader, independent date-set induction, and index operations.
 
 #include <cstdint>
 #include <memory>
@@ -54,7 +53,7 @@ ParseResult parseStbcal(const std::string& text, const std::string& name);
 double bofd(const BusinessCalendar& cal, double d);
 double dofb(const BusinessCalendar& cal, double i);
 
-// --- `bcal create` induction (bcal.ado:182-700 + writebcal at :1066-1172) ---
+// --- `bcal create` induction ([D] bcal, documented options and file format) ---
 struct InduceOpts {
   std::string calName;
   std::string dateformat = "ymd";  // bcal create ALWAYS writes it explicitly
@@ -73,15 +72,17 @@ struct InduceResult {
   int rc = 0;
   std::string message;
   std::string text;  // the .stbcal bytes, when ok
-  // `mismatch_code` riders bcal create prints as Notes (1 = range() starts
-  // before the first data date, 2 = range() ends after the last).
+  // The requested range extends beyond the source data's observed dates.
   bool leadNote = false, trailNote = false;
+  bool fractionalNote = false;  // noninteger source dates were floored
 };
 
 // `values` are the from() column's values for the observations that pass
-// if/in/excludemissing, in ANY order (the ado gsorts them itself). NaN is
-// Stata missing and is +infinity for the ordering, exactly as in Stata, so a
-// missing value trips the "cannot be after Dec 31, 9999" bound.
+// if/in/excludemissing, in any order. The induction uses distinct dates after
+// flooring fractional values. The caller applies exclusions first.
+// Explicit ranges may extend the observed span but cannot truncate it. Their
+// endpoints must fall on weekdays represented in the original business dates;
+// other absent dates remain holidays, and all gaps are subject to maxgap().
 InduceResult induceFromDates(const std::vector<double>& values, const InduceOpts& opts);
 
 // --- the process's calendar cache ------------------------------------------
@@ -115,6 +116,8 @@ InduceResult induceFromDates(const std::vector<double>& values, const InduceOpts
 // directory sitting in the key.
 void setSearchDir(std::string dir);
 const std::string& searchDir();
+void setPersonalDir(std::string dir);
+const std::string& personalDir();
 void clearCache();
 
 // The calendar-NAME rule, and the ONE place it lives. A calendar name is a
@@ -132,9 +135,7 @@ void clearCache();
 //                                        OTHER refusal and keeps its own rc)
 // `bcal dir` does NOT apply it: an eleven-character .stbcal in the directory is
 // still listed (measured, r(calendars) = "elevenchars elevenchar").
-// `bcal create` splits the same predicate into the ado's two distinct messages
-// (bcal.ado:218 "not a valid calendar name" / :224 "too long; calendar names
-// are limited to 10 characters") and so spells it out rather than calling this.
+// `bcal create` reports invalid names and excessive length separately.
 bool isValidCalName(const std::string& name);
 
 // The search directory a session's cwd names. An UNSET or empty session cwd
@@ -144,12 +145,17 @@ bool isValidCalName(const std::string& name);
 // expression surface reads it under another (review finding, non-blocking 3).
 std::string searchDirFor(const std::string& sessionCwd);
 
-// The one loader every surface goes through. `name` may carry a leading
+// The one loader every surface goes through: cwd first, then PERSONAL.
+// forceReload bypasses the name cache and reports the first matching file's
+// parse error rather than falling through to a same-named personal calendar.
+// `name` may carry a leading
 // "%tb"; a ".stbcal" SUFFIX is rejected (measured: `bofd("a_wk.stbcal", d)`
 // is missing); a name outside isValidCalName() is rejected too. Returns
 // nullptr for "not found, unreadable, or not a legal calendar name", which
 // every expression caller turns into Stata missing with rc 0.
-std::shared_ptr<const BusinessCalendar> lookup(const std::string& name);
+std::shared_ptr<const BusinessCalendar> lookup(const std::string& name,
+                                                bool forceReload = false,
+                                                StbcalError* errOut = nullptr);
 
 // `bcal load` / `bcal create ..., replace` refresh: parse the file at `path`
 // under `name` and install it, replacing any cached entry. `errOut` carries
@@ -170,6 +176,9 @@ std::string calNameFromFormat(const std::string& spec);
 std::int64_t daysFromCivil(std::int64_t y, unsigned m, unsigned d);
 // Stata dow(): 0 = Sunday. 01jan1960 (day 0) is a Friday.
 int dowOf(std::int64_t td);
+// Parse one complete daily date using the calendar reader's six date orders.
+// No calendar is constructed, and '*' years are not accepted.
+bool parseDailyDate(const std::string& token, const std::string& order, std::int64_t* out);
 // Render `td` under a bcal-create dateformat ("ymd".."dmy") the way Stata's
 // derived %td display format does (2020jan02 for ymd, 02jan2020 for dmy).
 std::string renderUnderDateformat(std::int64_t td, const std::string& dateformat);

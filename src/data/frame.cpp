@@ -2930,14 +2930,170 @@ std::string stata_string_of(double v, const std::string& fmt) {
         "silently wrong value in a join key");
 }
 
-// These interfaces remain so callers receive an explicit public-beta refusal.
-// Implementations withheld pending redistribution provenance clearance.
-void Frame::egen_concat(const std::string&, const std::vector<std::string>&,
-                        const ConcatOpts&) {
-    throw EngineError("unsupported", "egen concat(): unavailable in this public beta (provenance review)");
+// Fresh implementations from the public [D] egen contract and synthetic cases.
+// No proprietary ado source or removed implementation is used here.
+void Frame::egen_concat(const std::string& out, const std::vector<std::string>& vars,
+                        const ConcatOpts& co) {
+    if (out.empty() || has(out))
+        throw EngineError("bad_input", "egen concat(): requires a new output variable", out);
+    if (vars.empty())
+        throw EngineError("bad_input", "egen concat(): requires a varlist");
+    if (co.maxlength < 0 || co.maxlength > 32000)
+        throw EngineError("bad_input", "egen concat(): maxlength() must be between 1 and 32000");
+
+    std::vector<const FrameColumn*> inputs;
+    inputs.reserve(vars.size());
+    for (const auto& name : vars) {
+        if (!has(name))
+            throw EngineError("missing_column", "egen concat(): variable '" + name + "' not found", name);
+        const FrameColumn& c = col(name);
+        if (!c.is_factor && !co.format.empty()) (void)stata_string_of(0.0, co.format);
+        inputs.push_back(&c);
+    }
+
+    std::vector<int32_t> codes(static_cast<size_t>(n_), -1);
+    std::vector<std::string> levels;
+    std::unordered_map<std::string, int32_t> dictionary;
+    for (int64_t row = 0; row < n_; ++row) {
+        std::string joined;
+        for (size_t field = 0; field < inputs.size(); ++field) {
+            if (field != 0) joined += co.punct;
+            const FrameColumn& c = *inputs[field];
+            if (c.is_factor) {
+                const int32_t code = c.codes[static_cast<size_t>(row)];
+                if (code >= 0) joined += c.levels[static_cast<size_t>(code)];
+            } else {
+                const double value = c.f64[static_cast<size_t>(row)];
+                const std::string* decoded = nullptr;
+                if (co.decode && std::isfinite(value) && value == std::trunc(value) &&
+                    value >= std::numeric_limits<int>::min() &&
+                    value <= std::numeric_limits<int>::max()) {
+                    auto variable = co.valueLabels.find(vars[field]);
+                    if (variable != co.valueLabels.end()) {
+                        auto label = variable->second.find(static_cast<int>(value));
+                        if (label != variable->second.end()) decoded = &label->second;
+                    }
+                }
+                size_t labelBytes = decoded == nullptr ? 0 : std::min(
+                    decoded->size(), static_cast<size_t>(co.maxlength ? co.maxlength : 32000));
+                // Keep the byte limit at a UTF-8 boundary; an empty prefix uses
+                // the numeric fallback, just as an empty or absent label does.
+                while (decoded != nullptr && labelBytes > 0 && labelBytes < decoded->size() &&
+                       (static_cast<unsigned char>((*decoded)[labelBytes]) & 0xC0) == 0x80)
+                    --labelBytes;
+                if (labelBytes > 0) {
+                    joined.append(*decoded, 0, labelBytes);
+                } else {
+                    joined += std::isnan(value) ? missing_text(missing_kind(value))
+                                               : stata_string_of(value, co.format);
+                }
+            }
+        }
+        if (joined.empty()) continue;
+        auto found = dictionary.find(joined);
+        if (found == dictionary.end()) {
+            const int32_t code = static_cast<int32_t>(levels.size());
+            dictionary.emplace(joined, code);
+            levels.push_back(std::move(joined));
+            codes[static_cast<size_t>(row)] = code;
+        } else {
+            codes[static_cast<size_t>(row)] = found->second;
+        }
+    }
+    set_or_replace_factor(out, std::move(codes), std::move(levels));
 }
-void Frame::egen_cut(const std::string&, const std::string&, const CutOpts&, StoreType) {
-    throw EngineError("unsupported", "egen cut(): unavailable in this public beta (provenance review)");
+void Frame::egen_cut(const std::string& out, const std::string& var, const CutOpts& co,
+                     StoreType st, std::map<int, std::string>* labelsOut,
+                     StoreType* storedTypeOut) {
+    if (out.empty() || has(out))
+        throw EngineError("bad_input", "egen cut(): requires a new output variable", out);
+    if (!has(var))
+        throw EngineError("missing_column", "egen cut(): variable '" + var + "' not found", var);
+    const FrameColumn& input = col(var);
+    if (input.is_factor)
+        throw EngineError("factor_misuse", "egen cut(): requires a numeric variable", var);
+    if ((!co.at.empty() && co.group != 0) || (co.at.empty() && co.group < 2))
+        throw EngineError("bad_input", "egen cut(): specify exactly one of at() or group()");
+
+    const bool grouped = co.at.empty();
+    const bool integer_codes = grouped || co.icodes || co.label;
+    std::vector<double> edges = co.at;
+    if (!grouped) {
+        if (edges.size() < 2)
+            throw EngineError("bad_input", "egen cut(): at() requires at least two edges");
+        for (size_t i = 0; i < edges.size(); ++i) {
+            if (!std::isfinite(edges[i]) || (i && edges[i] <= edges[i - 1]))
+                throw EngineError("bad_input", "egen cut(): at() edges must be finite and strictly increasing");
+        }
+    } else {
+        std::vector<double> sorted;
+        sorted.reserve(static_cast<size_t>(n_));
+        for (int64_t row = 0; row < n_; ++row) {
+            const double value = input.f64[static_cast<size_t>(row)];
+            if (std::isfinite(value)) sorted.push_back(value);
+        }
+        if (sorted.empty())
+            throw EngineError("no_obs", "egen cut(): no nonmissing observations");
+        if (static_cast<size_t>(co.group) > sorted.size() + 1)
+            throw EngineError("bad_input", "egen cut(): group() exceeds the number of nonmissing observations plus one");
+        std::sort(sorted.begin(), sorted.end());
+        edges.reserve(static_cast<size_t>(co.group) + 1);
+        edges.push_back(sorted.front());
+        // Use order-statistic quantiles, averaging adjacent values when the
+        // quantile position is integral. Equal values then stay in one bin.
+        for (int k = 1; k < co.group; ++k) {
+            const uint64_t numerator = static_cast<uint64_t>(sorted.size()) * static_cast<uint64_t>(k);
+            const size_t position = static_cast<size_t>(numerator / static_cast<uint64_t>(co.group));
+            edges.push_back(numerator % static_cast<uint64_t>(co.group) == 0
+                                ? sorted[position - 1] / 2.0 + sorted[position] / 2.0
+                                : sorted[position]);
+        }
+        edges.push_back(sorted.back() + 1.0);
+    }
+
+    std::map<int, std::string> labels;
+    if (co.label) {
+        for (size_t i = 0; i < edges.size(); ++i)
+            labels.emplace(static_cast<int>(i), stata_string_of(edges[i], "") + "-");
+    }
+    std::vector<double> comparisonEdges = edges;
+    for (double& edge : comparisonEdges) edge = static_cast<double>(static_cast<float>(edge));
+    std::vector<double> result(static_cast<size_t>(n_), NAd);
+    for (int64_t row = 0; row < n_; ++row) {
+        double value = input.f64[static_cast<size_t>(row)];
+        if (!std::isfinite(value)) continue;
+        value = static_cast<double>(static_cast<float>(value));
+        if (!grouped && (value < comparisonEdges.front() || value >= comparisonEdges.back())) continue;
+        // The terminal edge is metadata for group(), whose maximum is always in
+        // the final group; at() instead uses its final edge as an exclusive bound.
+        const auto last = grouped ? comparisonEdges.end() - 1 : comparisonEdges.end();
+        const size_t bin = static_cast<size_t>(std::upper_bound(comparisonEdges.begin(), last, value) -
+                                                comparisonEdges.begin() - 1);
+        result[static_cast<size_t>(row)] = integer_codes ? static_cast<double>(bin) : edges[bin];
+    }
+    if (frame_detail::is_integer_store(st)) {
+        double lo = 0, hi = 0;
+        bool fractional = false;
+        for (double value : result) {
+            if (!std::isfinite(value)) continue;
+            lo = std::min(lo, value);
+            hi = std::max(hi, value);
+            fractional = fractional || value != std::trunc(value);
+        }
+        if (fractional) {
+            st = st == StoreType::Long ? StoreType::Double : StoreType::Float;
+        } else {
+            if (st == StoreType::Byte && (lo < frame_detail::kStoreByteLo || hi > frame_detail::kStoreByteHi))
+                st = StoreType::Int;
+            if (st == StoreType::Int && (lo < frame_detail::kStoreIntLo || hi > frame_detail::kStoreIntHi))
+                st = StoreType::Long;
+            if (st == StoreType::Long && (lo < frame_detail::kStoreLongLo || hi > frame_detail::kStoreLongHi))
+                st = StoreType::Double;
+        }
+    }
+    set_or_replace(out, std::move(result), st);
+    if (labelsOut != nullptr) *labelsOut = std::move(labels);
+    if (storedTypeOut != nullptr) *storedTypeOut = st;
 }
 
 void Frame::row_egen(const std::string& out, RowFn fn, const std::vector<std::string>& cols,
