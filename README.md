@@ -1,6 +1,6 @@
 # PIET + CoBrA — a free, offline, Stata-syntax-compatible econometrics tool
 
-**PIET** is a desktop application for learning and doing econometrics with the
+**PIET** (Parser, Interpreter & Econometric Tools) is a desktop application for learning and doing econometrics with the
 command syntax many researchers already know. It reads `.do` scripts and `.dta`
 datasets, runs them through its own independent computation engine, and renders
 tables, regression output, and graphs — fully offline, no license server, no
