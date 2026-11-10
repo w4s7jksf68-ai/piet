@@ -7,7 +7,7 @@
 // This is a single-entry-point module: handleDisplay() is the only public
 // symbol. All of the Python file's `_`-prefixed helpers (_resolve_token,
 // _resolve_e_scalar, _resolve_b_ref, _resolve_N) become file-local static
-// functions in display_hardening.cpp (_fmt_numeric's `%.9g` substitution is
+// functions in language/scalar_expression.cpp (_fmt_numeric's `%.9g` substitution is
 // gone since BUG-554: the resolvers substitute at full precision, and only
 // display's verbatim fallback still prints `%.9g`, verbatimCoefText) —
 // deliberately NOT shared with piet/eval/macros.cpp's own (anonymous-namespace,
@@ -43,12 +43,12 @@ ojson handleDisplay(const std::string& rawArgs, SessionState& session);
 
 // Stata's DEFAULT numeric display format, `%9.0g` — the nine-character rule
 // measured against the answerbook's own Stata 19.5 log (see the definition in
-// display_hardening.cpp for the worked examples). Exported at the P6 wave
+// language/display_number_format.cpp for the worked examples). Exported at the P6 wave
 // because the resampling tables must render their numbers the way `display`
 // already does; a second copy would be a second thing to keep in step, which is
 // how the two-layer divergences in this codebase have started before.
 // NOTE this is deliberately NOT the `%.9g` text of display's verbatim fallback
-// (display_hardening.cpp verbatimCoefText) — do not conflate them.
+// (language/display_command.cpp verbatimCoefText) — do not conflate them.
 std::string fmtStataDefaultG(double v);
 
 // A number (`valueText`: its digits, or `.`/`.a`-`.z`) under a numeric %fmt,

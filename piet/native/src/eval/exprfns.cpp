@@ -13,7 +13,7 @@
 #include "piet/eval/session.h"         // runiform(): EvalSession::rngSeed / rngDraws
 #include "core/rng_mt64.h"               // runiform(): EvalSession::rngMt64, the Stata stream
 
-#include "../dispatch_profile.h"  // EXPRLAYER: namespace-build counter (opt-in, stderr)
+#include "dispatch/dispatch_profile.h"  // EXPRLAYER: namespace-build counter (opt-in, stderr)
 #include "piet/stata_format.h"    // BUG-195: the ONE Stata numeric-format renderer
 
 // BUG-660: t/normal distribution tail probabilities and quantiles, shared
@@ -175,7 +175,7 @@ std::string gFormat(double v) {
 // digits", so ignoring w got the DIGITS wrong, not just the alignment.
 //
 // It matters more than the display twin did. `tostring, usedisplayformat`
-// (handlers_data_verbs.cpp) writes this output into a string VARIABLE — stored
+// (datamgmt/tostring.cpp) writes this output into a string VARIABLE — stored
 // data that survives save and export, not pixels on a screen.
 //
 // The renderer is now the shared one (piet/stata_format.h). Two things stay
@@ -475,7 +475,7 @@ PyValue fnSum(const std::vector<PyValue>& args) {
 // failed at obs 1 (rc 1) where Stata stores "1x" "1x" "4x" on k = 1, ., 3. A
 // missing x adds 0. Each call site keeps its own total: within one evaluation of
 // an expression on a row the calls run in a fixed order -- every operand is
-// evaluated, `&` and `|` included, since Stata has no short-circuit (strmutate.cpp
+// evaluated, `&` and `|` included, since Stata has no short-circuit (datamgmt/row_evaluation.cpp
 // rewriteExpr) -- so the n-th sum() call of the condition (or of the right-hand
 // side) is the same call site on every row, and its total lives at index n.
 // Only rows the expression is evaluated on count, so `if` limits the rows a
@@ -742,7 +742,7 @@ static double invttailBisectNewton(double df, double p) {
 // so Stata's own value is ~1.5e-15 low there. invt(10,.975) still renders
 // as the oracle's text; invttail(10,.025) (2.2281388519862739 since fix
 // round v4, text 2.228138851986274) is the listed display mismatch (numeric
-// gate T1 passes); see selftest_w2c_macrofns.cpp.
+// gate T1 passes); see selftest_language_macro_functions.cpp.
 double stataInvttail(double df, double p) {
   if (std::isnan(df) || df >= kStataMissingSentinel) return kStataMissingSentinel;
   if (std::isnan(p) || p >= kStataMissingSentinel) return kStataMissingSentinel;
@@ -818,7 +818,7 @@ PyValue fnInvt(const std::vector<PyValue>& args) {
 //
 // Implements the function per the StataNow help file (f_ftail.ihlp) and
 // identified against StataBE probes (a 1,440-point grid over df1, df2, f plus
-// the edge cases below; the selftest in selftest_w2c_macrofns.cpp keeps a
+// the edge cases below; the selftest in selftest_language_macro_functions.cpp keeps a
 // representative subset with the expression for each value):
 //   * any missing argument -> plain `.` (StataBE drops the .a-.z kind here:
 //     Ftail(.a,100,2), Ftail(3,.b,2) and Ftail(3,100,.c) all print `.`);
@@ -1377,7 +1377,7 @@ PyValue fnTobytes(const std::vector<PyValue>& args) {
 //
 // Review finding (v2): these drew from the C library's rand() and ignored
 // `set seed`. They now draw from the engine's Philox4x32-10 (core/rng.h, as
-// handlers_resample.cpp does), keyed on the session's `set seed` through
+// estimation/resampling_prefix_support.cpp does), keyed on the session's `set seed` through
 // EvalSession::rngSeed and counted by EvalSession::rngDraws, so `set seed 7`
 // followed by the same draws gives the same values. A draw needs the session,
 // and ns.fns entries carry none, so the SESSION-BOUND versions are installed
@@ -1659,7 +1659,7 @@ PyValue fnRegexm(const std::vector<PyValue>& args) {
 // the same; regexs_group_unmatched (:619, group 2 of "(A)(Z)?" never takes
 // part) stores "" everywhere, "(20 missing values generated)". The rule this
 // evaluator applies, which reproduces those three observables: while a
-// RegexsRowScope is open (strmutate.cpp evalRows), regexs() reads the match
+// RegexsRowScope is open (datamgmt/row_evaluation.cpp evalRows), regexs() reads the match
 // state as it stood when the current expression BEGAN evaluating on the
 // current row -- i.e. Stata's regexs() runs before its own expression's
 // regexm(), and so sees the previous row's match (none before row 1 in a
@@ -1684,7 +1684,7 @@ void RegexsRowScope::beginExpression() { regexsRowSnapshot() = lastRegexMatch();
 // BUG-660 fix round: regexs(n) -- the capture-group readback for regexm()
 // above. w2c_functions.log's regexs_macro_standalone arm (`local x =
 // regexs(0)` -> "A", rc 0) needs a PRECEDING regexm() in the same evaluator;
-// see selftest_w2c_macrofns.cpp for the arm this rests on. An out-of-range n
+// see selftest_language_macro_functions.cpp for the arm this rests on. An out-of-range n
 // or no prior successful match is Stata's own answer for the same case: the
 // empty string, not an error.
 PyValue fnRegexs(const std::vector<PyValue>& args) {
@@ -2659,7 +2659,7 @@ PyValue fnLn1m(const std::vector<PyValue>& a) {
 // value: `scalar s = date("01jan2010")` and `generate double g =
 // date("01jan2010")` both answer 198 (w2y_fn_datetime fd_date1). The `r(198):`
 // prefix is the channel evalArith (scalar/local/display) and the row evaluator
-// (strmutate) forward as the exact code.
+// (datamgmt/row_evaluation.cpp) forward as the exact code.
 PyValue translateFn(const std::vector<PyValue>& args, datemask::Kind kind,
                     const char* name) {
   if (args.size() < 2 || args.size() > 3)
@@ -2912,13 +2912,13 @@ void addStataFns(PyNamespace& ns) {
   // sum()/group()/runiform()/runiformint() are DELIBERATELY NOT here — see
   // addStataMacroOnlyFns() below, which registers them instead, into the two
   // NO-ROW-PLANE registries (stataMathNamespace()/postfileStataMathNamespace())
-  // only. addStataFns() is ALSO strmutate.cpp's baseNamespace() -- the
+  // only. addStataFns() is ALSO datamgmt/row_evaluation.cpp's baseNamespace() -- the
   // ROW-plane string generate/replace/count-if evaluator, which walks actual
   // data rows -- and sum()/group() answering their macro-layer, single-
   // evaluation shape there would be a silent wrong answer for `generate str
   // t = string(sum(x))` (fnSum's own comment: "outside of one a single
   // evaluation just answers x itself" — inside a row plane, Stata wants a
-  // running total -- strmutate.cpp installs that one, addRowPlaneSum). runiform()/
+  // running total -- datamgmt/row_evaluation.cpp installs that one, addRowPlaneSum). runiform()/
   // runiformint() move for the same reason: a per-evaluation draw reaching a
   // row-plane `generate` would not be the engine's seeded per-row stream.
   // The registry entries themselves refuse by name (r(199)); a session-bound
@@ -2962,7 +2962,7 @@ void addStataFns(PyNamespace& ns) {
   // with no macro twin. itrim() is Stata's older name of stritrim() (same
   // pointer: itrim_data :440 "  Ab cD " is exactly stritrim's internal-run
   // collapse); the four ustr* names are new functions above. Each name is
-  // also in strmutate.cpp's stringFnNames(), the row evaluator's routing
+  // also in datamgmt/row_evaluation.cpp's stringFnNames(), the row evaluator's routing
   // vocabulary.
   ns.fns["itrim"] = fnStritrim;
   ns.fns["ustrlen"] = fnUstrlen;
@@ -2985,7 +2985,7 @@ void addStataFns(PyNamespace& ns) {
 // reach (see that function's own comment for the failure mode this avoids).
 // Called by stataMathNamespace() below and macros.cpp's
 // postfileStataMathNamespace() -- the two no-row-plane registries -- not by
-// strmutate.cpp's baseNamespace() (the row-plane one, unedited by this fix,
+// datamgmt/row_evaluation.cpp's baseNamespace() (the row-plane one, unedited by this fix,
 // out of manifest).
 //
 // regexs() lives here, not in addStataFns(): review evidence (fix round 2)
@@ -2993,7 +2993,7 @@ void addStataFns(PyNamespace& ns) {
 // in a `generate cond(regexm(...), regexs(...), ...)`) give an empty row 1
 // because Stata's real row-plane regexm/regexs pairing has an evaluation-order
 // dependency this per-call, non-row-aware ns.fns entry cannot reproduce --
-// strmutate.cpp's row iteration (out of manifest) would have to carry that
+// datamgmt/row_evaluation.cpp's row iteration (out of manifest) would have to carry that
 // state per row. Registering regexs() in the row plane at all made every row
 // silently answer with the CURRENT row's match instead, which is a silent
 // wrong answer, not the honest r(133) "unknown function" the row plane gave

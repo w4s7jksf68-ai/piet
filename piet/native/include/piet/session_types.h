@@ -141,7 +141,7 @@ struct LastModel {
 
   // contract_A §31 session-estimation-store handle ("est:<nonce>:<n>"), or
   // empty when this model has none. OPAQUE — never parsed, constructed or
-  // predicted. Filled by estimation_m4.cpp's post-estimation path from the
+  // predicted. Filled by postestimation/postestimation_context.cpp's post-estimation path from the
   // `est.handle` the engine mints on the FIRST lincom/nlcom/test after a fit;
   // every subsequent combination on the same model addresses the stored
   // (names, β, V) tuple through it instead of re-specifying the model and
@@ -187,7 +187,7 @@ struct LastModel {
   // esampleColumnInstalls at that install, >= 1). The column follows the rows,
   // so the working frame can come to carry ANOTHER fit's mask while this model
   // is live -- a resampling prefix leaves its last replicate's model and
-  // returns to the frame it started from (handlers_resample.cpp). The serial in
+  // returns to the frame it started from (estimation/bootstrap_prefix.cpp). The serial in
   // the cells is what tells the two apart (esampleReading refuses a mismatch).
   unsigned long long esampleSerial = 0;
   // kColumn only: the working frame the install produced (the fit's frame plus
@@ -199,7 +199,7 @@ struct LastModel {
   // The fit kept its singleton fixed-effect groups (`--keep-singletons`): areg
   // and xtreg,fe always do, as Stata does (w2_esample.log:897 D3 e(N) 59 / N_g
   // 11, :925 D4 59, :1957 H8 58), and reghdfe with `keepsingletons`. Every
-  // engine refit forwards it (estimation_m4c.cpp fitConventionFlagsM4) so the
+  // engine refit forwards it (postestimation/postestimation_context.cpp fitConventionFlagsM4) so the
   // refit's sample is the fit's.
   bool keepSingletons = false;
   // BUG-1067: the fit omitted the LATER member of each collinear set
@@ -333,7 +333,7 @@ struct PostHandle {
 enum class LogOp { Pause, Resume, Close };
 
 // BUG-028 / BS-006: one open `log using` file. path is the resolved
-// absolute path (post handlers_m3.cpp::runLog's cwd-relative resolution);
+// absolute path (post environment/logging_commands.cpp::runLog's cwd-relative resolution);
 // stream is held open for the log's whole lifetime (SessionState::openLog/
 // closeLog own it); paused mirrors Stata's `log off`/`log on` (the stream
 // stays open but writes are suspended while true). The text format keeps its
@@ -380,7 +380,7 @@ struct LogState {
 // `startedAt` are transient (only meaningful between an `on` and its
 // matching `off`); `totalSeconds`/`count` accumulate across on/off cycles
 // so `timer list` can report total / count = average, oracle-pinned
-// format (see handlers_m3.cpp::runTimer's doc comment for the exact
+// format (see environment/timer_commands.cpp::runTimer's doc comment for the exact
 // column widths).
 struct TimerSlot {
   bool running = false;

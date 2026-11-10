@@ -226,7 +226,7 @@ static double jnum(const ojson& v, double dflt = 0.0) {
 // jnum's "read a possibly-absent/possibly-null object KEY" counterpart --
 // used by buildSvgMarginsplot/buildSvgCoefplot below (BS-011) where a
 // coefplot row's ci_lo/ci_hi may be JSON null (no CI for that coefficient;
-// see eststo_esttab.cpp's runCoefplot, which stores `ojson(nullptr)` for a
+// see coefplot_estimates_block.cpp's runCoefplot, which stores `ojson(nullptr)` for a
 // NaN bound) -- `obj[key]` alone would still be a legal (null) ojson, but
 // jnum() only guards a value ALREADY in hand, not a missing key.
 static double jnumOr(const ojson& obj, const char* key, double dflt) {

@@ -11,6 +11,9 @@ cd "$(dirname "$0")/.."
 source_root=$(pwd -P)
 # Keep the builder's local path out of the binaries (including __FILE__).
 path_map="-ffile-prefix-map=$source_root=."
+# The native sources are organised by function; fail early if a file is misplaced,
+# missing from the build lists, or not mapped in its directory README.
+python3 tools/lint_source_layout.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 "-DCMAKE_CXX_FLAGS=$path_map"
 cmake --build build --parallel "${BUILD_JOBS:-2}"
 cmake -S piet/native -B piet/native/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 "-DCMAKE_CXX_FLAGS=$path_map"

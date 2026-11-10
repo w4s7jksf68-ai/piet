@@ -34,7 +34,8 @@
 #include "piet/eval/macros.h"
 #include "piet/eval/pyvalue.h"
 #include "piet/eval/tokenizer.h"
-#include "piet/handlers.h"
+#include "piet/session_state.h"
+#include "vendor/nlohmann/json.hpp"
 #include "piet/inrange_filter.h"
 #include "piet/loops.h"
 #include "piet/mata_subset.h"
@@ -42,8 +43,8 @@
 #include "piet/strmutate.h"
 #include "piet/storage_type.h"  // BUG-471 T2: the store-type resolver
 #include "piet/strutil.h"
-#include "../dispatch_helpers.h"
-#include "../dispatch_profile.h"  // WS-D1: per-zone dispatch attribution (stderr, opt-in)
+#include "varlist_join.h"
+#include "dispatch_profile.h"  // WS-D1: per-zone dispatch attribution (stderr, opt-in)
 #include "io/win_compat.h"  // cecon::to_native_path / native_unlink (BUG-050 wide open)
 #include "piet/delimited_io.h"  // describe, replace: the description staged as a dataset
 #include "piet/mutation_result.h"
@@ -56,8 +57,8 @@
 #include "piet/time_declarations.h"
 #include "piet/settings.h"  // WS-B: settings::extcompatEnabled() (the extcompat gate below)
 #include "piet/preflight.h"  // SPEC II-4: memory pre-flight before data-size-scaling verbs
-#include "../registry.h"
-#include "estimation_internal.h"  // e(sample) T2: runExpandIf and the copy verbs' mask helpers
+#include "registry.h"
+#include "estimation/estimation_sample_internal.h"  // e(sample) T2: the copy verbs' mask helpers
 
 
 namespace piet::dispatch_detail {
@@ -215,8 +216,8 @@ struct BysortPrefix {
 // if-expr builds (BUG-077, egen.cpp's runBysortGen) — this is the
 // IDENTICAL MVP grammar (bare INT, INT/INT, f/INT, INT/l, f/l; negative
 // bounds rejected) reproduced here as a file-local helper so the STRING
-// path (strmutate.cpp, a different TU with its own row-wise `_n`/`_N`
-// evaluator — see strmutate.cpp's evalRows) can fold `in` into a combined
+// path (datamgmt/string_generate_replace.cpp, a different TU with its own row-wise `_n`/`_N`
+// evaluator — see datamgmt/row_evaluation.cpp's evalRows) can fold `in` into a combined
 // RAW (un-rewritten) Stata-syntax ifExpr string BEFORE calling
 // runStringGen/runStringReplace, which each internally rewrite_expr() the
 // ifExpr they're given exactly like they already do for a real `if`. Not a

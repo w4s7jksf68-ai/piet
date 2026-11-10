@@ -117,7 +117,7 @@ InduceResult induceFromDates(const std::vector<double>& values, const InduceOpts
 // The earlier (search directory, name) key therefore made a `cd` silently
 // DROP a loaded calendar and a `cd` back resurrect a stale one -- a missing
 // and a wrong value, both at rc 0. `cd` still re-points the SEARCH DIRECTORY
-// (handlers_m3.cpp runCd), which is what lets a not-yet-loaded calendar be
+// (environment/workspace_commands.cpp runCd), which is what lets a not-yet-loaded calendar be
 // found in the new cwd (oracle l_cd_bofd_in_sub = 1); resolution is by
 // directory, memory is by name.
 //

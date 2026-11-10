@@ -387,7 +387,7 @@ void testD5BS087Mkspline() {
 
   (void)piet::dispatch("sysuse fatalities, clear", session);
 
-  // nknots() ENGINE FIX (see runMkspline's header comment, estimation_m4.cpp):
+  // nknots() ENGINE FIX (see runMkspline's header comment, datamgmt/data_splines.cpp):
   // cobra eval --mkspline's own nknots(#) clause was broken through 0.24.0
   // (a paren_arg substring collision), fixed in 0.25.0 — the D5g oracle's
   // own exact invocation (`nknots(4)`) now SUCCEEDS cleanly instead of

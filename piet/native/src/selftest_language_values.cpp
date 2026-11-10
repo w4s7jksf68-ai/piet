@@ -1042,7 +1042,7 @@ void testG_BUG369TsInExpressionLock() {
   }
 
   // (b) The SAME operator read two ways must agree. `count if L.beertax > 0.5`
-  // goes down a different road than the materialised column (handlers_m3.cpp's
+  // goes down a different road than the materialised column (descriptive/data_listing.cpp's
   // CiParser bails on the dot and the cobra fallback answers), so equality here
   // is a real cross-check of the wiring, not a restatement of (a).
   std::string cntOp, cntCol;

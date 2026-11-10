@@ -6,6 +6,7 @@
 #include "text_support.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/variables.h"
 
 namespace piet::dispatch_detail {
 
@@ -364,7 +365,7 @@ int64_t rowsBeforeForRN(SessionState& session) {
 // Is `varname` a variable of the loaded data? nullopt = no datastore to ask.
 std::optional<bool> targetVarExists(SessionState& session, const std::string& varname) {
   // C4-L2A (D1 card plane): existence is card-answerable — a CURRENT card is
-  // authoritative for name presence either way (handlers_m3.cpp::runConfirm's
+  // authoritative for name presence either way (language/confirm_command.cpp::runConfirm's
   // idiom). nullptr means "answer from the datastore", never "assume absent".
   if (const std::vector<VarInfo>* card = session.residentReadCard()) {
     for (const auto& vi : *card) {
@@ -381,7 +382,7 @@ std::optional<bool> targetVarExists(SessionState& session, const std::string& va
 // BUG-112(1) PIET-half: Stata's `generate` REFUSES a name that already exists
 // (r(110) "variable X already defined"); `replace` is the verb that overwrites.
 // PIET honoured that on exactly ONE of its four gen sinks — strmutate::
-// runStringGen guards (strmutate.cpp:977) — while the three NUMERIC sinks
+// runStringGen guards (datamgmt/string_generate_replace.cpp) — while the three NUMERIC sinks
 // (handlers::runGen · egen::runBysortGen via the standalone `_n`/`_N` + `in`
 // route · the same handler via the `bysort v:` prefixed route) all shipped
 // straight to `cobra eval --gen`, whose Frame::generate is create-or-replace.
@@ -499,7 +500,7 @@ std::optional<ojson> replaceNoPromote(
 
 
 // `[type] NEWVAR = expr` (post-stripStorageType text) -> NEWVAR. First `=`
-// wins, matching both the gen block's own inline split and handlers.cpp::
+// wins, matching both the gen block's own inline split and datamgmt/data_generate.cpp::
 // splitAssign. No `=` at all -> empty, i.e. NO exists-guard: that form is a
 // syntax error the downstream handler already owns, and Stata likewise reports
 // the syntax problem rather than the name one.

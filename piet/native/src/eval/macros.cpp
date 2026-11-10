@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
-// macros: see macro_modules.md for ownership and call flow.
+// macros: see README.md for ownership and call flow.
 #include "piet/eval/macros.h"
 #include "estimators/postest_names.h"  // coefFullName: the engine's coefficient-name rule
 
-#include "../dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
+#include "dispatch/dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
 
 #ifndef _WIN32
 #include <fnmatch.h>  // WP-W5: POSIX-only; the Windows branch uses globMatchPeriod below
@@ -62,7 +62,7 @@ using namespace macro_detail;
 
 
 // B4-W3b: is this line one of the MATRIX verbs — the only surface that can
-// consume an r-class matrix reference (handlers_m3.cpp:1978 / :1955)? Stata's
+// consume an r-class matrix reference (matrix/matrix_commands.cpp)? Stata's
 // own abbreviations of `matrix` are mat/matr/matri/matrix; `matlist` is the
 // separate display verb that reads the same store.
 bool isMatrixVerbLine(const std::string& line) {
@@ -695,7 +695,7 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
       // place, exactly as the e() layer below leaves e(b) for the matrix layer
       // ("splicing it here would take e(b) away from the matrix layer"). It was
       // not: `matrix T = r(table)` — sktest's own posted matrix, which
-      // handlers_m3.cpp:1978 already knows how to copy — died HERE with
+      // matrix/matrix_commands.cpp already knows how to copy — died HERE with
       // "r(table) is not set", because this loop only ever looked in
       // rStrings/rValues and then declared the name unknown; nothing
       // downstream could see the reference to answer it.
@@ -782,7 +782,7 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
         }
         // An estimation (or margins, or a replicating prefix) after which Stata
         // posts r(table) but this build does not -- interaction (#) columns, say --
-        // leaves the reason in EvalSession::rTableRefusal (handlers_aer_estim.cpp),
+        // leaves the reason in EvalSession::rTableRefusal (postestimation/rtable_rclass_lifecycle.cpp),
         // so a read is a NAMED refusal instead of the r(198)/r(109) of a table
         // Stata would not have either.
         if (name == "table" && !session.rTableRefusal.empty()) {
@@ -792,7 +792,7 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
         // On a MATRIX verb an absent name is the matrix layer's to answer, as a
         // posted one is (the exemption at the top of this loop): `matrix T =
         // r(nosuch)` is rc 0 in Stata (w2f_residuals.log:1675) with content no arm
-        // pins yet, and that grammar lives in handlers_m3.cpp runMatrixDef.
+        // pins yet, and that grammar lives in matrix/matrix_commands.cpp runMatrixDef.
         // A `matrix NAME = ...` definition reads an absent r(NAME) as the missing
         // value, a 1x1 `.` matrix (w2f_residuals.log:1675 `matrix T = r(nosuch)`
         // rc 0; w2n_followups.log:938 E05, :1027 E10, :1043 E11 `capture matrix

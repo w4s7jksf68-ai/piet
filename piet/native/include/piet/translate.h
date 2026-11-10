@@ -7,7 +7,7 @@
 // (`feols y L.x1[...]` with/without xtset). The full build_estimation_argv
 // / build_iv_argv / build_csdid_argv / ... translate surface stays on the
 // Python oracle beyond this milestone (M3b+); the M2 vertical-slice
-// handlers.cpp::runRegress keeps building its own argv inline and calls
+// estimation/linear_estimation.cpp::runRegress keeps building its own argv inline and calls
 // into this module only for the TS pieces.
 #ifndef PIET_NATIVE_TRANSLATE_H
 #define PIET_NATIVE_TRANSLATE_H

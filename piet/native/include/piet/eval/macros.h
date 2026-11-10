@@ -335,7 +335,7 @@ std::string replaceEsampleToken(const std::string& s, const std::string& with);
 // AER-SCOPE1 bundle E (2026-09-04) exposed it: `eststo` freezes the e() scalars
 // into its snapshot so `esttab, stats(N r2_a)` has something to read, and doing
 // that from a private copy would have made a THIRD table to keep in step. There
-// are already two -- display_hardening.cpp holds a std::map twin with the same
+// are already two -- language/scalar_expression.cpp holds a std::map twin with the same
 // content, and both copies carry a comment saying so.
 const std::vector<std::pair<std::string, std::string>>& eScalarKey();
 

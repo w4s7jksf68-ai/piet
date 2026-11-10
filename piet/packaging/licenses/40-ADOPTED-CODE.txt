@@ -35,7 +35,7 @@ REGISTER
 Format: <project> | <version/commit> | <license> | <our file(s)> | <scope>
 
   LAPACK | 3.12.0 (Netlib, incl. reference BLAS) | BSD-3-Clause |
-    piet/native/src/lapack_dsyevr.h, lapack_dsyevr.cpp, lapack_dlaruv_mm.inc |
+    piet/native/src/matrix/lapack_dsyevr.h, lapack_dsyevr.cpp, lapack_dlaruv_mm.inc |
     C++ translation of DSYEVR(JOBZ='V',RANGE='A',UPLO='L') and the routines
     it reaches (DSYTRD/DLATRD/DSYTD2, DSTEMR/DLARRE/DLARRV/DLASQ2-6,
     DSTEBZ/DLAEBZ/DSTEIN/DLAGTF/DLAGTS, DORMTR/DORMQR/DORM2R/DLARFT/DLARFB,
@@ -59,63 +59,71 @@ Format: <project> | <version/commit> | <license> | <our file(s)> | <scope>
     folds. Notice: 61-MT19937-64-BSD-3-Clause.txt.
 
   lassopack | 1.3 (rlasso.ado 1.0.10, lassoutils.ado 1.1.03; SSC s458458) | GPL-3.0 |
-    piet/native/src/handlers_e3_lasso.cpp |
+    piet/native/src/estimation/lasso_estimation.cpp |
     The `rlasso` default path (plug-in penalty loadings, lasso coefficients),
     derived from the Mata in lassoutils.ado and the ado bookkeeping in
     rlasso.ado. License: GPL v3 as stated in the SSC listing (no LICENSE file
     ships with the package). Notice: 62-lassopack-GPL-3.0.txt.
 
   swindex | SSC s458912 (listing revision 2021-02-24; SJ 20-4 st0622) | GPL-3.0 |
-    piet/native/src/handlers_e3_swindex.cpp |
+    piet/native/src/datamgmt/swindex.cpp |
     The `swindex` command (Anderson 2008 inverse-covariance-weighted index),
     derived from swindex.ado. License: GPL v3 as stated in the SSC listing
     (the ado header names the authors but no license). Notice:
     63-swindex-GPL-3.0.txt.
 
   estout (estout, esttab, estadd, eststo; Ben Jann) | 3.33 | MIT |
-    piet/native/src/handlers_aer_tables.cpp (estadd section; "estout core" WRITE
-    phase), piet/native/src/eststo_esttab.cpp (esttab) |
+    piet/native/src/tables/table_estadd.cpp (estadd section),
+    piet/native/src/tables/table_options.cpp ("estout core" WRITE phase),
+    piet/native/src/tables/estout_format.cpp, tables/estout_grammar.cpp,
+    tables/estout_models.cpp, tables/estout_internal.h, tables/table_esttab.cpp,
+    tables/table_estout.cpp,
+    piet/native/src/tables/esttab_block.cpp, tables/estimates_table.cpp,
+    results/stored_estimates_commands.cpp, results/stored_estimates_snapshot.cpp,
+    results/stored_estimates_internal.h, results/estimates_save_use.cpp,
+    graph/coefplot_estimates_block.cpp (esttab) |
     The estout WRITE phase and its helpers, esttab's option translation onto it,
     and estadd, derived from the ados (line cites in the comments). Notice and
     verbatim MIT text: 64-estout-MIT.txt.
 
   coefplot (Ben Jann) | 1.8.8 | MIT |
-    piet/native/src/handlers_coefplot.cpp |
+    piet/native/src/graph/coefplot.cpp, coefplot_syntax.cpp, coefplot_syntax.h |
     The coefplot data pipeline (subgraph/plot/model grammar, collection, keep/
     drop, arrangement, offsets, generate(), r() results), derived from
     coefplot.ado; the drawn graph is not derived. Notice: 65-coefplot-MIT.txt.
 
   texsave (Julian Reif) | 1.6.1 | MIT |
-    piet/native/src/handlers_aer_tables.cpp (texsave section) |
+    piet/native/src/tables/table_tex_files.cpp, tables/tables_internal.h (texsave section) |
     `texsave` (dataset as a LaTeX table), derived from texsave.ado. Notice:
     66-texsave-MIT.txt.
 
   outreg2 (Roy Wada) | 2.3.2 | GPL-3.0 |
-    piet/native/src/handlers_aer_tables.cpp (outreg2 section) |
+    piet/native/src/tables/table_outreg.cpp, tables/outreg2_internal.h (outreg2 section),
+    tables/table_options.cpp |
     `outreg2` (ledger grid, makeFile/appendFile/cleanFile, tex and xml
     outputs), derived from outreg2.ado. License: GPL v3 as stated in the SSC
     listing (no licence header in the ado). Notice: 67-outreg2-GPL-3.0.txt.
 
   mat2txt (Ben Jann, Michael Blasnik) | 1.1.2 | GPL-3.0 |
-    piet/native/src/handlers_aer_tables.cpp (mat2txt section) |
+    piet/native/src/tables/table_dataset_export.cpp (mat2txt section) |
     `mat2txt` (matrix as tab-separated text), derived from mat2txt.ado.
     License: GPL v3 as stated in the SSC listing. Notice: 68-mat2txt-GPL-3.0.txt.
 
   acreg (Colella, Lalive, Sakalli, Thoenig) | 1.1.0 (Dec 2020) | GPL-3.0 |
-    piet/native/src/handlers_e3_acreg.cpp |
+    piet/native/src/estimation/acreg_estimation.cpp |
     `acreg` corpus paths (arbitrary-cluster standard errors), derived from
     acreg.ado. License: GPL v3 as stated in the SSC listing; the ado header
     reads "Beta Version, please do not circulate" (recorded in the notice).
     Notice: 69-acreg-GPL-3.0.txt.
 
   qreg2 (Machado, Parente, Santos Silva) | 4.00 (31 Aug 2020) | GPL-3.0 |
-    piet/native/src/handlers_e3_qreg2.cpp |
+    piet/native/src/estimation/qreg2_estimation.cpp |
     `qreg2` (quantile regression with robust and clustered SEs), derived from
     qreg2.ado. License: GPL v3 as stated in the SSC listing; the ado carries
     only an as-is warranty disclaimer. Notice: 70-qreg2-GPL-3.0.txt.
 
   ritest (Simon Hess) | 1.1.7 | GPL-3.0 |
-    piet/native/src/handlers_e3_ritest.cpp |
+    piet/native/src/estimation/ritest_inference.cpp |
     `ritest` (randomization inference), derived from ritest.ado. License: GPL
     v3 as stated in the SSC listing (the GitHub repository has no LICENSE
     file). Notice: 71-ritest-GPL-3.0.txt.

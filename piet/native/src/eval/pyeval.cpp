@@ -10,7 +10,7 @@
 #include "core/stata_arith.h"  // `^`/`**` with StataBE's bits
 #include "core/ident.h"  // Unicode names: the shared identifier byte tests
 
-#include "../dispatch_profile.h"  // EXPRLAYER: expression-zone attribution (opt-in, stderr)
+#include "dispatch/dispatch_profile.h"  // EXPRLAYER: expression-zone attribution (opt-in, stderr)
 
 #include <cerrno>
 #include <climits>
@@ -185,7 +185,7 @@ struct Lexer {
     // This lexer was written to PYTHON semantics (its own comment said "Python
     // keeps unknown escapes literally"), which is right for a Python evaluator and
     // wrong for every caller it has: macros.cpp, postfile.cpp, loops.cpp,
-    // strmutate.cpp and evalcase_ext.cpp all evaluate STATA expressions. The cost
+    // datamgmt/row_evaluation.cpp and evalcase_ext.cpp all evaluate STATA expressions. The cost
     // was silent and everywhere a path or a LaTeX macro appears -- `"c:\data\new"`
     // lost two characters and `"\begin{tabular}"` one.
     while (i < src.size() && src[i] != quote) {

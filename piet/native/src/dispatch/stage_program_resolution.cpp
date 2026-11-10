@@ -4,6 +4,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/session_commands.h"
 namespace piet::dispatch_detail {
 bool resolveProgramCommand(std::string& cmd,
     eval::ParsedCommand& parsed,

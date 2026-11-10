@@ -5,6 +5,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/session_commands.h"
 namespace piet::dispatch_detail {
 bool interceptProgramCompletion(SessionState& session,
     ojson& echo,

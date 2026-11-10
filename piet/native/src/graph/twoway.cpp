@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-#include "piet/handlers.h"
+#include "piet/handlers/graph.h"
 #include "piet/cobra_runner.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/macros.h"
@@ -26,7 +26,7 @@
 #include "piet/twoway_opts.h"
 #include "piet/twoway_parse.h"
 #include "io/win_compat.h"
-#include "support.h"
+#include "graph_support.h"
 #include "distribution.h"
 
 namespace piet::eval {
@@ -52,8 +52,8 @@ using ojson = nlohmann::ordered_json;
 
 
 // nextPathG: local copy of the "generate a fresh scratch .hbin path" helper
-// every M2+ handler file carries its own copy of (see handlers.cpp/
-// handlers_m3.cpp/egen.cpp's identically-named nextPath — kept file-local
+// every M2+ handler file carries its own copy of (see engine/engine_call_internal.h/
+// datamgmt/egen_internal.h's identically-named nextPath — kept file-local
 // per this codebase's established per-TU convention rather than factored
 // into a shared header).
 static std::string nextPathG(const std::string& workdir, const std::string& prefix) {
@@ -1128,7 +1128,7 @@ static ojson reflines(const MaybeOptFromOpts& raw) {
 // at the first `)` inside the label, a label containing `off`, `size(` or
 // `cols(` bound to the wrong suboption, and `order(2 1)` (no text) vanished.
 // There was no reusable top-level splitter in src/ or include/ (the only
-// `splitTopLevel` is file-local to handlers_aer_tables.cpp), so this one is
+// `splitTopLevel` is internal to tables/table_text.cpp), so this one is
 // written here. It splits ONCE into top-level suboptions with a quote-aware
 // (plain "..." and compound `"..."') and paren-balanced scan; every consumer
 // below reads from that list.
@@ -1292,7 +1292,7 @@ using namespace graph_detail;
 // of legend(...); one top-level split (quote-aware, paren-balanced), nothing
 // searched in the raw text: `off` is a standalone top-level token, so "Payoff"
 // or `size(off)` inside a label or another suboption is not it. (Also called
-// from handlers_aer_graphx.cpp's cdfplot block.) order() lists the keys as
+// from cdfplot.cpp's cdfplot block.) order() lists the keys as
 // [plot index (0-based), text]: a bare index shows keyText(index), and one
 // keyText has no plot for is dropped. A `-` entry is text with no key, [-1,
 // text] (BUG-1311). Each quoted string is a line of the text, joined with "\n"
@@ -1836,7 +1836,7 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
     if (pt == "lfit" || pt == "qfit") return std::string("Fitted values");
     if (ls.varlist.empty()) return std::string();
     // eval.varLabels is a projection refreshed only on demand (see
-    // handlers_aer_tables.cpp's esttab `label` note); pay for it once, and
+    // tables/table_esttab.cpp's esttab `label` note); pay for it once, and
     // only when a bare index actually needs a default.
     if (!labelsSynced) {
       session.syncEvalVarLabels();

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
-// Gallery selection and rendering; console.js owns graph storage.
-import { getGraphEntries, getGraphById, getResidentGraph, getGraphSpilledCount, getGraphDroppedCount } from './console.js';
+// Gallery selection and rendering; graphics-gallery-store.js owns graph storage.
+import { getGraphEntries, getGraphById, getResidentGraph, getGraphSpilledCount, getGraphDroppedCount } from './graphics-gallery-store.js';
 import { renderGraph } from './graph.js';
 
 export function createGraphicsController({ layout, svgToPng }) {

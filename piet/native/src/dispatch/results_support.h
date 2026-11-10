@@ -22,7 +22,8 @@ size_t findEststoPrefixColon(const std::string& s);
 
 // BUG-733: run a fit that writes its own e() values (eval.eScalars / eStrings /
 // eMatrices) BEFORE it calls setLastModel -- grep-measured, exactly runPca,
-// runOaxaca and runTeffects (handlers_aer_estim.cpp). setLastModel drops a
+// runOaxaca and runTeffects (estimation/principal_components.cpp,
+// estimation/oaxaca_decomposition.cpp, estimation/teffects_nnmatch.cpp). setLastModel drops a
 // live posting (`ereturn post`, estpost) and the names recorded on top of the
 // previous fit (SessionState::eOnFitNames) at its top, which for these three
 // would also drop the fit's own values (`ereturn local title "mine"` then

@@ -4,6 +4,17 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/data_combine.h"
+#include "piet/handlers/data_values.h"
+#include "piet/handlers/descriptive.h"
+#include "piet/handlers/gtools_aliases.h"
+#include "piet/handlers/io.h"
+#include "piet/handlers/observations.h"
+#include "piet/handlers/postestimation.h"
+#include "piet/handlers/results.h"
+#include "piet/handlers/session_commands.h"
+#include "piet/handlers/utility.h"
+#include "piet/handlers/variables.h"
 namespace piet::dispatch_detail {
 bool route_extensions(std::string& cmd,
     std::string& cmdTyped,

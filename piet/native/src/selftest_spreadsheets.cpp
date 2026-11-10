@@ -497,7 +497,7 @@ void testW3aSpreadsheetOptions() {
 
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
 
     // `describe` is a QUERY: it publishes r() and must not disturb the dataset.
     auto r0 = exec("sysuse fatalities, clear\nkeep in 1/5\n", s);

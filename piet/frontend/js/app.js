@@ -2,7 +2,8 @@
 // Copyright (C) 2026 M.K. Kim
 // Application composition and DOM boot. Feature state lives in its controller.
 import { HTTPClient } from './api.js';
-import { initConsole, appendBlock, setMemoryBudgetMb } from './console.js';
+import { initConsole, appendBlock } from './console.js';
+import { setMemoryBudgetMb } from './console-budget.js';
 import { initPanels, loadHistory } from './panels.js';
 import { VirtualizedGrid, setGridMemoryBudgetMb } from './grid.js';
 import { initPanes } from './panes.js';

@@ -7,6 +7,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/estimates_tables.h"
 namespace piet::dispatch_detail {
 bool interceptOutputPrefixes(SessionState& session,
     ojson& echo,
@@ -294,7 +295,7 @@ bool interceptEstimatePrefix(SessionState& session,
   // unified-prefix philosophy as capture/quietly/noisily above (recognise on
   // the raw line, dispatch the remainder exactly once, apply this prefix's own
   // post-processing): run the remainder FIRST so handlers::runEststo
-  // (eststo_esttab.cpp) snapshots the FRESH result, then store it.
+  // (results/stored_estimates_commands.cpp) snapshots the FRESH result, then store it.
   //
   // W2 eststoprefix (BUG-520). This arm used to be the regex
   // `^eststo\s+(\w+)\s*:` on the RAW line, which is blind to everything but a

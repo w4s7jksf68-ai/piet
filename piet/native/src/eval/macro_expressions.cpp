@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
-// macro expressions: see macro_modules.md for ownership and call flow.
+// macro expressions: see README.md for ownership and call flow.
 #include "piet/eval/macros.h"
 #include "estimators/postest_names.h"  // coefFullName: the engine's coefficient-name rule
 
-#include "../dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
+#include "dispatch/dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
 
 #ifndef _WIN32
 #include <fnmatch.h>  // WP-W5: POSIX-only; the Windows branch uses globMatchPeriod below
@@ -320,7 +320,7 @@ namespace piet::eval::macro_detail {
 // _eval_arith (macros.py)
 
 // A bare `.` and an extended `.a`..`.z` become their exact doubles (exprfns.h
-// replaceStataMissingLiterals, shared with loops.cpp and strmutate.cpp) so e.g.
+// replaceStataMissingLiterals, shared with loops.cpp and datamgmt/row_evaluation.cpp) so e.g.
 // `substr(s, 3, .)` (missing length == "to end of string") reaches fnSubstr as a
 // huge length and arithmetic on missing reaches pyeval's collapse rather than a
 // Python SyntaxError. BUG-249: each kind keeps its own double, so string(.a)
@@ -992,7 +992,7 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
       // BUG-660 fix round: evalArith itself stays ROUND-TRIP-EXACT
       // (pythonFloatRepr) for every caller -- `scalar s = expr` stores this
       // text straight into session.scalars, and program.cpp's return/
-      // ereturn scalar and handlers_resample.cpp's exp_list both parse it
+      // ereturn scalar and estimation/resampling_prefix_support.cpp's exp_list both parse it
       // back with std::stod expecting the full precision. Only local/global
       // storage wants Stata's capped 16-sig-fig macro convention, applied by
       // their own call sites (see capNumericTextToStataLocalDigits below),

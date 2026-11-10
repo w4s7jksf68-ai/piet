@@ -334,7 +334,7 @@ class CobraSession {
 // same shape of answer: it decouples a caller that needs the worker from the
 // ownership chain, so no session pointer has to be threaded through. SessionState
 // owns its CobraSession privately and drives it from the runCobra intercept; the
-// §31 post-estimation call site (estimation_m4.cpp) sits outside that ownership
+// §31 post-estimation call site (postestimation/postestimation_context.cpp) sits outside that ownership
 // and has no route to it — it reaches the engine through runCobraJson, which is
 // deliberately argv-shaped and cannot express a frame op.
 //

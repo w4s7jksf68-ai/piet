@@ -91,8 +91,8 @@ nlohmann::json runCobraJson(const std::vector<std::string>& args);
 // BUG-038(a) FIX (W3 fuzzer stabilization): renders a CobraError as the
 // final, user-facing message string — the ONE mapping point every
 // "[code] message" formatter scattered across the handler files
-// (handlers.cpp/handlers_m3.cpp/handlers_data_verbs.cpp/egen.cpp's own
-// `cobraErrorStr`, estimation_m4.cpp's `cobraErrorStrM4`, winsor2.cpp's
+// (the handler files' own
+// `cobraErrorStr`, estimation/estimation_support.cpp's `cobraErrorStrM4`, datamgmt/winsor2.cpp's
 // `cobraErrorStrW`, dispatcher.cpp's inline copy) now forwards to, instead
 // of each independently formatting "[" + ce.code + "] " + ce.what(). cobra's
 // `code: "internal"` is its generic C++-exception catch-all (any expression

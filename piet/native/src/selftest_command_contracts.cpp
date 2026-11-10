@@ -51,8 +51,8 @@ void testClusterVceAndUnknownOptionFixes() {
   };
 
   // --- P2 / BUG-055: legacy cluster(v) alone maps to --vcov cluster
-  // --cluster v (mirrors both copies of the fix: handlers.cpp::runRegress
-  // AND estimation_m4.cpp's shared vcovFromOpts). Uses the bundled
+  // --cluster v (mirrors both copies of the fix: estimation/linear_estimation.cpp::runRegress
+  // AND estimation/estimation_support.cpp's shared vcovFromOpts). Uses the bundled
   // `fatalities` panel sample (state/year, 1982-1988); `year` is used as
   // the cluster var (7 distinct numeric values) rather than the string/
   // factor-coded `state`, so this test isolates the vcov-mapping fix from
@@ -258,7 +258,7 @@ void testClusterVceAndUnknownOptionFixes() {
     // "zero significant digits". Every expectation below is a VERBATIM row
     // from a StataBE 19.5 capture taken on 2026-08-06 (171 cases: 9 specs x
     // 19 values); the full capture and the derived rule are documented on
-    // stataGeneral() in display_hardening.cpp. These nine are the ones that
+    // general() in piet/stata_format.h. These nine are the ones that
     // pin a distinct clause of it, so a regression names which clause broke.
     {
       auto disp = [&](const char* cmd) {
@@ -1663,8 +1663,8 @@ void testBS046To048SetRegistry() {
   // (c) genuinely narrows a `ttest`'s CI — the ONE PIET-wired command whose
   // cobra CLI actually reads --level (verified: cmd_ttest, cmds_summary.cpp
   // reads opt(a,"--level") and applies it to alpha/t_critical throughout;
-  // cmd_feols/cmd_xtreg/cmd_logit/cmd_probit do NOT — see estimation_m4.cpp/
-  // handlers.cpp's own comments on why the session.level fallback was
+  // cmd_feols/cmd_xtreg/cmd_logit/cmd_probit do NOT — see estimation/estimation_support.cpp/
+  // estimation/linear_estimation.cpp's own comments on why the session.level fallback was
   // deliberately NOT extended to those).
   {
     std::string wd = base + "/level";
@@ -1720,7 +1720,7 @@ void testBS046To048SetRegistry() {
 
       // Regression-safety: `set level 90` must NOT break an ordinary plain
       // regress afterward (cobra's feols CLI never reads --level at all —
-      // see the comment in handlers.cpp::runRegress on why that fallback
+      // see the comment in estimation/linear_estimation.cpp::runRegress on why that fallback
       // was deliberately NOT wired there).
       auto jReg = runCmd(session, "regress fatal beertax");
       bool regOk = true;
@@ -2354,7 +2354,7 @@ void testBUG105AbbrevArc() {
               piet::registry::resolveCanonical("zzz_not_a_command") == "zzz_not_a_command",
           "BUG-105(b): an unregistered token passes through resolveCanonical unchanged");
     // reghdfe is the one spelling the community exemption actually reaches, and
-    // it is load-bearing: handlers.cpp's runRegress reads `stataCmd ==
+    // it is load-bearing: estimation/linear_estimation.cpp's runRegress reads `stataCmd ==
     // "reghdfe"` for the keepsingletons net, and the extcompat gate matches on
     // the typed name. Folding it to `feols` would kill both silently.
     check(piet::registry::resolveCanonical("reghdfe") == "reghdfe",
@@ -2918,9 +2918,9 @@ void testBUG105AbbrevArc() {
 // Measured accept-then-drop before the fix, three files, three shapes:
 //   winsor2 fatal, cuts(5 95) -> mean 864.4791666666666   (dispatcher.cpp)
 //   winsor2 fatal, cut(5 95)  -> mean 925.5386904761905   == no option, WRONG
-//   ttest fatal, by(grp) unequal -> se 103.88516730576413 (estimation_m4.cpp)
+//   ttest fatal, by(grp) unequal -> se 103.88516730576413 (descriptive/descriptive_statistics.cpp)
 //   ttest fatal, by(grp) uneq    -> se 103.0699932930575  == no option, WRONG
-//   esttab m1, nostar -> stars ""                         (eststo_esttab.cpp)
+//   esttab m1, nostar -> stars ""                         (tables/esttab_block.cpp)
 //   esttab m1, nosta  -> stars "***"                      == no option, WRONG
 //
 // Bidirectional per net, the BUG-148 fixture pattern: the abbreviation now works
@@ -3177,7 +3177,7 @@ void testAerA1VocabDumps() {
         "A1: --dump-optvocab serializes every registered command (" + std::to_string(live) +
             " live, " + std::to_string(vocab.size()) + " emitted)");
 
-  // The one aliases-bearing net in the tree (handlers_aer_graphx.cpp's geonear:
+  // The one aliases-bearing net in the tree (utility/geodesic_distance.cpp's geonear:
   // `n` prefixes BOTH neighbors and nearcount, so only geonear.ado's own
   // declaration can bind it). Asserted THROUGH the serializer, so an aliases
   // map that quietly stops being emitted fails here and not only in the CLI.

@@ -5,6 +5,12 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "estimation/estimation_internal.h"  // runExpandIf
+#include "piet/handlers/data_values.h"
+#include "piet/handlers/observations.h"
+#include "piet/handlers/session_commands.h"
+#include "piet/handlers/time_panel.h"
+#include "piet/handlers/variables.h"
 namespace piet::dispatch_detail {
 bool route_data_rows(std::string& cmd,
     std::string& cmdTyped,

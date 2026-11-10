@@ -330,7 +330,7 @@ void testG_BS088TsOperatorInjectionLock() {
   // BS-088 (ADJUDICATED, Secretary 2026-07-12): tsops has no standalone
   // user-facing verb — PIET reaches L./F./D./S. resolution via translate.cpp's
   // hasTsToken/injectTsContext, which fires for any estimator y/x token
-  // (handlers.cpp::runRegress, estimation_m4.cpp's IV family). This locks THAT
+  // (estimation/linear_estimation.cpp::runRegress, estimation/instrumental_variables.cpp's IV family). This locks THAT
   // mechanism, with both an L. and a D. token in the SAME estimation to prove
   // the injection doesn't special-case a single letter.
   //

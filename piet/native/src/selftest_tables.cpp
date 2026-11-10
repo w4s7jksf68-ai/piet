@@ -135,7 +135,7 @@ void testAerTables() {
   // the frozen e() scalars into the snapshot. ────────────────────────────────
   piet::SessionState session(workdir);
   session.eval.cwd = workdir;
-  session.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040);
+  session.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp);
   // eval.cwd alone leaves every `using` file in the process cwd -- the repo root.
   {
     auto r = exec(kMake30 +
@@ -180,7 +180,7 @@ void testAerTables() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040);
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp);
     // eval.cwd alone leaves every `using` file in the process cwd -- the repo root.
     auto r = exec(kMake30 +
                       "regress y x1\n"
@@ -275,7 +275,7 @@ void testAerTables() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040);
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp);
     // eval.cwd alone leaves every `using` file in the process cwd -- the repo root.
     auto r = exec(kMake30 +
                       "regress y x1\n"
@@ -342,7 +342,7 @@ void testAerTables() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040);
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp);
     // eval.cwd alone leaves every `using` file in the process cwd -- the repo root.
     // Bare `esttab`, NOT `esttab, cells(...)`. estpost posts e(b)=mean and
     // e(se)=sd, so esttab's DEFAULT b-over-(se) layout already renders mean over
@@ -399,7 +399,7 @@ void testAerTables() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040);
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp);
     // eval.cwd alone leaves every `using` file in the process cwd -- the repo root.
     (void)exec(kMake30 + "regress y x1\n", s);
     // The coefficient is read from e() in C++ BEFORE regsave runs, because
@@ -474,7 +474,7 @@ void testAerTables() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040);
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp);
     // eval.cwd alone leaves every `using` file in the process cwd -- the repo root.
     auto r = exec(kMake30 +
                       "regress y x1\n"
@@ -507,7 +507,7 @@ void testAerTables() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040);
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp);
     // eval.cwd alone leaves every `using` file in the process cwd -- the repo root.
     (void)exec(kMake30 + "regress y x1\n", s);
     auto r = exec("outreg2 using \"ow\", word\n", s);
@@ -552,7 +552,7 @@ void testAerTables() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040);
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp);
     // eval.cwd alone leaves every `using` file in the process cwd -- the repo root.
     auto r = exec("estadd local c \"Yes\"\n", s);
     auto err = firstError(r.blocks);
@@ -586,7 +586,7 @@ void testAerTables() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040)
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp)
     (void)exec(kMake30 +
                    "regress y x1 x2\n"
                    "eststo w5a\n"
@@ -2557,7 +2557,7 @@ void testAerTables() {
 // label for the bare level (verified live against StataBE 19.5: `regress y
 // i.state_num` with `label values state_num statelbl` prints "Arizona"/
 // "Idaho" rows, not "2.state_num"/"3.state_num") — checks the substituted
-// case (regress's own M2 slice, handlers.cpp's cobraToEstimation) and the
+// case (regress's own M2 slice, estimation/linear_estimation_support.cpp's cobraToEstimation) and the
 // label-less fallback (bare "<level>.<var>" unchanged, same session shape).
 void testBug102CoeftableValueLabels() {
   std::printf("[selftest] --- BUG-102 coeftable value-label substitution ---\n");
@@ -2635,10 +2635,10 @@ void testBug102CoeftableValueLabels() {
 // --- O. BS-097 option consume-or-reject net + BS-018 `do`/`run FILE,
 // nostop` (BETA campaign Phase A2). ---
 //
-// BS-097: before this phase, dispatcher.cpp/estimation_m4.cpp/
-// eststo_esttab.cpp had exactly 3 ad-hoc "unknown option -> honest reject"
-// nets (summarize inline in dispatcher.cpp; handlers.cpp's runRegress;
-// estimation_m4.cpp's shared xtreg(fe/re)/logit/probit builder — all
+// BS-097: before this phase, dispatcher.cpp, the M4 estimation code and
+// the eststo/esttab code had exactly 3 ad-hoc "unknown option -> honest reject"
+// nets (summarize inline in dispatcher.cpp; estimation/linear_estimation.cpp's runRegress;
+// estimation/estimation_support.cpp's shared xtreg(fe/re)/logit/probit builder — all
 // exercised above by testClusterVceAndUnknownOptionFixes). `margins` had
 // ZERO such net (the B6 audit finding this phase is named for). This phase
 // adds ONE shared helper (eval::rejectUnknownOptions, eval/errors.h/.cpp —

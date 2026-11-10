@@ -5,6 +5,8 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/gtools_aliases.h"
+#include "piet/handlers/session_commands.h"
 namespace piet::dispatch_detail {
 bool resolveCommandOptions(std::string& cmd,
     eval::ParsedCommand& parsed,

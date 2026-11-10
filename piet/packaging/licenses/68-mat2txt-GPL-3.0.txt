@@ -1,5 +1,5 @@
 mat2txt 1.1.2 (Ben Jann, Michael Blasnik) — GPL-3.0
-Adopted at: piet/native/src/handlers_aer_tables.cpp (the `mat2txt` section)
+Adopted at: piet/native/src/tables/table_dataset_export.cpp (the `mat2txt` section)
 
 Project:  mat2txt — Stata module to write matrix to ASCII file
 Authors:  Ben Jann, Michael Blasnik (mat2txt.ado: "1.1.2 Ben Jann 24 Nov 2004; 1.1.1 M Blasnik 18 Feb 2004")

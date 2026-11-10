@@ -326,7 +326,7 @@ void testB4W3bEstimatesAndDataVerbs() {
   }
 
   // ══ 5. matrix NAME = r(MATRIX) — the wiring gap `save` walked into ═══════
-  // handlers_m3.cpp:1978 has always known how to copy a posted r-class matrix,
+  // matrix/matrix_commands.cpp has always known how to copy a posted r-class matrix,
   // and the macro layer ate the reference before it could: `matrix T =
   // r(table)` (sktest's own matrix) died as "r(table) is not set".
   {
@@ -595,7 +595,7 @@ void testB4W3bEstimatesAndDataVerbs() {
   // NOTE ON THE FIXTURE: the oracle's own scenario fits `regress` first.
   // Deliberately NOT reproduced here -- `margins, dydx(x)` after a plain
   // OLS/feols model is a PRE-EXISTING, UNRELATED honest reject
-  // (estimation_m4c.cpp's `kLinearCmds` set, "marginal effects (dydx) after
+  // (postestimation/margins.cpp's `kLinearCmds` set, "marginal effects (dydx) after
   // a linear model are not supported"), and it must stay that way: cobra's
   // own `margins` AME path (apps/cmds/cmds_postest.cpp:929,
   // `opt(a, "--model", "logit")`) has NO plain-OLS branch and DEFAULTS TO
@@ -713,7 +713,7 @@ void testB4W3bEstimatesAndDataVerbs() {
   // Cells `B4REC|kdensity|generate_nodraw|0|`, `B4VAL|kx_N|50|kx_mean|
   // +1.2bf4000000001X+00d` (= 9598.500000000002 decimal) — the ONLY in-repo
   // Stata capture of kdensity's grid size under generate(); NOT a general
-  // claim about Stata's default n (graph_m4.cpp's own comment says so —
+  // claim about Stata's default n (graph/distribution_commands.cpp's own comment says so —
   // do not read this leg as validating min(N,50) beyond this one fixture).
   {
     piet::SessionState session(workdir);

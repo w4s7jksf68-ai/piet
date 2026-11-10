@@ -35,7 +35,7 @@
 //
 // TWO TRAPS THIS FUNCTION PAYS FOR UP FRONT.
 //   1. `session.cwd` is seeded as well as `session.eval.cwd`: resolveUserPath
-//      (handlers.cpp:2040) reads SessionState::cwd, and `geonear` resolves a
+//      (fileio/user_paths.cpp) reads SessionState::cwd, and `geonear` resolves a
 //      `using` file through it. Bundle E seeded only eval.cwd and sixteen
 //      checks failed for that one reason.
 //   2. Every numeric report goes through `fullPrec` (%.17g). std::to_string
@@ -58,7 +58,7 @@ void testAerGraphX() {
   };
   auto seed = [&](piet::SessionState& s) {
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
   };
   // Returns a NULL json rather than throwing when there is no error block --
   // the BUG-129 trap, and check()'s message argument is built EAGERLY (on the
@@ -865,7 +865,7 @@ void testAerGraphX() {
 // wiring (BS-009/U2), bare-form name() -> namedGraphs registration
 // (BS-010/U3), and `graph combine ..., name(X, replace)` suffix-leak fix
 // (BS-057). All four share ONE mechanism (BS-099's "single title/axis/
-// legend/name/note consumer") added in graph_m4.cpp.
+// legend/name/note consumer") added in graph/graph_support.cpp.
 void testBS008To057GraphTitleNoteName() {
   std::printf("[selftest] --- BS-008/009/010/057 graph title/note/name (B-graph part A) ---\n");
   namespace fs = std::filesystem;
@@ -995,7 +995,7 @@ void testBS008To057GraphTitleNoteName() {
     runCmd(session, "line fatal beertax, name(lineG)");
     check(session.namedGraphs.count("lineG") == 1, "BS-010: bare `line ..., name(lineG)` registers");
 
-    // xtset ALSO seeds session.timevar (handlers_m3.cpp::runXtset), so one
+    // xtset ALSO seeds session.timevar (time/time_panel_state.cpp::runXtset), so one
     // call unblocks both xtline (needs panelvar+timevar) and tsline (needs
     // only timevar) -- no separate tsset needed on this multi-state panel.
     // The panel id is numeric: xtset refuses the string `state` (BUG-1164).
@@ -2262,7 +2262,7 @@ void testBUG129And130GraphHonesty() {
   //       The multi-layer path had NO unknown-option net on either plane, so a
   //       typed option name was accepted, dropped and never mentioned. THE
   //       SEEDED-RED for this leg is the net itself: delete the net block in
-  //       graph_m4.cpp's runTwowayLayers and the two `bogus` legs below go RED
+  //       graph/twoway.cpp's runTwowayLayers and the two `bogus` legs below go RED
   //       while everything else stays GREEN.
   //   (2) `scatter y x, xline(0)` -> r(198), while the multi-layer renderer
   //       READ xline all along. A wiring gap: one surface could not reach

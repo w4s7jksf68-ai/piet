@@ -4,6 +4,7 @@
 #include "text_support.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/observations.h"
 
 namespace piet::dispatch_detail {
 

@@ -7,7 +7,7 @@ namespace piet::selftest {
 const char* selftestSourceFile() { return __FILE__; }
 }
 
-// W2 scaffold: the per-lane selftest TUs (selftest_w2_*.cpp) report through this.
+// Feature scaffold: the per-feature selftest TUs (selftest_*.cpp) report through this.
 void w2check(bool cond, const std::string& label) { check(cond, label); }
 void w2skip(const std::string& label, const std::string& why) { skip(label, why); }
 
@@ -617,7 +617,7 @@ int runSelftest() {
   // to main(), which replaced the whole run's blocks with one error.
   testControlFlowOutOfContext();
 
-  // W2 (2026-09-19): one TU per lane -- see selftest_w2.h.
+  // Feature cases (2026-09-19): one TU per feature -- see selftest_feature_cases.h.
   testW2MacroN();
   testW2PredictFrame();
   testW2EststoPrefix();
@@ -690,12 +690,12 @@ int runSelftest() {
   testW2UniD();
   testW2UniW();
   testW2C1067();
-  { void testW2yDatetime(); testW2yDatetime(); }  // selftest_w2y_datetime.cpp (goal ge2-fn-uncovered-datetime)
+  { void testW2yDatetime(); testW2yDatetime(); }  // selftest_language_datetime_functions.cpp (goal ge2-fn-uncovered-datetime)
   testW2DisplayFormat();
   testW2afFormat();
   testW2AhDataVerbs();
   testW2iVarsub();
-  { void testW2eFloat(); testW2eFloat(); }  // selftest_w2e_float.cpp (BUG-471 T2); last, so its fallback count covers the suite
+  { void testW2eFloat(); testW2eFloat(); }  // selftest_variable_storage_types.cpp (BUG-471 T2); last, so its fallback count covers the suite
 
   return finishSelftest();
 }

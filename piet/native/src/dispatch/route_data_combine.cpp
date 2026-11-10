@@ -5,6 +5,8 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/data_combine.h"
+#include "piet/handlers/observations.h"
 namespace piet::dispatch_detail {
 bool route_data_combine(std::string& cmd,
     eval::ParsedCommand& parsed,
@@ -357,7 +359,7 @@ bool route_data_combine(std::string& cmd,
   // ------------------------------------------------------------------
   // frames (P6 wave) — `frame` is BOTH a command family (`frame put/drop`)
   // and a prefix (`frame NAME: CMD`), so the sub-token decides which. See
-  // handlers_frames.cpp for the design; the current frame is always `default`
+  // datamgmt/frames.cpp for the design; the current frame is always `default`
   // in this build and `frame create`/`change`/`pwf` are honest rejects, not
   // silent no-ops.
   if (cmd == "frame") {

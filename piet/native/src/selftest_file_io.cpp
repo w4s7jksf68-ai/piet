@@ -329,7 +329,7 @@ void testAerEnvBundle() {
         {"shell rm -f " + at("nothing.txt") + " | cat", "shell metacharacter"},
         {"winexec notepad.exe", "winexec"},
         // twoway__histogram_gen left this list when gfx-histogram-kdensity-family
-        // served it (w2aq_histogram_family hk_thg_*); selftest_w2aq_histogram pins it.
+        // served it (w2aq_histogram_family hk_thg_*); selftest_graphics_histogram_kdensity pins it.
     };
     for (const auto& [src, what] : kRefusals) {
       piet::SessionState session(workdir);
@@ -385,7 +385,7 @@ void testAerEnvBundle() {
   // --- the accept-notes, verbatim. For these verbs the note IS the behaviour.
   {
     // adopath and sysdir RECORD the resolved path but ECHO the argument as it
-    // was written (handlers_aer_env.cpp says why: a resolved echo would bake
+    // was written (environment/ado_paths_and_packages.cpp says why: a resolved echo would bake
     // the capture machine's cwd into every golden that pins the note). These
     // two probes pass an ABSOLUTE path anyway, so as-written and as-resolved
     // are the same string and the expectation stays exact whichever way a
@@ -570,7 +570,7 @@ void testAerEnvBundle() {
 // our own reader agree about".
 //
 // The other standing trap this file has paid for twice (bundle E, then F):
-// `resolveUserPath` (handlers.cpp:2040) reads `SessionState::cwd`, NOT
+// `resolveUserPath` (fileio/user_paths.cpp) reads `SessionState::cwd`, NOT
 // `SessionState::eval.cwd`. A session seeded with only the latter writes every
 // `using` file into the PROCESS cwd -- the repo root -- and each leg then reads
 // a file it never wrote. `seed()` below sets both, and every session in this
@@ -592,7 +592,7 @@ void testAerIoText() {
   // because unlike E and F almost every leg here names a file.
   auto seed = [&](piet::SessionState& s) {
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
   };
   // NULL rather than a throw when there is no error block -- the BUG-129 trap:
   // check()'s message argument is built EAGERLY, on the passing path too, so a
@@ -1361,7 +1361,7 @@ void testAerIoText() {
   // this leg really guards is the second half: rows sharing one cause string is
   // a user typing `odbc` and being told there is no shapefile reader.
   // AER tier-1 (2026-10-28): unzipfile and zipfile left this table -- they run
-  // now (zip_io.h), and selftest_w2_t1_zip.cpp checks them.
+  // now (zip_io.h), and selftest_file_io_zip_commands.cpp checks them.
   {
     struct Refusal { const char* cmd; const char* reason; };
     const std::vector<Refusal> kRefusals = {

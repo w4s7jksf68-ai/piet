@@ -1089,7 +1089,7 @@ void testBUG350SwallowedErrors() {
 // verified by driving serve directly), and the estimation block carried nothing.
 //
 // The carry had to land TWICE. `regress` normalises through
-// handlers.cpp::cobraToEstimation (the M2 copy); estimation_m4.cpp's
+// estimation/linear_estimation_support.cpp::cobraToEstimation (the M2 copy); estimation/estimation_support.cpp's
 // cobraToEstimationM4 is its twin, and the M4a-only version of this fix left the
 // most common estimator still silent — the twin-allowlist hazard the passthrough
 // list's own comment warns about. This leg drives `regress`, i.e. the M2 path.
@@ -1197,40 +1197,50 @@ void testBUG105ErrHonestyLeaks() {
       ss << f.rdbuf();
       return ss.str();
     };
-    std::string strmutate = slurp(srcDir + "/strmutate.cpp");
+    bool allDataWritersRead = true;
+    auto slurpRequired = [&](const char* file) {
+      std::string source = slurp(srcDir + "/" + file);
+      allDataWritersRead = allDataWritersRead && !source.empty();
+      return source;
+    };
+    // The row-wise string writers: writeNew is in string_generate_replace.cpp
+    // and filterRowsIf in row_conditions.cpp; row_evaluation.cpp and the
+    // family's private header are read for the jargon-absence half of the gate.
+    std::string strmutate = slurpRequired("datamgmt/string_generate_replace.cpp") +
+                            slurpRequired("datamgmt/row_conditions.cpp") +
+                            slurpRequired("datamgmt/row_evaluation.cpp") +
+                            slurpRequired("datamgmt/row_evaluation_internal.h");
     // Read every data writer, including the extracted string conversions, so
     // moving a writer does not remove it from this defensive-message check.
-    std::string conversions = slurp(srcDir + "/handlers_string_conversion.cpp");
+    std::string conversions = slurpRequired("datamgmt/string_conversion_support.cpp") +
+                              slurpRequired("datamgmt/destring.cpp") +
+                              slurpRequired("datamgmt/decode.cpp") +
+                              slurpRequired("datamgmt/tostring.cpp") +
+                              slurpRequired("datamgmt/encode.cpp") +
+                              slurpRequired("datamgmt/string_conversion_internal.h");
     std::string handlers = conversions;
-    bool allDataWritersRead = true;
     for (const char* file : {
-        "data_order_options.cpp",
-        "dataset_save.cpp",
-        "variable_copy_rename.cpp",
-        "data_collapse.cpp",
-        "data_order.cpp",
-        "data_recode.cpp",
-        "data_duplicates.cpp",
-        "data_combine_options.cpp",
-        "data_reshape.cpp",
-        "data_append.cpp",
-        "data_merge.cpp",
-        "data_duplicates_route.cpp",
-        "panel_descriptive_statistics.cpp",
-        "time_fill_options.cpp",
-        "data_joinby.cpp",
-        "time_fill.cpp",
-        "data_quantiles.cpp",
-        "data_interpolation.cpp",
-        "data_observation_expansion.cpp",
-        "delimited_export.cpp",
-        "delimited_import.cpp",
-        "spreadsheet_export.cpp",
-        "spreadsheet_import.cpp",
+        "fileio/dataset_save.cpp",
+        "datamgmt/variable_copy_rename.cpp",
+        "datamgmt/data_collapse.cpp",
+        "datamgmt/data_order.cpp",
+        "datamgmt/data_recode.cpp",
+        "datamgmt/data_duplicates.cpp",
+        "datamgmt/data_reshape.cpp",
+        "datamgmt/data_append.cpp",
+        "datamgmt/data_merge.cpp",
+        "descriptive/panel_descriptive_statistics.cpp",
+        "datamgmt/data_joinby.cpp",
+        "time/time_fill.cpp",
+        "datamgmt/data_quantiles.cpp",
+        "datamgmt/data_interpolation.cpp",
+        "datamgmt/data_observation_expansion.cpp",
+        "fileio/delimited_export.cpp",
+        "fileio/delimited_import.cpp",
+        "fileio/spreadsheet_export.cpp",
+        "fileio/spreadsheet_import.cpp",
     }) {
-      auto source = slurp(srcDir + "/" + file);
-      allDataWritersRead = allDataWritersRead && !source.empty();
-      handlers += source;
+      handlers += slurpRequired(file);
     }
     check(!strmutate.empty() && !conversions.empty() && allDataWritersRead,
           "BUG-105: strmutate.cpp, all data verbs and string conversions read for the grep gate");

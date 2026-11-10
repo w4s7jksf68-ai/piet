@@ -6,6 +6,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/variables.h"
 namespace piet::dispatch_detail {
 bool route_data_names(std::string& cmd,
     std::string& cmdTyped,
@@ -619,7 +620,7 @@ bool route_data_names(std::string& cmd,
       // Stata's documented behaviour: label data sets a dataset label of up to
       // 80 characters, and with no label given it removes the existing one.
       // session.dataLabel is the field the .dta writer already
-      // carries (handlers_data_verbs_internal.h); this is its first in-session
+      // carries (piet/session_state.h); this is its first in-session
       // mutator, so `label data` no longer stops a do-file (14 corpus uses in
       // 5 papers). Not an oracle arm -- the definition is the help file's.
       // Text is everything after the subcommand token, quotes stripped (the

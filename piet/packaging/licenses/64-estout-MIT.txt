@@ -1,6 +1,10 @@
 estout / esttab / estadd / eststo (Ben Jann) 3.33 — MIT
-Adopted at: piet/native/src/handlers_aer_tables.cpp (estout WRITE phase and helpers, estadd) and
-piet/native/src/eststo_esttab.cpp (esttab); line citations in those files refer to the upstream ados
+Adopted at: piet/native/src/tables/table_options.cpp, piet/native/src/tables/table_estadd.cpp,
+piet/native/src/tables/estout_format.cpp, piet/native/src/tables/estout_grammar.cpp, piet/native/src/tables/estout_models.cpp,
+piet/native/src/tables/estout_internal.h, piet/native/src/tables/table_esttab.cpp, piet/native/src/tables/table_estout.cpp (estout WRITE phase and helpers, estadd) and
+piet/native/src/tables/esttab_block.cpp, piet/native/src/tables/estimates_table.cpp, piet/native/src/results/stored_estimates_commands.cpp,
+piet/native/src/results/stored_estimates_snapshot.cpp, piet/native/src/results/stored_estimates_internal.h,
+piet/native/src/results/estimates_save_use.cpp, piet/native/src/graph/coefplot_estimates_block.cpp (esttab); line citations in those files refer to the upstream ados
 
 Project:  estout — Stata module to make regression tables (estout, esttab, eststo, estadd, estpost)
 Authors:  Ben Jann

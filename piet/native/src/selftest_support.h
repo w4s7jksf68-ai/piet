@@ -68,12 +68,12 @@
 #include <utility>
 #include <vector>
 
-#include "base64.h"  // P8.1-W2: base64Encode roundtrip for the file.save leg
-#include "bridge_internal.h"
+#include "app/base64.h"  // P8.1-W2: base64Encode roundtrip for the file.save leg
+#include "app/bridge_internal.h"
 #include "io/win_compat.h"  // cecon::to_native_path / native_unlink (BUG-050 wide open)
 #include "piet/bundle_paths.h"
 #include "piet/coord_root.h"  // BUG-209: upward search for the coordination tree (releases/CURRENT leg below)
-#include "xlsx.h"  // P1 wave: the .xlsx reader/writer under selftest
+#include "fileio/xlsx.h"  // P1 wave: the .xlsx reader/writer under selftest
 #include "piet/cobra_runner.h"
 #include "piet/cobra_session.h"
 #include "piet/dispatcher.h"
@@ -89,15 +89,14 @@
 #include "piet/eval/pyeval.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/bcal.h"  // AER scope-2 B2-3: the calendar reader/writer under test
-#include "piet/handlers.h"
 #include "piet/progress.h"
 #include "piet/routes.h"
 #include "piet/session_state.h"
 #include "piet/settings.h"
 #include "piet/strmutate.h"  // S4a gate: needsStringCount -> factorColumns, called directly
-#include "registry.h"
+#include "dispatch/registry.h"
 #include "vendor/nlohmann/json.hpp"
-#include "selftest_w2.h"
+#include "selftest_feature_cases.h"
 #include "selftest_suites.h"
 #include "piet/strutil.h"
 

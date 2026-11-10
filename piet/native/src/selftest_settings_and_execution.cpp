@@ -243,16 +243,16 @@ void testSettingsPersistence() {
   }
 
   // P6: provenance_hash round-trip — OFF (the interactive default) makes
-  // estimation_m4.cpp's shared runCobraJsonM4 append --no-provenance to
+  // estimation/estimation_support.cpp's shared runCobraJsonM4 append --no-provenance to
   // every M4a cobra call; ON leaves the engine's own CLI default
   // (provenance ON) untouched. Exercised end-to-end through the real
   // dispatcher + cobra subprocess (logit, M4a-scoped) rather than
   // re-deriving the decision, so a real wiring regression in
-  // estimation_m4.cpp would actually fail this leg. cobra's raw JSON
+  // estimation/estimation_support.cpp would actually fail this leg. cobra's raw JSON
   // carries a top-level `provenance` object (argv / cobra_version / a data
   // hash) when not suppressed — confirmed directly against the pinned
   // cobra 0.20.3 binary (`--no-provenance` drops the key; its absence
-  // leaves the key present) — and estimation_m4.cpp's cacheLastModelM4
+  // leaves the key present) — and estimation/panel_estimation.cpp's cacheLastModelM4
   // caches that raw JSON verbatim onto LastModel::result (no allow-list
   // filtering like the ResultBlock returned to the frontend has), so it is
   // the one place in the public SessionState surface this native-only

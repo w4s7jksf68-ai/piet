@@ -5,6 +5,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/graph.h"
 namespace piet::dispatch_detail {
 bool route_graphics(std::string& cmd,
     std::string& cmdTyped,
@@ -26,8 +27,9 @@ bool route_graphics(std::string& cmd,
   // ==================== AER-SCOPE2 bundle K1 arms =========================
   // The corpus's remaining small names. `grc1leg` is an alias, `beep` and
   // `window` are accept-notes, and the three renamers below them have real
-  // handlers in handlers_aer_k1.cpp -- every rule in which was measured against
-  // StataBE with the packages installed, before it was written. `parallel` is
+  // handlers in datamgmt/variable_bulk_rename.cpp and datamgmt/variable_move.cpp --
+  // every rule in which was measured against StataBE with the packages installed,
+  // before it was written. `parallel` is
   // the one still open (K1c).
   if (cmd == "grc1leg") {
     // Vince Wiggins' original (stata.trk: stata.com/users/vwiggins). We answer
@@ -71,7 +73,7 @@ bool route_graphics(std::string& cmd,
 
   if (cmd == "coefplot") {
     // coefplot-family AN-1..AN-4: coefplot.ado 1.8.8's own pipeline
-    // (handlers_coefplot.cpp) decides what is plotted, generate() and r(); the
+    // (graph/coefplot.cpp) decides what is plotted, generate() and r(); the
     // option set is coefplot's (its unknown options are twoway's and pass), so
     // the W4 vocabulary net no longer runs here. `event_plot` keeps calling
     // runCoefplot directly. name() onto a graph in memory without replace is
@@ -211,7 +213,7 @@ bool route_graphics(std::string& cmd,
   // M4a item 4 + M4b: graph JSON surface. Scope: scatter/histogram/
   // kdensity/line/xtline/tsline + the bare (non-parenthesised) `twoway
   // PLOTTYPE var...` single-plot form (M4a); `graph export`/`graph save`/
-  // `graph combine` (M4b — see graph_m4.cpp's runGraphExport/Save/Combine).
+  // `graph combine` (M4b — see graph/files.cpp's runGraphExport/Save/Combine).
   // The parenthesised multi-layer `twoway (rarea ...) (scatter ...)` form
   // (twoway_opts.py/twoway_parse.py) remains M4a-remaining/out of scope —
   // rejected explicitly below, not silently mis-parsed.
@@ -230,7 +232,7 @@ bool route_graphics(std::string& cmd,
         return sub.size() >= minLen && sub.size() <= f.size() && f.compare(0, sub.size(), sub) == 0;
       };
       // graph-family AI-4/AI-6/AI-7/AI-9: graph describe/copy/rename/display/
-      // draw/close/set/query (graph_store.cpp).
+      // draw/close/set/query (graph/named_graphs.cpp).
       {
         const std::string subArgs = [&]() {
           std::string a = rawArgsAfterCmd(rawArgsAfterCmd(parsed.raw));
@@ -375,7 +377,7 @@ bool route_graphics(std::string& cmd,
             }
           }
         }
-        // W4: runGraphCombine reads exactly these eight (graph_m4.cpp:2606-2642).
+        // W4: runGraphCombine reads exactly these eight (graph/files.cpp).
         // The corpus also hands it `scale()` (25 uses) and `xcommon` (1), which
         // it does not read; those now resolve (kGraphCosmetic) and are named in
         // the note instead of vanishing. No reject net is added here: this
@@ -627,7 +629,7 @@ bool route_graphics(std::string& cmd,
         // layer's interior) lives inside runTwowayLayers, AFTER its
         // supported-plot-type pre-scan, so `(rcap ...)` still answers "plot type
         // is not supported" rather than complaining about `lstyle`. See
-        // graph_m4.cpp. Only the note is assembled here, because only the
+        // graph/twoway.cpp. Only the note is assembled here, because only the
         // dispatcher knows which of the two routes produced the block.
         //
         // The note reads the global block AND every layer interior: a cosmetic
@@ -826,7 +828,7 @@ bool route_graphics(std::string& cmd,
     // sub-commands set gc=sub above with nothing downstream to catch
     // them). Mirrors the parenthesised multi-layer `twoway (plottype ...)`
     // form's reject-before-output guard (runTwowayLayers' supported-plot-type
-    // pre-scan, graph_m4.cpp — BUG-129) — applied here to the single-plot
+    // pre-scan, graph/twoway.cpp — BUG-129) — applied here to the single-plot
     // dispatch path so these name the gap explicitly (SPEC I-3) rather than
     // silently misrouting to scatter's grammar.
     static const std::set<std::string> kUnsupportedBareGraphTypes = {
@@ -850,7 +852,8 @@ bool route_graphics(std::string& cmd,
     };
     // BUG-336 (graph arm): this arm had NO unknown-option net at all — nine
     // command tokens accepting any option name and dropping it. The known sets
-    // below are MEASURED from graph_m4.cpp's handler bodies (optStr/optBool/
+    // below are MEASURED from the handler bodies in graph/commands.cpp and
+    // graph/distribution_commands.cpp (optStr/optBool/
     // optTitleStr reads), not guessed:
     //   every plot: title/xtitle/ytitle/note      (runScatter:271, runGraphLine:849,
     //                                              runXtline:950, runTsline:1054)
@@ -905,7 +908,7 @@ bool route_graphics(std::string& cmd,
     // MEASURED on main today: `scatter y x, xline(0)` was r(198) while
     // `twoway (scatter y x) (line y x), xline(0)` drew the reference line. The
     // renderer for xline/yline/xscale/yscale/xlabel/ylabel/legend/subtitle
-    // exists (graph_m4.cpp's `axes`/`legend` block, and graph.js draws both ONLY
+    // exists (graph/twoway.cpp's `axes`/`legend` block, and graph.js draws both ONLY
     // for kind=="twoway"); the single-plot arm simply could not reach it. So the
     // fix is routing, not a new feature.
     //
@@ -919,7 +922,7 @@ bool route_graphics(std::string& cmd,
     //
     // `vl.size() == 2` is load-bearing and was measured too: `scatter y1 y2 x` is
     // Stata's shared-x multi-series form and runScatter builds a `series` array
-    // for it (BS-050, graph_m4.cpp:220-260), while `twoway::LayerSpec` carries a
+    // for it (BS-050, graph/commands.cpp's runScatter), while `twoway::LayerSpec` carries a
     // single yvar/xvar pair. Re-routing a 3+-token varlist would silently drop
     // every series after the first.
     const bool layerReroutable = (gc == "scatter" || gc == "line" || gc == "connected");

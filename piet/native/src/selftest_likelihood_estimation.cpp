@@ -369,7 +369,7 @@ void testD2BS072Mediate() {
   // d2b-mediate.log's working form: `mediate (income) (spirits) (beertax,
   // continuous(0.5 1))` -- dispatch succeeds and real numbers come back,
   // but this is ENGINE-parity, NOT Stata-parity (see runMediate's own
-  // header comment in estimation_m4.cpp for the full disclosure: cobra's
+  // header comment in estimation/mediation_estimation.cpp for the full disclosure: cobra's
   // mediate has no treatment-mediator interaction term / no contrast-level
   // surface, so its point estimates are a genuinely different, simpler
   // model than Stata's oracle NDE=-855.2799/NIE=-107.2333/TE=-962.5132).
@@ -388,7 +388,7 @@ void testD2BS072Mediate() {
     // cobra mediate's per-unit `indirect` for income~spirits~beertax with no
     // controls is -177.150128... (live-verified against this exact engine
     // build; matches a plain feols a-path * b-path decomposition exactly —
-    // see the disclosure comment in estimation_m4.cpp's runMediate). Stata's
+    // see the disclosure comment in estimation/mediation_estimation.cpp's runMediate). Stata's
     // oracle NIE=-107.2333 differs by a documented, characterized
     // missing-interaction-term model gap, not a dispatch/argv bug.
     check(est->contains("indirect") && est->at("indirect").is_number() &&
@@ -499,7 +499,7 @@ void testD3BS073Poisson() {
 
   // D3c: `poisson cnt beertax unemp, vce(robust)`. b unchanged; se scales up
   // (Wald sandwich). ENGINE FINDING (see runPoisson's header comment,
-  // estimation_m4.cpp): cobra's HC1 has a small (~0.3% relative) small-
+  // estimation/count_estimation.cpp): cobra's HC1 has a small (~0.3% relative) small-
   // sample gap vs Stata's own poisson robust SE here — tolerance widened to
   // cover the ENGINE's actual value while still catching a real regression.
   {
@@ -566,7 +566,7 @@ void testD3BS074Nbreg() {
   namespace fs = std::filesystem;
 
   // ENGINE FIX (cobra 0.25.0, see runNbreg's header comment,
-  // estimation_m4.cpp): cobra's nbreg Newton fit used to fail to converge
+  // estimation/count_estimation.cpp): cobra's nbreg Newton fit used to fail to converge
   // on the D3e oracle's own data (fatalities/cnt); it now converges — the
   // MLE sits at the alpha->0 boundary (the Poisson limit; a Poisson
   // warm-start + boundary report), live-verified against the compiled
@@ -665,7 +665,7 @@ void testD3BS074Nbreg() {
                 std::abs(est->at("lnalpha").get<double>() - (-0.09104366361898894)) < 1e-6,
             "D3/BS-074: lnalpha field ~= -.09104366");
       // Backfilled p/ci (cobra's own nbreg coeftable ships p=ci=null — see
-      // fillCoeftableStatsM4, estimation_m4.cpp).
+      // fillCoeftableStatsM4, estimation/inference_statistics.cpp).
       auto p = coefFieldD1(*est, "x1", "p");
       check(p.has_value(), "D3/BS-074: coeftable p is backfilled (not left null)");
       auto ciLo = coefFieldD1(*est, "x1", "ci_lo");

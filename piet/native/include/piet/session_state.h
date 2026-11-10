@@ -114,7 +114,7 @@ class SessionState {
   // step first). currentFile_ always holds the user-facing ORIGINAL path, so
   // the varlist route and the open-action result can tell the frontend
   // "what's actually loaded" instead of a painted-but-empty status bar. Set
-  // only on a successful load (handlers.cpp's runUse); never auto-cleared —
+  // only on a successful load (fileio/dataset_use.cpp's runUse); never auto-cleared —
   // out of this item's minimal additive scope.
   // BETA A4 (BS-091): a successful `use` is the one point that resets
   // c(changed) to false — see load()'s corresponding true-set below.
@@ -424,7 +424,7 @@ class SessionState {
   //   • pure-ADD {gen,egen,duplicates_tag,recode-gen}: carry all but newVars;
   //   • replace-style (action "gen", empty newVars): carry all but the
   //     rewrittenVars target(s) — DORMANT until the call site passes them
-  //     (handlers.cpp::runReplace still passes none, so it rescans fully);
+  //     (datamgmt/data_generate.cpp::runReplace still passes none, so it rescans fully);
   //   • variable drop/keep (action "drop"/"keep": a column subset, rows
   //     untouched): carry the survivors, drop the removed keys;
   //   • rename (action "rename"): move the cached count old->new.
@@ -495,7 +495,7 @@ class SessionState {
   // `by` prefix-stripping or a replayed do-file/loop/program body, must NOT
   // individually re-tee). All PARSING/VALIDATION (replace vs append, the
   // text-vs-smcl format and file-extension rule, "file already exists") lives
-  // in handlers_m3.cpp's runLog — this class only owns the open stream + the render-and-write
+  // in environment/logging_commands.cpp's runLog — this class only owns the open stream + the render-and-write
   // mechanics (session_state.cpp). logIsOpen() is the first thing every one
   // of these checks, so a session that never calls `log using` — the
   // overwhelming majority of fixtures — pays zero cost and stays
@@ -640,7 +640,7 @@ class SessionState {
   // L./F./D./S. operators step by this many index units instead of the
   // engine's implicit default of 1. Reset (not just left stale) on every
   // tsset/xtset call, matching real Stata's "each tsset call fully replaces
-  // the prior ts state" semantics — see handlers_m3.cpp::runTsDeclare/runXtset.
+  // the prior ts state" semantics — see time/time_panel_state.cpp::runTsDeclare/runXtset.
   std::optional<double> delta;
 
   // -- frames (P6 wave) -----------------------------------------------------
@@ -759,7 +759,7 @@ class SessionState {
   // process-persistent app-shell config) — the single source both the `set`
   // dispatch arm (dispatcher.cpp) WRITES and the c()-class resolver
   // (piet/cclass.h) + the estimation `--level` flow (buildEstimationArgvM4 /
-  // handlers.cpp::runRegress / runTtest) READ.
+  // estimation/linear_estimation.cpp::runRegress / descriptive/descriptive_statistics.cpp::runTtest) READ.
   //
   // level: `set level #` / `set clevel #` (BS-048) — the session default
   // confidence level consulted ONLY when a command's own `level(#)` option
@@ -770,7 +770,7 @@ class SessionState {
   // The macro-expanded text of the command the innermost dispatch tokenized
   // (dispatcher.cpp), cleared at every dispatch entry. The fit hook's default
   // e(cmdline) reads it: the line a prefix re-dispatches can still be the
-  // unexpanded `c' (handlers_aer_estim.cpp postDefaultCmdline).
+  // unexpanded `c' (postestimation/fit_default_e_macros.cpp postDefaultCmdline).
   std::string leafCmdExpanded;
   // BUG-471 T2: `set type float|double` — the storage type an UNTYPED
   // generate / egen / bysort-gen takes (Stata's c(type); factory default
@@ -800,9 +800,9 @@ class SessionState {
   // (cwd moves).
   std::map<std::string, std::string> sysdir;
   std::vector<std::string> adopath;
-  // graphicsOff: `set graphics on|off` (BS-047) — read by graph_m4.cpp's
+  // graphicsOff: `set graphics on|off` (BS-047) — read by graph/twoway.cpp's and graph/files.cpp's
   // twoway/graph_combine builders to populate the wire-schema `suppressed`
-  // field (previously hardcoded false; see graph_m4.cpp's own comment).
+  // field (previously hardcoded false; see the comment at each of those call sites).
   bool graphicsOff = false;
   // seed: `set seed #` (BS-046) — persisted for c(seed) readback. No cobra
   // command in this build's current dispatch surface consumes a session-
@@ -906,16 +906,16 @@ class SessionState {
   // esample:`, `estimates use` and the ML mask install that follows a logit/
   // probit fit (dispatcher.cpp) change only which rows e(sample) is. `dataPath`
   // moves only when the install names the on-disk base of an unmoved frame
-  // (handlers.cpp esampleInstallOnHead); pass the model's own otherwise.
+  // (estimation/estimation_sample_install.cpp esampleInstallOnHead); pass the model's own otherwise.
   void setLastModelEsample(LastModel::EsampleState state, unsigned long long serial,
                            std::string installPath, std::string dataPath);
   // How many times a fit installed the mask column in this session
-  // (handlers.cpp esampleInstallColumn). Zero means no frame of this session
+  // (estimation/estimation_sample_install.cpp esampleInstallColumn). Zero means no frame of this session
   // can carry it, so a writer that must leave it out (save) skips the check.
   unsigned long long esampleColumnInstalls = 0;
   // Every load() of a new head, counted (the install's equivalence test below).
   unsigned long long headLoadCount = 0;
-  // The last plain mask install (handlers.cpp esampleInstallOnHead): the frame it
+  // The last plain mask install (estimation/estimation_sample_install.cpp esampleInstallOnHead): the frame it
   // produced, the ON-DISK frame it was built from, and headLoadCount right after
   // its load. While the head is still that frame (same path, no load since), it
   // IS the base frame plus the hidden column -- same rows, same values -- so:
@@ -958,7 +958,7 @@ class SessionState {
   // driver that captured the head path around an inner fit relies on that:
   // bootstrap/jackknife/permute record `startHbin`, dispatch the command once
   // for the observed statistic, then resample from and return to that path
-  // (handlers_resample.cpp). The supersede inside the install's load() would
+  // (estimation/bootstrap_prefix.cpp, estimation/jackknife_permute_prefix.cpp). The supersede inside the install's load() would
   // reclaim it there ("run failed: cannot open .../esample_install_*.hbin",
   // measured in selftest W2C(postest) `bootstrap ...: regress`). So the
   // pre-install head is PINNED: spared by reclaimSupersededScratch and the
@@ -973,7 +973,7 @@ class SessionState {
   void releasePreInstallPins();
 
   // BUG-733 (W2D-T01 round 2): the lifetime of a POSTED e(). `ereturn post`
-  // (handlers_ereturn.cpp) and an estpost pseudo-estimate (handlers_aer_tables.cpp
+  // (results/ereturn_commands.cpp) and an estpost pseudo-estimate (tables/table_estpost.cpp
   // postPseudoEstimate; dispatcher.cpp sets the flag after a successful
   // estpost) install a whole new e() into eval.eScalars / eStrings / eMatrices
   // with no fitted model behind it, and every e() reader prefers those stores
@@ -1001,8 +1001,8 @@ class SessionState {
   bool ePostedLive = false;
   // Stata's ordered e() name lists (`: e(scalars)`, `: e(macros)`,
   // `: e(matrices)`) for ONE fit, published by the fit handler for the paths
-  // whose whole Stata namespace it posts (estimation_m4.cpp
-  // installENameContractM4). Stata lists names in its e() store's own order
+  // whose whole Stata namespace it posts (estimation/estimation_results.cpp
+  // installENameContractNL). Stata lists names in its e() store's own order
   // (StataBE 19.5: macros newest-first, matrices `b V` then newest-first,
   // scalars the store's order), which PIET's lazily resolved e() cannot
   // reproduce from its stores, so the fit names the order. A kind left nullopt
@@ -1024,7 +1024,7 @@ class SessionState {
   std::optional<std::vector<std::string>> eNameOrderFor(const std::string& kind) const;
   // `set rng NAME` (dispatcher.cpp), read back by c(rng).
   std::string rngSetting = "default";
-  // `ereturn post ..., esample(VAR)` (handlers_ereturn.cpp runPost): the posted
+  // `ereturn post ..., esample(VAR)` (results/ereturn_commands.cpp runPost): the posted
   // e() has no LastModel, so its e(sample) is the mask column installed under
   // THIS serial (the same `__piet_esample__` column and serial scheme a fit
   // uses, SessionState::esampleColumnInstalls). 0 = the posting has no mask
@@ -1210,7 +1210,7 @@ class SessionState {
   std::vector<std::string> labelSetOrder() const;
 
   // FIX:PIET-SAVE-DTA-CHARS-CARRIAGE: the two blocks a .dta's own metadata
-  // carries that applyDtaMeta() used to leave unread (handlers.cpp) — see that
+  // carries that applyDtaMeta() used to leave unread (fileio/dataset_use.cpp) — see that
   // function's doc comment for why a `use A.dta` -> `save B.dta` round trip
   // silently lost both until now. dataLabel is Stata's `label data`;
   // characteristics is the flat `char` table (dataset-level "_dta" entries and
@@ -1338,7 +1338,7 @@ class SessionState {
   //
   // `: type` IS carried since BUG-250's close. The dispatcher's gen/egen arms
   // now record the DECLARED subtype at creation into VarMeta::stataType (the
-  // .dta import path already did, handlers.cpp:254), and the projection below
+  // .dta import path already did, fileio/dataset_use.cpp applyDtaMeta), and the projection below
   // carries it under kEvalVarTypePrefix with describe's own fallback: a
   // numeric column with no declaration projects "float" (also Stata's `gen`
   // default), a string column with no recorded width projects NOTHING — its
@@ -1418,7 +1418,7 @@ class SessionState {
   }
   // BUG-291: every varname-keyed metadata plane must forget a column the moment
   // that column leaves the frame. Before this existed, the only eraser in the
-  // tree was rename's (handlers_data_verbs.cpp), so `gen double x` -> `drop x`
+  // tree was rename's (datamgmt/variable_copy_rename.cpp), so `gen double x` -> `drop x`
   // -> `gen x = 1` left the stale `double` claim behind and `describe x`
   // answered double where Stata (19.5 IC, measured) answers float. labelDefs is
   // NOT pruned here: it is keyed by label-set name, not varname, and Stata keeps
@@ -1938,7 +1938,7 @@ class SessionState {
   // -- _request() interactive dialog request/response (BUG-087, D9 BETA
   // Phase F: contract_B additive MINOR — one new route + one new push-event
   // shape). Native side of the `display ... _request(macroName)` extended
-  // macro function (display_hardening.cpp is the real call site — see that
+  // macro function (language/display_command.cpp is the real call site — see that
   // file for why): blocks the do-executor WORKER thread, pushes a
   // `{"kind":"request_dialog","requestId":...,"prompt":...,"macroName":...}`
   // event over the SAME pietEvents channel RunProgress ticks already use,
@@ -1952,7 +1952,7 @@ class SessionState {
   // immediately after constructing the Shell in the windowed / --ui-smoke
   // entry points). Left unset (nullptr) in headless contexts — runDoFile
   // Headless() never constructs a Shell at all — so hasRequestPostEvent()
-  // IS the "is there a real Shell/webview" signal display_hardening.cpp
+  // IS the "is there a real Shell/webview" signal language/display_command.cpp
   // consults to choose the blocking-modal path vs the headless
   // PIET_REQUEST_<NAME> env-var fallback.
   using PostEventFn = std::function<void(const std::string&)>;
@@ -2159,7 +2159,7 @@ class SessionState {
 
   // -- timer stopwatch bank (BS-124, BETA campaign C4) ----------------------
   // Slots 1..100 (index 0 unused, matching Stata's own 1-based numbering);
-  // see TimerSlot's doc comment above and handlers_m3.cpp::runTimer for the
+  // see TimerSlot's doc comment above and environment/timer_commands.cpp::runTimer for the
   // on/off/clear/list state machine this backs.
   std::array<TimerSlot, 101> timers;
 
@@ -2222,7 +2222,7 @@ class SessionState {
   // hbin bytes to whatever target name `postfile ... using` was given
   // (commonly a `tempfile`-generated path with a `.tmp`/no-hbin extension —
   // that is completely routine, universal Stata usage, not a mislabeled or
-  // stale file). handlers.cpp's runUse BUG-A hbin-sniff (commit ad23151)
+  // stale file). fileio/dataset_use.cpp's runUse BUG-A hbin-sniff (commit ad23151)
   // correctly rescues a genuinely mislabeled/stale-save-era file with an
   // explanatory note, but it fired on this routine postfile round-trip too,
   // inserting an unrequested extra block. Track the resolved absolute path
@@ -2334,8 +2334,8 @@ class SessionState {
 
   // The fingerprint itself has one implementation in session_estimates.cpp,
   // because TWO translation units must agree on it exactly:
-  // handlers_aer_tables.cpp WRITES it when `estadd` fills the bag, and
-  // eststo_esttab.cpp READS it when `eststo` decides whether the bag still
+  // tables/table_estadd.cpp WRITES it when `estadd` fills the bag, and
+  // tables/table_model_context.cpp READS it when `eststo` decides whether the bag still
   // belongs to the active estimate. Two private copies that drift by one field
   // would make the bag silently never match, and the visible symptom would be
   // an `estadd`ed row quietly missing from the table -- rc 0, plausible output.
@@ -2438,7 +2438,7 @@ class SessionState {
   // dropped: the next lincom/test re-specifies the model rather than trusting
   // a handle minted in an earlier state of the worker. e(sample) is left a named
   // r(198) here (kUnavailable); the one caller, handlers' runEstimatesRestore
-  // (eststo_esttab.cpp), then installs the mask from `_est_NAME` (T3).
+  // (results/stored_estimates_commands.cpp), then installs the mask from `_est_NAME` (T3).
   bool estimatesRestore(const std::string& name);
 
   // The stored bag back into e(), the way runEstadd posts a live addition

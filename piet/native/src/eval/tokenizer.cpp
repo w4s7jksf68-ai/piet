@@ -12,7 +12,7 @@
 #include "piet/eval/macros.h"
 #include "piet/strutil.h"
 #include "core/ident.h"  // Unicode names: the shared identifier rule
-#include "registry.h"
+#include "dispatch/registry.h"
 
 namespace piet::eval {
 
@@ -969,7 +969,7 @@ bool compoundLiteralCommand(const std::vector<std::string>& toks) {
 }
 
 // `matrix accum`'s subcommand word, abbreviations included (ac, acc, accu: the
-// spellings handlers_m3.cpp's reAccum routes to runMatrixAccum).
+// spellings matrix/matrix_commands.cpp's reAccum routes to runMatrixAccum).
 bool isMatrixAccumWord(const std::string& word) {
   const std::string w = toLower(word);
   return w.size() >= 2 && std::string("accum").compare(0, w.size(), w) == 0;

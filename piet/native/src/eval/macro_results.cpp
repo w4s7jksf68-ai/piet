@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
-// macro results: see macro_modules.md for ownership and call flow.
+// macro results: see README.md for ownership and call flow.
 #include "piet/eval/macros.h"
 #include "estimators/postest_names.h"  // coefFullName: the engine's coefficient-name rule
 
-#include "../dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
+#include "dispatch/dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
 
 #ifndef _WIN32
 #include <fnmatch.h>  // WP-W5: POSIX-only; the Windows branch uses globMatchPeriod below
@@ -51,14 +51,14 @@ namespace piet::eval::macro_detail {
 
 
 // ---------------------------------------------------------------------------
-// display_hardening resolvers (the est-scalar subset _eval_arith needs)
+// display resolvers (language/scalar_expression.cpp) (the est-scalar subset _eval_arith needs)
 
 // _E_SCALAR_KEY: MOVED out of this anonymous namespace to piet::eval proper
-// (AER-SCOPE1 bundle E, 2026-09-04) so handlers_aer_tables.cpp can freeze the
+// (AER-SCOPE1 bundle E, 2026-09-04) so results/stored_estimates_snapshot.cpp can freeze the
 // same e() scalar names into an eststo snapshot. The body is unchanged and now
 // lives just below the anonymous namespace's closing brace; declared in
 // eval/macros.h. Exposing it was the alternative to a THIRD copy of the table --
-// there are already two (the twin is display_hardening.cpp's std::map version,
+// there are already two (the twin is language/scalar_expression.cpp's std::map version,
 // identical in content today and commented as such in both files).
 
 std::optional<double> jsonToFloat(const nlohmann::ordered_json& v) {
@@ -135,11 +135,11 @@ std::string resolveEScalar(const std::string& name, const EvalSession& session) 
 // all real Stata code uses — matched nothing and fell through to ".", i.e. a
 // silent missing with rc 0.
 // NOTE: this resolver is DUPLICATED (macros.cpp for expressions/if-conditions,
-// display_hardening.cpp for `display`). Both copies must carry this alias or
+// language/scalar_expression.cpp for `display`). Both copies must carry this alias or
 // `display _b[_cons]` and `scalar q = _b[_cons]` disagree — the exact
 // two-layer split that makes a wrong answer silent. Change them together.
 // BUG-456 (2026-09-08): `err` is the r(111) channel the display twin has had
-// since BUG-162 (display_hardening.cpp resolveBRef). A coefficient NAME that is
+// since BUG-162 (language/scalar_expression.cpp, display's _b[] resolution). A coefficient NAME that is
 // not in the model is r(111) "[nosuch] not found" on EVERY Stata surface --
 // local, scalar, gen, count, assert, if (refute3_capture.log V3-V8) -- and
 // returning `.` for it turned a typo into a missing that `assert _b[nosuch]==0`
@@ -283,7 +283,7 @@ const std::vector<std::pair<std::string, std::string>>& eScalarKey() {
       // COMPUTE work and stays open; only this unreachable-but-correct entry
       // is closed here.
       // Duplicated table — the twin lives in the other of
-      // {eval/macros.cpp, display_hardening.cpp}. Keep them in step or
+      // {eval/macro_results.cpp, language/scalar_expression.cpp}. Keep them in step or
       // `display e(r2_w)` and `scalar q = e(r2_w)` disagree.
       {"r2_w", "r2_within"},
       // BUG-156 (wiring half, P2-PREP) — the rest of the names, so the Stata
@@ -301,7 +301,7 @@ const std::vector<std::pair<std::string, std::string>>& eScalarKey() {
       // a STORED estimate's escalars -- `esttab <logit>, pr2` rendered a blank
       // cell. Measured on this engine: poisson publishes `r2_p` (.0126126) and
       // logit/probit publish `r2_pseudo` (.0321488 / .0345996), each leaving
-      // the other missing, and nbreg publishes neither. `estimation_m4.cpp:430`
+      // the other missing, and nbreg publishes neither. estimation/estimation_support.cpp (kGlm passthrough)
       // already emits it; only the travel was missing.
       {"r2_pseudo", "r2_pseudo"},
       {"sigma_u", "sigma_u"}, {"sigma_e", "sigma_e"}, {"rho", "rho"},
@@ -322,7 +322,7 @@ std::string resolveEstScalarRefs(std::string expr, const EvalSession& session,
   // spelling (`_b[overall:difference]` after oaxaca, `_b[ATE:r1vs0.t]` after
   // teffects). The coeftable row NAME carries the same `eq:name` string, so the
   // lookup stays an exact match; only the reference grammar widens. The twin in
-  // display_hardening.cpp (reBRef/reSeRef) MUST stay in step.
+  // language/scalar_expression.cpp (reBRef/reSeRef) MUST stay in step.
   // B2-4 (2026-09-09) widened the tail class by ONE character, `.`: the comment
   // above already named `_b[ATE:r1vs0.t]` as the target spelling, but `[\w:]`
   // has no dot, so the reference fell through to the undefined-matrix arm and
@@ -334,7 +334,7 @@ std::string resolveEstScalarRefs(std::string expr, const EvalSession& session,
   // for an interaction cell), so `local q = _b[2.c]` and `generate g = _b[2.c]`
   // fell through to "_b not found" / "unknown variable _b" while `test 2.c` and
   // `lincom _b[2.c]` answered (w2c_postest.log families (2)-(4)). The display
-  // twin (display_hardening.cpp reBRef/reSeRef) carries the same classes.
+  // twin (language/scalar_expression.cpp reBRef/reSeRef) carries the same classes.
   static const std::regex reB(R"(_b\[([A-Za-z_0-9/\x80-\xff][\w:.#\x80-\xff]*)\])");
   static const std::regex reSe(R"(_se\[([A-Za-z_0-9/\x80-\xff][\w:.#\x80-\xff]*)\])");
   static const std::regex reECall(R"(\be\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))");

@@ -115,7 +115,7 @@ inline std::optional<std::string> stataMissingToken(double v) {
 // `.ab`, `x.a` and `1.e5` pass through untouched). Each is spelled `%.17g`, which
 // strtod reads back to the exact double. `substr(s, 3, .)` (missing length = to
 // the end) then reaches fnSubstr as a huge length. Shared by macros.cpp's
-// evalArith, loops.cpp's `if {}` and strmutate.cpp's string row evaluator so the
+// evalArith, language/if_while_condition.cpp's `if {}` and datamgmt/row_evaluation.cpp's string row evaluator so the
 // three sites apply one word-boundary rule.
 inline std::string stataMissingLiteral(int kind) {
   char buf[40];
@@ -187,12 +187,12 @@ inline bool exprHasRunningSum(const std::string& e) {
 // Add the STATA_FNS entries (exprfns.py) to `ns`.
 void addStataFns(PyNamespace& ns);
 
-// The row plane's regexs() (strmutate.cpp baseNamespace): fnRegexs, which
+// The row plane's regexs() (datamgmt/row_evaluation.cpp baseNamespace): fnRegexs, which
 // reads the RegexsRowScope snapshot while a scope is open. Not part of
 // addStataFns() because only a row loop that opens the scope may carry it.
 void addRowPlaneRegexs(PyNamespace& ns);
 
-// Open for the duration of a row loop (strmutate.cpp evalRows). Call
+// Open for the duration of a row loop (datamgmt/row_evaluation.cpp evalRows). Call
 // beginExpression() before each expression evaluated on a row: regexs() then
 // answers from the regexm() state as it stood at that moment, not from a
 // regexm() inside the same expression (w2c_functions.log regexs_whole :599,
@@ -206,12 +206,12 @@ class RegexsRowScope {
   void beginExpression();
 };
 
-// The row plane's sum() (strmutate.cpp baseNamespace): a running total per call
+// The row plane's sum() (datamgmt/row_evaluation.cpp baseNamespace): a running total per call
 // site, kept by the RunningSumRowScope a row loop opens (BUG-1369). Outside a
 // scope it answers like the macro layer's single-evaluation sum().
 void addRowPlaneSum(PyNamespace& ns);
 
-// Open for the duration of a row loop (strmutate.cpp evalRows). Call
+// Open for the duration of a row loop (datamgmt/row_evaluation.cpp evalRows). Call
 // beginExpression(0) before the condition and beginExpression(1) before the
 // right-hand side is evaluated on a row: the n-th sum() call of that expression
 // adds the row's value to the n-th running total of that expression.

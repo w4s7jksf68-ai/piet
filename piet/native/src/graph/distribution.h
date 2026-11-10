@@ -2,7 +2,7 @@
 // Copyright (C) 2026 M.K. Kim
 #pragma once
 
-#include "piet/handlers.h"
+#include "piet/handlers/graph.h"
 
 namespace piet::handlers::graph_detail {
 using ojson = nlohmann::ordered_json;

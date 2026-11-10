@@ -1223,7 +1223,7 @@ void testG_BS060MeanonlyStrmutateLock() {
     check(!sawError, "BS-060(a): `summarize beertax, meanonly` is accepted (no error)");
   }
 
-  // (b) string-typed gen/replace (strmutate.cpp): create a string column,
+  // (b) string-typed gen/replace (datamgmt/string_generate_replace.cpp): create a string column,
   // then replace part of it — both routed through strmutate::runStringGen/
   // runStringReplace's own row-wise evaluator (cobra is all-f64 and cannot
   // hold string columns at all, so this MUST stay a PIET-native path).

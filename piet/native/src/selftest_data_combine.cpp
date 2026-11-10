@@ -21,7 +21,7 @@
 //
 // TWO HOUSE RULES ARE FOLLOWED LITERALLY HERE BECAUSE BOTH HAVE COST TIME:
 //   - EVERY session sets `cwd` as well as `eval.cwd`. resolveUserPath reads
-//     SessionState::cwd (handlers.cpp:2040); a session that seeds only
+//     SessionState::cwd (fileio/user_paths.cpp); a session that seeds only
 //     eval.cwd writes leg (xi)'s .dta into the PROCESS cwd -- the repo root --
 //     and the round-trip half of that leg fails for a reason that has nothing
 //     to do with `notes`.
@@ -136,7 +136,7 @@ void testAerReshape() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     auto r = exec("clear\ninput x y\n1 2\n3 4\n5 6\nend\n", s);
     check(firstError(r.blocks).is_null(),
           "AER-RESHAPE (i): `input x y` ... `end` runs clean into an empty session. Got `" +
@@ -182,7 +182,7 @@ void testAerReshape() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     auto r = exec("clear\nset obs 6\ngen str9 sv = \"a-b-c\"\nsplit sv, parse(\"-\") gen(p)\n", s);
     check(firstError(r.blocks).is_null(),
           "AER-RESHAPE (ii): `split sv, parse(\"-\") gen(p)` runs clean. Got `" +
@@ -238,7 +238,7 @@ void testAerReshape() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     auto r = exec("clear\nset obs 10\ngen double x = _n\n_pctile x, p(25 50)\n", s);
     check(firstError(r.blocks).is_null(),
           "AER-RESHAPE (iii): `_pctile x, p(25 50)` runs clean. Got `" +
@@ -277,7 +277,7 @@ void testAerReshape() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     auto r = exec("clear\nset obs 10\ngen double x = _n\ncumul x, gen(cx)\n", s);
     check(firstError(r.blocks).is_null(),
           "AER-RESHAPE (iv): `cumul x, gen(cx)` runs clean. Got `" +
@@ -317,7 +317,7 @@ void testAerReshape() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     auto r = exec("clear\nset obs 5\ngen double x = _n\ninsobs 2, before(1)\n"
                   "display \"RS_INS1=\" x[1]\n"
                   "display \"RS_INS3=\" x[3]\n"
@@ -360,7 +360,7 @@ void testAerReshape() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     auto r = exec("clear\nset obs 3\ngen double a = _n\ngen double b = _n*10\n"
                   "xpose, clear varname\n"
                   "display \"RS_XP11=\" %22.17f v1[1]\n"
@@ -398,7 +398,7 @@ void testAerReshape() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     auto r = exec("clear\nset obs 4\ngen double a = _n\ngen double b = _n + 100\n"
                   "stack a b, into(sv) clear\n", s);
     check(firstError(r.blocks).is_null(),
@@ -443,7 +443,7 @@ void testAerReshape() {
     auto sampleSum = [&](int seed, double& n) {
       piet::SessionState s(workdir);
       s.eval.cwd = workdir;
-      s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+      s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
       auto r = exec(kMk100 + "set seed " + std::to_string(seed) + "\nsample 50\n", s);
       if (!firstError(r.blocks).is_null()) {
         n = std::nan("");
@@ -493,7 +493,7 @@ void testAerReshape() {
     auto draw = [&](int seed, std::vector<double>& per, double& ncMin, double& ncMax) {
       piet::SessionState s(workdir);
       s.eval.cwd = workdir;
-      s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+      s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
       auto r = exec(kMkG + "set seed " + std::to_string(seed) +
                         "\nbsample, cluster(g) idcluster(nc)\n",
                     s);
@@ -557,7 +557,7 @@ void testAerReshape() {
         "clear\nmatrix C = (1, 0.6 \\ 0.6, 1)\ndrawnorm u v, n(2000) corr(C) seed(3)\n";
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     auto r = exec(kDraw, s);
     check(firstError(r.blocks).is_null(),
           "AER-RESHAPE (x): `drawnorm u v, n(2000) corr(C) seed(3)` runs clean with no data in "
@@ -583,7 +583,7 @@ void testAerReshape() {
           "passes. Got " + fullPrec(rho));
     piet::SessionState s2(workdir);
     s2.eval.cwd = workdir;
-    s2.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s2.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     (void)exec(kDraw, s2);
     const double rho2 = runR(s2, "correlate u v", "rho");
     check(!std::isnan(rho2) && rho2 == rho,
@@ -596,7 +596,7 @@ void testAerReshape() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040);
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp);
     // eval.cwd alone puts rs_notes.dta in the PROCESS cwd -- the repo root --
     // and the round trip below then reads a file this leg never wrote.
     auto hasChar = [](piet::SessionState& ss, const std::string& vn, const std::string& cn,
@@ -648,7 +648,7 @@ void testAerReshape() {
   {
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     auto r = exec("clear\nset obs 6\ngen double x = _n / 3\n", s);
     check(firstError(r.blocks).is_null(),
           "AER-RESHAPE (xii): setup runs clean. Got `" + errText(firstError(r.blocks)) + "`");
@@ -690,7 +690,7 @@ void testAerReshape() {
     // and compares wrong.
     piet::SessionState s(workdir);
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     (void)exec("clear\nset obs 4\ngen double n = _n\n", s);
     const size_t varsBefore = varNames(s).size();
     auto r = exec("split n, parse(\"-\") gen(zz)\n", s);
@@ -711,7 +711,7 @@ void testAerReshape() {
     // Stata makes the caller say so.
     piet::SessionState s2(workdir);
     s2.eval.cwd = workdir;
-    s2.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s2.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     (void)exec("clear\nset obs 3\ngen double a = _n\ngen double b = _n*10\n", s2);
     auto r2 = exec("xpose\n", s2);
     auto err2 = firstError(r2.blocks);
@@ -731,7 +731,7 @@ void testAerReshape() {
     // must be refused as an OPTION, not accepted and dropped.
     piet::SessionState s3(workdir);
     s3.eval.cwd = workdir;
-    s3.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s3.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     (void)exec("clear\nset obs 20\ngen double g = 1\nreplace g = 2 in 11/20\n", s3);
     auto r3 = exec("sample 10, by(g)\n", s3);
     auto err3 = firstError(r3.blocks);

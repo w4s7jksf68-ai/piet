@@ -15,7 +15,7 @@ bool foldCommandCondition(std::string& cmd,
     static const std::unordered_set<std::string> kOwnRowCondition = {
         "generate", "gen", "g", "replace", "count", "keep", "drop",
         "by", "bys", "byso", "bysor", "bysort"};
-    // Graph commands read their `if` per plot layer (graph_m4.cpp), not from here.
+    // Graph commands read their `if` per plot layer (graph/twoway_parse.cpp), not from here.
     const registry::CommandSpec* routeSpec = registry::findByName(cmd);
     const bool graphFamily = routeSpec != nullptr && routeSpec->family == registry::Family::Graph;
     // BUG-1327 / BUG-1093: assert's `if` reads its constant string cells

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 // Command/file execution and authoritative dataset-view synchronization.
-import { appendBlock, appendBlocks, clearConsole, endDisplayLine, clearGraphGallery } from './console.js';
+import { appendBlock, appendBlocks, clearConsole, endDisplayLine } from './console.js';
+import { clearGraphGallery } from './graphics-gallery-store.js';
 import { updateVariables, appendHistory } from './panels.js';
 import { withMutationSummaries } from './result-blocks.js';
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 // Blocking native questions: answer or cancel; ordinary overlays cannot dismiss it.
-import { setMemoryBudgetMb } from './console.js';
+import { setMemoryBudgetMb } from './console-budget.js';
 import { setGridMemoryBudgetMb } from './grid.js';
 
 export function createRequestDialogController({ getClient, invalidateSettingsCache }) {

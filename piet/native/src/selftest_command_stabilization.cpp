@@ -195,8 +195,8 @@ void testCommandLayerStabilizationW3() {
 // silently created a column with an invalid Stata identifier. Each leg
 // below reproduces the ORIGINAL failure shape from the fuzz campaign
 // (fail_024/038/041_SILENT_SWALLOW.do) and asserts the fixed behavior; see
-// handlers_data_verbs.cpp::runSaveData/runRename, handlers.cpp::runUse/
-// runGen/runReplace, and strutil.h::isValidStataIdentifier.
+// fileio/dataset_save.cpp::runSaveData, datamgmt/variable_copy_rename.cpp::runRename, fileio/dataset_use.cpp::runUse/
+// datamgmt/data_generate.cpp::datamgmt/data_generate.cpp::runGen/runReplace, and strutil.h::isValidStataIdentifier.
 void testFuzzCampaignBugfixes() {
   std::printf("[selftest] --- W3 fuzzer-campaign bugfixes (save-.dta / rename / identifier) ---\n");
 
@@ -685,8 +685,8 @@ void testFuzzCampaignBugfixes() {
 // completion but did not CONVERGE) — the pre-fix code discarded that JSON
 // and manufactured a generic "[engine_error] cobra exited 1" instead of
 // surfacing the honest non-convergence diagnostics. See
-// handlers_data_verbs.cpp::runClonevar/writeColumnCsvRoundTrip,
-// cobra_runner.h/.cpp::cobraErrorMessage, and cobra_runner.cpp::runCobraJson.
+// datamgmt/variable_copy_rename.cpp::runClonevar (the CSV round-trip helper it once used is deleted),
+// piet/cobra_runner.h and engine/cobra_runner.cpp::cobraErrorMessage, and engine/cobra_runner.cpp::runCobraJson.
 void testW3FinalFixerBugfixes() {
   std::printf("[selftest] --- W3-final fixer bugfixes (clonevar-string / [internal] leak / "
               "exit-1 JSON) ---\n");

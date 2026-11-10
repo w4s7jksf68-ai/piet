@@ -11,10 +11,11 @@
 #include <utility>
 #include <vector>
 
-#include "piet/handlers.h"
+#include "piet/handlers/graph.h"
+#include "piet/user_paths.h"
 #include "piet/eval/errors.h"
 #include "io/win_compat.h"
-#include "support.h"
+#include "graph_support.h"
 
 namespace piet::handlers::graph_detail {
 using ojson = nlohmann::ordered_json;
@@ -43,7 +44,7 @@ static std::optional<nlohmann::ordered_json> loadGphFile(const std::string& path
   std::ifstream f(cecon::to_native_path(path), std::ios::binary);
   if (!f) return std::nullopt;
   // Whole-file slurp: the same `ostringstream << rdbuf()` idiom used
-  // throughout this codebase (doexec.cpp/handlers.cpp/main.cpp/routes.cpp/
+  // throughout this codebase (doexec.cpp/main.cpp/routes.cpp/
   // settings.cpp) rather than istreambuf_iterator, for consistency.
   std::ostringstream ss;
   ss << f.rdbuf();
@@ -292,7 +293,7 @@ ojson runGraphCombine(const std::vector<std::string>& names,
     // NOT quote-aware (eval/tokenizer.cpp's splitWs is a bare `>>` split),
     // so a token can arrive as e.g. `"a.gph"` with the quote characters
     // still embedded -- one-layer dequote first (same single-pair-strip
-    // rule as handlers.cpp's dequoteUserPath, replicated here per this
+    // rule as fileio/user_paths.cpp's dequoteUserPath, replicated here per this
     // TU's established per-file small-helper convention -- see
     // firstNameToken above) before either lookup.
     std::string tok = raw;

@@ -5,6 +5,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/resampling.h"
 namespace piet::dispatch_detail {
 bool interceptResampling(SessionState& session,
     ojson& blocks,
@@ -112,7 +113,7 @@ bool interceptRandomization(SessionState& session,
 
 
   // ------------------------------------------------------------------
-  // 0a-ter. `ritest` (E3, handlers_e3_ritest.cpp) -- intercepted before macro
+  // 0a-ter. `ritest` (E3, estimation/ritest_inference.cpp) -- intercepted before macro
   // expansion for the resampling prefixes' reason: its exp_list (`_b[tri]`,
   // `e(n)`) is evaluated after every replicate, never against the e() the
   // previous command left. The driver expands every other part itself.

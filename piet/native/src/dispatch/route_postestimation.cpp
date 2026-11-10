@@ -5,6 +5,9 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/estimates_tables.h"
+#include "piet/handlers/postestimation.h"
+#include "piet/handlers/results.h"
 namespace piet::dispatch_detail {
 bool route_postestimation(std::string& cmd,
     std::string& cmdTyped,
@@ -292,7 +295,7 @@ bool route_postestimation(std::string& cmd,
       }
       return true;
     }
-    // qreg2 (handlers_e3_qreg2.cpp): no engine refit exists for it; its linear-index
+    // qreg2 (estimation/qreg2_estimation.cpp): no engine refit exists for it; its linear-index
     // dy/dx comes from the posted e(b)/e(V) (w2j_e3_qreg2.log M01/M08).
     if (session.lastModel().has_value() && session.lastModel()->cobraCmd == "qreg2") {
       ojson r_qm = handlers::runQreg2Margins(parsed, session);

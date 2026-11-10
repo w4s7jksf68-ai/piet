@@ -1,5 +1,5 @@
 texsave 1.6.1 (Julian Reif) — MIT
-Adopted at: piet/native/src/handlers_aer_tables.cpp (the `texsave` section)
+Adopted at: piet/native/src/tables/table_tex_files.cpp, piet/native/src/tables/tables_internal.h (the `texsave` section)
 
 Project:  texsave — Stata module to save a dataset in LaTeX format
 Authors:  Julian Reif

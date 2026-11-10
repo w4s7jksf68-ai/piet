@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-#include "piet/handlers.h"
-#include "support.h"
+#include "piet/handlers/graph.h"
+#include "graph_support.h"
 #include "distribution.h"
 
 namespace piet::eval {

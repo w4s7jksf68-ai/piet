@@ -2,6 +2,7 @@
 // Existing behavioral tests: startup and paths.
 #include "selftest_support.h"
 #include "selftest_cases.h"
+#include "piet/user_paths.h"
 
 
 void testVersionSingleSource() {
@@ -219,12 +220,11 @@ void testLegalNoticesRoute() {
 // invariants ------------------------------------------------------------
 //
 // piet/native has no ctest harness — path-resolution invariants live here.
-// resolveUserPath replaces THREE independent forks (handlers.cpp's old
-// resolvePath, graph_m4.cpp's resolvePathG, handlers_m3.cpp's
-// resolveShimPath) plus several inline session.cwd-or-workdir() joins
-// (save/append/merge in handlers_data_verbs.cpp, postclose in
-// postfile.cpp) with ONE shared implementation; this leg is the one place
-// that consolidation now needs covering.
+// resolveUserPath (fileio/user_paths.cpp) is the ONE shared implementation of
+// path resolution; it replaced THREE independent forks (resolvePath,
+// resolvePathG, resolveShimPath) plus several inline session.cwd-or-workdir()
+// joins (save/append/merge, postclose in fileio/postfile.cpp); this leg is the
+// one place that consolidation now needs covering.
 void testResolveUserPath() {
   std::printf("[selftest] --- native-paths: piet::resolveUserPath invariants ---\n");
 

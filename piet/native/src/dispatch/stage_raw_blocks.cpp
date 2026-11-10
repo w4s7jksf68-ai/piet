@@ -4,6 +4,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/io.h"
 namespace piet::dispatch_detail {
 bool interceptControlBlocks(SessionState& session,
     ojson& echo,

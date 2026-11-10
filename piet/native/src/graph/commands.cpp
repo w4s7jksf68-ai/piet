@@ -9,10 +9,10 @@
 #include <utility>
 #include <vector>
 
-#include "piet/handlers.h"
+#include "piet/handlers/graph.h"
 #include "piet/eval/errors.h"
 #include "piet/twoway_opts.h"
-#include "support.h"
+#include "graph_support.h"
 
 namespace piet::handlers {
 using ojson = nlohmann::ordered_json;

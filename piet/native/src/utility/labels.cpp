@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
-#include "piet/handlers.h"
+#include "piet/handlers/utility.h"
+#include "piet/handlers/variables.h"
 
 #include <algorithm>
 #include <cctype>
@@ -36,8 +37,8 @@
 #include "piet/session_state.h"
 #include "piet/strutil.h"
 
-#include "support.h"
-#include "options.h"
+#include "utility_support.h"
+#include "utility_options.h"
 
 namespace piet::handlers {
 using ojson = nlohmann::ordered_json;

@@ -4,8 +4,8 @@
 // data_mutation envelope every handler TU that mutates the loaded dataset
 // returns (mirrors piet/backend/piet/mutate.py's `_mutation_result`).
 //
-// Consolidated from FOUR near-identical per-TU copies (handlers.cpp,
-// handlers_m3.cpp, handlers_data_verbs.cpp, egen.cpp) per Eval's rule-of-
+// Consolidated from FOUR near-identical per-TU copies (one in each of the
+// handler files that mutate the dataset) per Eval's rule-of-
 // three call (COMMS §4 item 9): the duplication had already caused three
 // separate MEASURED problems — an ordering defect present in all four that
 // a single-copy fix would have left broken in the other three, an

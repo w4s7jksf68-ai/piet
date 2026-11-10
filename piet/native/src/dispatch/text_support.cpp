@@ -40,8 +40,8 @@ std::string rstripColon(std::string s) {
 // formation site subsumed every second copy of a spelling set. Measured: it does
 // for the if-chain arms, kNoDataCommands and kFixedArityCommands, but NOT for
 // two handlers that hold their own copy —
-//   · handlers_m3.cpp's runMatrixDef (five `^\s*mat(?:rix)?\s+…` regexes)
-//   · handlers_m3.cpp's runLabelDefine (`^label\s+define\s+`)
+//   · matrix/matrix_commands.cpp's runMatrixDef (five `^\s*mat(?:rix)?\s+…` regexes)
+//   · datamgmt/label_metadata.cpp's runLabelDefine (`^label\s+define\s+`)
 // — because they receive `parsed.raw`, never `cmd`. Under the widened sets
 // `matr list X` and `labe define L 1 "a"` would have fallen through to those
 // handlers' generic "unsupported form" rejects: a WRONG ANSWER wearing a

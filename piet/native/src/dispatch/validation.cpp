@@ -56,8 +56,8 @@ bool commandNeedsNoData(const std::string& cmd) {
       // needs actual variable statistics and errors with no data, so it
       // stays on the outer no-data guard, unaffected. The "describe"/"desc"
       // arm below special-cases !session.hasData() itself rather than
-      // calling handlers::runDescribe() (handlers.cpp, out of this
-      // workstream's manifest), whose own internal guard still returns
+      // calling handlers::runDescribe() (descriptive/describe.cpp),
+      // whose own internal guard still returns
       // noDataLoaded() unconditionally.
       // BUG-105 abbreviation stopgap: `d` is listed here for the same
       // reason `desc` is — an alias that routes to the describe arm but

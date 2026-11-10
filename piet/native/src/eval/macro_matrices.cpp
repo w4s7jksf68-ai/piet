@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
-// macro matrices: see macro_modules.md for ownership and call flow.
+// macro matrices: see README.md for ownership and call flow.
 #include "piet/eval/macros.h"
 #include "estimators/postest_names.h"  // coefFullName: the engine's coefficient-name rule
 
-#include "../dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
+#include "dispatch/dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
 
 #ifndef _WIN32
 #include <fnmatch.h>  // WP-W5: POSIX-only; the Windows branch uses globMatchPeriod below
@@ -648,7 +648,7 @@ EvalSession::EMatrixAnswer EvalSession::resolveEMatrixFor(const std::string& nam
     return a;
   }
   // e(beta) and e(V_modelbased) of a fit whose block records them (regress's
-  // `beta_std`, a built-in multiway fit's `e_Vmb`; estimation_m4.cpp
+  // `beta_std`, a built-in multiway fit's `e_Vmb`; estimation/estimation_results.cpp
   // postENameListsRegressM4): read at the moment of need from a local copy of
   // the live block with its coefficients (covariance) replaced, through the very
   // e(b) (e(V)) reader below, so they carry e(b)'s (e(V)'s) stripe -- the base
@@ -752,7 +752,7 @@ EvalSession::EMatrixAnswer EvalSession::resolveFitEMatrixFrom(
     if (row.key != nullptr && row.rule == EStripe::kRefuse) return refuse(rowReason());
     return fail(111, "matrix e(" + name + ") not found", true);
   }
-  // `erepost b = M` (handlers_aer_tables.cpp runErepost marks the block): on a
+  // `erepost b = M` (tables/table_erepost.cpp runErepost marks the block): on a
   // posting with no e(b) (estpost) the rows ARE M -- its names, its order, no
   // e(V) (erepost.ado `eret post `b''; w2v_estpost_ematrix.log
   // ep14e_colnames_eb `c1 c2`, ep14e2_colnames_eb `x1 x2`). On a fit the rows
@@ -1039,7 +1039,7 @@ EOperand resolveEOperand(const EvalSession& session, const std::string& name) {
 //     (`se11=type mismatch`, display_rc=109, after a failed fit under
 //     `ereturn clear`), and the r() twin's w2c_postest.log:377-384;
 //   * a subscript `e(NAME)[i,j]` / `r(NAME)[i,j]`: e() keeps the r(111) of
-//     display's own whole-token arm (display_hardening.cpp resolveToken 3b,
+//     display's own whole-token arm (language/scalar_expression.cpp resolveToken 3b,
 //     posted matrices only, W2D-T03), r() keeps absentRMatrixRc's r(198)
 //     (w2c_postest.log:363-370); an index outside a present matrix is r(503);
 //   * a refusal from resolveEOperand, and an off-diagonal cell of an e(V) that
@@ -1156,7 +1156,7 @@ using namespace macro_detail;
 
 // A matrix cell can hold Stata's missing, and pythonFloatRepr spells that "nan",
 // which is a NameError once it is substituted back into the expression. Emit the
-// missing TOKEN instead (`.`, or `.a` for a `.a` cell, handlers_m3.cpp stores
+// missing TOKEN instead (`.`, or `.a` for a `.a` cell, matrix/matrix_commands.cpp stores
 // stataMissingWithKind) -- replaceStataMissingLiterals runs after this pass and
 // turns it back into the exact double. A decimal spelling of a band value would
 // be read by the next layer as a number. Reachable from B3(c) onward because

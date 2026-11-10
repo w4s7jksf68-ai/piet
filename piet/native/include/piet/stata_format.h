@@ -5,7 +5,7 @@
 // WHY THIS FILE EXISTS (BUG-195).
 // -------------------------------
 // PIET had TWO hand-written renderers for `%w.Pg`:
-//   * display_hardening.cpp's applyStataFmtLocal(), serving the `display`
+//   * language/display_number_format.cpp's applyStataFmtLocal(), serving the `display`
 //     command, and
 //   * eval/exprfns.cpp's applyStataFmt(), serving `string(x, "fmt")` and
 //     `tostring, usedisplayformat`.
@@ -102,7 +102,7 @@
 // 0x7fe -> +3ff), which is what hexFloat() prints for every value; a negative
 // zero prints as zero (w2x_fn_string_math fx_ceil_edges: ceil(-0.5) is
 // +0.0000000000000X-3ff). Grammar: display claims `%21x` and `%-21x` in its
-// own renderer (display_hardening.cpp renderHex21, which spells the same
+// own renderer (language/display_number_format.cpp renderHex21, which spells the same
 // fields); string() admits only the 21-wide, flag-free spec (1107 golden
 // uses, all `%21x`) through a `(?=21x$)` alternative of its own regex, which
 // leaves the width group unmatched and puts `21` in the precision group, and

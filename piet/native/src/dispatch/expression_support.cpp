@@ -4,6 +4,7 @@
 #include "text_support.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/session_commands.h"
 
 namespace piet::dispatch_detail {
 
@@ -460,7 +461,7 @@ bool tryCLocal(const std::string& rawLine, SessionState& session, nlohmann::orde
 // NAMED GAP (2026-09-09, review finding 11): the operand scanner below bounds a
 // literal with a bare rfind('"')/find('"') and does NOT understand the `\"`
 // escaping resolveERef (macros.cpp) and resolveEStringLiteral
-// (display_hardening.cpp) emit. Unreachable today -- measured: PIET refuses
+// (language/scalar_expression.cpp) emit. Unreachable today -- measured: PIET refuses
 // compound double quotes, so no e-string can carry a `"` -- so this is a pin
 // owed whenever that gap closes, not a live defect.
 // String FUNCTIONS on a constant (`inlist(e(cmd),"a")`, `strpos(e(cmdline),
@@ -1074,8 +1075,8 @@ std::string substituteRowExprRefs(const std::string& in, SessionState& session,
 
 
 // W2D-T01 round 3: test/testparm/lincom/nlcom/estat/erepost act on the model
-// already installed and may re-enter setLastModel on it (estimation_m4c.cpp
-// setEstHandleM4, the estat re-call; handlers_aer_tables.cpp runErepost). In
+// already installed and may re-enter setLastModel on it (postestimation/postestimation_context.cpp
+// setEstHandleM4, the estat re-call; tables/table_erepost.cpp runErepost). In
 // Stata they leave e() alone (test/lincom/nlcom store r() only; repost changes
 // b/V and nothing else), so a live posting and the names recorded on top of
 // the fit must survive them; none of the six writes the e() stores itself, so

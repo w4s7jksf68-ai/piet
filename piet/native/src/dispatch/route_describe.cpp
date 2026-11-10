@@ -5,6 +5,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/descriptive.h"
 namespace piet::dispatch_detail {
 bool route_describe(std::string& cmd,
     eval::ParsedCommand& parsed,
@@ -38,7 +39,7 @@ bool route_describe(std::string& cmd,
     // already carries every Stata percentile (verified live: p1/p5/p10/
     // p25/p50/p75/p90/p95/p99), and runSummarize forwards that raw per-var
     // object VERBATIM into its "stats" — summarize's own renderer just
-    // never displays them. No handlers.cpp changes needed: both
+    // never displays them. No handler changes needed: both
     // runSummarize and runDescribe's per-variable logic are reused/mirrored
     // as-is.
     if (!session.hasData()) {
@@ -569,8 +570,8 @@ bool route_describe(std::string& cmd,
         handlers::runLevelsof(parsed.varlist[0], localName, clean, parsed.ifExpr, session));
     if (result.value("type", "") == "levelsof" && result.contains("levels") &&
         result["levels"].is_array()) {
-      // handlers::runLevelsof (handlers_m3.cpp — outside this batch's file
-      // scope) has no missing/separate support at all: its numeric/factor
+      // handlers::runLevelsof (descriptive/levels_command.cpp) has no
+      // missing/separate support at all: its numeric/factor
       // scan explicitly drops NaN/negative codes (missing) and always
       // space-joins. Both are applied here as a post-process over its
       // `levels` array instead of duplicating that scan. `missing` appends
@@ -678,7 +679,7 @@ bool route_describe(std::string& cmd,
     // dropped filter would silently list the WRONG variables, which is worse
     // than an error. B5-D7: `not` is now accepted (kVocabDs.known) and
     // implemented as the complement of the varlist against every variable in
-    // the dataset — runKeep's own complement idiom (handlers_m3.cpp). Measured
+    // the dataset — runKeep's own complement idiom (datamgmt/observation_selection.cpp). Measured
     // B4REC|ds|not|0| (tests/eval/golden/aer_b4/pins_oracle_r.log:163-164).
     // Bound to the REGISTERED vocabulary below (kVocabDs), not an inline
     // literal set — this arm used to carry its own duplicate copy of

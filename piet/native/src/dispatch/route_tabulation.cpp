@@ -6,6 +6,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/descriptive.h"
 namespace piet::dispatch_detail {
 bool route_tabulation(std::string& cmd,
     std::string& cmdTyped,
@@ -709,7 +710,8 @@ bool route_tabulation(std::string& cmd,
 
   if (cmd == "tabstat") {
     // A refused tabstat leaves r() empty. That is judged after the line, by
-    // rTableAfterCommand's leaf rule (handlers_aer_estim.cpp), for every tabstat
+    // rTableAfterCommand's leaf rule (postestimation/rtable_rclass_lifecycle.cpp),
+    // for every tabstat
     // that ended in an error, the refusals raised before this arm included
     // (BUG-1151).
     auto failed = [&](ojson blk) {

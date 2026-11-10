@@ -8,6 +8,11 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/data_values.h"
+#include "piet/handlers/descriptive.h"
+#include "piet/handlers/gtools_aliases.h"
+#include "piet/handlers/observations.h"
+#include "piet/handlers/variables.h"
 namespace piet::dispatch_detail {
 bool executeByPrefix(std::string& cmd,
     eval::ParsedCommand& parsed,

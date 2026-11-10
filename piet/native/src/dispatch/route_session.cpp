@@ -7,6 +7,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/session_commands.h"
 namespace piet::dispatch_detail {
 bool route_session(std::string& cmd,
     eval::ParsedCommand& parsed,
@@ -35,9 +36,10 @@ bool route_session(std::string& cmd,
 
   if (cmd == "set" && !parsed.varlist.empty() && lower(parsed.varlist[0]) == "graphics") {
     // BS-047 (BETA A4): `set graphics on|off` is now genuinely tracked —
-    // graph_m4.cpp's twoway/graph_combine builders read session.graphicsOff
-    // to populate the wire-schema `suppressed` field (previously hardcoded
-    // false; see graph_m4.cpp's own comment at both call sites).
+    // the twoway builder (graph/twoway.cpp) and the graph combine builder
+    // (graph/files.cpp) read session.graphicsOff to populate the wire-schema
+    // `suppressed` field (previously hardcoded false; see the comment at each
+    // of those call sites).
     std::string arg = parsed.varlist.size() > 1 ? lower(parsed.varlist[1]) : std::string();
     if (arg.empty()) {
       std::smatch m;
@@ -74,7 +76,8 @@ bool route_session(std::string& cmd,
     // BS-048 (BETA A4): `set level #` / `set clevel #` — the session
     // default confidence level, consulted ONLY when a command's own
     // `level(#)` option is absent (the existing --level flow:
-    // buildEstimationArgvM4 / handlers.cpp::runRegress / runTtest).
+    // buildEstimationArgvM4 in estimation/estimation_support.cpp, runRegress in
+    // estimation/linear_estimation.cpp, runTtest in descriptive/descriptive_statistics.cpp).
     std::smatch m;
     static const std::regex reSetLevel(R"(\bset\s+(?:level|clevel)\s+(\S+))", std::regex::icase);
     std::string nArg = parsed.varlist.size() > 1 ? parsed.varlist[1] : std::string();
@@ -603,7 +606,7 @@ bool route_session(std::string& cmd,
 
 
   // BUG-180 (P2-PREP): `rmdir DIR` had NO arm at all — see runRmdir
-  // (handlers_m3.cpp) for the live-probed semantics and the benchmark-harness
+  // (environment/filesystem_commands.cpp) for the live-probed semantics and the benchmark-harness
   // failure that surfaced it.
   if (cmd == "rmdir") {
     ojson r = handlers::runRmdir(parsed.raw, parsed.varlist, parsed.opts, session);

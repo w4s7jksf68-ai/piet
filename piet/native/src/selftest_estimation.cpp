@@ -537,8 +537,8 @@ void testAerEstimBundle() {
 
   // (j) E3. Registered so the NAME resolves, refused with a cause the route
   // drift guard can tell apart from an unrecognised token. Each name's own
-  // selftest_w2_e3<cmd>.cpp now owns its refusal arm (the native task flips it);
-  // this leg stays as the cross-name count of eight.
+  // per-command selftest file (see SELFTESTS.md) now owns its refusal arm (the
+  // native task flips it); this leg stays as the cross-name count of eight.
   {
     piet::SessionState session(workdir);
     (void)piet::dispatch("use " + autoFix + ", clear", session);
@@ -563,9 +563,9 @@ void testAerEstimBundle() {
     // (handlers_e3_{swindex,acreg,suest}.cpp; their legs live in testW2E3Swindex /
     // testW2E3Acreg / testW2E3Suest, oracles w2j_e3_swindex.log, w2j_e3_acreg.log,
     // w2j_e3_builtin.log S_*). Four since: `rlasso` left E3
-    // (handlers_e3_lasso.cpp runRlasso; testW2E3Lasso, oracle w2j_e3_rlasso.log).
-    // Three since: `ritest` left E3 (handlers_e3_ritest.cpp; testW2E3Ritest,
-    // oracle w2j_e3_ritest.log). Two since: `qreg2` left E3 (handlers_e3_qreg2.cpp;
+    // (estimation/lasso_estimation.cpp runRlasso; testW2E3Lasso, oracle w2j_e3_rlasso.log).
+    // Three since: `ritest` left E3 (estimation/ritest_inference.cpp; testW2E3Ritest,
+    // oracle w2j_e3_ritest.log). Two since: `qreg2` left E3 (estimation/qreg2_estimation.cpp;
     // testW2E3Qreg2, oracle w2j_e3_qreg2.log).
     check(refused == 2,
           "H/E3: both refuse with reason `refused:e3_deferred` -- got " +
@@ -1459,7 +1459,7 @@ void testBUG331Offset() {
 // any confidence level. Cross-checks the raw `cobra` CLI directly (the fix
 // lives in apps/cmds/{cmds_mle,cmds_panel}.cpp + options_table.cpp, none of
 // which PIET's dispatcher forwards `level()` into yet for these four verbs —
-// see the estimation_m4.cpp reject sites this same fix leaves stale, filed
+// see the reject sites under estimation/ this same fix leaves stale, filed
 // separately) against the same tests/validate fixtures the estimator unit
 // tests (test_nbreg/test_tobit/test_heckman/test_xtpois) already pin:
 // tobit.hbin, heckman.hbin, xtpois_in.hbin. Two independent proofs per

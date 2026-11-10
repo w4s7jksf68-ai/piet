@@ -108,7 +108,7 @@ PyEvalOutcome evalPyExprDetailed(const std::string& expr, const PyNamespace& ns)
 // bd_sca_div0, bd_inl_div0 at rc 0). While a scope is alive on this thread, `/`
 // by zero evaluates to the missing sentinel instead of raising
 // ZeroDivisionError. The Stata expression surfaces (eval::evalArith and
-// eval::evalMacroExpr, strmutate.cpp's string row evaluator, loops.cpp's
+// eval::evalMacroExpr, datamgmt/row_evaluation.cpp's string row evaluator, language/if_while_condition.cpp's
 // `if`/`while` condition) open one; a caller that wants Python's semantics (the
 // pyeval contract selftest, postfile) simply does not. Scopes nest.
 //

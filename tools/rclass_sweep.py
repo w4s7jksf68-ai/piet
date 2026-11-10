@@ -830,7 +830,7 @@ def table_sweep(a):
 
 def default_registry_path():
     here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.normpath(os.path.join(here, "..", "piet", "native", "src", "registry.cpp"))
+    return os.path.normpath(os.path.join(here, "..", "piet", "native", "src", "dispatch", "registry.cpp"))
 
 
 def main():

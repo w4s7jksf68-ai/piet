@@ -23,7 +23,7 @@ void testTempfileReapedOnProgramReturnBug360() {
   //
   // And note `export delimited`, not `save`. A `save` to a MINTED tempfile is
   // routed to the engine's in-RAM virtual-file table when the resident plane is
-  // live (handlers_data_verbs.cpp's isMintedTempfile arm) and writes NO bytes,
+  // live (fileio/dataset_save.cpp's isMintedTempfile arm) and writes NO bytes,
   // so a disk-existence assertion against it would pass whether or not this fix
   // works — a false green. `export delimited` always writes real bytes.
   // (`confirm file` is no help either: it consults the filesystem and is blind
@@ -1647,7 +1647,7 @@ void testBUG112DoexecRaiiReap() {
     f << "display 1\n";
   }
 
-  // Mirrors runTempfile's own minting shape (handlers_m3.cpp) so the guard
+  // Mirrors runTempfile's own minting shape (language/temporary_names.cpp) so the guard
   // is exercised against a realistic session.runTempdir value, not a stand-in.
   std::string mintedTempdir = workdir + "/tmp_bug112_7";
   fs::create_directories(mintedTempdir, ec);

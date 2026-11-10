@@ -5,6 +5,8 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/variables.h"
+#include "piet/handlers/vce_types.h"
 namespace piet::dispatch_detail {
 bool tokenizeCommand(std::string& cmd,
     std::string& cmdTyped,

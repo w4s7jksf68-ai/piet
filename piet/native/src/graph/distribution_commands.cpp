@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "piet/handlers.h"
+#include "piet/handlers/graph.h"
 #include "piet/cobra_runner.h"
 #include "piet/dispatcher.h"
 #include "piet/display_hardening.h"
@@ -26,7 +26,7 @@
 #include "piet/translate.h"
 #include "piet/twoway_parse.h"
 #include "io/win_compat.h"
-#include "support.h"
+#include "graph_support.h"
 #include "distribution.h"
 
 namespace piet::handlers::graph_detail {

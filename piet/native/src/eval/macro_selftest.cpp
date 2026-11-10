@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
-// macro selftest: see macro_modules.md for ownership and call flow.
+// macro selftest: see README.md for ownership and call flow.
 #include "piet/eval/macros.h"
 #include "estimators/postest_names.h"  // coefFullName: the engine's coefficient-name rule
 
-#include "../dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
+#include "dispatch/dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
 
 #ifndef _WIN32
 #include <fnmatch.h>  // WP-W5: POSIX-only; the Windows branch uses globMatchPeriod below

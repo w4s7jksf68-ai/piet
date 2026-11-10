@@ -6,6 +6,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/data_values.h"
 namespace piet::dispatch_detail {
 bool route_data_generate(std::string& cmd,
     std::string& cmdTyped,
@@ -444,8 +445,8 @@ bool route_data_generate(std::string& cmd,
 
 
   // BS-003/D4 (BETA B-data): `destring`/`tostring` — PIET-NATIVE (no cobra
-  // verb, no hbin-v2 dependency; handlers_data_verbs2.cpp's runDestring/
-  // runTostring ride the existing factor-column machinery).
+  // verb, no hbin-v2 dependency; datamgmt/destring.cpp's runDestring and
+  // datamgmt/tostring.cpp's runTostring ride the existing factor-column machinery).
   //
   // BUG-664/665 (closes BUG-440): both now take a VARLIST, as Stata's destring
   // and tostring do -- the handler converts one variable and this arm loops

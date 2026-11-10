@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 // Native preferences, UI persistence, consent, and appearance.
-import { setMemoryBudgetMb } from './console.js';
+import { setMemoryBudgetMb } from './console-budget.js';
 import { setGridMemoryBudgetMb } from './grid.js';
 import { RECENT_KEY } from './recent-files.js';
 import { SPLIT_KEY } from './layout.js';

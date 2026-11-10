@@ -9,7 +9,7 @@ namespace piet::dispatch_detail {
 
 
 // e(sample) T4 (w2_esample.log:1692 H1 `0|60|60|`, :1725 H2 `0|47|47|`): an ML
-// fit installed its model (estimation_m4.cpp cacheLastModelM4) with no mask;
+// fit installed its model (estimation/panel_estimation.cpp cacheLastModelM4) with no mask;
 // esampleInstallMlMask writes it on the head and only the e(sample) fields of
 // the live model move (setLastModelEsample) -- a second setLastModel would drop
 // the e() keys the handler posted after its own (e(chi2type), e(rules)). A mask
@@ -43,8 +43,8 @@ void installMlEsampleAfterFit(const ojson& block, SessionState& session) {
 
 
 // Replace-or-append a user matrix (tabulate's matcell()/matrow()/matcol()).
-// The same three lines are file-local twice already (handlers_aer_results.cpp
-// storeMatrix, handlers_m3.cpp storeMatrixResult); neither is reachable from
+// The same three lines are file-local twice already (matrix/variables_to_matrix.cpp
+// storeMatrix, matrix/matrix_expression.cpp storeMatrixResult); neither is reachable from
 // here. Replace, never append: findMatrix() answers the FIRST match. A scalar
 // of the same name is destroyed: scalars and matrices share one namespace ([P]
 // matrix define, "Namespace").
@@ -86,7 +86,7 @@ std::string dequoteEstTitle(std::string t) {
 // scratch -- as does the same model after `estimates store` + `estimates
 // restore`. The verbs then failed with
 // `[data_io] cannot open .../piet_native_XXXX/...hbin` at rc 1. predict already
-// refuses this shape by name (estimation_m4c.cpp, the BUG-518 remainder); this
+// refuses this shape by name (postestimation/prediction.cpp, the BUG-518 remainder); this
 // is its sibling for the verbs whose ONLY path is that replay. NOT margins:
 // `margins, dydx()` after a linear fit answers from the coefficient table
 // (buildLinearAmeRawM4) without the file, so a guard here would refuse a

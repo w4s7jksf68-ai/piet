@@ -2,6 +2,9 @@
 // Existing behavioral tests: bridge routes.
 #include "selftest_support.h"
 #include "selftest_cases.h"
+#include "piet/handlers/data_values.h"
+#include "piet/handlers/observations.h"
+#include "piet/handlers/variables.h"
 
 
 // --- 4. (M4b) bridge routes --------------------------------------------------
@@ -276,7 +279,7 @@ void testBridgeRoutesM4b() {
     // supposed to consult). Datastore::fullScanCount() (datastore.h)
     // instruments the MECHANISM instead of the value: it counts every
     // nMissing() call that fell through the nMissSeed_ lookup into a real
-    // O(rows) scan. mutationResult (handlers_m3.cpp) builds a BRAND NEW
+    // O(rows) scan. mutationResult (engine/mutation_result.cpp) builds a BRAND NEW
     // Datastore per mutation (invalidateDatastore()+datastore()), so a
     // freshly-refetched ds's counter starts at 0 and reflects only what THIS
     // sort's own varlist()-cache build did. nMissCache_ already covers every
@@ -311,7 +314,7 @@ void testBridgeRoutesM4b() {
   }
   {
     // MAXPERF gate (fix/sort-validate-lazy): runSort's varlist NAME-only
-    // validation (handlers_m3.cpp) must consult the resident shadow card
+    // validation (datamgmt/observation_selection.cpp) must consult the resident shadow card
     // (session.shadowVarlistIfCurrent()) instead of unconditionally forcing
     // session.datastore() open the current hbin — that eager re-open purely
     // to answer "does column X exist" was the measured ~700ms-1700ms/sort
@@ -359,8 +362,8 @@ void testBridgeRoutesM4b() {
   }
   {
     // Card-tax gate sibling: `gsort` (descending is its native `-var`
-    // spelling) delegates to handlers_data_verbs.cpp's runGsort — a SEPARATE
-    // mutationResult copy from handlers_m3.cpp's runSort just gated above.
+    // spelling) delegates to datamgmt/data_order.cpp's runGsort — a SEPARATE
+    // mutationResult call site from datamgmt/observation_selection.cpp's runSort just gated above.
     // Reused via sortRoute (not the "command" route) to stay off dispatch()'s
     // resident-frame short-circuit, same as the setup above.
     nlohmann::json sb3{{"varlist", nlohmann::json::array({"mpg"})},
@@ -396,7 +399,7 @@ void testBridgeRoutesM4b() {
     // Sibling to the three gates above, but for seedNMissForPureAdd branch
     // (2) (session_state.cpp: action=="gen" && newVars.empty() &&
     // !rewrittenVars.empty()) instead of their shared branch (5). runReplace
-    // (handlers.cpp) passes `varname` as mutationResult's 5th (rewrittenVars)
+    // (datamgmt/data_generate.cpp) passes `varname` as mutationResult's 5th (rewrittenVars)
     // argument; branch 2 erases exactly that column from the carried seed
     // (its value just changed, so its old count is untrustworthy) and seeds
     // every other column — ONE real rescan, not zero. Prime with another
@@ -567,8 +570,8 @@ void testBridgeRoutesM4b() {
   // lazy mechanism (session.shadowVarlistIfCurrent(), Datastore::
   // constructCount() instrumentation — both in datastore.h/session_state.h,
   // both already proven by the sort construct-count gate above) from runSort
-  // to drop/keep/gsort/order: handlers_m3.cpp (drop/keep) and
-  // handlers_data_verbs.cpp (gsort/order) each now consult the resident
+  // to drop/keep/gsort/order: datamgmt/observation_selection.cpp (drop/keep) and
+  // datamgmt/data_order.cpp (gsort/order) each now consult the resident
   // shadow card before falling back to session.datastore() purely to
   // validate column NAMES.
   //
@@ -1507,7 +1510,7 @@ void testBridgeRoutesM4b() {
   // MAXPERF S4a gate (fix/verb-overhead-sweep) — strmutate::factorColumns, the
   // names-and-dtypes predicate that was re-opening the whole dataset.
   //
-  // WHAT IS BEING GATED. factorColumns (strmutate.cpp) answers "which columns
+  // WHAT IS BEING GATED. factorColumns (datamgmt/row_evaluation.cpp) answers "which columns
   // are factors", and it was answering it with session.datastore() — which on a
   // resident chain first calls ensureMaterializedHead(), snapshotting the whole
   // virtual 164 MB frame to disk, and then mmaps and header-parses it. (It does
@@ -1525,7 +1528,7 @@ void testBridgeRoutesM4b() {
   // WHY THIS LEG IS DIRECT AND NOT DRIVEN THROUGH A VERB. Every verb that
   // reaches factorColumns also, on at least one of its branches, legitimately
   // opens the datastore afterwards (runCount does so unconditionally,
-  // handlers_m3.cpp:772), and session.datastore() memoizes — so an unfixed
+  // descriptive/data_listing.cpp), and session.datastore() memoizes — so an unfixed
   // factorColumns and a fixed one would both read a total of ONE construct
   // through those verbs. A check that cannot fail is not a gate (the same
   // reasoning the S1 legs above give for using the chain shape rather than a
@@ -1548,7 +1551,7 @@ void testBridgeRoutesM4b() {
 
     piet::Datastore::resetConstructCount();
     // `mpg > 20` names no factor, uses no string fn and holds no literal — so
-    // needsStringCount cannot short-circuit (strmutate.cpp checks usesStringFn
+    // needsStringCount cannot short-circuit (datamgmt/row_evaluation.cpp checks usesStringFn
     // and hasStringLiteral first) and MUST consult the complete dtype map to
     // answer. This is the measured call.
     const bool numericNeedsString =
@@ -1658,10 +1661,10 @@ void testBridgeRoutesM4b() {
     piet::SessionState::resetCardFoldCount();
     // Driven through dispatch() with NOTHING entered here: the resident opt-in
     // must come from runKeepIf's own `SessionState::ResidentEligible`
-    // (handlers_m3.cpp). An earlier draft of this leg entered that guard
+    // (datamgmt/observation_selection.cpp). An earlier draft of this leg entered that guard
     // itself, which made every assertion below pass while production still
     // routed `keep if` stateless — the gate proved the card path and silently
-    // assumed the wiring. Delete either opt-in line in handlers_m3.cpp and this
+    // assumed the wiring. Delete either opt-in line in datamgmt/observation_selection.cpp and this
     // leg goes red, which is the only thing that makes it a ROUTING gate rather
     // than a card gate wearing one's clothes.
     nlohmann::ordered_json blk = mutationBlock(piet::dispatch("keep if mpg > 20", session));
@@ -1861,7 +1864,7 @@ void testBridgeRoutesM4b() {
   // without the re-fit.
   //
   // WHAT IS BEING GATED. lincom/nlcom/test used to rebuild the whole model
-  // specification on every call (estimation_m4.cpp's lastModelBaseArgv) and the
+  // specification on every call (postestimation/postestimation_context.cpp's lastModelBaseArgv) and the
   // engine answered by fitting that model AGAIN — measured at 54 lincom calls /
   // 22.61 s in one dependent-variable pass, 17 % of it. contract_A §31 lets the
   // engine retain the fit and PIET address it by an opaque handle, so only the

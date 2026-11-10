@@ -139,8 +139,8 @@ void hoistTwowayLevelOptions(twoway::ParseResult& pr) {
 
 // W4, "honesty over silence". A graph arm pushes exactly ONE block, so a note
 // cannot be a sibling display block; it is appended to the block's own `note`
-// string, which every graph renderer already draws (graph_m4.cpp:75 gives every
-// bare block the key, and handlers_aer_graphx.cpp:294 does the same thing for
+// string, which every graph renderer already draws (graph/commands.cpp gives every
+// bare block the key, and graph/graph_extension_support.cpp does the same thing for
 // grc1leg/event_plot -- this is that helper, at the dispatcher).
 //
 // `applied` is the set of keys the path that BUILT this block actually read, so

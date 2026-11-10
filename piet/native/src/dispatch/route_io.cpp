@@ -4,6 +4,8 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/io.h"
+#include "piet/user_paths.h"
 namespace piet::dispatch_detail {
 bool route_io(std::string& cmd,
     std::string& cmdTyped,

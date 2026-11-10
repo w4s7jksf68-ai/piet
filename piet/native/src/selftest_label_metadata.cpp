@@ -19,7 +19,7 @@ void testAerUtilRenameLabel() {
   };
   auto seed = [&](piet::SessionState& s) {
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
   };
   auto firstError = [](const nlohmann::ordered_json& blocks) -> nlohmann::ordered_json {
     for (const auto& b : blocks)

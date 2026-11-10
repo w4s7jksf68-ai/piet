@@ -301,7 +301,7 @@ const piet::eval::OptVocab& kVocabCodebook = piet::eval::registerOptVocab(
 
 // B5-D5: `fullnames` moves to known -- a VALIDATED NO-OP, not a semantics
 // change. The describe block always carries the FULL, untruncated variable
-// name (handlers.cpp's describeEntry: entry["name"] = name;) and the one
+// name (descriptive/describe.cpp's describeEntry: entry["name"] = name;) and the one
 // renderer sizes its name column to the longest name present
 // (console.js:formatDescribe, nameW = Math.max(13, ...v.name.length)) -- PIET
 // never abbreviates, so `fullnames` is satisfied by construction. Measured
@@ -521,7 +521,7 @@ const piet::eval::OptVocab& kVocabExport = piet::eval::registerOptVocab(
      {{"sh", "sheet"}, {"q", "quote"}}});
 
 // Item 5 (User ruling 2026-09-09): `post` moves from `unimplemented` to
-// `known` — it now really is implemented (estimation_m4c.cpp's runNlcom).
+// `known` — it now really is implemented (postestimation/hypothesis_tests.cpp's runNlcom).
 // `nlcom` is NOT in kOptMinComplete (generated/opt_minimums_bug264.inc), so
 // this arms the generic >=2-char unique-prefix rule for `post` (`po`/`pos`
 // would start resolving) — an UNMEASURED widening, not captured by any
@@ -569,14 +569,15 @@ const piet::eval::OptVocab& kVocabEncode = piet::eval::registerOptVocab(
 // site is cited, and testAerW2OptVocabTwoWay() pins the transcription against
 // the live dispatcher — a drifted copy fails the selftest, it does not rot.
 //
-// regress/feols: handlers.cpp:1571-1615 reads vce/vcov/robust/cluster/
-// noconstant/nocons/level/absorb; :1645 names `beta` as the real-but-unwired
-// one. `keepsingletons` is deliberately in NEITHER set: handlers.cpp:1638
-// rejects it outright for regress/feols (real Stata has it on reghdfe only),
-// and reghdfe's own vocabulary is kVocabIvRegress (estimation_m4.cpp:141).
+// regress/feols: runRegress (estimation/linear_estimation.cpp) reads vce/vcov/
+// robust/cluster/noconstant/nocons/level/absorb and names `beta` as the
+// real-but-unwired one. `keepsingletons` is deliberately in NEITHER set:
+// runRegress rejects it outright for regress/feols (real Stata has it on
+// reghdfe only), and reghdfe's own vocabulary is kVocabIvRegress
+// (estimation/estimation_options.cpp).
 // BUG-473: `absorb` stays in this shared set (so `ab()` keeps resolving to
 // the full spelling for the reject message) but is gated by the ACTUAL Stata
-// word the user typed, same shape as `keepsingletons` — handlers.cpp's own
+// word the user typed, same shape as `keepsingletons` — runRegress's own
 // reject net answers r(198) "option absorb() not allowed" when stataCmd ==
 // "regress", and still builds the FE model for feols/reghdfe/areg.
 const piet::eval::OptVocab& kVocabRegress = piet::eval::registerOptVocab(
@@ -584,9 +585,9 @@ const piet::eval::OptVocab& kVocabRegress = piet::eval::registerOptVocab(
                             "level", "absorb"},
      {"beta"}});
 
-// xtreg: estimation_m4.cpp:1316-1324 reads fe/re; :1386 the RE vcov guard;
-// the shared builder at :702-725 reads noconstant/nocons/level and :617
-// absorb. :1303-1310 refuses gls/mle/ec1/pa BY NAME as real xtreg
+// xtreg: runXtreg (estimation/panel_estimation.cpp) reads fe/re and holds the
+// RE vcov guard; the shared builder there reads noconstant/nocons/level and
+// absorb. runXtreg refuses gls/mle/ec1/pa BY NAME as real xtreg
 // estimators this build does not have — the definition of unimplemented;
 // `be` fits (BUG-1515), its `wls` is refused by name.
 const piet::eval::OptVocab& kVocabXtreg = piet::eval::registerOptVocab(
@@ -625,19 +626,18 @@ const piet::eval::OptVocab& kVocabSummarize = piet::eval::registerOptVocab(
 // B5-D9: `emptyok` accepted as a validated no-op. Measured
 // B4REC|save|replace_emptyok|0| (tests/eval/golden/aer_b4/pins_oracle_r.log
 // :90-93) on `clear` + `set obs 0` + `save F, replace emptyok`. runSetObs's
-// zero-data-in-memory branch (handlers_m3.cpp:runSetObs) already loads a real
+// zero-data-in-memory branch (runSetObs in environment/workspace_commands.cpp) already loads a real
 // {n_rows:0, columns:[]} hbin at that point, so runSaveData's only gate
 // (session.hasData()) already passes and the ordinary copy-the-current-hbin
 // path already writes a valid empty file — there is no refusal here for
-// `emptyok` to relax, unlike saveold's emptyok (handlers_aer_iotext.cpp:
-// 163-166), which stays unimplemented because saveold's writer DOES drop
+// `emptyok` to relax, unlike saveold's emptyok (fileio/saveold.cpp), which stays unimplemented because saveold's writer DOES drop
 // metadata under nolabel/orphans/emptyok. `save` has no such lossy path.
 const piet::eval::OptVocab& kVocabSave = piet::eval::registerOptVocab(
     {"save"}, {{"replace", "emptyok"},
      {"nolabel", "orphans", "version"}});
 
 // predict: a CENSUS row. No rejectUnknownOptions call reads kVocabPredict;
-// runPredict (estimation_m4c.cpp) refuses by name itself. The registry row feeds
+// runPredict (postestimation/prediction.cpp) refuses by name itself. The registry row feeds
 // canonicalizeForCommand (prefix and alias resolution), the floor table's exact-
 // spelling test and `piet_native --dump-optvocab`. FU-19: `known` is the set
 // runPredict serves -- xb/resid/residuals/fe (kSupported), pr/n after
@@ -671,13 +671,14 @@ const piet::eval::OptVocab& kVocabPredict = piet::eval::registerOptVocab(
       "equation"},
      {{"re", "residuals"}, {"res", "residuals"}, {"resi", "residuals"}}});
 
-// ivreg2/xtivreg2: handlers_aer_estim.cpp:326-338 consumes r/robust/cl/cluster/
-// gmm2s/fe/small and passes everything else to runIvRegress, whose net is
-// kVocabIvRegress (estimation_m4.cpp:141) — so the known set is the union of
+// ivreg2/xtivreg2: runIvreg2 (estimation/areg_ivreg2_aliases.cpp) consumes
+// r/robust/cl/cluster/gmm2s/fe/small and passes everything else to
+// runIvRegress, whose net is kVocabIvRegress
+// (estimation/estimation_options.cpp) — so the known set is the union of
 // the two. The unimplemented names are the ivreg2 options the 12 papers use
 // that neither layer reads (sfirst/saverfprefix); each
 // is corpus-attested Stata that ran, not a recollection. FU-252: `first` and
-// `partial` are read by runIvRegress since w2b-iv-options (estimation_m4b.cpp
+// `partial` are read by runIvRegress since w2b-iv-options (estimation/instrumental_variables.cpp
 // wantFirst/wantPartial, w2b_estim.log ivreg2_partial), so they are known, and so
 // are ffirst/savefirst/savefprefix for ivreg2 (wantFfirst/wantSavefirst,
 // w2d_uncovered.log ivreg2_ffirst_savefirst_068). A census row like kVocabPredict:
@@ -689,7 +690,7 @@ const piet::eval::OptVocab& kVocabIvreg2 = piet::eval::registerOptVocab(
      {"sfirst", "saverfprefix"}});
 
 // estimates/eststo: `estimates table` is the one sub-form carrying options and
-// eststo_esttab.cpp:938-940 reads b/se/stats. B4-W3b moved `title` and
+// runEstimatesTable (tables/estimates_table.cpp) reads b/se/stats. B4-W3b moved `title` and
 // `replace` from "unimplemented"/"absent" into the KNOWN set, because both are
 // now read: `estimates store NAME, title("…")` (73 corpus uses) lands on the
 // snapshot and prints in `estimates dir`, and `estimates save F, replace` (86
@@ -721,8 +722,8 @@ const piet::eval::OptVocab& kVocabEststoStore = piet::eval::registerOptVocab(
 // (the W2 brief forbids adding a net where the handler re-parses raw), it only
 // makes the surface visible to the census. The missing net is the finding.
 //
-// collapse: handlers_data_verbs.cpp:1020 pulls `by(...)` out of the RAW line
-// with its own regex; nothing reads `fast`. BUG-477/item2: `fast` moves to
+// collapse: runCollapse (datamgmt/data_collapse.cpp) pulls `by(...)` out of the RAW line
+// with its own parse; nothing reads `fast`. BUG-477/item2: `fast` moves to
 // KNOWN -- it was classified unimplemented even though the handler already
 // answers rc 0 for it (this build has no "original data" copy to skip
 // restoring, so `fast`'s only real effect in Stata is a no-op acknowledgement
@@ -748,7 +749,7 @@ const piet::eval::OptVocab& kVocabFile = piet::eval::registerOptVocab(
     {"file"}, {{"read", "write", "append", "replace", "text"},
      {"binary"}});
 
-// tsfilter: handlers_aer_estim.cpp:1046-1048 reads trend/smooth.
+// tsfilter: time/hodrick_prescott_filter.cpp reads trend/smooth.
 const piet::eval::OptVocab& kVocabTsfilter = piet::eval::registerOptVocab(
     {"tsfilter"}, {{"trend", "smooth"},
      {}});
@@ -812,7 +813,7 @@ const std::unordered_set<std::string> kGraphBaseKnown = {"title", "xtitle", "yti
 // arm answer for it. Three new sets, each MEASURED from the code that reads it:
 //
 //   kGraphTwowayGlobals -- the eight globals `runTwowayLayers` honours that no
-//     bare handler reads (graph_m4.cpp:1595-1668: axes.xline/yline, the
+//     bare handler reads (runTwowayLayers in graph/twoway.cpp: axes.xline/yline, the
 //     xscale/yscale `noline` flags, the xlabel/ylabel `none` flags, the legend
 //     order/cols/size/off block, and `subtitle`). title/xtitle/ytitle/note are
 //     honoured by BOTH surfaces and stay in kGraphBaseKnown. The presence of one
@@ -858,7 +859,7 @@ const std::unordered_set<std::string> kGraphCosmetic = {
 
 // What is left after W4: `aspectratio` has no renderer concept at all, and
 // `by()` is graph FACETING -- a different set of panels, which is a different
-// answer, and which `rejectByFacet` (graph_m4.cpp:93) already refuses by name on
+// answer, and which `rejectByFacet` (graph/graph_support.cpp) already refuses by name on
 // the twoway path. It sits in the unimplemented half so the bare arm says "valid
 // Stata option this build does not implement" instead of "not allowed".
 // serset-twoway VOC: aspectratio left this set -- Stata draws with it at rc 0
@@ -875,7 +876,7 @@ const std::unordered_set<std::string> kGraphSharedKnown =
 // gfx-histogram-kdensity-family (oracle w2aq_histogram_family): histogram's
 // documented options -- discrete, bins()/width()/start(), the four height types, the
 // kdensity/normal overlays and their opts(), addlabels, barwidth, horizontal,
-// binrescale -- and by() panels are served by runHistogram (graph_m4.cpp).
+// binrescale -- and by() panels are served by runHistogram (graph/distribution_commands.cpp).
 // addplot()/addlabopts()/barwidth()/blcolor() are carried, not drawn, and so
 // stay out of the applied set (graphAcceptedNotApplied names them).
 const std::unordered_set<std::string> kGraphHistExtra = {
@@ -895,7 +896,7 @@ const std::unordered_set<std::string> kGraphXtlineExtra = {"overlay"};
 
 // serset-twoway FIT: twoway_lfit_parse.class / twoway_lfitci_parse.class's own
 // options. n(), range(), level() and stdp/stdf/stdr change the fitted numbers
-// and are APPLIED (graph_m4.cpp parseFitOptions); the rest are drawing choices.
+// and are APPLIED (graph/twoway.cpp parseFitOptions); the rest are drawing choices.
 const std::unordered_set<std::string> kGraphFitExtra = {
     "level", "stdp", "stdf", "stdr", "nofit", "fitplot", "ciplot", "atobs", "estopts", "predopts"};
 
@@ -981,10 +982,10 @@ const piet::eval::OptVocab& kVocabGraphTwoway = piet::eval::registerOptVocab(
 // `parseLayerInterior`, which never consults the command registry. They are
 // registered anyway for two reasons, both measured:
 //   * `runTwowayLayers` now runs an unknown-option net over each layer's own
-//     interior (graph_m4.cpp), and it reads its vocabulary back from HERE under
+//     interior (graph/twoway.cpp), and it reads its vocabulary back from HERE under
 //     the non-command token `twoway_layer` -- the same "a net owns one copy of
 //     its set" contract every other registration follows (precedent:
-//     `mediate:tvar`, estimation_m4b.cpp:102).
+//     `mediate:tvar`, estimation/estimation_options.cpp).
 //   * The AER option census attributes a `||` chain segment's options to that
 //     SEGMENT's plot type, which is Stata's grammar, so `connected`/`lfit`/
 //     `area`/`rarea`/`rcap`/`function` are commands as far as the census is
@@ -1004,13 +1005,13 @@ const piet::eval::OptVocab& kVocabGraphLayer = piet::eval::registerOptVocab(
 // registration carrying only the plot vocabulary is not merely incomplete — it
 // MIS-RESOLVES: `graph export "f", as(png)` has `as` rewritten to
 // `aspectratio` (the plot arm's unimplemented list), and the export handler,
-// which reads `as` at graph_m4.cpp:2726, stops seeing its format. Six selftest
+// which reads `as` (runGraphExport in graph/files.cpp), stops seeing its format. Six selftest
 // legs (BS-012, BUG-103) named it immediately. So the graph token's `known` is
 // the union of the plot arm's and the SUBCOMMAND handlers' own reads:
-//   graph export   as / name / replace          (graph_m4.cpp:2674,2726,2743)
-//   graph save     replace                      (:2504)
+//   graph export   as / name / replace          (runGraphExport, graph/files.cpp)
+//   graph save     replace                      (runGraphSave, graph/files.cpp)
 //   graph combine  rows / cols / title / subtitle / note / name / imargin /
-//                  graphregion                  (:2606,2607,2626,2627,2628,2634,2635,2642)
+//                  graphregion                  (runGraphCombine, graph/files.cpp)
 // `subtitle` and `graphregion` are in the plot arm's UNIMPLEMENTED list and in
 // combine's READ list; the registry unions both and `known` wins at every
 // decision point, which is the right answer for the token as a whole.
@@ -1039,11 +1040,11 @@ const piet::eval::OptVocab& kVocabGraphMultiplex = piet::eval::registerOptVocab(
 // `known` here is split the same way as the plot arm's: the keys the handler
 // READS, plus the keys it accepts and reports. The reads are measured, not
 // guessed:
-//   coefplot     level / drop / keep / xline      (eststo_esttab.cpp:666,684,689,698)
-//                title / xtitle / ytitle          (:817-819)
+//   coefplot     level / drop / keep / xline      (runCoefplot, graph/coefplot_estimates_block.cpp)
+//                title / xtitle / ytitle          (same function)
 //                name                             (registerGraphOutput, this file)
-//   marginsplot  title / note                     (graph_m4.cpp:1736,1739) + name
-//   binscatter   nquantiles                       (handlers_qe.cpp:970 pushOpt)
+//   marginsplot  title / note                     (runMarginsplot, graph/commands.cpp) + name
+//   binscatter   nquantiles                       (runBinscatter, graph/binscatter.cpp)
 // Everything else the twelve papers hand these three is a drawing instruction
 // -- `recast(bar)`, `ciopts()`, `vertical`, `coeflabels()`, `groups()` -- and a
 // drawing instruction is not a number (the §B4(c) call). Those are accepted and
@@ -1053,7 +1054,7 @@ const piet::eval::OptVocab& kVocabGraphMultiplex = piet::eval::registerOptVocab(
 // the unimplemented half so they say so: coefplot's `levels()` and `ci()` set
 // WHICH interval is drawn (this build draws `level()`'s, defaulting to 95), and
 // accepting them quietly would draw a 95% band for a statement that asked for
-// 90%. binscatter's own `by`/`linetype`/`controls`/`absorb` (handlers_qe.cpp:85)
+// 90%. binscatter's own `by`/`linetype`/`controls`/`absorb` (graph/binscatter.cpp)
 // keep the refusals they already had -- those change the fitted values.
 const std::unordered_set<std::string> kCoefplotSpecific = {
     "at",        "base",     "ciopts",   "citop",       "coeflabels", "eqlabels",
@@ -1072,7 +1073,7 @@ const piet::eval::OptVocab& kVocabMarginsplot = piet::eval::registerOptVocab(
                                                   "ciopts", "plot", "x", "noci"}),
                       kGraphBaseUnimpl, kGraphAliases});
 
-// binscatter already has a net and a vocabulary (handlers_qe.cpp kVocabBinscatter).
+// binscatter already has a net and a vocabulary (graph/binscatter.cpp kVocabBinscatter).
 // This registration UNIONS the graph drawing keys into the SAME registry slot --
 // the documented merge rule (errors.h) -- so `binscatter y x, nq(20)
 // xtitle("...") scheme(s1mono)` is accepted, its twoway keys carried into
@@ -1087,7 +1088,7 @@ const std::unordered_set<std::string> kCoefplotApplied = {
 
 const std::unordered_set<std::string> kMarginsplotApplied = {"title", "note", "name"};
 
-// gfx-binscatter: every option of handlers_qe.cpp's kVocabBinscatter known half
+// gfx-binscatter: every option of graph/binscatter.cpp's kVocabBinscatter known half
 // is read by runBinscatter (bins, residualization, fits, colors and symbols in
 // the drawn layers, savedata); the twoway keys stay noted.
 const std::unordered_set<std::string> kBinscatterApplied = {
@@ -1142,6 +1143,19 @@ const std::unordered_set<std::string> kLpolyApplied = {
 const std::unordered_set<std::string> kLowessApplied = {
     "nograph", "generate", "adjust", "logit", "bwidth", "mean", "noweight", "sort",
     "title", "xtitle", "ytitle", "note", "name"};
+
+// parallel's options, split by what this build can honour while running the
+// work IN THIS PROCESS. `do()` and `expression()` are append's two arguments and
+// both are read. `if()`/`in()` are append's row filters, applied to each file as
+// it is read, and are read too. The rest name a cluster topology that does not
+// exist here: `processors()`, `statapath()`, `programs()`, `seeds()`,
+// `randtype()`, `force`, `nodata`, `keep`, `by()`. Refusing them is the honest
+// answer -- silently accepting `seeds(random)` would promise a draw scheme this
+// build does not implement.
+const piet::eval::OptVocab& kVocabParallel = piet::eval::registerOptVocab(
+    {"parallel"}, {{"do", "expression", "if", "in"},
+                   {"processors", "statapath", "programs", "program", "seeds", "randtype",
+                    "force", "nodata", "keep", "by", "sandbox"}});
 }  // namespace piet::dispatch_detail
 
 namespace piet {
@@ -1171,7 +1185,7 @@ OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::s
   };
   // level: estimation_options.sthlp `{opt l:evel(#)}` + live `regress price mpg, l(90)` rc=0.
   // level: estimation_options.sthlp `{opt l:evel(#)}` + live `regress price mpg, l(90)` rc=0.
-#include "../generated/opt_minimums_bug264.inc"  // NOLINT — table body, see gen_table.py
+#include "generated/opt_minimums_bug264.inc"  // NOLINT — table body, see gen_table.py
   const auto& kOptMinimums = kOptMinimumsGenerated;
 
   // Generated rows a later oracle overrules (the table must not be hand-edited).

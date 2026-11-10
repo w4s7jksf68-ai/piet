@@ -7,6 +7,9 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/descriptive.h"
+#include "piet/handlers/estimates_tables.h"
+#include "piet/handlers/results.h"
 namespace piet::dispatch_detail {
 bool route_results(std::string& cmd,
     std::string& cmdTyped,
@@ -117,9 +120,9 @@ bool route_results(std::string& cmd,
 
 
   // BS-039 (BETA campaign C3): `ereturn list` — display-only e() dump
-  // (handlers_m3.cpp::runEreturnList).
+  // (results/scalar_results.cpp::runEreturnList).
   // W2D-T01: every other sub-verb goes to handlers::runEreturn
-  // (handlers_ereturn.cpp: clear/post/local, a named refusal for the rest).
+  // (results/ereturn_commands.cpp: clear/post/local, a named refusal for the rest).
   // `ereturn` is on kNoDataCommands because `ereturn clear` is the first line
   // of a do-file helper that runs before anything is loaded
   // (w2d_uncovered.log 211-212); `ereturn list` keeps the no-data answer it

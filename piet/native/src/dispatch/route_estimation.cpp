@@ -65,12 +65,12 @@ bool route_estimation(std::string& cmd,
     // before cobra sees it; with no TS context set, cobra's own
     // `ts_no_tsset` engine error surfaces, re-wrapped with the `[code]`
     // prefix runRegress's catch clause adds (matches the 2 Eval
-    // M2-ratification carve-out cells byte-for-byte — see handlers.cpp).
+    // M2-ratification carve-out cells byte-for-byte — see estimation/linear_estimation.cpp).
     // `reghdfe` IS `feols --fe` under the hood (cobra has no separate
     // reghdfe estimator — verified bit-for-bit against the Stata
     // oracle); it is routed through the exact same runRegress path as
     // regress/reg/r/feols, with only the display "estimator" label
-    // differing (handlers.cpp's stataCmd param).
+    // differing (estimation/linear_estimation.cpp's stataCmd param).
     // BUG-539 (W2 estimopts): `reghdfe ..., residuals[(v)]` also creates a
     // column. The handler returns the estimation block alone and hands the
     // data_mutation back through this out-parameter, so it lands as a block
@@ -584,7 +584,7 @@ bool route_estimation(std::string& cmd,
     // aware, since the treatment block nests continuous(...) inside its
     // own parens); only the continuous-treatment, two-explicit-level form
     // is in beta scope. ENGINE-PARITY not Stata-parity — see runMediate's
-    // own header comment (estimation_m4.cpp) for the full disclosure.
+    // own header comment (estimation/mediation_estimation.cpp) for the full disclosure.
     blocks.push_back(ojson(handlers::runMediate(parsed, session)));
     return true;
   }
@@ -681,7 +681,7 @@ bool route_estimation(std::string& cmd,
     // BS-074 (BETA D3b): negative-binomial (NB2) regression -> cobra nbreg.
     // NOTE: the engine has a live-verified convergence gap on data whose
     // fitted intercept sits away from zero (including the D3e oracle's own
-    // fatalities/cnt data) — see runNbreg's header comment (estimation_m4.cpp)
+    // fatalities/cnt data) — see runNbreg's header comment (estimation/count_estimation.cpp)
     // for the full disclosure; this is an engine-side limitation, not a
     // wiring gap.
     blocks.push_back(ojson(handlers::runNbreg(parsed, session)));
@@ -715,7 +715,7 @@ bool route_estimation(std::string& cmd,
 
   // ---- Arc F (P3 wave): the seven QE/RD commands. Unlike every neighbouring
   // estimator arm, these handlers return an ARRAY (one `display` block per
-  // printed line + one structured block last — the handlers_resample.cpp
+  // printed line + one structured block last — the estimation/bootstrap_prefix.cpp
   // shape), because the tables are rendered as TEXT here rather than being
   // handed to the frontend as a coeftable. So the arms splice; they must not
   // push_back, which would nest an array inside the block stream. ----
@@ -730,7 +730,7 @@ bool route_estimation(std::string& cmd,
     else if (cmd == "did_imputation") res = handlers::runDidImputation(parsed, session);
     else res = handlers::runSdid(parsed, session);
     if (cmd == "binscatter") {
-      // W4: binscatter's own net (handlers_qe.cpp) has already run and now
+      // W4: binscatter's own net (graph/binscatter.cpp) has already run and now
       // ACCEPTS the graph drawing keys (kVocabBinscatterGraph unions them in).
       // Accepting them without saying so would be the silent drop this wave
       // exists to close, so the block carries the note.
@@ -754,7 +754,7 @@ bool route_estimation(std::string& cmd,
     // engine csdid machinery as `csdid` above, ONE (g,t) cell — now its OWN
     // handler (previously shared csdid's arm above and unconditionally
     // rejected on missing gvar(), since real drdid syntax has no gvar()
-    // option at all). See runDrdid's header comment (estimation_m4.cpp) for
+    // option at all). See runDrdid's header comment (estimation/did_two_period.cpp) for
     // how the wiring leaves the estimator unmodified and the live-verified
     // oracle match.
     blocks.push_back(ojson(handlers::runDrdid(parsed, session)));
@@ -834,9 +834,9 @@ bool route_estimation(std::string& cmd,
   // BETA campaign Phase D batch D5 (post-estimation/diag/misc wirings):
   // BS-085 sdtest, BS-083 hausman, BS-084 chow, BS-087(part) mkspline.
   // (BS-021 durbinalt fix + BS-082 estat endogenous/overid/firststage live
-  // inside runEstat, estimation_m4.cpp — no separate dispatch arm needed,
+  // inside runEstat, postestimation/estimation_diagnostics.cpp — no separate dispatch arm needed,
   // both ride the existing `estat` arm below. BS-086 margins ,at() fix
-  // lives inside runMargins, same file — no dispatch change needed either.)
+  // lives inside runMargins, postestimation/margins.cpp — no dispatch change needed either.)
 
   if (cmd == "sdtest") {
     // Real Stata's `sdtest varname [if], by(groupvar)` / `sdtest varname

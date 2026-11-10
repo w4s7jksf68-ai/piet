@@ -525,7 +525,7 @@ void testAerGtoolsBundle() {
 //
 // THREE HOUSE RULES ARE FOLLOWED LITERALLY, ALL THREE BECAUSE THEY COST TIME:
 //   - EVERY session seeds `cwd` as well as `eval.cwd`. resolveUserPath reads
-//     SessionState::cwd (handlers.cpp:2040); bundle E seeded only eval.cwd and
+//     SessionState::cwd (fileio/user_paths.cpp); bundle E seeded only eval.cwd and
 //     sixteen checks failed for that one reason. `filelist` is file I/O.
 //   - Numeric comparisons report through `fullPrec` (%.17g), never
 //     std::to_string, which prints six decimals and renders a genuine
@@ -554,7 +554,7 @@ void testAerUtilCounts() {
   };
   auto seed = [&](piet::SessionState& s) {
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
   };
   // NULL rather than a throw when there is no error block -- the BUG-129 trap:
   // check()'s message argument is built EAGERLY, on the passing path too.
@@ -984,7 +984,7 @@ void testAerUtilFillers() {
   };
   auto seed = [&](piet::SessionState& s) {
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
   };
   auto firstError = [](const nlohmann::ordered_json& blocks) -> nlohmann::ordered_json {
     for (const auto& b : blocks)
@@ -1438,7 +1438,7 @@ void testAerUtilRefusals() {
   };
   auto seed = [&](piet::SessionState& s) {
     s.eval.cwd = workdir;
-    s.cwd = workdir;  // resolveUserPath reads THIS field (handlers.cpp:2040).
+    s.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
   };
   auto firstError = [](const nlohmann::ordered_json& blocks) -> nlohmann::ordered_json {
     for (const auto& b : blocks)
@@ -2761,7 +2761,7 @@ void testBS092BysortSummarize() {
 // option token their opts-loop didn't explicitly read (e.g. a real Stata
 // `merge` option this build doesn't implement, like `force`) — same class as
 // the `save` suboption fix (@c638da1). Each verb now runs its known-option
-// set through eval::rejectUnknownOptions (handlers_data_verbs.cpp), naming
+// set through eval::rejectUnknownOptions (datamgmt/data_merge.cpp, data_reshape.cpp, data_order.cpp), naming
 // the first unrecognized key instead of swallowing it.
 void testBUG105OptNetDataVerbs() {
   std::printf("[selftest] --- BUG-105 옵션망: merge/reshape/order residual-option honest-reject ---\n");

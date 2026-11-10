@@ -127,7 +127,7 @@ nlohmann::json engineError(const std::string& message, const std::string& code =
 //     non-convergence, ...) -> "1", UNCHANGED from before this map existed.
 // Any block missing a recognized `code` at all also falls back to "1".
 // Takes ordered_json (not plain json) — matches every call site's own JSON
-// type (dispatcher.cpp/estimation_m4.cpp/etc. all alias `ojson =
+// type (the dispatcher, the estimation files, etc. all alias `ojson =
 // nlohmann::ordered_json`), sidestepping any cross-basic_json-specialization
 // conversion question entirely.
 std::string coarseRc(const nlohmann::ordered_json& block);
@@ -171,7 +171,7 @@ std::string timeSpanRefusal(const std::string& msg, std::string* rc);
 // (nothing to reject — the common case); otherwise an r(198)-parity
 // CommandErrorResult (code "unsupported_option", message
 // "option `KEY` not allowed", the EXACT wording dispatcher.cpp's summarize
-// arm / handlers.cpp's runRegress / estimation_m4.cpp's shared xtreg/logit/
+// arm / estimation/linear_estimation.cpp's runRegress / estimation/estimation_support.cpp's shared xtreg/logit/
 // probit builder already use — see testClusterVceAndUnknownOptionFixes in
 // selftest.cpp) naming the FIRST unrecognized key, so a caller just does:
 //
@@ -196,7 +196,7 @@ std::string timeSpanRefusal(const std::string& msg, std::string* rc);
 // arm has deliberately chosen not to implement; a key found there gets the
 // honest "valid Stata option, not yet implemented" wording instead of the
 // ambiguous default (mirrors the hand-curated `beta` special case in
-// handlers.cpp's regress reject-net, generalized here for callers that
+// estimation/linear_estimation.cpp's regress reject-net, generalized here for callers that
 // already use this shared helper).
 // BUG-148: Stata option abbreviations. `resolveOptionAbbrev` maps a key to the unique canonical
 // name it prefixes (exact spelling wins; ambiguous or <2 chars are left alone, so the caller still
