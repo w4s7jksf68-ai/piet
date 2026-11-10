@@ -43,8 +43,8 @@ namespace piet::handlers {
 // Parsed `in a/b` bounds, ALREADY resolved to literal 1-based row numbers
 // (f -> 1, l -> nRowsTotal, -k -> nRowsTotal-k+1). Every consumer of this
 // struct needs a plain numeric bound, whether that's this file's own --keepif
-// predicate, gen/replace's `_n` fold (egen.cpp), list's browse window
-// (handlers_m3.cpp) or strmutate.cpp's row-wise mask. This is THE one parser
+// predicate, gen/replace's `_n` fold (datamgmt/generate_by_group.cpp), list's browse window
+// (descriptive/data_listing.cpp) or datamgmt/row_conditions.cpp's row-wise mask. This is THE one parser
 // of Stata's range grammar ([U] 11.1.4): `#1[/#2]`, each # a positive or
 // negative integer (negative counts from the end, -1 = last row) or f/F/l/L.
 // A resolved range is honoured only when 1 <= a <= b <= nRowsTotal; anything

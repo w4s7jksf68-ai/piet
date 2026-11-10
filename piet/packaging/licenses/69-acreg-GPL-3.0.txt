@@ -1,5 +1,5 @@
 acreg 1.1.0 (Colella, Lalive, Sakalli, Thoenig) — GPL-3.0
-Adopted at: piet/native/src/handlers_e3_acreg.cpp (derived from acreg.ado; line cites there refer to the ado)
+Adopted at: piet/native/src/estimation/acreg_estimation.cpp (derived from acreg.ado; line cites there refer to the ado)
 
 Project:  acreg — Stata module to perform Arbitrary Correlation Regression
 Authors:  F. Colella, R. Lalive, S.O. Sakalli, M. Thoenig

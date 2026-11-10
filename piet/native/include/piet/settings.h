@@ -30,7 +30,7 @@ struct Settings {
   std::string defaultWorkingDir;  // "" -> defaultUserCwd()      (restart-to-apply)
   int64_t memoryBudgetMb = 0;     // 0  -> recommended (SPEC II-2)
   int computeCores = 0;           // 0  -> auto (all cores)
-  // P6: false -> estimation_m4.cpp's shared cobra-argv path appends
+  // P6: false -> estimation/estimation_support.cpp's shared cobra-argv path appends
   // --no-provenance (interactive default: OFF, applies to the next
   // command). true -> nothing appended, so the engine CLI's own default
   // (provenance ON) is used. This flips only PIET's native default; the

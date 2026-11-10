@@ -6,6 +6,7 @@
 // still exercises the exact code the product ships. `piet_native --selftest`
 // exec()s this binary from its own directory, keeping every documented
 // invocation and every gate script working unchanged.
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -15,9 +16,21 @@
 #include <unistd.h>
 #endif
 
-int runSelftest();  // selftest.cpp (external linkage, deliberately un-namespaced)
+#include "selftest_suites.h"
 
-int main() {
+int main(int argc, char** argv) {
+  std::string suite;
+  if (argc == 2 && std::string(argv[1]) == "--list-suites") {
+    listSelftestSuites();
+    return 0;
+  }
+  if (argc == 3 && std::string(argv[1]) == "--suite") {
+    suite = argv[2];
+  } else if (argc != 1) {
+    std::fprintf(stderr, "Usage: piet_selftest [--list-suites | --suite NAME]\n");
+    return 2;
+  }
+  auto run = [&]() { return argc == 1 ? runSelftest() : runSelftestSuite(suite); };
 #if !defined(_WIN32)
   // BUG-1068: the legs name their workdirs under temp_directory_path() with FIXED
   // names (piet_native_selftest_m4b, ..._getcols, ...), so two selftests that
@@ -36,13 +49,13 @@ int main() {
     own = buf.data();
     ::setenv("TMPDIR", own.c_str(), 1);
   }
-  const int rc = runSelftest();
+  const int rc = run();
   if (!own.empty() && std::getenv("PIET_KEEP_SCRATCH") == nullptr) {
     std::error_code ec;
     std::filesystem::remove_all(own, ec);
   }
   return rc;
 #else
-  return runSelftest();
+  return run();
 #endif
 }

@@ -3,9 +3,9 @@
 // cclass.h — BETA Phase A4 c()-class system-value registry (BS-091/BS-101).
 //
 // Single source for every `c(name)` read, whichever context it appears in:
-// `display`'s bespoke tokenizer (display_hardening.cpp), a `gen`/`replace`
+// `display`'s bespoke tokenizer (language/display_command.cpp, language/scalar_expression.cpp), a `gen`/`replace`
 // RHS forwarded row-wise to cobra (dispatcher.cpp), an `if`/`while` condition
-// (loops.cpp::evalBoolExpr), or a `scalar NAME = expr` / `local NAME = expr`
+// (language/if_while_condition.cpp::evalBoolExpr), or a `scalar NAME = expr` / `local NAME = expr`
 // capture (dispatcher.cpp's tryCaptureDefinition call site). Before this
 // module, c(current_date)/c(current_time) were the ONLY two keys
 // implemented, and only inside display's own resolver — every other context

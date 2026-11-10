@@ -59,7 +59,7 @@ inline int64_t g_setcolBytes = 0;
 // depvar" vs §2's engine-call log showing import-dta ×1): how many `use`
 // dispatches actually paid the disk path vs restored from the worker's
 // virtual-file table, and how many paid a full .dta→hbin conversion. All three
-// are counts of the runUse branch taken (handlers.cpp), not bytes.
+// are counts of the runUse branch taken (fileio/dataset_use.cpp), not bytes.
 inline int64_t g_useDiskLoads = 0;    // disk-open path taken (any format)
 inline int64_t g_useVirtualHits = 0;  // virtual-save table restore (loadFromVirtual)
 inline int64_t g_dtaConverts = 0;     // import-dta full conversions invoked
@@ -480,7 +480,7 @@ inline const std::string& firstSwallowedError() { return g_firstSwallowedError; 
 // setcol_cost_split.md already decomposed the ENGINE half (114 ms/call, header
 // re-parse dominant) — this decomposes the PIET half, on the same seam.
 //
-// Four phases, one accumulator each (ns), billed inside strmutate.cpp:
+// Four phases, one accumulator each (ns), billed inside datamgmt/row_evaluation.cpp:
 //   evalrows  — the compiled row loop: fillSlots + PreboundExpr::eval per row
 //   outbuild  — materialising outStrings/outNums from the eval result
 //   csvwrite  — csvEscape/csvNum + the ofstream write of the values CSV

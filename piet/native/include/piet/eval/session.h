@@ -42,7 +42,7 @@ namespace piet::eval {
 // generation no earlier state had.
 //
 // That is what lets ONE site replace r() for every r-class command
-// (handlers_aer_estim.cpp replaceStaleRClass, called from dispatcher.cpp's
+// (postestimation/rtable_rclass_lifecycle.cpp replaceStaleRClass, called from dispatcher.cpp's
 // dispatch()): Stata replaces all of r() at every r-class command, but PIET's
 // r-class handlers MERGE their keys into whatever the previous command left
 // (correlate, levelsof, count, describe, ... ). "Did this command write r()?" is
@@ -276,7 +276,7 @@ struct EvalSession {
   // survive it.
   std::vector<std::pair<std::string, EvalMatrix>> rMatrices;   // _r_matrices
 
-  // r(table) bookkeeping (handlers_aer_estim.cpp), kept OUTSIDE every r() store
+  // r(table) bookkeeping (postestimation/rtable_rclass_lifecycle.cpp), kept OUTSIDE every r() store
   // on purpose: an r-class command that wipes r() wholesale (`label language`,
   // getmata, boottest) used to delete a stamp kept under a reserved rStrings key,
   // and the table then outlived every later r-class command (BUG-629, review
@@ -455,7 +455,7 @@ struct EvalSession {
   // SessionState::eNameOrderFor; unset in session-less harnesses.
   std::function<std::optional<std::vector<std::string>>(const std::string&)> eNameOrder;
   // A scoped coefficient source, set only by esttab's transform() guard
-  // (handlers_aer_tables.cpp TrScopedModel) while it evaluates one stored model.
+  // (tables/tables_internal.h TrScopedModel) while it evaluates one stored model.
   const nlohmann::ordered_json* coefOverride = nullptr;
 
   // The block _b[]/_se[] and the canonical e(b)/e(V) read: the override, else
@@ -528,7 +528,7 @@ struct EvalSession {
   // live e(cmd)'s stripe row) for an explicit source block. resolveEMatrixFor
   // passes coefSource(); the derived e(beta)/e(V_modelbased) pass a local copy
   // of it with the coefficients or covariance replaced, so the live block (and
-  // its identity, handlers_aer_estim.cpp liveEstimationIdentity) is never
+  // its identity, postestimation/rtable_rclass_lifecycle.cpp liveEstimationIdentity) is never
   // swapped or touched.
   EMatrixAnswer resolveFitEMatrixFrom(const std::string& name, EReader reader,
                                       const nlohmann::ordered_json* source) const;
@@ -605,7 +605,7 @@ std::optional<EvalMatrix> canonicalEMatrix(const nlohmann::ordered_json& block, 
                                            std::string* why = nullptr);
 
 // eb-order T-E2 (ME08/C7/EB-BASE): Stata's e(b) stripe as the FIT recorded it
-// in its block (`eb_stripe`, written once at the fit by handlers_aer_estim.cpp
+// in its block (`eb_stripe`, written once at the fit by postestimation/coefficient_column_names.cpp
 // annotateEbStripe, from the same factor-level rules r(table) uses): Stata's
 // columns in order, each the canonical (canonicalEMatrix) column it reads, or
 // an empty `src` for a column Stata posts and the engine does not send -- a

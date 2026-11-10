@@ -309,7 +309,7 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
     // in real Stata). Matches both message shapes already produced in this
     // codebase — "variable X not found" (summarize/generic lookup) and
     // "variable 'X' not found in dataset" (confirm variable,
-    // handlers_m3.cpp's runConfirm) — without over-matching the
+    // language/confirm_command.cpp's runConfirm) — without over-matching the
     // file/directory case just above (checked first, so a message that
     // happens to also mention "file" still wins 601/602 as before).
     if (lower.find("variable") != std::string::npos && lower.find("not found") != std::string::npos) {
@@ -360,7 +360,7 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
     // frame -> Stata's own r(111) as well, same "named thing does not exist"
     // class as the variable and scalar rules around it. Narrow substring
     // pairing ("frame" + "not found"), matching the one message shape
-    // handlers_frames.cpp produces ("frame NAME not found").
+    // datamgmt/frames.cpp produces ("frame NAME not found").
     if (lower.find("frame") != std::string::npos && lower.find("not found") != std::string::npos) {
       return "111";
     }
@@ -391,7 +391,7 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
     }
     // BETA campaign C4 (BS-042): confirm's "already defined" class (oracle:
     // `confirm new variable <existing-var>` -> rc=110) — previously
-    // unreachable because handlers_m3.cpp's runConfirm never recognised
+    // unreachable because language/confirm_command.cpp's runConfirm never recognised
     // "new variable" as a sub-command at all (see the C1-era note this
     // replaced); FIXED this batch (runConfirm now emits an
     // "... already defined" message for the conflict), so this mapping is
@@ -468,13 +468,13 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
     }
     // W:P8 (BUG-169): `graph export FILE, name(NOSUCH)` -> Stata's own r(693)
     // ("could not find Graph window", live-probed on StataBE 19.5). The
-    // message shape is unique to graph_m4.cpp's export arm.
+    // message shape is unique to graph/files.cpp's graph-export arm.
     if (lower.find("could not find graph window") != std::string::npos) {
       return "693";
     }
     // W:P8: `log close NOSUCH` -> Stata's own r(111) "log NOSUCH not found",
     // the same "named thing does not exist" class as the variable/scalar/frame
-    // rules above. Pairs on the leading "log " that handlers_m3.cpp's runLog
+    // rules above. Pairs on the leading "log " that environment/logging_commands.cpp's runLog
     // is the only producer of.
     if (lower.rfind("log ", 0) == 0 && lower.find("not found") != std::string::npos) {
       return "111";

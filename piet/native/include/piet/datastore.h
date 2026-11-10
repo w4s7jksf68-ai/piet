@@ -239,7 +239,7 @@ inline bool namesHiddenColumn(const std::string& text) {
 // any column, and SessionState::esampleReading names the verb in its r(198).
 // gcollapse/fcollapse run collapse's engine verb here, but their marker rule is
 // their plugin's, which no capture has measured. joinby and `merge 1:m` keep
-// the marker on the first copy of each master row (handlers.cpp
+// the marker on the first copy of each master row (estimation/estimation_sample_carry.cpp
 // esampleKeepFirstCopy; w2_esample_copies.log:470 X4, :596 M1); their codes
 // remain for a result whose key columns that rule cannot read.
 enum class EsampleLostBy : int {

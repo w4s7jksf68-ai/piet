@@ -1,5 +1,5 @@
 swindex (SSC s458912; Stata Journal 20-4 st0622) — GPL-3.0
-Adopted at: piet/native/src/handlers_e3_swindex.cpp (the `swindex` command: the
+Adopted at: piet/native/src/datamgmt/swindex.cpp (the `swindex` command: the
 Anderson (2008) inverse-covariance-weighted index, derived from swindex.ado;
 line citations in that file, ADO:line, refer to the upstream ado)
 

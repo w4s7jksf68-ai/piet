@@ -1,6 +1,210 @@
 # PIET + CoBrA — System Architecture
 
 **Audience: an AI agent that must modify this system correctly without reading the whole tree.**
+
+## Maintenance entrypoint — 2026-11-10
+
+This map reflects the current layout of `piet/native/src`: sources live in domain
+directories, each directory has a `README.md` that maps its files, and only the selftest
+files remain directly in `piet/native/src`. It is a navigation map, not a new
+numerical-accuracy or performance certificate. The numbered sections after the separator
+retain their **2026-07-29 snapshot**; recheck historical versions, paths, target counts
+and performance claims before using them.
+
+Start with the symptom below and its existing behavioral checks. The repository stays
+one build and one product. Functions moved without redesigning command semantics;
+each file's floating-point compile flag moved with it. Paths in the table are relative
+to `piet/native/src` unless they start with `piet/` or `include/`. In a frontend row,
+bare `.js` file names after the first full path are relative to `piet/frontend/js`.
+
+| Symptom | Implementation to read first | Relevant state and existing checks |
+|---|---|---|
+| You do not yet know which file owns the behavior | The `README.md` of the matching directory (see "Source tree" below): a command-or-symptom to owner table, private headers, state, compile flags and selftests | `SELFTESTS.md` maps every selftest file to its feature and entry functions; public declarations are in `include/piet/handlers/*.h` |
+| A prefix, macro, qualifier, option abbreviation, `_rc`, or output order behaves incorrectly | `dispatch/dispatcher.cpp` shows the ordered pipeline and outer result/log lifecycle; `dispatch/stage_*.cpp` owns each step; `dispatch/route_*.cpp` owns command families | `dispatch/registry.cpp` is the command-name/abbreviation/qualifier authority; `dispatch/options_support.cpp` holds the shared option vocabularies, and per-directory option files and command files register their own through `registerOptVocab`; `dispatch/*_support.h` exposes helpers by owner. Read `dispatch/README.md`; `selftest_command_contracts.cpp`, `selftest_command_errors.cpp`; full native selftest, freeze, pangram and structural floor gates cover integration |
+| The app does not start, a bridge route is unknown, settings or scratch location are wrong | `app/main.cpp` (command-line modes), `app/bridge_route_bindings.cpp`, `app/routes.cpp`, `app/settings.cpp`, `app/startup_environment.cpp` | `AppState` owns the one `SessionState`; `app/README.md`; `selftest_bridge_routes.cpp`, `selftest_bridge_transport.cpp`, `selftest_settings_and_execution.cpp`, `selftest_startup_and_paths.cpp` |
+| The wrong engine binary runs, a worker dies, or an `.hbin` read is wrong | `engine/cobra_runner.cpp`, `engine/cobra_session.cpp`, `engine/datastore.cpp`, `engine/storage_type.cpp` | Resident frame and dirty bit belong to `SessionState`; `engine/README.md`; `selftest_data_storage.cpp`, `selftest_variable_storage_types.cpp` |
+| `esttab`, `estout`, `outreg2` or a table file has wrong cells, escaping or spacing | `tables/esttab_block.cpp`, `tables/table_esttab.cpp`, `tables/table_estout.cpp`, `tables/table_outreg.cpp`; estout grammar/model/format helpers in `tables/estout_*.cpp`; shared prepared-table rendering in `tables/table_render.cpp` and `include/piet/table_{model,render}.h` | `tables/table_model_context.cpp`, `tables/table_number_format.cpp`, `tables/table_files.cpp`; `--suite tables`, `selftest_tables.cpp`, `selftest_tables_esttab_namelists.cpp` |
+| Added estimate results or exported datasets/matrices are wrong | `tables/table_estadd.cpp`, `tables/table_estpost.cpp`, `tables/table_dataset_export.cpp`, `tables/table_matrix_export.cpp`, `tables/table_tex_files.cpp`, `tables/table_erepost.cpp` | Active/stored fits and live `e()` mirrors; same table suite plus full selftest |
+| `return list`, `ereturn`, `scalar list`, `eststo` or `estimates save/use` is wrong | `results/return_list.cpp`, `results/ereturn_commands.cpp`, `results/scalar_results.cpp`, `results/stored_estimates_commands.cpp`, `results/estimates_save_use.cpp` | e() stores on the session evaluator, `session.estimatesModels`; `results/README.md`; `selftest_ereturn_*.cpp`, `selftest_stored_estimates*.cpp`, `--suite stored-estimates` |
+| Macro expansion, definitions, numeric text or matrix references are wrong | `eval/macros.cpp` coordinates expansion; `eval/macro_{definitions,scanners,text,expressions,results,matrices}.cpp` own the specific work | `eval/README.md`; `selftest_language_macro_*.cpp`, `selftest_language_values.cpp`, `selftest_unicode_names_macros.cpp` |
+| A do-file, loop, program, `syntax`, `display` or `tempvar` behaves incorrectly | `language/doexec.cpp`, `language/loops.cpp`, `language/program.cpp`, `language/program_syntax.cpp`, `language/display_command.cpp`, `language/scalar_expression.cpp`, `language/temporary_names.cpp` | Loop-body depth and minted names belong to `SessionState`; `language/README.md`; `selftest_language_control*.cpp`, `selftest_language_loops.cpp`, `selftest_language_do_include_scope.cpp` |
+| A `matrix` command, matrix expression, `svmat`/`mkmat` or the Mata subset is wrong | `matrix/matrix_commands.cpp`, `matrix/matrix_expression.cpp`, `matrix/matrix_to_variables.cpp`, `matrix/variables_to_matrix.cpp`, `matrix/mata_subset.cpp` | `session.eval.matrices` is written in three places that must stay identical; `matrix/README.md`; `selftest_matrix_*.cpp`, `selftest_mata_subset_getmata.cpp` |
+| Graph blocks, histogram/density, SVG export or live-view thinning are wrong | `graph/commands.cpp`, `graph/distribution_commands.cpp`, `graph/twoway.cpp`, `graph/svg.cpp`, `graph/files.cpp`, `graph/graph_export_formats.cpp`, `graph/view.cpp` | Graphs and sersets in `SessionState`; `graph/README.md`; `selftest_graphics*.cpp` and exact SVG comparisons |
+| Uniqueness, missingness, labels, file lists, spells, rolling statistics or calendars are wrong | Named command files under `utility/`; `utility/utility_support.cpp` owns shared column/read/write helpers | `utility/README.md`; `selftest_data_commands.cpp`, `selftest_calendars.cpp`, `selftest_command_contracts.cpp` |
+| A model fit has the wrong options or engine request | Named files under `estimation/`, for example `binary_estimation.cpp`, `panel_estimation.cpp`, `instrumental_variables.cpp`, `count_estimation.cpp`; shared `estimation/estimation_support.cpp`, `estimation_results.cpp`, `estimation_options.cpp` | `estimation/estimation_internal.h` and family-specific internal headers; `estimation/README.md`; `selftest_estimation*.cpp`, `selftest_iv_*.cpp`, `selftest_*_estimation.cpp` |
+| `bootstrap`, `jackknife`, `permute`, `rolling` or `statsby` prefix is wrong | `estimation/bootstrap_prefix.cpp`, `estimation/jackknife_permute_prefix.cpp`, `estimation/rolling_prefix.cpp`, `estimation/statsby_prefix.cpp`, `estimation/resampling_prefix_support.cpp`; the line is recognized in `dispatch/stage_resampling.cpp` | Session random stream (`estimation/bsample_draws.h`); `selftest_bootstrap_prefix.cpp` |
+| `predict`, `margins`, `test`, `lincom`, `nlcom`, or `estat` uses the wrong fit/sample | `postestimation/prediction.cpp`, `postestimation/margins.cpp`, `postestimation/hypothesis_tests.cpp`, `postestimation/estimation_diagnostics.cpp`, `postestimation/postestimation_context.cpp` | `LastModel`, fit restrictions/weights, `e(sample)`, live `e()`/`r()`; `postestimation/README.md`; `selftest_postestimation*.cpp`, `selftest_model_diagnostics.cpp` |
+| `merge`, `append`, `joinby` or `reshape` loses rows, types or labels | `datamgmt/data_merge.cpp`, `datamgmt/data_append.cpp`, `datamgmt/data_joinby.cpp`, `datamgmt/data_reshape.cpp`; `datamgmt/using_dataset.h` reads the `using` file | Dataset keys/order, metadata and resident/materialized mutation results; `datamgmt/data_combine_internal.h`; `selftest_data_combine.cpp`, `selftest_data_combine_varlist_options.cpp` |
+| A data command changes the wrong variables/rows | `datamgmt/variable_copy_rename.cpp`, `data_collapse.cpp`, `data_order.cpp`, `data_duplicates.cpp`, `data_recode.cpp`, `data_observation_expansion.cpp`, `data_quantiles.cpp`, `data_interpolation.cpp`; shape verbs (`split`, `xpose`, `stack`, ...) in their own `datamgmt/` files | Shared writer rules in `datamgmt/data_mutation_internal.h` and `datamgmt/datamgmt_support.h`; `datamgmt/README.md`; `selftest_data_commands.cpp`, `selftest_data_storage.cpp`, `selftest_data_rename_recode_encode.cpp` |
+| `generate`, `replace`, `egen` or a row expression gives the wrong values | `datamgmt/data_generate.cpp`, `datamgmt/string_generate_replace.cpp`, `datamgmt/row_evaluation.cpp`, `datamgmt/row_conditions.cpp`, `datamgmt/egen.cpp` | Hidden qualifier columns, storage types; `selftest_data_egen_statistics.cpp`, `selftest_data_string_functions.cpp`, `selftest_variable_storage_types.cpp` |
+| Save, CSV, spreadsheet or string conversion is wrong | `fileio/dataset_save.cpp`, `fileio/delimited_import.cpp`, `fileio/delimited_export.cpp`, `fileio/spreadsheet_import.cpp`, `fileio/spreadsheet_export.cpp`; `datamgmt/destring.cpp`, `tostring.cpp`, `encode.cpp`, `decode.cpp` | Native read/write services, metadata and file overwrite rules; `fileio/README.md`; `selftest_file_io.cpp`, `selftest_spreadsheets.cpp`; `--suite data-conversion` |
+| `cd`, `clear`, `log`, `timer`, `shell`, `mkdir` or `ssc` behaves incorrectly | Command families under `environment/` (for example `workspace_commands.cpp`, `logging_commands.cpp`, `shell_translation.cpp`) | State lives in `SessionState`; `environment/README.md`; `selftest_file_io.cpp`, `selftest_settings_and_execution.cpp` |
+| `describe`, `summarize`, `tabulate`, `count` or `list` output is wrong | `descriptive/describe.cpp`, `descriptive/summarize.cpp`, `descriptive/tabulate.cpp`, `descriptive/data_listing.cpp`, `descriptive/descriptive_statistics.cpp` | Read-only except `r()`; `descriptive/README.md`; `selftest_descriptive_statistics.cpp` |
+| Stored estimates restore the wrong model or added results | `session/session_estimates.cpp`, `session/session_fit_state.cpp`; the commands are in `results/stored_estimates_commands.cpp` | Snapshot/model pins, `e(sample)`, live `e()` and added mirrors; `--suite stored-estimates` |
+| Dataset replacement, scratch ownership or a resident card is stale | `session/session_dataset.cpp`, `session/session_resident_head.cpp`, `session/session_resident_card*.cpp`, `session/session_scratch.cpp`; `session/session_memory.cpp` owns memory accounting | `load`, `datastore`, materialization and pin/reclaim lifetimes; `session/README.md`; `selftest_bridge_routes.cpp`, `selftest_data_storage.cpp` |
+| Time/panel declarations disappear or display incorrectly | `time/time_declarations.cpp`, `session/session_time_metadata.cpp`, `time/time_panel_state.cpp`, `time/time_fill.cpp` | Panel/time metadata, formats, characteristics and `r()`; `time/README.md`; `--suite time-declarations` |
+| A `parallel` block or automatic parallel region misbehaves | `parallel/parallel_block.cpp`, `parallel/parallel.cpp`, `parallel/parallel_auto.cpp`, `parallel/parallel_effects.cpp` | Recognizer refuses whatever it cannot prove independent; `parallel/README.md`; `selftest_parallel_execution.cpp` |
+| Editor contents, file reopen, command execution or cancellation is wrong | `piet/frontend/js/editor.js`, `execution.js`, `command-input.js`, `run-progress.js`, `request-dialog.js`, `recent-files.js` | Controllers own feature state; `app.js` composes narrow callbacks; `piet/frontend/js/README.md`; DOM suite and actual native UI smoke |
+| Split panes, settings or window restoration is wrong | `piet/frontend/js/layout.js`, `settings.js`, `app-navigation.js`; existing `panes.js` and `piet/frontend/css/piet.css` | Local storage/native `ui_state`, DOM order and deferred controller callbacks; DOM suite and actual native UI smoke |
+
+### Source tree
+
+Code files are `.cpp`, `.h` and `.inc` files directly in the directory.
+
+| Directory under `piet/native/src` | Responsibility | Code files |
+|---|---|---:|
+| `app/` | Process entry point, command-line modes, webview shell, bridge routes, settings, headless and UI-smoke runners | 18 |
+| `dispatch/` | Ordered pipeline from a typed line to result blocks: stages, per-family routes, command registry, option vocabularies | 54 |
+| `eval/` | Tokenizer, macro expansion, expression evaluator and function library, error payloads | 25 |
+| `language/` | Do-file execution, loops, programs and `syntax`, `display`, `c()`, temporary names, small program commands | 23 |
+| `session/` | Out-of-line members of `SessionState`: dataset lifecycle, resident head and card, scratch, logs, fits | 20 |
+| `engine/` | Engine process and worker client, `.hbin` reader, engine arguments, storage types, memory pre-flight | 13 |
+| `datamgmt/` | Commands that create, change, combine, reshape, convert and label data; frames; `preserve`/`restore` | 81 |
+| `descriptive/` | Read-only reports: describe, summarize, tabulate, listings, comparisons, `centile` | 13 |
+| `fileio/` | `use`/`save`, delimited, fixed-format, spreadsheet and ZIP files, `file`/`postfile`, typed paths | 27 |
+| `environment/` | Working directory, `clear`, logs, timers, filesystem commands, `shell`, ado paths and packages | 12 |
+| `estimation/` | Model fits, shared estimation support, resampling prefixes, `e(sample)` install | 66 |
+| `postestimation/` | `predict`, `margins`, tests, `estat`, `boottest`, `lrtest`, `suest`, `r(table)` | 14 |
+| `results/` | `return list`, `ereturn`, `scalar list`, stored estimates and `.ster` files | 7 |
+| `tables/` | `esttab`, `estout`, `outreg2`, `estadd`, `estpost`, `estimates table`, table file exporters | 26 |
+| `matrix/` | Matrix commands and expressions, matrix/variable conversion, Mata subset, LAPACK eigen translation | 12 |
+| `graph/` | Graph blocks, twoway layers, distribution plots, sersets, SVG and export formats | 38 |
+| `time/` | `tsset`/`xtset`, `tsfill`, Hodrick-Prescott filter, `sctorezone`, business-calendar library | 6 |
+| `utility/` | Community data utilities (`unique`, `missings`, `rangestat`, `filelist`, `bcal` command, `geodist`) | 14 |
+| `parallel/` | `parallel` block, worker processes, automatic recognizer | 5 |
+| `generated/` | Generated option-minimum table included by `dispatch/options_support.cpp`; not edited by hand | 1 |
+| top level | Selftest runner, shared helpers, declarations and the 99 case files indexed in `SELFTESTS.md` | 106 |
+
+Public declarations are under `piet/native/include/piet/`. Command entry points are
+declared by domain in `include/piet/handlers/*.h`; `piet/handlers.h` includes all of them.
+
+### Boundaries that matter
+
+`dispatch/dispatcher.cpp` is orchestration. Preserve the order of its preprocessing
+stages, its recursion and the lifetime of `RcHiddenScope` / `QualifierColumnGuard`
+(defined in `dispatch/types.h`). Routes run only after those common steps. Keep command
+names and abbreviations in `dispatch/registry.cpp`; a route family is an implementation
+grouping, not another command registry. A new ordinary command needs its implementation
+file in the matching domain directory, a registry row, an arm in the matching
+`dispatch/route_*.cpp` and a row in that directory's `README.md`.
+
+Prepared-table rendering takes a table and settings and returns text. It must not fetch
+a model, mutate a session or write a file. Command-specific esttab/estout/outreg writers
+retain their established formatting paths: follow the actual call before changing a
+shared renderer. `tables/tables_internal.h` contains implementation-private types and
+helper declarations; helpers have one definition in their named source file.
+
+`SessionState` remains the owner of the same fields and resource lifetimes. Shared value
+types live in `include/piet/session_types.h`; `include/piet/session_state.h` exposes
+declarations, layout and small accessors. Constructor wiring, dataset transitions,
+resident head and card, scratch, live-fit posting, metadata/time metadata, logs and
+memory accounting have separate files under `session/`. Splitting the implementation
+did not turn session fields into separately copied state objects.
+
+Includes: `piet/native/src` is on the include path. A header in the same directory is
+included by bare name; a header in another directory by its path from `src`
+(for example `dispatch/registry.h`); never with `../`. Private `*_internal.h` and
+`*_support.h` headers belong to their directory or named family; each directory README
+lists the few that are included from elsewhere. Do not add catch-all files: put new code
+in the file that owns the command, or in a new file named for what it does.
+
+Floating-point flags: the `-ffp-contract=off` list in `piet/native/CMakeLists.txt` and
+the in-file `#pragma clang fp contract(off)` sites are part of the numerical behavior. A
+file keeps its flag when it is moved or split, and a function moved out of a listed file
+must go to a file with the same flag. Each directory README names its listed files.
+
+### Build and focused checks
+
+The application and selftest link the same `piet_core` objects. Test cases are excluded
+from the application. `selftest.cpp` selects suites and calls the established full run;
+219 embedded cases live in 29 files declared in `selftest_cases.h`; 78 feature entry
+functions live in 70 feature files, 76 declared in `selftest_feature_cases.h` and two
+(`testW2yDatetime`, `testW2eFloat`) declared at their call in `selftest.cpp`.
+`SELFTESTS.md` indexes all 99 case files. Shared counters and fixture helpers have one
+definition in `selftest_support.cpp`. The full run's call order is preserved, including
+its final float-store fallback check. `selftest.cpp` must keep its name and directory:
+cases locate the repository root and fixtures through its `__FILE__`
+(`selftestSourceFile()`).
+
+For a public checkout, use `sh scripts/build-macos.sh` and
+`python3 tests/ui_smoke.py` on macOS; the build script runs the public engine and
+application smoke checks. The Windows counterpart is `scripts/build-windows.sh`. (In the maintainer checkout these
+files are under `public/`; the export places them at the root.)
+The full maintainer selftest below depends on additional fixtures that are not
+included in the public source distribution. A missing fixture is not a passing test.
+
+For a maintainer checkout, from the repository root:
+
+```sh
+python3 tools/lint_source_layout.py
+cmake --build piet/native/build -j4
+piet/native/build/piet_selftest --list-suites
+COBRA_BIN="$PWD/build/cobra" piet/native/build/piet_selftest --suite tables
+COBRA_BIN="$PWD/build/cobra" piet/native/build/piet_selftest --suite data-conversion
+COBRA_BIN="$PWD/build/cobra" piet/native/build/piet_selftest --suite stored-estimates
+COBRA_BIN="$PWD/build/cobra" piet/native/build/piet_selftest --suite time-declarations
+COBRA_BIN="$PWD/build/cobra" piet/native/build/piet_native --selftest
+node piet/frontend/test/dom_runner.mjs
+```
+
+`tools/lint_source_layout.py` is the layout check: it fails when a non-selftest C++
+file sits directly in `piet/native/src`, a source is missing from or listed twice in the
+CMake build lists, a `-ffp-contract=off` path does not exist, two code files share a
+basename, a file or directory name carries a development-history token or shadows an
+engine include directory, a directory README omits one of its code files or names a
+missing one, or a quoted include uses `../`.
+
+Selections reuse existing test functions and assertions; they do not replace integration
+checks. `--suite all` selects the unchanged full run. The nine entry points in
+`selftest_unimplemented_scaffolds.cpp` have empty bodies; a matching name alone does not
+prove coverage. Source-path checks must follow every relocated writer, keep their
+original expected counts and assert that every file was read.
+
+For a structural change compare output bytes, errors, state effects, registry and option
+vocabulary before/after. Run the applicable `tools/merge_gate.sh` checks on the final
+candidate. UI changes also need the native `--ui-smoke` journey; DOM tests alone do not
+establish webview geometry, the native bridge or restoration across a restart. Keep
+oracle data, tolerances, graders and command schemas unchanged.
+
+### What stays whole
+
+There is no line limit. These large files were deliberately left as one file because
+each holds one command, one grammar or one algorithm, and a split would separate code
+that shares one set of rules (sizes from `wc -l`):
+
+- `matrix/lapack_dsyevr.cpp` (3,933 lines): a translation of one LAPACK call tree under
+  one adopted-code notice. It is on the `-ffp-contract=off` list, and the fused
+  multiply-adds of the reference build are written as explicit `std::fma` at the same
+  sites; any piece split off would have to carry both rules.
+- `eval/exprfns.cpp` (3,047): the Stata function library. `regexs()` reads the memo of
+  the last `regexm()`, the regex functions share one process-wide compiled-regex cache,
+  and the running-sum stack is a thread-local in the same file.
+- `postestimation/margins.cpp` (2,742) and `postestimation/prediction.cpp` (2,326):
+  one command each with many option paths; both are on the `-ffp-contract=off` list, so
+  any piece split off must carry the flag.
+- `matrix/matrix_expression.cpp` (2,384): the matrix expression grammar, `matrix list`
+  rendering and `storeMatrixResult`; `matrix/matrix_expression_internal.h` is its only
+  seam, to `matrix/matrix_commands.cpp`.
+- `dispatch/registry.cpp` (2,259): the single table of command names, abbreviations,
+  qualifier allow-lists and community names. One table is the authority the tokenizer,
+  the by-prefix and the contract selftests read.
+- `estimation/qreg2_estimation.cpp` (2,278) and `estimation/lasso_estimation.cpp`
+  (2,119): each carries code derived from one community package (`qreg2`; lassopack's
+  `rlasso` path). The adopted-code register in
+  `piet/packaging/licenses/40-ADOPTED-CODE.txt` names the file that carries the derived
+  code, so each port stays in one file under one notice.
+- Engine `src/data/frame*.cpp`, the LAPACK translations and estimator kernels remain in
+  their numerical/data-plane layer. Splitting a cohesive algorithm only to reduce line
+  count would not narrow a normal command/UI maintenance task.
+
+These boundaries do not claim that every remaining function is short or that all design
+debt is gone. For normal maintenance, use the symptom map and the directory README
+before widening the read scope.
+
+---
+
+## Historical architecture snapshot — 2026-07-29
+
 Written 2026-07-29 by the Secretary from direct inspection of the repo at `main @27f2deb`
 (4-tuple `{piet B.6.2, cobra 0.34.2, contract_A 1.20.0, contract_B 2.6.0}`).
 

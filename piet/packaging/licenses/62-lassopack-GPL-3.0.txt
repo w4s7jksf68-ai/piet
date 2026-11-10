@@ -1,5 +1,5 @@
 lassopack 1.3 (rlasso.ado 1.0.10, lassoutils.ado 1.1.03) — GPL-3.0
-Adopted at: piet/native/src/handlers_e3_lasso.cpp (the `rlasso` path: a native
+Adopted at: piet/native/src/estimation/lasso_estimation.cpp (the `rlasso` path: a native
 port derived from the Mata in lassoutils.ado and the ado bookkeeping in
 rlasso.ado; line citations in that file, L:line and R:line, refer to those
 two upstream files)

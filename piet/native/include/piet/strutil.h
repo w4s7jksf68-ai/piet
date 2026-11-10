@@ -2,23 +2,23 @@
 // Copyright (C) 2026 M.K. Kim
 // Shared ASCII string helpers (lower-case fold, " \t"-only trim) — hoisted
 // out of the ~9 near-identical anonymous-namespace copies scattered across
-// the native TUs (A5-04): dispatcher.cpp's lower()/trimWs(), handlers_m3.cpp's
-// lower()/trim(), handlers.cpp's lower(), handlers_data_verbs.cpp's
-// lower()/trim(), egen.cpp's lower()/trim(), postfile.cpp's lower()/trim(),
+// the native TUs (A5-04): the dispatcher's lower()/trimWs()
+// (dispatch/text_support.cpp), the command handlers' lower()/trim() copies,
+// egen.cpp's lower()/trim(), postfile.cpp's lower()/trim(),
 // loops.cpp's lower()/trim(), program.cpp's lower()/trim(), doexec.cpp's
-// lower()/trim(), estimation_m4.cpp's lowerM4()/trimM4(), and
+// lower()/trim(), estimation/estimation_support.cpp's lowerM4()/trimM4(), and
 // eval/tokenizer.cpp's toLower(). Each of those TU-local copies has internal
 // linkage (wrapped in its own anonymous namespace), so there was never an
 // ODR violation at link time — just duplicated logic to keep in sync by
 // hand. This header is the single source of truth going forward.
 //
-// TUs in this workstream's manifest (dispatcher.cpp, handlers_m3.cpp,
-// eval/tokenizer.cpp) now forward their locally-named helper to these
+// TUs in this workstream's manifest (dispatch/text_support.cpp, the command
+// handler TUs, eval/tokenizer.cpp) now forward their locally-named helper to these
 // implementations, kept as thin one-line wrappers rather than removed
 // outright — that way none of their many existing call sites needed
 // touching (pure dedup, no behavior change). TUs outside the manifest
-// (handlers.cpp, handlers_data_verbs.cpp, egen.cpp, postfile.cpp, loops.cpp,
-// program.cpp, doexec.cpp, estimation_m4.cpp) still carry their own copy —
+// (the other handler TUs, egen.cpp, postfile.cpp, loops.cpp,
+// program.cpp, doexec.cpp, estimation/estimation_support.cpp) still carry their own copy —
 // left alone here and reported for a future sweep.
 //
 // NOT the same thing as eval::tokenizer.cpp's strip()/lstrip()/rstrip()
@@ -62,7 +62,7 @@ inline std::string trim(const std::string& s) {
 // SILENT_SWALLOW): a new-variable name (gen's LHS, rename's target, ...)
 // must be a valid Stata identifier — letters/digits/underscore, NOT
 // starting with a digit, at most 32 characters, non-empty. Before this, the
-// rule was enforced ONLY on strmutate.cpp's string-gen fallback path (its
+// rule was enforced ONLY on datamgmt/string_generate_replace.cpp's string-gen fallback path (its
 // own `identRe()`, which didn't even check the length cap); the far more
 // common numeric `gen`/`replace` path shipped straight to `cobra eval
 // --gen` with no check at all, so `gen 9zzz = 1` silently created a column
@@ -95,7 +95,7 @@ inline std::string stataIdentifierRuleText() {
 // most commands follow. A few (tostring, destring, xtile, pctile, predict,
 // tssmooth, ...) reach the other words through their own syntax, and Stata answers
 // them with that syntax's own refusal; those refuse only the eight here. svmat
-// keeps its own list (handlers_aer_results.cpp).
+// keeps its own list (matrix/matrix_to_variables.cpp).
 inline bool isReservedVarName(const std::string& name) {
   static const char* const kReserved[] = {"_b",  "_coef", "_cons", "_n",
                                           "_N",  "_pi",   "_pred", "_rc"};
@@ -235,8 +235,9 @@ inline std::string rejoinQuotedWord(const std::vector<std::string>& words, size_
 // ASCII table has one — so only the level segment is substituted.
 //
 // WHY IT LIVES HERE. This was TWO byte-identical hand-written copies —
-// handlers.cpp's `substituteFactorLevelLabel` (the M2/regress slice) and
-// estimation_m4.cpp's `substituteFactorLevelLabelM4` — differing in ONE comment
+// estimation/linear_estimation_support.cpp's `substituteFactorLevelLabel` (the
+// M2/regress slice) and estimation/estimation_support.cpp's
+// `substituteFactorLevelLabelM4` — differing in ONE comment
 // line and nothing else. The copy's own note said no shared header linked the
 // two anonymous namespaces; the answer was to make one. Two copies of a display
 // RULE that must agree is the twin class this codebase has already been bitten
@@ -288,12 +289,12 @@ inline std::string substituteFactorLevelLabel(
 // adding a platform dependency for it would cost more than it saves.
 //
 // This is Stata's `match()` / `strmatch()` for the surfaces that need it as a
-// utility. It moved here from handlers_aer_util.cpp's anonymous namespace,
-// byte-identical, when handlers_aer_tables.cpp needed the SAME matcher for
+// utility. It was hoisted here out of an anonymous namespace,
+// byte-identical, when the esttab/estout code in tables/ needed the SAME matcher for
 // esttab/estout `keep()`/`drop()`/`order()` and `transform()`'s coefficient
 // patterns -- a second copy in a sibling translation unit is how two surfaces
-// end up disagreeing about what `*` means. `loops.cpp` and `estimation_m4c.cpp`
-// still carry their own (BUG-496 records the count); they are not callers here.
+// end up disagreeing about what `*` means. `loops.cpp` and other translation
+// units may still carry their own (BUG-496 records the count); they are not callers here.
 //
 // `?` is ONE CHARACTER, not one byte (StataBE: `ds ق?` lists the two-letter
 // Arabic names), and a `*` backtrack resumes on a character boundary.

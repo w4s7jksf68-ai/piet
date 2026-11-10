@@ -1,5 +1,5 @@
 ritest 1.1.7 (Simon Hess) — GPL-3.0
-Adopted at: piet/native/src/handlers_e3_ritest.cpp (derived from ritest.ado; line cites there refer to the ado)
+Adopted at: piet/native/src/estimation/ritest_inference.cpp (derived from ritest.ado; line cites there refer to the ado)
 
 Project:  ritest — Stata module to perform randomization inference and permutation tests
 Authors:  Simon Hess

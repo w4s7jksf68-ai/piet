@@ -1,5 +1,5 @@
 qreg2 4.00 (Machado, Parente, Santos Silva) — GPL-3.0
-Adopted at: piet/native/src/handlers_e3_qreg2.cpp (derived from qreg2.ado; line cites there refer to the ado)
+Adopted at: piet/native/src/estimation/qreg2_estimation.cpp (derived from qreg2.ado; line cites there refer to the ado)
 
 Project:  qreg2 — Stata module to perform quantile regression with robust and clustered standard errors
 Authors:  J.A.F. Machado, Paulo M.D.C. Parente, J.M.C. Santos Silva

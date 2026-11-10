@@ -1,5 +1,5 @@
 outreg2 2.3.2 (Roy Wada) — GPL-3.0
-Adopted at: piet/native/src/handlers_aer_tables.cpp (the `outreg2` section; derived from outreg2.ado's own staged grid)
+Adopted at: piet/native/src/tables/table_outreg.cpp, piet/native/src/tables/outreg2_internal.h, piet/native/src/tables/table_options.cpp (the `outreg2` section; derived from outreg2.ado's own staged grid)
 
 Project:  outreg2 — Stata module to arrange regression outputs into an illustrative table
 Authors:  Roy Wada (outreg2.ado header: "outreg2 2.3.2 17aug2014 by roywada@hotmail.com; based on outreg 3.0.6/4.0.0 by john_gallup@alum.swarthmore.edu")

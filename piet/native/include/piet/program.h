@@ -98,7 +98,7 @@ std::vector<std::string> captureProgams(const std::vector<std::string>& lines, S
 // captureProgams registers definitions at PREPROCESS time, i.e. before any
 // statement of the do-file has run. Anything executed later that clears the
 // program table therefore deletes definitions that appear AFTER it in the
-// source and have not been reached yet. `clear all` (handlers_m3.cpp, the
+// source and have not been reached yet. `clear all` (environment/workspace_commands.cpp, the
 // `program drop _all` half) is exactly that, so the near-universal Stata
 // prologue
 //     clear all
@@ -164,7 +164,7 @@ ojson runProgram(const ProgramDef& progDef, const std::string& argstr, SessionSt
 // started) -- what Stata does when that program or do-file concludes, on
 // success and on error alike. Only a failed restore leaves a block, appended
 // to `blocks`; it stops the unwinding there. The one unwinder (session_state.h
-// PreserveFrame I3); defined in handlers_m3.cpp beside runRestore.
+// PreserveFrame I3); defined in datamgmt/preserve_restore.cpp beside runRestore.
 void restorePreservesDeeperThan(int callerLevel, SessionState& session, ojson& blocks);
 
 // BUG-922: everything Stata undoes when a program returns or a nested do/run
