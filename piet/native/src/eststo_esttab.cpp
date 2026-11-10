@@ -30,7 +30,7 @@
 #include "piet/dispatcher.h"  // `estimates esample:` marks its rows through `generate`
 #include "piet/eval/errors.h"
 #include "piet/eval/macros.h"  // eScalarKey(): the ONE e()-name table
-#include "estimation_m4_internal.h"  // e(sample) T2's mask writer (esampleRewriteHeadMask)
+#include "estimation_internal.h"  // e(sample) T2's mask writer (esampleRewriteHeadMask)
 #include "io/win_compat.h"     // cecon::native_exists / to_native_path
 
 // ---------------------------------------------------------------------------

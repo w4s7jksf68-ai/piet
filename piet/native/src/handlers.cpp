@@ -21,7 +21,7 @@
 #include <sstream>
 #include <unordered_set>
 
-#include "estimation_m4_internal.h"  // e(sample) T2: the esample helpers' declarations
+#include "estimation_internal.h"  // e(sample) T2: the esample helpers' declarations
 #include "piet/cobra_runner.h"
 #include "piet/column_fetch.h"
 #include "piet/counters.h"  // PP-L1 use-plane split counters (runUse)

@@ -66,7 +66,7 @@
 #include "piet/session_state.h"
 #include "piet/strutil.h"
 #include "piet/twoway_opts.h"
-#include "estimation_m4_internal.h"
+#include "estimation_internal.h"
 #include "estimators/postest_names.h"  // factor_vars_of / parse_level_ref (the engine's one resolver)
 #include "registry.h"  // resolveCanonical: the command word as Stata names it
 

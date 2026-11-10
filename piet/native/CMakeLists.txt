@@ -31,7 +31,7 @@ add_compile_options(-Wall -Wextra -Wno-deprecated-declarations)
 # last ULP. That divergence is invisible to the cross_impl numeric-
 # tolerance profile but breaks Eval's ZERO-TOLERANCE CoefficientRow anchor
 # harness (ci_lo/ci_hi ARE anchor fields, Doctrine ①):
-#   - graph_m4.cpp   : bin/grid-edge `xmin + step*i` (np.linspace internals)
+#   - graph/*.cpp    : bin/grid-edge `xmin + step*i` (np.linspace internals)
 #   - estimation_m4.cpp: CI bounds `b ± kZ975*se` in the margins BUG-006
 #                        AME remap (cobraToEstimationM4) and csdid's
 #                        _coef_row (coefRowM4, feeding estat simple/event)
@@ -43,10 +43,49 @@ add_compile_options(-Wall -Wextra -Wno-deprecated-declarations)
 # Scoped to just these numpy-parity files — NOT applied globally, since no
 # other TU in this build has been shown to need it.
 set_source_files_properties(
-  src/graph_m4.cpp
-  src/estimation_m4.cpp
-  src/estimation_m4b.cpp
-  src/estimation_m4c.cpp
+  src/graph/support.cpp
+  src/graph/commands.cpp
+  src/graph/distribution_math.cpp
+  src/graph/distribution_commands.cpp
+  src/graph/twoway.cpp
+  src/graph/svg.cpp
+  src/graph/files.cpp
+  src/graph/view.cpp
+  src/estimation_support.cpp
+  src/estimation_results.cpp
+  src/descriptive_statistics.cpp
+  src/panel_estimation.cpp
+  src/likelihood_support.cpp
+  src/categorical_estimation.cpp
+  src/vector_time_series.cpp
+  src/multiple_imputation.cpp
+  src/dynamic_panel_estimation.cpp
+  src/nonlinear_estimation.cpp
+  src/mixed_estimation.cpp
+  src/survey_commands.cpp
+  src/survival_estimation.cpp
+  src/binary_estimation.cpp
+  src/estimation_options.cpp
+  src/did_estimation.cpp
+  src/iv_specification.cpp
+  src/instrumental_variables.cpp
+  src/system_estimation.cpp
+  src/bootstrap_inference.cpp
+  src/censored_estimation.cpp
+  src/selection_estimation.cpp
+  src/quantile_estimation.cpp
+  src/mediation_estimation.cpp
+  src/inference_statistics.cpp
+  src/count_estimation.cpp
+  src/did_two_period.cpp
+  src/postestimation_context.cpp
+  src/hypothesis_tests.cpp
+  src/margins.cpp
+  src/prediction.cpp
+  src/estimation_diagnostics.cpp
+  src/time_series_estimation.cpp
+  src/model_comparison.cpp
+  src/data_splines.cpp
   src/eststo_esttab.cpp
   src/twoway_opts.cpp
   # Mata invsym(): StataBE's invsym() rounds every product and difference
@@ -58,7 +97,21 @@ set_source_files_properties(
   # `matrix` expressions (handlers_m3.cpp): StataBE's products and inv() round
   # every product and sum separately; fused, `(0.1,0.7)*(0.2\0.6)` differs in
   # the last bit and inv() of a singular X'X misses its zero pivot.
-  src/handlers_m3.cpp
+  src/command_support.cpp
+  src/time_panel_state.cpp
+  src/observation_selection.cpp
+  src/data_listing.cpp
+  src/scalar_results.cpp
+  src/matrix_expression.cpp
+  src/matrix_commands.cpp
+  src/label_metadata.cpp
+  src/preserve_restore.cpp
+  src/temporary_names.cpp
+  src/levels_command.cpp
+  src/session_commands.cpp
+  src/logging_commands.cpp
+  src/environment_commands.cpp
+  src/timer_commands.cpp
   # LAPACK DSYEVR translation (Mata symeigensystem() in StataBE): the fused
   # multiply-adds of StataBE's gfortran build are written as std::fma at the
   # same sites; nothing else may be contracted.
@@ -101,17 +154,69 @@ add_library(piet_core OBJECT
   src/eval/pyvalue.cpp
   src/eval/pyeval.cpp
   src/eval/exprfns.cpp
+  src/eval/macro_text.cpp
+  src/eval/macro_scanners.cpp
   src/eval/macros.cpp
+  src/eval/macro_results.cpp
+  src/eval/macro_expressions.cpp
+  src/eval/macro_matrices.cpp
+  src/eval/macro_definitions.cpp
+  src/eval/macro_selftest.cpp
   src/eval/evalcase.cpp
   src/eval/evalcase_ext.cpp
   # M2 glue + vertical slice (see ROADMAP.md §2.0.0 "M2")
   src/datastore.cpp
   src/session_state.cpp
+  src/session_estimates.cpp
+  src/session_lifecycle.cpp
+  src/session_dataset.cpp
+  src/session_fit_state.cpp
+  src/session_log_queries.cpp
+  src/session_memory.cpp
+  src/session_metadata.cpp
+  src/session_time_metadata.cpp
   # BETA campaign Phase A4: the c()-class system-value registry (BS-091/
   # BS-101) — single source for every `c(name)` read (display, gen/replace's
   # cobra-forwarded RHS, if/while conditions, scalar/local `= expr`).
   src/cclass.cpp
   src/dispatcher.cpp
+  src/dispatch/options_support.cpp
+  src/dispatch/data_support.cpp
+  src/dispatch/expression_support.cpp
+  src/dispatch/graphics_support.cpp
+  src/dispatch/prefix_support.cpp
+  src/dispatch/results_support.cpp
+  src/dispatch/route_data_combine.cpp
+  src/dispatch/route_data_generate.cpp
+  src/dispatch/route_data_names.cpp
+  src/dispatch/route_data_rows.cpp
+  src/dispatch/route_describe.cpp
+  src/dispatch/route_environment.cpp
+  src/dispatch/route_estimation.cpp
+  src/dispatch/route_extensions.cpp
+  src/dispatch/route_graphics.cpp
+  src/dispatch/route_io.cpp
+  src/dispatch/route_postestimation.cpp
+  src/dispatch/route_results.cpp
+  src/dispatch/route_session.cpp
+  src/dispatch/route_table_family.cpp
+  src/dispatch/route_tabulation.cpp
+  src/dispatch/route_time.cpp
+  src/dispatch/session_support.cpp
+  src/dispatch/stage_by_prefix.cpp
+  src/dispatch/stage_macro_expansion.cpp
+  src/dispatch/stage_prefixes.cpp
+  src/dispatch/stage_program_resolution.cpp
+  src/dispatch/stage_qualifiers.cpp
+  src/dispatch/stage_raw_blocks.cpp
+  src/dispatch/stage_raw_files.cpp
+  src/dispatch/stage_raw_programs.cpp
+  src/dispatch/stage_resampling.cpp
+  src/dispatch/stage_tokenization.cpp
+  src/dispatch/stage_validation.cpp
+  src/dispatch/summary_support.cpp
+  src/dispatch/text_support.cpp
+  src/dispatch/validation.cpp
   # Shared mutationResult builder (see include/piet/mutation_result.h) —
   # consolidated out of four near-identical per-TU copies (handlers.cpp,
   # handlers_m3.cpp, handlers_data_verbs.cpp, egen.cpp).
@@ -136,22 +241,78 @@ add_library(piet_core OBJECT
   src/parallel_effects.cpp
   src/parallel_paths.cpp
   src/doexec.cpp
-  src/handlers_m3.cpp
+  src/command_support.cpp
+  src/time_panel_state.cpp
+  src/observation_selection.cpp
+  src/data_listing.cpp
+  src/scalar_results.cpp
+  src/matrix_expression.cpp
+  src/matrix_commands.cpp
+  src/label_metadata.cpp
+  src/preserve_restore.cpp
+  src/temporary_names.cpp
+  src/levels_command.cpp
+  src/session_commands.cpp
+  src/logging_commands.cpp
+  src/environment_commands.cpp
+  src/timer_commands.cpp
   src/handlers_aer_env.cpp
   src/handlers_aer_abbrev.cpp
   src/handlers_aer_results.cpp
   src/mata_subset.cpp
   src/handlers_aer_gtools.cpp
-  src/handlers_aer_tables.cpp
+  src/table_options.cpp
+  src/table_text.cpp
+  src/table_number_format.cpp
+  src/table_files.cpp
+  src/table_model_context.cpp
+  src/table_transform.cpp
+  src/table_composition.cpp
+  src/table_estadd.cpp
+  src/table_estpost.cpp
+  src/estout_models.cpp
+  src/estout_grammar.cpp
+  src/estout_format.cpp
+  src/table_esttab.cpp
+  src/table_estout.cpp
+  src/table_outreg.cpp
+  src/table_tex_files.cpp
+  src/table_matrix_export.cpp
+  src/table_dataset_export.cpp
+  src/table_erepost.cpp
+  src/table_render.cpp
+  src/table_commands.cpp
+  src/time_declarations.cpp
   # W2D-T01: `ereturn clear|post|local` (+ named refusals for the rest).
   src/handlers_ereturn.cpp
   src/handlers_aer_reshape.cpp
   src/program.cpp
   src/display_hardening.cpp
   # M3b: MI-066 data verbs via cobra 0.18.0 (see ROADMAP.md §2.0.0 "M3b")
-  src/handlers_data_verbs.cpp
-  src/handlers_data_verbs2.cpp
-  src/handlers_data_verbs3.cpp
+  src/data_order_options.cpp
+    src/dataset_save.cpp
+    src/variable_copy_rename.cpp
+    src/data_collapse.cpp
+    src/data_order.cpp
+    src/data_recode.cpp
+    src/data_duplicates.cpp
+  src/data_combine_options.cpp
+    src/data_reshape.cpp
+    src/data_append.cpp
+    src/data_merge.cpp
+    src/data_duplicates_route.cpp
+    src/panel_descriptive_statistics.cpp
+  src/handlers_string_conversion.cpp
+  src/time_fill_options.cpp
+    src/data_joinby.cpp
+    src/time_fill.cpp
+    src/data_quantiles.cpp
+    src/data_interpolation.cpp
+    src/data_observation_expansion.cpp
+    src/delimited_export.cpp
+    src/delimited_import.cpp
+    src/spreadsheet_export.cpp
+    src/spreadsheet_import.cpp
   # The one delimited-text reader behind import delimited / insheet
   # (include/piet/delimited_io.h; data-io-family design-step3.md section 2).
   src/delimited_io.cpp
@@ -178,11 +339,50 @@ add_library(piet_core OBJECT
   # M4a: output-completion surface (see ROADMAP.md §2.0.0 "M4")
   src/tabulate.cpp
   src/winsor2.cpp
-  src/estimation_m4.cpp
-  src/estimation_m4b.cpp
-  src/estimation_m4c.cpp
+  src/estimation_support.cpp
+  src/estimation_results.cpp
+  src/descriptive_statistics.cpp
+  src/panel_estimation.cpp
+  src/likelihood_support.cpp
+  src/categorical_estimation.cpp
+  src/vector_time_series.cpp
+  src/multiple_imputation.cpp
+  src/dynamic_panel_estimation.cpp
+  src/nonlinear_estimation.cpp
+  src/mixed_estimation.cpp
+  src/survey_commands.cpp
+  src/survival_estimation.cpp
+  src/binary_estimation.cpp
+  src/estimation_options.cpp
+  src/did_estimation.cpp
+  src/iv_specification.cpp
+  src/instrumental_variables.cpp
+  src/system_estimation.cpp
+  src/bootstrap_inference.cpp
+  src/censored_estimation.cpp
+  src/selection_estimation.cpp
+  src/quantile_estimation.cpp
+  src/mediation_estimation.cpp
+  src/inference_statistics.cpp
+  src/count_estimation.cpp
+  src/did_two_period.cpp
+  src/postestimation_context.cpp
+  src/hypothesis_tests.cpp
+  src/margins.cpp
+  src/prediction.cpp
+  src/estimation_diagnostics.cpp
+  src/time_series_estimation.cpp
+  src/model_comparison.cpp
+  src/data_splines.cpp
   src/eststo_esttab.cpp
-  src/graph_m4.cpp
+  src/graph/support.cpp
+  src/graph/commands.cpp
+  src/graph/distribution_math.cpp
+  src/graph/distribution_commands.cpp
+  src/graph/twoway.cpp
+  src/graph/svg.cpp
+  src/graph/files.cpp
+  src/graph/view.cpp
   # graph-family AI-1/AI-2: graph bar/hbar/box/hbox (bargraph_g.class) + its serset
   src/graph_bar.cpp
   # graph-family AI-4/6/7: graph describe/copy/rename/display/draw
@@ -204,7 +404,17 @@ add_library(piet_core OBJECT
   # linked, not copied — src/** stays read-only (Master Plan Doctrine ③)
   src/xlsx.cpp
   src/handlers_aer_iotext.cpp
-  src/handlers_aer_util.cpp
+  src/utility/support.cpp
+  src/utility/options.cpp
+  src/utility/uniqueness.cpp
+  src/utility/missingness.cpp
+  src/utility/labels.cpp
+  src/utility/string_distance.cpp
+  src/utility/sample.cpp
+  src/utility/filelist.cpp
+  src/utility/series.cpp
+  src/utility/rolling.cpp
+  src/utility/calendar.cpp
   src/handlers_t7_lookfor.cpp
   src/handlers_t7_ihstrans.cpp
   src/handlers_t7_sctorezone.cpp
@@ -244,7 +454,37 @@ add_library(piet_settings INTERFACE)
 target_link_libraries(piet_core PRIVATE piet_settings)
 
 add_executable(piet_native src/main.cpp $<TARGET_OBJECTS:piet_core>)
-add_executable(piet_selftest src/selftest.cpp src/selftest_main.cpp
+add_executable(piet_selftest src/selftest.cpp
+  src/selftest_support.cpp
+  src/selftest_bridge_transport.cpp
+  src/selftest_bridge_routes.cpp
+  src/selftest_data_storage.cpp
+  src/selftest_startup_and_paths.cpp
+  src/selftest_language_values.cpp
+  src/selftest_command_stabilization.cpp
+  src/selftest_settings_and_execution.cpp
+  src/selftest_estimation.cpp
+  src/selftest_command_contracts.cpp
+  src/selftest_language_control.cpp
+  src/selftest_file_io.cpp
+  src/selftest_data_commands.cpp
+  src/selftest_parallel_execution.cpp
+  src/selftest_descriptive_statistics.cpp
+  src/selftest_matrix_and_returns.cpp
+  src/selftest_tables.cpp
+  src/selftest_data_combine.cpp
+  src/selftest_label_metadata.cpp
+  src/selftest_graphics.cpp
+  src/selftest_spreadsheets.cpp
+  src/selftest_calendars.cpp
+  src/selftest_treatment_estimators.cpp
+  src/selftest_command_errors.cpp
+  src/selftest_postestimation.cpp
+  src/selftest_model_diagnostics.cpp
+  src/selftest_iv_and_inference.cpp
+  src/selftest_likelihood_estimation.cpp
+  src/selftest_time_series_estimation.cpp
+  src/selftest_stored_estimates.cpp src/selftest_main.cpp
   src/selftest_w2_macron.cpp
   src/selftest_w2_predictframe.cpp
   src/selftest_w2_eststoprefix.cpp

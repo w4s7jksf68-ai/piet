@@ -23,7 +23,7 @@
 #include <sstream>
 
 #include "core/distributions.h"
-#include "estimation_m4_internal.h"  // esampleInstallOnHead
+#include "estimation_internal.h"  // esampleInstallOnHead
 #include "io/win_compat.h"
 #include "piet/cobra_runner.h"
 #include "piet/datastore.h"

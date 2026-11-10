@@ -3842,20 +3842,40 @@ suite('U7 (P8.1): a SUCCESSFUL `graph drop _all` clears the frontend Graphics ga
 const recentObs = await (async () => {
   const obs = {};
   const SRC = 'summarize price';
+  let pickerPath = '/fake/dir/recentme.do';
+  let hydratedUiState = null;
+  let holdRead = false;
+  const readPaths = [], openPaths = [], executionKeys = [], mirrors = [], releaseReads = [];
+  let pickerCalls = 0;
   dom.window.pietNative = {
-    request: async (key) => {
+    request: async (key, body) => {
       switch (key) {
         case 'varlist':      return { varlist: [], n_rows: 0, n_cols: 0 };
         case 'history':      return { history: [] };
         case 'version':      return { piet_version: '0.0.0-test', cobra_version: '0.0.0-test' };
-        case 'dialog.open':  return { path: '/fake/dir/recentme.do' };
-        case 'file.read':    return { source: SRC, resolved_path: '/fake/dir/recentme.do' };
+        case 'settings.get': return hydratedUiState ? { ui_state: hydratedUiState } : {};
+        case 'settings.set':
+          if (body.ui_state) mirrors.push(body.ui_state);
+          return {};
+        case 'dialog.open':
+          pickerCalls++;
+          return { path: pickerPath };
+        case 'file.read':
+          readPaths.push(body.path);
+          if (holdRead) await new Promise(resolve => releaseReads.push(resolve));
+          return { source: SRC, resolved_path: body.path };
+        case 'open':
+          openPaths.push(body.filepath);
+          return { action: 'open', varlist_after: [], n_rows_after: 0 };
+        case 'command': case 'do': case 'do_string':
+          executionKeys.push(key);
+          return { blocks: [] };
         case 'run_progress': return { running: false, current_line: 0, total_lines: 0, current_cmd: '', elapsed_ms: 0 };
         default:             return {};
       }
     },
   };
-  document.body.innerHTML = `
+  const markup = `
     <div id="pane-console">
       <div id="console-wrap"><div id="console-empty"></div><div id="console-body"></div></div>
       <div id="cmd-bar"><input id="cmd-input" type="text"><button id="btn-run" type="button">Run</button></div>
@@ -3868,6 +3888,7 @@ const recentObs = await (async () => {
       <div class="menu-dropdown">
         <a href="#" tabindex="0">File ▾</a>
         <div class="menu-dropdown-content">
+          <a href="#" data-action="open">Open Data…</a>
           <a href="#" data-action="do-open">Open do-file…</a>
           <div class="menu-recent-group" id="file-menu-recent-group" hidden>
             <div class="menu-dropdown-sep" role="separator"></div>
@@ -3881,6 +3902,7 @@ const recentObs = await (async () => {
     <ul id="hist-list"></ul>
     <span id="status-file">(no data)</span><span id="status-dims"></span>
     <span class="kernel-dot" id="kernel-dot"></span>`;
+  document.body.innerHTML = markup;
   localStorage.removeItem('piet-recent-files');
   localStorage.removeItem('piet-paste-autorun');
   const { init } = await import(JS('app.js'));
@@ -3901,6 +3923,75 @@ const recentObs = await (async () => {
   obs.afterEntryText   = list.querySelector('a')?.textContent ?? null;
   obs.afterEntryTitle  = list.querySelector('a')?.title ?? null;
 
+  // Exercise tracking through real picker opens, then inspect storage and menu.
+  // The final path also checks Windows separators and literal text rendering.
+  const paths = Array.from({ length: 10 }, (_, i) =>
+    i === 9 ? ['C:', 'data', '<recent>.do'].join(String.fromCharCode(92)) : `/fake/dir/entry${i}.do`);
+  for (const path of paths) {
+    pickerPath = path;
+    document.querySelector('[data-action="do-open"]').click();
+    await settle();
+  }
+  const entries = () => JSON.parse(localStorage.getItem('piet-recent-files') || '[]');
+  obs.cappedPaths = entries().map(entry => entry.path);
+  obs.expectedCappedPaths = paths.slice(2).reverse();
+  obs.windowsLabel = list.querySelector('a')?.textContent;
+  obs.windowsIsText = list.querySelector('a')?.children.length === 0;
+  pickerPath = paths[4];
+  document.querySelector('[data-action="do-open"]').click();
+  await settle();
+  obs.dedupedPaths = entries().map(entry => entry.path);
+  obs.expectedDedupedPaths = [paths[4], ...obs.expectedCappedPaths.filter(path => path !== paths[4])];
+
+  const pickerCallsBeforeRecent = pickerCalls;
+  document.getElementById('doedit-text').value = 'replaced by recent reopen';
+  list.querySelector('a').click();
+  await settle();
+  obs.recentReadPath = readPaths.at(-1);
+  obs.recentEditorText = document.getElementById('doedit-text').value;
+  obs.recentEditorOpen = document.getElementById('doedit-overlay').classList.contains('open');
+  obs.recentSkippedPicker = pickerCalls === pickerCallsBeforeRecent;
+  obs.recentDidNotExecute = executionKeys.length === 0;
+
+  // Hold an actual file read in flight so the app owns its normal busy lock.
+  // A second recent click must not issue another read or a data-open request.
+  holdRead = true;
+  list.querySelector('a').click();
+  const readCountWhileBusy = readPaths.length;
+  const openCountWhileBusy = openPaths.length;
+  list.querySelectorAll('a')[1].click();
+  await settle();
+  obs.busyBlocked = document.getElementById('cmd-input').disabled &&
+    readPaths.length === readCountWhileBusy && openPaths.length === openCountWhileBusy;
+  holdRead = false;
+  releaseReads.splice(0).forEach(release => release());
+  await settle();
+
+  // Data entries use the existing known-path open route as well.
+  pickerPath = '/fake/dir/recentdata.dta';
+  document.querySelector('[data-action="open"]').click();
+  await settle();
+  const pickerCallsBeforeData = pickerCalls;
+  const openCountBeforeData = openPaths.length;
+  list.querySelector('a').click();
+  await settle();
+  obs.recentDataOpen = openPaths.length === openCountBeforeData + 1 &&
+    openPaths.at(-1) === pickerPath && pickerCalls === pickerCallsBeforeData;
+
+  // The debounced native settings mirror must still contain the current MRU.
+  const storedPaths = entries().map(entry => entry.path);
+  await new Promise(resolve => setTimeout(resolve, 450));
+  hydratedUiState = mirrors.at(-1) || null;
+  obs.mirroredPaths = hydratedUiState
+    ? JSON.parse(JSON.parse(hydratedUiState)['piet-recent-files'] || '[]').map(entry => entry.path)
+    : [];
+  obs.expectedStoredPaths = storedPaths;
+  // Simulate a new document with empty local storage and a native saved UI blob.
+  localStorage.removeItem('piet-recent-files');
+  document.body.innerHTML = markup;
+  await init();
+  obs.restoredPaths = Array.from(document.querySelectorAll('#file-menu-recent a'), a => a.title);
+
   document.body.innerHTML = '';
   delete dom.window.pietNative;
   localStorage.removeItem('piet-recent-files');
@@ -3915,6 +4006,23 @@ suite('Recent files (P8.1): empty localStorage shows a visible "(no recent files
   check(ctx, recentObs.afterHasEmptyRow === false, 'opening a do-file REPLACES the placeholder row (no longer present)');
   check(ctx, recentObs.afterEntryText === 'recentme.do', `the real entry shows the file's basename (got ${JSON.stringify(recentObs.afterEntryText)})`);
   check(ctx, recentObs.afterEntryTitle === '/fake/dir/recentme.do', 'the entry\'s title carries the full path');
+  check(ctx, JSON.stringify(recentObs.cappedPaths) === JSON.stringify(recentObs.expectedCappedPaths),
+    'ten distinct opens retain the newest eight entries in MRU order');
+  check(ctx, JSON.stringify(recentObs.dedupedPaths) === JSON.stringify(recentObs.expectedDedupedPaths),
+    'reopening an existing path moves it to the front without duplicates');
+  check(ctx, recentObs.windowsLabel === '<recent>.do' && recentObs.windowsIsText,
+    `a Windows path displays its basename as literal text rather than HTML (got ${JSON.stringify([recentObs.windowsLabel, recentObs.windowsIsText])})`);
+  check(ctx, recentObs.recentReadPath === recentObs.expectedDedupedPaths[0] &&
+    recentObs.recentEditorText === 'summarize price' && recentObs.recentEditorOpen,
+    'clicking a recent do-file reads the known path and opens its source in the editor');
+  check(ctx, recentObs.recentSkippedPicker && recentObs.recentDidNotExecute,
+    'recent do-file reopen bypasses the picker and never runs the source');
+  check(ctx, recentObs.busyBlocked, 'a recent click while an open is busy issues no second request');
+  check(ctx, recentObs.recentDataOpen, 'a recent data click uses the known-path data open route');
+  check(ctx, JSON.stringify(recentObs.mirroredPaths) === JSON.stringify(recentObs.expectedStoredPaths),
+    'tracking still mirrors the current recent-file list into native ui_state');
+  check(ctx, JSON.stringify(recentObs.restoredPaths) === JSON.stringify(recentObs.expectedStoredPaths),
+    'a new document renders saved recent entries after native ui_state hydration');
 });
 
 // ── T3 addendum (P8.1, operator): ⌥↑/↓ block-group navigation ────────────────

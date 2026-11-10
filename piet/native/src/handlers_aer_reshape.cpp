@@ -131,7 +131,7 @@
 #include "piet/session_state.h"
 #include "piet/storage_type.h"  // FU-944: input's c(type) and float store
 #include "piet/strutil.h"
-#include "estimation_m4_internal.h"  // esampleHeadMask / esampleRewriteHeadMask
+#include "estimation_internal.h"  // esampleHeadMask / esampleRewriteHeadMask
 #include "scratch_columns.h"          // cumul's if/in restriction and weight columns
 
 // ---------------------------------------------------------------------------
