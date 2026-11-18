@@ -54,11 +54,13 @@ std::optional<std::string> executablePath() {
   WideCharToMultiByte(CP_UTF8, 0, wbuf, static_cast<int>(n), &out[0], len,
                       nullptr, nullptr);
   return out;
+#elif defined(__linux__)
+  // /proc resolves the actual executable even through /usr/bin/piet's symlink.
+  std::error_code ec;
+  auto path = std::filesystem::read_symlink("/proc/self/exe", ec);
+  if (!ec) return path.string();
+  return std::nullopt;
 #else
-  // Linux bundle-path resolution is a Phase D (porting) concern —
-  // M5 GA is macOS-only (ROADMAP §2.0.0 M5). Returning nullopt here makes
-  // bundleResourcesDir() correctly report "not bundled" so callers fall
-  // back to their dev-tree resolution on any non-Apple build.
   return std::nullopt;
 #endif
 }
@@ -80,6 +82,11 @@ std::optional<std::string> bundleResourcesDir() {
   if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
     return resources;
   }
+  return std::nullopt;
+#elif defined(__linux__)
+  auto resources = std::filesystem::path(*exe).parent_path() / "resources";
+  std::error_code ec;
+  if (std::filesystem::is_directory(resources, ec)) return resources.string();
   return std::nullopt;
 #else
   const std::string suffix = ".app/Contents/MacOS";

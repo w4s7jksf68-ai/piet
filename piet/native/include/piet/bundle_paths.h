@@ -33,7 +33,7 @@
 namespace piet {
 
 // Returns the running executable's own absolute, symlink-resolved path, or
-// std::nullopt if the platform API failed (should not happen on macOS).
+// std::nullopt if the platform API failed. Linux reads /proc/self/exe.
 std::optional<std::string> executablePath();
 
 // If the running executable lives at .../Foo.app/Contents/MacOS/exe, returns
@@ -42,7 +42,7 @@ std::optional<std::string> executablePath();
 // check that). Returns std::nullopt when not running from inside a
 // .app/Contents/MacOS directory (dev build, `cmake --build` binary run
 // in-place, --run-block headless harness invocation via a raw build/
-// path, non-macOS platform).
+// path). Linux and Windows use a resources/ directory beside the executable.
 std::optional<std::string> bundleResourcesDir();
 
 // The development checkout this binary belongs to (the directory that holds

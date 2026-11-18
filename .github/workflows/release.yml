@@ -9,6 +9,8 @@ permissions:
 jobs:
   windows:
     uses: ./.github/workflows/windows.yml
+  linux:
+    uses: ./.github/workflows/linux.yml
   macos:
     runs-on: macos-latest
     timeout-minutes: 60
@@ -30,7 +32,7 @@ jobs:
             dist/*.dmg
             dist/*.sha256
   publish:
-    needs: [windows, macos]
+    needs: [windows, macos, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -47,7 +49,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          for file in "PIET-$TAG-setup.exe" "PIET-$TAG-windows-x64-portable.zip" "PIET-$TAG-macos-arm64.dmg"; do
+          for file in "PIET-$TAG-setup.exe" "PIET-$TAG-windows-x64-portable.zip" "PIET-$TAG-macos-arm64.dmg" "PIET-$TAG-linux-x64.deb" "PIET-$TAG-linux-x64.tar.xz"; do
             test -s "assets/$file" || { echo "Missing assets/$file: the tag and the compiled version disagree"; ls assets; exit 1; }
           done
       - name: Publish

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -301,13 +302,51 @@ void Shell::setVirtualHostMapping(const std::string& host, const std::string& fo
 
 void Shell::initJs(const std::string& js) { impl_->view.init(js); }
 
-// BUG-1469: the vendored GTK backend (Linux) has no native file panels, so the
-// two forwarders below compiled only on macOS and Windows and piet/native did
-// not build on Linux. There they answer "" -- the routes' cancelled dialog --
-// until the GTK backend grows the panels.
+#ifdef __linux__
+namespace {
+
+void addGtkFileFilter(GtkFileChooser* chooser, const std::string& extensions) {
+  if (extensions.empty()) return;
+  GtkFileFilter* filter = gtk_file_filter_new();
+  gtk_file_filter_set_name(filter, extensions.c_str());
+  std::istringstream parts(extensions);
+  std::string ext;
+  while (std::getline(parts, ext, ',')) {
+    if (!ext.empty()) gtk_file_filter_add_pattern(filter, ("*." + ext).c_str());
+  }
+  gtk_file_chooser_add_filter(chooser, filter);
+  GtkFileFilter* all = gtk_file_filter_new();
+  gtk_file_filter_set_name(all, "All files");
+  gtk_file_filter_add_pattern(all, "*");
+  gtk_file_chooser_add_filter(chooser, all);
+}
+
+std::string runGtkFileDialog(GtkWidget* dialog) {
+  std::string path;
+  if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+    char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+    if (filename) {
+      path = filename;
+      g_free(filename);
+    }
+  }
+  gtk_widget_destroy(dialog);
+  return path;
+}
+
+}  // namespace
+#endif
+
 std::string Shell::openFileDialog(const std::string& exts) {
 #if defined(__APPLE__) || defined(_WIN32)
   return impl_->view.show_open_dialog(exts);
+#elif defined(__linux__)
+  GtkWidget* dialog = gtk_file_chooser_dialog_new(
+      "Open file", GTK_WINDOW(impl_->view.window()), GTK_FILE_CHOOSER_ACTION_OPEN,
+      "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, nullptr);
+  gtk_file_chooser_set_local_only(GTK_FILE_CHOOSER(dialog), TRUE);
+  addGtkFileFilter(GTK_FILE_CHOOSER(dialog), exts);
+  return runGtkFileDialog(dialog);
 #else
   (void)exts;
   return std::string();
@@ -319,6 +358,16 @@ std::string Shell::openFileDialog(const std::string& exts) {
 std::string Shell::saveFileDialog(const std::string& suggestedName, const std::string& ext) {
 #if defined(__APPLE__) || defined(_WIN32)
   return impl_->view.show_save_dialog(suggestedName, ext);
+#elif defined(__linux__)
+  GtkWidget* dialog = gtk_file_chooser_dialog_new(
+      "Save file", GTK_WINDOW(impl_->view.window()), GTK_FILE_CHOOSER_ACTION_SAVE,
+      "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, nullptr);
+  GtkFileChooser* chooser = GTK_FILE_CHOOSER(dialog);
+  gtk_file_chooser_set_local_only(chooser, TRUE);
+  gtk_file_chooser_set_do_overwrite_confirmation(chooser, TRUE);
+  if (!suggestedName.empty()) gtk_file_chooser_set_current_name(chooser, suggestedName.c_str());
+  addGtkFileFilter(chooser, ext);
+  return runGtkFileDialog(dialog);
 #else
   (void)suggestedName;
   (void)ext;

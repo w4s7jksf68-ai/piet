@@ -1,0 +1,10 @@
+# Linux release builder. Build on Ubuntu 22.04 so glibc 2.35 is the floor.
+# docker build --platform linux/amd64 -f docker/Dockerfile.piet-linux -t piet-linux-builder .
+# docker run --rm -v "$PWD:/src" -w /src piet-linux-builder sh scripts/build-linux.sh
+FROM ubuntu:22.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config python3 \
+    libopenblas-dev liblapacke-dev libwebkit2gtk-4.1-dev \
+    ca-certificates dpkg-dev file xz-utils xvfb xauth dbus-x11 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
