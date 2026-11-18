@@ -711,6 +711,11 @@ add_executable(piet_selftest src/selftest.cpp
   $<TARGET_OBJECTS:piet_core>)
 target_link_libraries(piet_native PRIVATE piet_settings)
 target_link_libraries(piet_selftest PRIVATE piet_settings)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(piet_linux_dialog_smoke
+    ../../tests/linux_dialog_smoke.cpp $<TARGET_OBJECTS:piet_core>)
+  target_link_libraries(piet_linux_dialog_smoke PRIVATE piet_settings)
+endif()
 
 target_include_directories(piet_settings INTERFACE
   include
@@ -797,10 +802,8 @@ if(APPLE)
     COMPILE_FLAGS "-x objective-c++"
   )
 elseif(UNIX)
-  # WEBVIEW_GTK path — needs webkit2gtk + gtk3 via pkg-config. This is the
-  # Linux target Phase D ports to; M0's docker compile-check exercises this
-  # branch (see docker/Dockerfile.linux-webkitgtk-check, added for this
-  # milestone).
+  # Linux desktop backend. scripts/build-linux.sh and the Linux workflow
+  # build and exercise the packaged application against WebKitGTK 4.1.
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(WEBKIT2GTK REQUIRED webkit2gtk-4.1)
   target_include_directories(piet_settings INTERFACE ${WEBKIT2GTK_INCLUDE_DIRS})

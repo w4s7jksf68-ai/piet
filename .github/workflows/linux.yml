@@ -1,0 +1,53 @@
+name: Linux build and self-test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install build and desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config python3 \
+            libopenblas-dev liblapacke-dev libwebkit2gtk-4.1-dev \
+            dpkg-dev file xz-utils xvfb xauth dbus-x11
+      - name: Build and test
+        env:
+          BUILD_JOBS: 2
+        run: sh scripts/build-linux.sh
+      - name: Package Linux downloads
+        run: sh scripts/package-linux.sh
+      - name: Exercise the native GTK file pickers
+        run: dbus-run-session -- xvfb-run -a piet/native/build/piet_linux_dialog_smoke
+      - name: Run the packaged app in a desktop session
+        run: |
+          test_dir=$(mktemp -d)
+          tar -xJf dist/linux-amd64/PIET-*.tar.xz -C "$test_dir"
+          cd "$test_dir"
+          for app in "$test_dir"/PIET-*/PIET; do
+            dbus-run-session -- xvfb-run -a python3 "$GITHUB_WORKSPACE/tests/ui_smoke.py" "$app"
+          done
+      - name: Install and test the Debian package
+        run: |
+          sudo apt-get install -y ./dist/linux-amd64/PIET-*.deb
+          cd "$(mktemp -d)"
+          dbus-run-session -- xvfb-run -a python3 "$GITHUB_WORKSPACE/tests/ui_smoke.py" /usr/bin/piet
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: piet-linux-x64
+          if-no-files-found: error
+          path: |
+            dist/linux-amd64/*.deb
+            dist/linux-amd64/*.tar.xz
+            dist/linux-amd64/*.sha256

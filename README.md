@@ -27,7 +27,7 @@ A ready-built app for Apple Silicon Macs is attached to each release on the
 containing `PIET.app` (the interface, the CoBrA engine, the sample dataset,
 the licence and the third-party notices), with its SHA-256 beside it. Drag
 `PIET.app` to Applications. Requirements: macOS 13.3 or newer, Apple Silicon
-(arm64); Intel Macs and Linux are not built yet.
+(arm64); Intel Macs are not built yet.
 
 **About the security warning on first launch.** The app is signed only with
 an ad-hoc signature and is **not notarized**: notarization needs an Apple
@@ -72,6 +72,35 @@ Two behaviours differ from the macOS build, and `RELEASE_NOTES.md` gives the
 reason for each: `ustrregexra()` and `ustrregexm()` refuse characters above U+FFFF
 such as emoji, and `sdid, vce(bootstrap)` standard errors can differ in about the
 fourth significant digit.
+
+## Linux
+
+The Linux port builds PIET A.1.0 / CoBrA 1.1.0 for x86-64 PCs (SSE4.2,
+roughly 2009 onward), using GTK 3 and WebKitGTK 4.1. The release build uses
+Ubuntu 24.04; Ubuntu 24.04 or newer is supported. The application runs offline
+and includes its engine, frontend, sample data, examples and licence notices.
+
+`scripts/package-linux.sh` produces two files under `dist/linux-amd64/`,
+with a SHA-256 beside each:
+
+- `PIET-A.1.0-linux-x64.deb`: install with
+  `sudo apt install ./PIET-A.1.0-linux-x64.deb`, then open **PIET** from the
+  application menu or run `piet`.
+- `PIET-A.1.0-linux-x64.tar.xz`: extract the entire folder and run `./PIET`
+  inside it. Install its system libraries first:
+  `sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libopenblas0 liblapacke`.
+
+Keep `resources/` beside the portable executable. Copy `demo/` to a writable
+folder before editing or running its examples. A graphical desktop session
+is needed for the interface; the command-line modes also work without one.
+The build script can also build natively on arm64 Linux; the automated release
+job produces x86-64 downloads.
+
+The x86-64 engine launcher uses OpenBLAS's fixed Nehalem kernel, so CPU dispatch
+does not change a nearly converged model's final iteration. The Linux build
+script runs the numerical gates with that same configuration. When running a
+raw development `build/cobra` or `ctest` directly, set
+`OPENBLAS_CORETYPE=NEHALEM` as well; packaged applications do this themselves.
 
 ## Developer's note
 
@@ -280,6 +309,19 @@ sh scripts/build-windows.sh    # the same, with both executables linked statical
 bash scripts/package-windows.sh   # the portable zip, and the installer if Inno Setup is present
 ```
 
+On Linux (Ubuntu 24.04+):
+
+```sh
+sudo apt install build-essential cmake ninja-build pkg-config python3 \
+  libopenblas-dev liblapacke-dev libwebkit2gtk-4.1-dev dpkg-dev file xz-utils
+sh scripts/build-linux.sh
+sh scripts/package-linux.sh
+python3 tests/ui_smoke.py  # run from a graphical desktop session
+```
+
+For a container build, see `docker/Dockerfile.piet-linux`. Linux CI also runs
+the packaged application's real-window journey under Xvfb.
+
 Step by step:
 
 ```sh
@@ -297,7 +339,7 @@ and `cmake -S piet/native -B piet/native/build -DCMAKE_BUILD_TYPE=Release`.
 
 **Tests from a fresh clone.** `ctest` (the engine's unit tests) and
 `tests/public_smoke.py` (import → regress → save → reload through the app, checked
-against an independent OLS) run self-contained; both build scripts run both.
+against an independent OLS) run self-contained; all platform build scripts run both.
 `tests/ui_smoke.py` runs the app's real-window journey and needs a desktop session.
 `piet_native --selftest` is the maintainers' suite: most of its arms read private
 oracle fixtures (Stata captures and datasets the repo deliberately does not ship),
