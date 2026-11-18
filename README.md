@@ -77,7 +77,7 @@ fourth significant digit.
 
 The Linux port builds PIET A.1.0 / CoBrA 1.1.0 for x86-64 PCs (SSE4.2,
 roughly 2009 onward), using GTK 3 and WebKitGTK 4.1. The release build uses
-Ubuntu 22.04; Ubuntu 22.04 or newer is supported. The application runs offline
+Ubuntu 24.04; Ubuntu 24.04 or newer is supported. The application runs offline
 and includes its engine, frontend, sample data, examples and licence notices.
 
 `scripts/package-linux.sh` produces two files under `dist/linux-amd64/`,
@@ -303,7 +303,7 @@ sh scripts/build-windows.sh    # the same, with both executables linked statical
 bash scripts/package-windows.sh   # the portable zip, and the installer if Inno Setup is present
 ```
 
-On Linux (Ubuntu 22.04+ or Debian 12+):
+On Linux (Ubuntu 24.04+):
 
 ```sh
 sudo apt install build-essential cmake ninja-build pkg-config python3 \

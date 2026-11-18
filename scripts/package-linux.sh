@@ -55,7 +55,7 @@ test -n "$deps"
 cat > "$staged/README-LINUX.txt" <<EOF
 PIET $version / Linux $label
 
-Ubuntu 22.04 or newer. Requires GTK 3, WebKitGTK 4.1, OpenBLAS and LAPACKE.
+Ubuntu 24.04 or newer. Requires GTK 3, WebKitGTK 4.1, OpenBLAS and LAPACKE.
 On Ubuntu/Debian, install dependencies with:
   sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libopenblas0 liblapacke
 
