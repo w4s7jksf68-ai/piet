@@ -14,5 +14,8 @@ cmake --build build --parallel "${BUILD_JOBS:-2}"
 ctest --test-dir build --output-on-failure --timeout 300
 cmake -S piet/native -B piet/native/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   "-DCMAKE_CXX_FLAGS=-ffile-prefix-map=$source_root=."
-cmake --build piet/native/build --parallel "${BUILD_JOBS:-2}"
+# The separate piet_selftest executable needs private fixtures and is neither
+# shipped nor run here. Build the application and the native picker check.
+cmake --build piet/native/build --parallel "${BUILD_JOBS:-2}" \
+  --target piet_native piet_linux_dialog_smoke
 python3 tests/public_smoke.py
