@@ -228,6 +228,13 @@ void installFileDropHandler(Shell* shell, void* nsWindowPtr) {
 }  // namespace
 
 Shell::Shell(bool debug) : impl_(new Impl(debug)) {
+#ifdef __linux__
+  // The frontend is loaded from the packaged file:// tree. WebKitGTK otherwise
+  // refuses its ES-module imports as cross-origin local-file requests.
+  GtkWidget* webview = gtk_bin_get_child(GTK_BIN(impl_->view.window()));
+  WebKitSettings* settings = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(webview));
+  webkit_settings_set_allow_file_access_from_file_urls(settings, TRUE);
+#endif
 #ifdef _WIN32
   // The PE resource supplies Explorer/shortcut branding; set the already-
   // created top-level WebView2 HWND as well so the same icon appears in the
