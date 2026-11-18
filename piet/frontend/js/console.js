@@ -51,9 +51,9 @@ let _elidedCount = 0;      // cumulative blocks dropped this session
 let _activeBlockEl = null;
 
 // BUG-1473: `display ... _continue` leaves its line open (a display block
-// flagged `continue`), and the next display's text goes on that line, past any
-// command echo between them -- the join doexec.cpp's pushBlock makes in the
-// stored transcript. A streaming do-run has already shown the first block when
+// flagged `continue`), and the next display's text goes on that line -- the
+// join doexec.cpp's pushBlock makes in the stored transcript. A command echo
+// between them closes the line, as in Stata's log. A streaming do-run has already shown the first block when
 // the next one comes (streamed, not stored), so it is joined here. Any other
 // block closes the line, and so does the start of a run (endDisplayLine, from
 // app.js's setBusy): the transcript joins within one run only.
@@ -158,7 +158,9 @@ export function appendBlock(block) {
     if (!_userScrolledUp) _wrapEl.scrollTop = _wrapEl.scrollHeight;
     return;
   }
-  if (block.type !== 'echo') _openDisplayEl = null;
+  // A command echo takes the rest of an open `_continue` line (Stata's log):
+  // what comes after it starts a new line.
+  _openDisplayEl = null;
 
   let el;
   switch (block.type) {

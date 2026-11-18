@@ -3,6 +3,9 @@
 // data quantiles.
 #include "data_io_internal.h"
 #include "piet/handlers/data_values.h"
+
+#include <limits>
+#include <set>
 namespace piet::handlers::data_io_detail {
 
 
@@ -242,7 +245,7 @@ ojson runXtileStata(const std::string& newvar, const std::string& expText,
                     const std::optional<std::string>& ifExpr,
                     const std::optional<std::string>& inRange,
                     const std::optional<std::string>& weightVar, SessionState& session,
-                    const std::optional<std::string>& weightType) {
+                    const std::optional<std::string>& weightType, bool leavesCountR) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
 
   std::string target;
@@ -318,6 +321,11 @@ ojson runXtileStata(const std::string& newvar, const std::string& expText,
     if (frequencyWeight && fractional)
       return rcErrorBlock("may not use noninteger frequency weights", 401);
   }
+  // xtile.ado: right after `mark` validated the weight.
+  bool altdef = false;
+  for (const auto& kv : opts)
+    if (kv.first == "altdef") altdef = true;
+  if (weighted && altdef) return rcErrorBlock("altdef option cannot be used with weights", 198);
 
   long long quantileCount = kXtileDefaultNq;
   std::string countShown = std::to_string(kXtileDefaultNq);
@@ -350,6 +358,35 @@ ojson runXtileStata(const std::string& newvar, const std::string& expText,
   }
   if (usableRows == 0) return rcErrorBlock("no observations", 2000);
 
+  // xtile is not r-class, so the r() it leaves is that of its last internal
+  // `count` (xtile.ado): MakeQuan's `count if p < .`, the number of distinct
+  // quantile cutpoints, or MakeCut's, the number of distinct cutpoints() values
+  // at or above the smallest exp. Measured: `xtile qw = x [fw=w], n(10)` on
+  // 11 squares leaves r(N) 8 (nine cutpoints, two equal).
+  long long distinctCutpoints = 0;
+  {
+    std::vector<double> sampleX(rowCount, std::numeric_limits<double>::quiet_NaN());
+    std::vector<double> sampleW;
+    if (weighted) sampleW.assign(rowCount, std::numeric_limits<double>::quiet_NaN());
+    double smallest = std::numeric_limits<double>::infinity();
+    for (size_t row = 0; row < rowCount; ++row) {
+      if (!restricted[row] || std::isnan(sourceCells[row])) continue;
+      if (weighted && !(weights[row] > 0.0)) continue;
+      sampleX[row] = sourceCells[row];
+      if (weighted) sampleW[row] = weights[row];
+      smallest = std::min(smallest, sourceCells[row]);
+    }
+    if (cutOption != nullptr) {
+      std::set<double> cuts;
+      for (double c : scratch.values(cutVariable))
+        if (!std::isnan(c) && c >= smallest) cuts.insert(c);
+      distinctCutpoints = static_cast<long long>(cuts.size());
+    } else {
+      distinctCutpoints = xtileDistinctCutpoints(sampleX, weighted ? &sampleW : nullptr,
+                                                 quantileCount, altdef);
+    }
+  }
+
   if (weighted && weightDropsARow) {
     const std::string keep = sourceColumn;
     if (auto failed = scratch.add(keep, " if " + weightColumn + " > 0 & " + weightColumn + " < .",
@@ -357,6 +394,16 @@ ojson runXtileStata(const std::string& newvar, const std::string& expText,
       return *failed;
   }
 
+  if (altdef && cutOption == nullptr) {
+    // xtile.ado's MakeQuan with altdef: the cutpoints are `pctile double q = x,
+    // n(nq) altdef` over the marked rows, and a value's category is 1 + the
+    // number of cutpoints strictly below it (duplicate cutpoints kept, which is
+    // MakeQuan's numbering by the first index of each distinct cutpoint).
+    std::vector<double> marked(rowCount, std::numeric_limits<double>::quiet_NaN());
+    for (size_t row = 0; row < rowCount; ++row)
+      if (restricted[row]) marked[row] = sourceCells[row];
+    if (auto failed = storeXtileAltdef(session, target, marked, quantileCount)) return *failed;
+  } else {
   std::string engineCall = target + "=" + sourceColumn + ", ";
   if (cutOption != nullptr) {
     engineCall += "cutpoints(" + cutVariable + ")";
@@ -376,6 +423,7 @@ ojson runXtileStata(const std::string& newvar, const std::string& expText,
     }
   }
   session.load(written);
+  }
   scratch.dropAll();
 
   const Datastore* result = session.datastore();
@@ -384,6 +432,13 @@ ojson runXtileStata(const std::string& newvar, const std::string& expText,
   for (size_t row = 0; row < rowCount; ++row)
     if (categories[row] > largest) largest = categories[row];  // false for a missing category
 
+  // Only xtile.ado leaks its count: gquantiles' xtile form (gtools) is its own
+  // r-class program with its own r(N), which this route does not post.
+  if (leavesCountR) {
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", static_cast<double>(distinctCutpoints));
+    eval::declareRPosted(session.eval, "xtile", {"N"});
+  }
   VarMeta& meta = session.varMeta[target];
   meta.stataType = xtileStorageType(largest);
   meta.format = "%8.0g";

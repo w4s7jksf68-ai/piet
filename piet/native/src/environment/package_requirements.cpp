@@ -74,13 +74,27 @@ using namespace command_reply_detail;
 // V above that is Stata's r(9) (envp2 req_stata21), and V at or below it rc 0.
 nlohmann::ordered_json runRequire(const eval::ParsedCommand& parsed, SessionState& session) {
   (void)session;
+  const std::string req = strutil::trim(parsed.argText);
+  // Nothing to require, and no `list` form: r(100) before any option is read
+  // (StataBE 19.5 `require , zzabbrprobe` is "something required",
+  // vs-stata bank 72ee2cab77139160).
+  bool listForm = false;
+  for (const auto& kv : parsed.opts) listForm = listForm || kv.first == "list";
+  if (req.empty() && !listForm) return envError("something required", 100);  // envp2 req_none
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabRequire.known,
                                             kVocabRequire.unimplemented))
     return ojson(*err);
-  const std::string req = strutil::trim(parsed.argText);
-  if (req.empty()) return envError("something required", 100);  // envp2 req_none
+  if (req.empty()) return envError("something required", 100);
   if (req.rfind("using", 0) == 0 && (req.size() == 5 || req[5] == ' ' || req[5] == '\t'))
     return ojson(eval::refusedCommand("require using", "no_package_store"));
+  // A package and a `using` file are two forms: `require reghdfe using
+  // reqs.txt` is r(101) "using not allowed" (StataBE 19.5, vs-stata bank
+  // 5092f519055743d4).
+  {
+    const std::string padded = " " + req + " ";
+    for (const char* ws : {" using ", "\tusing ", " using\t"})
+      if (padded.find(ws) != std::string::npos) return envError("using not allowed", 101);
+  }
 
   auto isOpChar = [](char c) { return c == '>' || c == '='; };
   size_t p = 0;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
+#include "piet/eval/result_order.h"  // orderRResults (summarize lists r() as Stata does)
 #include "data_support.h"
 #include "summary_support.h"
 #include "options.h"
@@ -607,35 +608,6 @@ nlohmann::ordered_json runTabulateGenerate(const std::string& stub,
   return ojson();  // null => no error
 }
 
-DescribeShape describeDatasetShape(SessionState& session) {
-  std::vector<std::pair<std::string, bool>> vars;  // name, string-typed
-  if (const std::vector<VarInfo>* card = session.residentReadCard()) {
-    for (const auto& v : *card) vars.emplace_back(v.name, v.dtype == "factor");
-  } else if (Datastore* ds = session.datastore()) {
-    for (const auto& n : ds->names()) vars.emplace_back(n, ds->dtype(n) == "factor");
-  }
-  DescribeShape shape;
-  shape.k = vars.size();
-  double width = 0.0;
-  for (const auto& [name, isString] : vars) {
-    const auto meta = session.varMeta.find(name);
-    const std::string t = meta != session.varMeta.end() && meta->second.stataType.has_value()
-                              ? *meta->second.stataType
-                              : (isString ? "str#" : "float");
-    if (t == "byte") width += 1;
-    else if (t == "int") width += 2;
-    else if (t == "long" || t == "float") width += 4;
-    else if (t == "double" || t == "strL") width += 8;
-    else if (t.size() > 3 && t.compare(0, 3, "str") == 0 &&
-             t.find_first_not_of("0123456789", 3) == std::string::npos)
-      width += std::stod(t.substr(3));
-    else return shape;
-  }
-  shape.width = width;
-  return shape;
-}
-
-
 // The r() a summarize block leaves behind, shared by the plain `summarize` arm and
 // the by-prefixed driver (which captures only the LAST group's block, as Stata does).
 void captureSummarizeR(const ojson& summBlock, bool meanonly, bool detail,
@@ -701,6 +673,18 @@ void captureSummarizeR(const ojson& summBlock, bool meanonly, bool detail,
     for (const auto& n : stataNames)
       if (session.eval.rValues.find(n) == nullptr)
         session.eval.rValues.set(n, eval::kStataMissingSentinel);
+    // Stata's listing order (vs-stata truth bank, `: r(scalars)` and `return
+    // list` after summarize): N sum_w mean Var sd min max sum; with detail N
+    // sum_w mean Var sd skewness kurtosis sum min max p1 ... p99; with meanonly
+    // N sum_w sum mean min max.
+    if (detail)
+      eval::orderRResults(session.eval, {"N", "sum_w", "mean", "Var", "sd", "skewness", "kurtosis",
+                                         "sum", "min", "max", "p1", "p5", "p10", "p25", "p50",
+                                         "p75", "p90", "p95", "p99"});
+    else if (meanonly)
+      eval::orderRResults(session.eval, {"N", "sum_w", "sum", "mean", "min", "max"});
+    else
+      eval::orderRResults(session.eval, {"N", "sum_w", "mean", "Var", "sd", "min", "max", "sum"});
     eval::declareRPosted(session.eval, "summarize", std::move(stataNames));
   }
 }

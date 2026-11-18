@@ -405,7 +405,7 @@ int cmd_eval(const std::vector<std::string>& a) {
                 fr.egen_cut(outn, trimx(inner), co, storeType); ++i;
             } else if (varlist_egen && fnm == "tag") {
                 // _gtag.ado ignores the requested type: --store-type does not reach it.
-                fr.egen_tag(outn, split_vars(inner)); ++i;
+                fr.egen_tag(outn, split_vars(inner), opts.find("missing") != std::string::npos); ++i;
             } else if (varlist_egen && fnm == "group") {
                 bool miss = (opts.find("missing") != std::string::npos);
                 fr.egen_group(outn, split_vars(inner), miss, storeType); ++i;
@@ -1737,10 +1737,24 @@ int cmd_import_dta(const std::vector<std::string>& a) {
                             {"value_label_name", vm.value_label_name}});
         }
         json vlabs = json::object();
+        // The object's keys come out sorted; the order the sets stand in the file
+        // is what `label list` shows (last one first), so it travels beside them.
+        json vlabOrder = json::array();
         for (const auto& vl : r.value_labels) {
             json m = json::object();
-            for (const auto& kv : vl.map) m[std::to_string(kv.first)] = hbin_level_json_text(kv.second);
+            for (const auto& kv : vl.map) {
+                // The codes 2147483621 ... 2147483647 of a label table are the extended
+                // missing values `.`, `.a` ... `.z`; they travel under the name Stata
+                // writes them with, the one export-dta reads back.
+                std::string key = std::to_string(kv.first);
+                if (kv.first == 2147483621LL)
+                    key = ".";
+                else if (kv.first > 2147483621LL && kv.first <= 2147483647LL)
+                    key = std::string(".") + static_cast<char>('a' + (kv.first - 2147483622LL));
+                m[key] = hbin_level_json_text(kv.second);
+            }
             vlabs[vl.name] = m;
+            vlabOrder.push_back(vl.name);
         }
         json chars = json::array();
         for (const auto& ch : r.characteristics) {
@@ -1750,7 +1764,7 @@ int cmd_import_dta(const std::vector<std::string>& a) {
         json meta = {{"format_version", r.format_version},
                      {"data_label", hbin_level_json_text(r.data_label)},
                     {"n_rows", r.frame.n_rows()}, {"variables", vars}, {"value_labels", vlabs},
-                    {"characteristics", chars}};
+                    {"value_label_order", vlabOrder}, {"characteristics", chars}};
         // "timestamp" (BUG-199): the source .dta's own <timestamp> header field,
         // round-tripped through this sidecar the same append-only-when-non-empty
         // discipline as the .hbin header's "label" key — emitted only when the
@@ -1869,7 +1883,17 @@ int cmd_export_dta(const std::vector<std::string>& a) {
                 for (auto e = it.value().begin(); e != it.value().end(); ++e) {
                     if (!e.value().is_string()) continue;
                     try {
-                        std::string& text = vl.map[std::stoll(e.key())];
+                        // An extended-missing code (`.`, `.a` ... `.z`) is the int the
+                        // reader shows it as: 2147483621 for `.`, one more for each letter.
+                        long long code = 0;
+                        const std::string& key = e.key();
+                        if (key == ".")
+                            code = 2147483621LL;
+                        else if (key.size() == 2 && key[0] == '.' && key[1] >= 'a' && key[1] <= 'z')
+                            code = 2147483621LL + (key[1] - 'a' + 1);
+                        else
+                            code = std::stoll(key);
+                        std::string& text = vl.map[code];
                         text = e.value().get<std::string>();
                         hbin_level_unescape(text);
                     } catch (const std::exception&) {

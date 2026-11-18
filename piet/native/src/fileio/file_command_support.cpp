@@ -334,6 +334,25 @@ bool splitUsing(const std::vector<std::string>& words, std::vector<std::string>*
 // end), so both `outsheet using f if g != 0` and `outfile s g if year == 2001
 // using f` keep their varlist and file. The qualifier itself reaches the
 // handler parsed (parsed.ifExpr / parsed.inRange).
+void trimConditionAtUsing(eval::ParsedCommand* parsed) {
+  if (!parsed->ifExpr.has_value()) return;
+  std::string& e = *parsed->ifExpr;
+  const std::string low = [&] {
+    std::string t = e;
+    for (char& ch : t) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return t;
+  }();
+  size_t cut = std::string::npos;
+  for (const char* word : {" using ", " in "}) {
+    const size_t at = low.find(word);
+    if (at != std::string::npos && at < cut) cut = at;
+  }
+  if (cut == std::string::npos) return;
+  size_t end = cut;
+  while (end > 0 && std::isspace(static_cast<unsigned char>(e[end - 1]))) --end;
+  e.resize(end);
+}
+
 std::vector<std::string> dropQualifierWords(const std::vector<std::string>& words) {
   std::vector<std::string> out;
   bool inQual = false;

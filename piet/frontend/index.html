@@ -532,6 +532,36 @@
             command names. Applies to the next command.</span>
         </div>
 
+        <!-- Table-size limits of `tabulate` (r(134) "too many values"). An empty box
+             is Stata's own limit (Stata/SE and MP); a whole number replaces it, up to
+             the ceiling on a table's cells. Bound to the native settings' tab_* fields;
+             settings.set republishes them, so Apply takes effect on the next command.
+             The caption is not a <label>: each box has its own. -->
+        <div class="settings-row" role="group" aria-labelledby="set-tab-limits-caption">
+          <span id="set-tab-limits-caption" class="settings-caption">Table size limits</span>
+          <span class="settings-limits-wrap">
+            <label class="settings-limit"><span>One-way rows</span>
+              <input type="number" id="set-tab-oneway-rows" class="settings-input settings-number"
+                     min="1" max="1000000" step="1" inputmode="numeric" placeholder="12000"></label>
+            <label class="settings-limit"><span>Two-way rows</span>
+              <input type="number" id="set-tab-twoway-rows" class="settings-input settings-number"
+                     min="1" max="1000000" step="1" inputmode="numeric" placeholder="1200"></label>
+            <label class="settings-limit"><span>Two-way columns</span>
+              <input type="number" id="set-tab-twoway-cols" class="settings-input settings-number"
+                     min="1" max="1000000" step="1" inputmode="numeric" placeholder="80"></label>
+            <label class="settings-limit"><span>With summarize(): cells</span>
+              <input type="number" id="set-tab-summarize-cells" class="settings-input settings-number"
+                     min="1" max="200000" step="1" inputmode="numeric" placeholder="375"></label>
+          </span>
+          <span class="settings-hint">The largest tables <code>tabulate</code>, <code>tab1</code> and
+            <code>tab2</code> draw; a table past a limit is not drawn (<em>too many values</em>, r(134)).
+            Empty = Stata's limit, shown in grey (that of Stata/SE and MP). Type a larger whole number to
+            raise a limit. Big tables take time and memory, and no table may have more than
+            <span id="set-tab-cell-ceiling">1,000,000</span> cells (rows &times; columns),
+            <span id="set-tab-summarize-ceiling">200,000</span> with summarize(). Apply, and the next
+            command uses the new limits.</span>
+        </div>
+
         <h3 class="settings-h">Display <span class="settings-note">(applied immediately)</span></h3>
 
         <div class="settings-row">

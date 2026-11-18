@@ -291,9 +291,6 @@ void postENameListsRegressM4(SessionState& session, const ojson& raw,
     putEStringNL(session, "estat_cmd", "regress_estat");
     putEStringNL(session, "_r_z__CL", "t");
     putEStringNL(session, "_r_z_abs__CL", "|t|");
-    // A weighted or noconstant fit's e(beta), e(V_modelbased) and ordered name lists
-    // are not measured.
-    if (weighted || noConstant) return;
     // e(beta) is posted by regress for every fit except a one-way cluster VCE
     // (StataBE `: e(matrices)`: OLS/robust/hc3/aw/fv `b V beta...`, vce(cluster id)
     // `b V V_modelbased`); the multiway path's inner regress runs without the cluster.
@@ -304,6 +301,10 @@ void postENameListsRegressM4(SessionState& session, const ojson& raw,
     // e(V_modelbased) is (X'X)^-1 = V/rmse^2 under every VCE the engine sends it for
     // (BUG-1043: one-way robust/cluster too, unweighted or fweighted).
     const bool vmb = path != Path::kOls && recordOnBlockNL(session, raw, "e_Vmb");
+    // A weighted or noconstant fit posts e(beta) and e(V_modelbased) too (bank d1d057bf
+    // [aw], 01386761 noconstant, 15739513 [pw]: the engine's beta_std and e_Vmb); its
+    // ordered name lists are not measured.
+    if (weighted || noConstant) return;
     const std::vector<std::string> base = {"cmdline", "title", "marginsprop", "marginsok",
                                            "vce", "_r_z_abs__CL", "_r_z__CL", "depvar", "cmd",
                                            "properties", "predict", "model", "estat_cmd"};
@@ -348,7 +349,16 @@ void postENameListsRegressM4(SessionState& session, const ojson& raw,
         break;
       }
     }
-    installENameContractNL(session, session.eval.eStrings.get("cmd"), std::move(S), std::move(M), std::move(X));
+    // A model test the fit could not carry out (a one-way cluster with fewer
+    // clusters than coefficients: runRegress nulls F) is a listed name with a
+    // missing value (bank 5aa7ac2b `vce(cluster c3)`: e(F) `.` in `: e(scalars)`).
+    std::vector<std::string> missing;
+    if (session.eval.lastModelResult.has_value() && session.eval.lastModelResult->is_object() &&
+        session.eval.lastModelResult->contains("F") &&
+        session.eval.lastModelResult->at("F").is_null())
+      missing.push_back("F");
+    installENameContractNL(session, session.eval.eStrings.get("cmd"), std::move(S), std::move(M),
+                           std::move(X), std::move(missing));
     return;
   }
 
@@ -540,6 +550,15 @@ void postENameListsXtregFeM4(SessionState& session, const ojson& raw,
 // ivregress 2sls under the built-in multiway VCE, asymptotic (no `small`),
 // unweighted, with the constant (ivregress.ado / ivregress 2sls). Called after
 // runIvRegress has posted e(mss)/e(tss)/e(rss)/e(r2)/e(r2_a)/e(df_m).
+// Stata's `ivreg` (ivreg.ado: `_regress` with instruments): the ordered e() lists
+// the fit posts (bank af8d994e, fbf39cf3, eb7250c9, 4b1e00b3), installed by
+// runIvRegress once it has posted every listed value.
+void installIvregENamesM4(SessionState& session, std::vector<std::string> scalars,
+                          std::vector<std::string> macros, std::vector<std::string> missing) {
+  installENameContractNL(session, "ivreg", std::move(scalars), std::move(macros),
+                         std::vector<std::string>{"b", "V"}, std::move(missing));
+}
+
 void postENameListsIvregressM4(SessionState& session, const ojson& raw, size_t kEndog) {
   session.eNameContract.reset();
   if (!session.lastModel().has_value() || !raw.is_object()) return;

@@ -18,6 +18,7 @@
 #include <map>
 #include <optional>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -302,6 +303,12 @@ std::optional<std::string> juxtaposedNotError(const std::vector<std::string>& ex
     const std::string& tok = expr[j];
     if (tok.empty() || (tok[0] != '!' && tok[0] != '~')) continue;
     if (tok.size() > 1 && tok[1] == '=') continue;
+    // `1 ! = 2` / `1 ~ = 2`: the operator `!=` with a blank inside, as the
+    // evaluator reads it (StataBE 19.5: 1; vs-stata bank 5defa41413b0239f,
+    // 41d0f554e516ba6e).
+    if (tok.size() == 1 && j + 1 < expr.size() && !expr[j + 1].empty() && expr[j + 1][0] == '=' &&
+        expr[j + 1].compare(0, 2, "==") != 0)
+      continue;
     const std::string& prev = expr[j - 1];
     size_t w = prev.size();
     while (w > 0 && isWordByte(prev[w - 1])) --w;
@@ -407,6 +414,293 @@ std::string verbatimCoefText(const std::string& token, const std::string& resolv
 
 // ---------------------------------------------------------------------------
 // Public entry point — handle_display
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// SMCL as plain text ([P] smcl), for what `display` shows. StataBE 19.5 draws
+// the directives of every string it displays (vs-stata bank display cells:
+// `display "{bf:raw?}"` is raw?, `{hline 20}` twenty dashes, `{dup 5:ab}`
+// ababababab, `{col 20}x{col 30}y`, `{ralign 10:abc}|{lalign 10:abc}|{center
+// 10:abc}|`, `{c 69}{c a:} {c TLC}{c -}{c TRC}` "Eä +-+", `{c -(}literal{c
+// )-}` {literal}, `a{tab}b` and a char(9) to the next multiple of 8, `{p 4 8
+// 2}` a paragraph wrapped at the line size). A brace that opens no directive
+// SMCL knows is shown as typed (`display "{"`).
+
+size_t smclColumn(const std::string& out) {
+  const size_t nl = out.rfind('\n');
+  size_t col = 0;
+  for (size_t k = nl == std::string::npos ? 0 : nl + 1; k < out.size(); ++k)
+    if ((static_cast<unsigned char>(out[k]) & 0xC0) != 0x80) ++col;
+  return col;
+}
+
+size_t smclWidth(const std::string& s) {
+  size_t n = 0;
+  for (char c : s)
+    if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) ++n;
+  return n;
+}
+
+std::string utf8Of(unsigned cp) {
+  std::string o;
+  if (cp < 0x80) {
+    o.push_back(static_cast<char>(cp));
+  } else if (cp < 0x800) {
+    o.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+    o.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else {
+    o.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+    o.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    o.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  }
+  return o;
+}
+
+// {c ...}: a character code, a named line-drawing piece (drawn as ASCII, as a
+// text log draws it), the two braces, or an accented letter.
+std::optional<std::string> smclChar(const std::string& argIn) {
+  const std::string arg = strip(argIn);
+  if (arg.empty()) return std::nullopt;
+  if (std::all_of(arg.begin(), arg.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); })) {
+    if (arg.size() > 3) return std::nullopt;
+    const unsigned v = static_cast<unsigned>(std::stoi(arg));
+    if (v >= 32 && v <= 126) return std::string(1, static_cast<char>(v));
+    if (v >= 160 && v <= 255) return utf8Of(v);
+    return std::nullopt;
+  }
+  static const std::map<std::string, std::string> kNamed = {
+      {"-(", "{"},  {")-", "}"},  {"-", "-"},   {"|", "|"},   {"+", "+"},   {"TT", "+"},
+      {"BT", "+"},  {"LT", "+"},  {"RT", "+"},  {"TLC", "+"}, {"TRC", "+"}, {"BLC", "+"},
+      {"BRC", "+"}, {"S|", "$"},  {"'g", "`"},  {"y:", "\xC3\xBF"}, {"c,", "\xC3\xA7"},
+      {"C,", "\xC3\x87"}, {"n~", "\xC3\xB1"}, {"N~", "\xC3\x91"}, {"ss", "\xC3\x9F"},
+      {"o/", "\xC3\xB8"}, {"O/", "\xC3\x98"}, {"ae", "\xC3\xA6"}, {"AE", "\xC3\x86"},
+      {"a~", "\xC3\xA3"}, {"o~", "\xC3\xB5"}, {"A~", "\xC3\x83"}, {"O~", "\xC3\x95"},
+      {"ao", "\xC3\xA5"}, {"Ao", "\xC3\x85"}};
+  if (auto it = kNamed.find(arg); it != kNamed.end()) return it->second;
+  // Vowel + accent: ' acute, ` grave, ^ circumflex, : umlaut (Latin-1 rows).
+  if (arg.size() == 2) {
+    static const std::string kVowels = "aeiouAEIOU";
+    // Latin-1 code points per vowel for grave, acute, circumflex, umlaut.
+    static const unsigned kTable[10][4] = {
+        {0xE0, 0xE1, 0xE2, 0xE4}, {0xE8, 0xE9, 0xEA, 0xEB}, {0xEC, 0xED, 0xEE, 0xEF},
+        {0xF2, 0xF3, 0xF4, 0xF6}, {0xF9, 0xFA, 0xFB, 0xFC}, {0xC0, 0xC1, 0xC2, 0xC4},
+        {0xC8, 0xC9, 0xCA, 0xCB}, {0xCC, 0xCD, 0xCE, 0xCF}, {0xD2, 0xD3, 0xD4, 0xD6},
+        {0xD9, 0xDA, 0xDB, 0xDC}};
+    const size_t v = kVowels.find(arg[0]);
+    const size_t a = std::string("`'^:").find(arg[1]);
+    if (v != std::string::npos && a != std::string::npos) return utf8Of(kTable[v][a]);
+  }
+  return std::nullopt;
+}
+
+// The matching `}` of the `{` at `open` (nested braces counted), or npos.
+size_t smclClose(const std::string& s, size_t open) {
+  int depth = 0;
+  for (size_t k = open; k < s.size(); ++k) {
+    if (s[k] == '{') ++depth;
+    else if (s[k] == '}' && --depth == 0) return k;
+  }
+  return std::string::npos;
+}
+
+bool smclNumber(const std::string& t, long* out) {
+  const std::string v = strip(t);
+  if (v.empty() || v.size() > 6) return false;
+  for (char c : v)
+    if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+  *out = std::stol(v);
+  return true;
+}
+
+void smclRender(const std::string& s, int linesize, std::string& out);
+
+// A paragraph ({p # # #} ... {p_end}): its words wrapped so that no line is
+// wider than linesize - right, the first line indented `first` columns and
+// the others `rest`.
+void smclParagraph(const std::string& body, long first, long rest, long right, int linesize,
+                   std::string& out) {
+  std::string flat;
+  smclRender(body, linesize, flat);
+  std::vector<std::string> words;
+  {
+    std::string cur;
+    for (char c : flat) {
+      if (c == ' ' || c == '\n' || c == '\t') {
+        if (!cur.empty()) words.push_back(cur);
+        cur.clear();
+      } else {
+        cur.push_back(c);
+      }
+    }
+    if (!cur.empty()) words.push_back(cur);
+  }
+  const size_t width = static_cast<size_t>(std::max<long>(linesize - right, 1));
+  if (smclColumn(out) != 0) out.push_back('\n');
+  std::string line(static_cast<size_t>(first), ' ');
+  bool lineHasWord = false;
+  for (const auto& w : words) {
+    if (lineHasWord && smclWidth(line) + 1 + smclWidth(w) > width) {
+      out += line;
+      out.push_back('\n');
+      line.assign(static_cast<size_t>(rest), ' ');
+      lineHasWord = false;
+    }
+    if (lineHasWord) line.push_back(' ');
+    line += w;
+    lineHasWord = true;
+  }
+  if (lineHasWord) out += line;
+}
+
+void smclRender(const std::string& s, int linesize, std::string& out) {
+  size_t i = 0;
+  while (i < s.size()) {
+    const char c = s[i];
+    if (c == '\t') {
+      const size_t col = smclColumn(out);
+      out.append(8 - col % 8, ' ');
+      ++i;
+      continue;
+    }
+    if (c != '{') {
+      out.push_back(c);
+      ++i;
+      continue;
+    }
+    const size_t close = smclClose(s, i);
+    if (close == std::string::npos) {
+      out.push_back(c);
+      ++i;
+      continue;
+    }
+    const std::string inner = s.substr(i + 1, close - i - 1);
+    // name, then its arguments up to the first colon, then the text after it
+    size_t ne = 0;
+    while (ne < inner.size() && inner[ne] != ' ' && inner[ne] != ':') ++ne;
+    const std::string name = inner.substr(0, ne);
+    std::string args, text;
+    bool hasText = false;
+    {
+      // the first colon outside "..." (syntaxes 3 and 4): a quoted argument
+      // may hold one, as a URL does (`{browse "http://x":text}`)
+      size_t colon = std::string::npos;
+      bool quoted = false;
+      for (size_t k = ne; k < inner.size(); ++k) {
+        if (inner[k] == '"') quoted = !quoted;
+        else if (inner[k] == ':' && !quoted) {
+          colon = k;
+          break;
+        }
+      }
+      // `{c a:}`: the colon belongs to the character's name
+      if (colon != std::string::npos && !(name == "c" || name == "char")) {
+        args = inner.substr(ne, colon - ne);
+        text = inner.substr(colon + 1);
+        hasText = true;
+      } else {
+        args = inner.substr(ne);
+      }
+    }
+    const std::string a = strip(args);
+    static const std::vector<std::string> kStyles = {
+        "txt", "text", "res", "result", "err", "error", "inp", "input", "com",
+        "cmd", "sf", "bf", "it", "hi", "hilite", "ul", "smcl", "reset", "sansfont", "input"};
+    static const std::vector<std::string> kLinks = {"stata", "help", "helpb", "browse", "view",
+                                                    "search", "net", "dialog", "manhelp"};
+    const auto in = [&name](const std::vector<std::string>& v) {
+      return std::find(v.begin(), v.end(), name) != v.end();
+    };
+    bool done = true;
+    long n = 0;
+    if (in(kStyles) && (hasText ? a.empty() : (a.empty() || (name == "ul" && (a == "on" || a == "off"))))) {
+      if (hasText) smclRender(text, linesize, out);
+    } else if (name == "hline" && !hasText && smclNumber(a, &n)) {
+      out.append(static_cast<size_t>(n), '-');
+    } else if (name == "dup" && hasText && smclNumber(a, &n)) {
+      std::string unit;
+      smclRender(text, linesize, unit);
+      for (long k = 0; k < n; ++k) out += unit;
+    } else if (name == "space" && !hasText && smclNumber(a, &n)) {
+      out.append(static_cast<size_t>(n), ' ');
+    } else if ((name == "col" || name == "column") && !hasText && smclNumber(a, &n)) {
+      const size_t col = smclColumn(out);
+      if (n > 1 && static_cast<size_t>(n - 1) > col) out.append(static_cast<size_t>(n - 1) - col, ' ');
+    } else if (name == "tab" && !hasText && a.empty()) {
+      const size_t col = smclColumn(out);
+      out.append(8 - col % 8, ' ');
+    } else if ((name == "c" || name == "char") && !a.empty() && smclChar(a)) {
+      out += *smclChar(a);
+    } else if ((name == "ralign" || name == "lalign" || name == "center") && hasText &&
+               smclNumber(a, &n)) {
+      std::string t;
+      smclRender(text, linesize, t);
+      const size_t w = smclWidth(t);
+      const size_t pad = static_cast<size_t>(n) > w ? static_cast<size_t>(n) - w : 0;
+      if (name == "ralign") out += std::string(pad, ' ') + t;
+      else if (name == "lalign") out += t + std::string(pad, ' ');
+      else out += std::string(pad / 2, ' ') + t + std::string(pad - pad / 2, ' ');
+    } else if (name == "title" && hasText && a.empty()) {
+      smclRender(text, linesize, out);
+    } else if (in(kLinks) && (hasText || !a.empty())) {
+      // a link draws its text, or with none its argument; the quotes that
+      // bind an argument (`{browse "https://x"}`) are not drawn
+      std::string arg = a;
+      if (arg.size() >= 4 && arg.compare(0, 2, "`\"") == 0 && arg.compare(arg.size() - 2, 2, "\"'") == 0)
+        arg = arg.substr(2, arg.size() - 4);
+      else if (arg.size() >= 2 && arg.front() == '"' && arg.back() == '"')
+        arg = arg.substr(1, arg.size() - 2);
+      smclRender(hasText ? text : arg, linesize, out);
+    } else if (name == "p_end" && !hasText && a.empty()) {
+      // the end of a paragraph that was not opened here: nothing to draw
+    } else if ((name == "p" || name == "pstd" || name == "phang" || name == "pin" ||
+                name == "pmore") && !hasText) {
+      long v[3] = {0, 0, 0};
+      if (name == "pstd") v[0] = 4, v[1] = 4, v[2] = 2;
+      if (name == "phang") v[0] = 4, v[1] = 8, v[2] = 2;
+      if (name == "pin") v[0] = 8, v[1] = 8, v[2] = 2;
+      if (name == "pmore") v[0] = 8, v[1] = 8, v[2] = 2;
+      bool ok = true;
+      if (name == "p" && !a.empty()) {
+        std::istringstream iss(a);
+        std::string w;
+        for (int k = 0; k < 3 && ok && (iss >> w); ++k) ok = smclNumber(w, &v[k]);
+        if (iss >> w) ok = false;
+      } else if (name != "p" && !a.empty()) {
+        ok = false;
+      }
+      if (!ok) {
+        done = false;
+      } else {
+        size_t endAt = s.find("{p_end}", close + 1);
+        const std::string body =
+            s.substr(close + 1, endAt == std::string::npos ? std::string::npos : endAt - close - 1);
+        smclParagraph(body, v[0], v[1], v[2], linesize, out);
+        i = endAt == std::string::npos ? s.size() : endAt + 7;
+        if (i < s.size()) out.push_back('\n');
+        continue;
+      }
+    } else {
+      done = false;
+    }
+    if (!done) {
+      out.push_back('{');
+      ++i;
+      continue;
+    }
+    i = close + 1;
+  }
+}
+
+}  // namespace
+
+std::string renderSmclText(const std::string& text, int linesize) {
+  if (text.find_first_of("{\t") == std::string::npos) return text;
+  std::string out;
+  out.reserve(text.size());
+  smclRender(text, linesize, out);
+  return out;
+}
 
 ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
   std::string rawArgs = rawArgsIn;
@@ -682,6 +976,14 @@ ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
       if (!displayError) {
         if (auto undef = eval::undefinedCRef(sourceJoined)) displayError = "r(133): " + *undef;
       }
+      // A real c() name this build does not serve (c(sortseed), c(dp), ...) is
+      // refused by name with its code, as `local x = c(NAME)` refuses it; it was
+      // the evaluator's raw `NameError: name 'c' is not defined` at rc 1.
+      if (!displayError && arithRaised.rfind("NameError: name 'c' ", 0) == 0) {
+        std::string cRc;
+        if (auto why = piet::unservedCRefError(sourceJoined, &cRc))
+          displayError = "r(" + cRc + "): " + *why;
+      }
       // BUG-088: a genuine NameError on a single call-syntax token `name(args)`
       // (an unsupported extended macro function) surfaces honestly rather than
       // being echoed as literal text. Narrowed to a lone call-syntax token so
@@ -838,7 +1140,82 @@ ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
       }
     }
   };
+  // An item that opens with a binary operator is no expression: StataBE 19.5
+  // reads the operator into a name and refuses it -- `display "<" ""*5` is
+  // `*5 invalid name`, `display "" < "a"` `<"a" invalid name`, `display "a" &
+  // 1` `&1 invalid name` (r(198); vs-stata bank 5935ce98b9029bb9,
+  // 3721dc3aee13017a, 02d083362bbbc963). After a printed part a leading `+`
+  // does the same before a name or a literal (`display "[" + s + "]"` is `+s
+  // invalid name`, 90350596f18279fd) and before a call is r(133) `unknown
+  // function +trim()` (17e95ad0bb6e2085). The message with its r(#) prefix, or
+  // nothing.
+  auto leadingOperatorError = [&](const std::vector<std::string>& toks) -> std::optional<std::string> {
+    if (toks.empty() || toks[0].empty()) return std::nullopt;
+    std::string joined;
+    for (const auto& t : toks) joined += t;
+    const char c0 = joined[0];
+    if (std::strchr("*&|<>^", c0) != nullptr) {
+      size_t e = 0;
+      while (e < joined.size() && std::strchr("*&|<>^=", joined[e]) != nullptr) ++e;
+      while (e < joined.size() && (std::isalnum(static_cast<unsigned char>(joined[e])) ||
+                                   joined[e] == '_' || joined[e] == '.' || joined[e] == '"'))
+        ++e;
+      return "r(198): " + joined.substr(0, e) + " invalid name";
+    }
+    if (c0 == '+' && !parts.empty() && joined.size() > 1) {
+      size_t e = 1;
+      const unsigned char c1 = static_cast<unsigned char>(joined[1]);
+      if (!(std::isalpha(c1) || c1 == '_' || c1 >= 0x80 || c1 == '"')) return std::nullopt;
+      if (c1 == '"') return "r(198): " + joined + " invalid name";
+      while (e < joined.size() && cecon::ident::isIdentByte(joined[e])) ++e;
+      if (e < joined.size() && joined[e] == '(')
+        return "r(133): unknown function " + joined.substr(0, e) + "()";
+      return "r(198): " + joined.substr(0, e) + " invalid name";
+    }
+    return std::nullopt;
+  };
   auto flushUnquoted = [&]() {
+    // `=exp` is exp: display reads the `=`s before an expression and drops
+    // them (StataBE 19.5 `display =2+3` is 5 and `display "1"==1` is 11;
+    // vs-stata bank ae69546035605574, 1818b1264386c1eb).
+    if (!unquotedTokens.empty() && !unquotedTokens[0].empty() && unquotedTokens[0][0] == '=') {
+      std::string& t0 = unquotedTokens[0];
+      t0.erase(0, t0.find_first_not_of('='));
+      if (t0.empty()) unquotedTokens.erase(unquotedTokens.begin());
+    }
+    if (!displayError.has_value() && !unquotedTokens.empty()) {
+      std::optional<std::string> bad = leadingOperatorError(unquotedTokens);
+      // Two groups with nothing between them, `(1)(2)` or `("a")("b")`, read as
+      // a call of the first: r(133) `unknown function ()` (vs-stata bank
+      // 1db2c412562ac97f, 216e8483bc7e1875); with a blank between them they
+      // are two items (`(1) (2)` is 12).
+      for (const auto& tok : unquotedTokens) {
+        if (bad) break;
+        int depth = 0;
+        for (size_t k = 0; k < tok.size(); ++k) {
+          const size_t q = skipQuotedSpan(tok, k);
+          if (q != k) {
+            k = q - 1;
+            continue;
+          }
+          if (tok[k] == '(' || tok[k] == '[') ++depth;
+          else if (tok[k] == ')' || tok[k] == ']') {
+            --depth;
+            if (depth == 0 && tok[k] == ')' && k + 1 < tok.size() && tok[k + 1] == '(') {
+              bad = std::string("r(133): unknown function ()");
+              break;
+            }
+          }
+        }
+      }
+      if (bad) {
+        unquotedTokens.clear();
+        pendingFmt.reset();
+        partsBeforeError = parts.size();
+        displayError = *bad;
+        return;
+      }
+    }
     // BUG-1333 / FU-142: each expression of the segment (splitExpressions), and
     // each of several adjacent groups inside one (splitAdjacentGroups), is
     // evaluated one by one, exactly as a lone item is. A pending %fmt formats
@@ -884,6 +1261,8 @@ ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
   std::optional<long long> dupCount;  // `_dup(#)`: repeat the next directive
   size_t dupMark = 0;
   bool continueLine = false;  // `_continue`: the display block says so (doexec joins)
+  size_t continueMark = 0;    // parts.size() at the `_continue`
+  bool asis = false;          // `_asis`: the strings are shown without SMCL
   auto applyDup = [&]() {
     if (!dupCount.has_value() || parts.size() <= dupMark) return;
     const std::vector<std::string> unit(parts.begin() + static_cast<std::ptrdiff_t>(dupMark),
@@ -982,14 +1361,38 @@ ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
     };
     const bool known = abbrevOf("_newline", 2) || (abbrevOf("_column", 4) && hasArg) ||
                        (name == "_char" && hasArg) || (abbrevOf("_continue", 2) && !hasArg) ||
-                       (abbrevOf("_skip", 2) && hasArg) || (abbrevOf("_dup", 2) && hasArg) ||
+                       abbrevOf("_skip", 2) || (abbrevOf("_dup", 2) && hasArg) ||
                        (abbrevOf("_asis", 2) && !hasArg);
     if (!known) return false;  // `_request(...)` and any other name keep their paths
     std::optional<long long> arg;
+    // A directive whose argument is no number, and `_newline(#)` below zero, are
+    // r(198) invalid syntax (StataBE 19.5: `display _char(abc)`, `_col(abc)`,
+    // `_dup(a)`, `_newline(-1)`; vs-stata bank 859ec1e4621eef16,
+    // 77dc52d0715c7ac1, baa452cee7d4ed1e, d117f9b700b18f38).
+    const auto invalid = [&]() {
+      flushDirective();
+      if (!displayError.has_value()) {
+        partsBeforeError = parts.size();
+        displayError = "r(198): invalid syntax";
+      }
+      return true;
+    };
     if (hasArg) {
       arg = directiveArg(dm[2].str());
-      if (!arg.has_value()) return false;
+      if (!arg.has_value()) {
+        // A string argument is not a number either; anything the evaluator
+        // cannot read keeps its old path only when it is no plain word.
+        static const std::regex reWordArg(R"(^\s*[A-Za-z_][A-Za-z0-9_]*\s*$)");
+        if (std::regex_match(dm[2].str(), reWordArg)) return invalid();
+        return false;
+      }
     }
+    if (abbrevOf("_newline", 2) && hasArg && *arg < 0) return invalid();
+    // `_char(#)` outside 1..255 and `_dup(#)` below zero are r(198) too
+    // (StataBE 19.5: `_char(300)`, `_char(0)`, `_dup(-1)`; vs-stata bank
+    // 8bda96245b2e9fe2, 073f765accb12d84).
+    if (name == "_char" && hasArg && (*arg < 1 || *arg > 255)) return invalid();
+    if (abbrevOf("_dup", 2) && hasArg && *arg < 0) return invalid();
     if (abbrevOf("_newline", 2)) {
       flushDirective();
       parts.push_back(std::string(static_cast<size_t>(std::max<long long>(hasArg ? *arg : 1, 0)), '\n'));
@@ -1011,11 +1414,14 @@ ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
     if (abbrevOf("_continue", 2) && !hasArg) {
       flushDirective();
       continueLine = true;
+      continueMark = parts.size();
       return true;
     }
-    if (abbrevOf("_skip", 2) && hasArg) {
+    // `_skip` alone skips one column (StataBE 19.5 `display "a" _skip "b"` is
+    // `a b`, vs-stata bank a861420270a6cb90).
+    if (abbrevOf("_skip", 2)) {
       flushDirective();
-      parts.push_back(std::string(static_cast<size_t>(std::max<long long>(*arg, 0)), ' '));
+      parts.push_back(std::string(static_cast<size_t>(std::max<long long>(hasArg ? *arg : 1, 0)), ' '));
       return true;
     }
     if (abbrevOf("_dup", 2) && hasArg) {
@@ -1026,6 +1432,7 @@ ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
     }
     if (abbrevOf("_asis", 2) && !hasArg) {
       flushDirective();
+      asis = true;
       return true;
     }
     return false;
@@ -1056,6 +1463,20 @@ ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
     if ((token == "as" && takeStyleWord(true)) || (token == "in" && takeStyleWord(false))) {
       flushDirective();
       return;
+    }
+    // `as` before a word that is no style is r(198) invalid syntax (StataBE
+    // 19.5 `display as zznotacolor "x"`, vs-stata bank 1d7ea2c454db43c8).
+    if (token == "as") {
+      size_t a = i;
+      while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+      if (a < s.size() && std::isalpha(static_cast<unsigned char>(s[a]))) {
+        flushDirective();
+        if (!displayError.has_value()) {
+          partsBeforeError = parts.size();
+          displayError = "r(198): invalid syntax";
+        }
+        return;
+      }
     }
     if (takeDirective(token)) return;
     unquotedTokens.push_back(token);
@@ -1113,8 +1534,16 @@ ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
       }
       const bool leftOperand =
           unquotedTokens.size() > 1 || prev.find_first_not_of("+-*/^=<>&|!~") != std::string::npos;
-      if (j != std::string::npos && !prev.empty() && leftOperand &&
-          std::string("+-*/^=<>&|").find(prev.back()) != std::string::npos) {
+      // A unary `-` or `!` with nothing on its left takes the literal as its
+      // operand too: `display -"a"`, `display !"a"` and `display "abc"-"c"` are
+      // r(109) type mismatch in StataBE 19.5 (vs-stata bank 2294437c3f7f5688,
+      // 9d53f722b2dfbec1, ddd2eac245585a5b), not a lone operator's r(198).
+      bool unaryOnly = true;
+      for (const auto& t : unquotedTokens)
+        unaryOnly = unaryOnly && !t.empty() && t.find_first_not_of("-!~") == std::string::npos;
+      if (j != std::string::npos && !prev.empty() &&
+          ((leftOperand && std::string("+-*/^=<>&|").find(prev.back()) != std::string::npos) ||
+           unaryOnly)) {
         unquotedTokens.push_back(s.substr(i, j - i));
         i = j;
         continue;
@@ -1278,12 +1707,19 @@ ojson handleDisplay(const std::string& rawArgsIn, SessionState& session) {
 
   std::string text;
   for (const auto& p : parts) text += p;
+  // `_continue` keeps the line open only when nothing is shown after it:
+  // `display _continue "x"` and `display "p" _continue " q"` end their line
+  // (StataBE 19.5, vs-stata bank 52a5e4107700dc75, 5064b82bec5544db).
+  for (size_t k = continueMark; continueLine && k < parts.size(); ++k)
+    if (!parts[k].empty()) continueLine = false;
 
   ojson out;
   out["type"] = "display";
   out["text"] = text;
   // `_continue`: the next display output joins this line (doexec's pushBlock).
   if (continueLine) out["continue"] = true;
+  // `_asis`: the display statement draws no SMCL (route_results reads this).
+  if (asis) out["asis"] = true;
   return out;
 }
 

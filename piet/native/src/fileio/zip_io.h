@@ -7,11 +7,12 @@
 //
 // Limits, all inherited and all loud: a ZIP64 archive, an encrypted entry, or a
 // compression method other than stored (0) / deflated (8) throws. The writer stores
-// only (no DEFLATE), stamps every entry 1980-01-01 00:00 so its bytes are
+// unless asked to deflate (zipfile and zipsave do), stamps every entry 1980-01-01 00:00 so its bytes are
 // deterministic, and keeps 16-bit entry counts and 32-bit sizes -- a caller must
 // refuse more than 65535 entries or an entry of 4 GiB or more before calling build().
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -26,8 +27,13 @@ struct Entry {
 // cannot be read or is not a ZIP, and for the unsupported cases above.
 std::vector<Entry> readEntries(const std::string& path);
 
-// The archive bytes for `entries`, stored, in the given order.
-std::string build(const std::vector<Entry>& entries);
+// The archive bytes for `entries`, in the given order. `deflateLevel` < 0 (the
+// default) stores every entry; 0-9 deflates each file entry at that level, as zlib
+// does, and adds the byte count of the deflate streams to *compressedBytes (and
+// each stream's to perEntryCompressed). A directory entry is always stored.
+std::string build(const std::vector<Entry>& entries, int deflateLevel = -1,
+                  size_t* compressedBytes = nullptr,
+                  std::vector<size_t>* perEntryCompressed = nullptr);
 
 // Write `bytes` to `path` through a sibling temp file and rename(2); an existing
 // file is never truncated by a failed write. Throws std::runtime_error.

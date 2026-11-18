@@ -461,6 +461,7 @@ GlmResult glm_fit(const double* X, int64_t n, int k, const double* y, const doub
                 r.V[c * k + a] = m;
             }
         r.n_clusters = G;
+        r.V_oim = bread;
     } else {
         r.V = bread;
     }

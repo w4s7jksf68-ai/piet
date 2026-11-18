@@ -81,6 +81,7 @@ struct VarResult {
     int lags = 0;      // p
     int m = 0;         // regressors per equation = K*lags + 1
     int64_t n_obs = 0; // T — usable rows after the lag sample is formed
+    std::vector<int64_t> sample_rows;  // the T rows of the lag sample (e(sample)), time order
     double t_first = 0, t_last = 0;  // Stata's "Sample: <first> thru <last>"
 
     std::vector<std::string> names;   // K variable names, equation order
@@ -93,6 +94,12 @@ struct VarResult {
     // (measured: it reproduces every printed Std. err. on the P7 oracle; the
     // T - m divisor does not).
     std::vector<double> vcov;
+    // X'X of the lag design, m x m row-major in rnames order (Stata's e(G) is
+    // X'X / T with the constant first).
+    std::vector<double> xtx;
+    // Gaps in the estimation sample: consecutive sample rows more than one
+    // delta apart (Stata's e(N_gaps)).
+    int64_t n_gaps = 0;
 
     double ll = 0, det_sigma = 0, fpe = 0, aic = 0, hqic = 0, sbic = 0;
     bool sigma_pd = false;  // Cholesky of sigma succeeded
@@ -111,7 +118,13 @@ struct VarResult {
 // caller's varlist and nothing downstream has to relabel.
 //
 // irf_steps < 0 skips the IRF block entirely (var/vargranger only).
+//
+// in_sample (optional, length n): a row with in_sample[i] == 0 is never an
+// estimation row but still supplies lagged values -- Stata's `if` restricts the
+// sample after the lag operators are evaluated, so `var y x if t > 50` uses the
+// values at t = 49, 50 as the first rows' lags (bank 1e267597: N 198, not 196).
 VarResult var_fit(const double* Y, const double* time, int64_t n,
-                  const std::vector<std::string>& names, int lags, int irf_steps, double delta);
+                  const std::vector<std::string>& names, int lags, int irf_steps, double delta,
+                  const char* in_sample = nullptr);
 
 }  // namespace cecon

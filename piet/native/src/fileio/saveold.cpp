@@ -47,8 +47,11 @@ namespace {
 
 // `nolabel`/`all`/`emptyok` change WHAT IS WRITTEN into the file, so they stay
 // in the unimplemented list rather than being accepted and dropped.
+// `all` writes e(sample) into the file and stays refused by name. emptyok and
+// orphans are `save`'s alone: saveold refuses them as unknown (bank
+// 98001ce25427fdef `option emptyok not allowed`).
 const piet::eval::OptVocab& kVocabSaveold = piet::eval::registerOptVocab(
-    {"saveold"}, {{"replace", "version"}, {"nolabel", "all", "emptyok", "orphans"}});
+    {"saveold"}, {{"replace", "version", "nolabel"}, {"all"}});
 
 }  // namespace
 
@@ -92,12 +95,13 @@ ojson runSaveold(const eval::ParsedCommand& parsed, SessionState& session) {
     return ioSyntax("saveold: version() needs a value, e.g. version(12)");
   }
   if (version.has_value()) {
-    // saveold writes releases for Stata 11 through 14 only; any other
-    // version() is r(198) and no file is written (w2ar dx_svo_v10
-    // `version(10)` 198 conf=601, log:4219).
+    // saveold writes releases for Stata 11 through 18 (14 to 18 are one
+    // format); any other version() is r(198) and no file is written (w2ar
+    // dx_svo_v10 `version(10)` 198 conf=601, log:4219; bank 085af3351c09b911,
+    // 29416ffe27339187, 76ad2d1ec0460d35: version(16), (17), (18) run).
     long long v = 0;
-    if (!parseStrictInt(*version, &v) || v < 11 || v > 14) {
-      return ioErrorRc("version(" + *version + ") invalid; saveold writes Stata 11 through 14 "
+    if (!parseStrictInt(*version, &v) || v < 11 || v > 18) {
+      return ioErrorRc("version(" + *version + ") invalid; saveold writes Stata 11 through 18 "
                        "datasets",
                        198);
     }
@@ -116,7 +120,10 @@ ojson runSaveold(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   // runSaveData names the spelling it was handed (`effectiveFp`) in its echo
   // and in every refusal (BUG-410), so its block goes out as it is.
-  ojson saved = runSaveData(spelling, hasFlag(parsed.opts, "replace"), session, release);
+  bool noLabel = false;
+  for (const auto& [key, value] : parsed.opts)
+    if (key.size() >= 3 && std::string("nolabel").compare(0, key.size(), key) == 0) noLabel = true;
+  ojson saved = runSaveData(spelling, hasFlag(parsed.opts, "replace"), session, release, noLabel);
   if (isErrorBlock(saved)) return saved;
 
   // EXACT text, pinned by the pangram section and by a do-file stdout check.

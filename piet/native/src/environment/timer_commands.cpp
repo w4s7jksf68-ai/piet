@@ -120,9 +120,14 @@ ojson runTimer(const std::string& sub, const std::optional<int>& slotArg, Sessio
     }
     TimerSlot& t = session.timers[static_cast<size_t>(*slotArg)];
     if (t.running) {
-      double elapsed =
-          std::chrono::duration<double>(std::chrono::steady_clock::now() - t.startedAt).count();
-      t.totalSeconds += elapsed;
+      // Stata's timers count whole milliseconds ([P] timer: accurate to about
+      // .001 seconds); an interval shorter than one adds nothing (vs-stata bank:
+      // `timer on 1` / `timer off 1` back to back reads r(t1) 0, also after three
+      // such intervals).
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t.startedAt)
+                          .count();
+      t.totalSeconds += static_cast<double>(ms) / 1000.0;
       t.count += 1;
       t.running = false;
     }
@@ -140,9 +145,23 @@ ojson runTimer(const std::string& sub, const std::optional<int>& slotArg, Sessio
   }
 
   if (sub == "list") {
+    // A running timer lists as if it stopped now: its interval so far (whole
+    // milliseconds) and one more count (StataBE 19.5 `timer on 1` / `timer
+    // list 1` is 0.00 / 1, r(t1) 0 r(nt1) 1; vs-stata bank f0d2d129af098532).
+    const auto listed = [](const TimerSlot& t) {
+      TimerSlot v = t;
+      if (t.running) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t.startedAt)
+                            .count();
+        v.totalSeconds += static_cast<double>(ms) / 1000.0;
+        v.count += 1;
+      }
+      return v;
+    };
     if (slotArg.has_value()) {
       if (!slotOk(*slotArg)) return engineErrorBlock("timer: invalid syntax", "syntax_error");
-      const TimerSlot& t = session.timers[static_cast<size_t>(*slotArg)];
+      const TimerSlot t = listed(session.timers[static_cast<size_t>(*slotArg)]);
       retireReturns(*slotArg);
       if (t.count == 0) return ojson::array();  // empty slot: silent, matches Stata
       setReturns(*slotArg, t);
@@ -155,7 +174,7 @@ ojson runTimer(const std::string& sub, const std::optional<int>& slotArg, Sessio
     for (int i = 1; i <= 100; ++i) retireReturns(i);
     std::string text;
     for (int i = 1; i <= 100; ++i) {
-      const TimerSlot& t = session.timers[static_cast<size_t>(i)];
+      const TimerSlot t = listed(session.timers[static_cast<size_t>(i)]);
       if (t.count == 0) continue;
       setReturns(i, t);
       if (!text.empty()) text += "\n";

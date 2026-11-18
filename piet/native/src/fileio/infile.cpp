@@ -47,12 +47,14 @@
 
 namespace {
 
-// `automatic` asks infile to build value labels from the string values it
-// reads, and `byvariable()` changes the record ORDER (all of v1, then all of
-// v2). Both change what the dataset IS, so neither may be accepted unread.
-// `using(data)` is the dictionary form's data file (runDictionaryRead).
+// `byvariable(#)` changes the record ORDER (all of v1, then all of v2) and is
+// read. `automatic` asks infile to build value labels from the non-numeric text
+// it meets in a numeric variable; the labelling itself is not implemented, so a
+// file that would need it is refused by name (runInfile) and any other file
+// reads exactly as without the option. `using(data)` is the dictionary form's
+// data file (runDictionaryRead).
 const piet::eval::OptVocab& kVocabInfile =
-    piet::eval::registerOptVocab({"infile"}, {{"clear", "using"}, {"automatic", "byvariable"}});
+    piet::eval::registerOptVocab({"infile"}, {{"clear", "using", "automatic", "byvariable"}, {}});
 
 }  // namespace
 
@@ -205,15 +207,17 @@ std::optional<ojson> writeAndConvert(SessionState& session, const CsvTable& t,
 
 // Adopt `hbin` as the session's dataset, exactly the way `use` does: the
 // resident chain is DROPPED (a load from disk never continues it), the display
-// metadata plane is cleared (a staged CSV declares no labels), and the source
-// the user named becomes c(filename). Unlike `use`, c(changed) is 1: the data
+// metadata plane is cleared (a staged CSV declares no labels), and c(filename)
+// is empty (a text import keeps no file name; a name-less `save, replace` after
+// it is r(198) and never writes over the raw source). Unlike `use`, c(changed) is 1: the data
 // read have not been saved (StataBE 19.5, BUG-1478: 1 after `infile a b using
 // f.raw, clear`, as after import delimited).
 void adoptLoadedFrame(SessionState& session, const std::string& hbin,
                       const std::string& sourceResolved) {
+  (void)sourceResolved;
   session.load(hbin, SessionState::LoadIntent::FreshRead);
   session.clearMetadata();
-  session.setCurrentFile(sourceResolved);
+  session.setCurrentFile(std::string());
   session.datasetChanged = true;
   session.invalidateDatastore();
 }
@@ -239,10 +243,12 @@ std::vector<std::string> freeFormatValues(const std::string& bytes, std::vector<
       ++i;
       continue;
     }
-    if (c == '"') {
+    if (c == '"' || c == '\'') {
+      // A run opened by either quote mark is one value (StataBE 19.5, bank
+      // 453553b39077e727: `'single q' 2` is two values).
       std::string tok;
       ++i;
-      while (i < n && bytes[i] != '"') {
+      while (i < n && bytes[i] != c) {
         tok.push_back(bytes[i]);
         ++i;
       }
@@ -265,7 +271,29 @@ std::vector<std::string> freeFormatValues(const std::string& bytes, std::vector<
 }  // namespace
 
 ojson runInfile(const eval::ParsedCommand& parsedIn, SessionState& session) {
-  const eval::ParsedCommand parsed = joinSpacedOptionValues(parsedIn);
+  eval::ParsedCommand parsed = joinSpacedOptionValues(parsedIn);
+  trimConditionAtUsing(&parsed);
+  // `infile spec in 2/3 using f`: a range written before `using` is not where
+  // the line tokenizer looks for it; it names the observations to keep.
+  if (!parsed.inRange.has_value()) {
+    const std::vector<std::string> w = quoteAwareWords(preCommaArgs(parsed.raw));
+    for (size_t i = 0; i + 1 < w.size(); ++i) {
+      const std::string lw = lowerOf(w[i]);
+      if (lw == "using") break;
+      if (lw == "in") {
+        parsed.inRange = w[i + 1];
+        break;
+      }
+    }
+  }
+  // Data in memory without `clear` is r(18) before anything else on the line
+  // is read, options included (StataBE 19.5: `infile , zzabbrprobe` and
+  // `infile ... using d.raw, c` are both r(18) over a loaded dataset). Without
+  // `clear` the check has no side effect; with it, clearing waits for the
+  // options and the file to be valid (below).
+  if (!hasFlag(parsed.opts, "clear")) {
+    if (auto err = requireEmptyOrClear(parsed, session)) return *err;
+  }
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabInfile.known,
                                             kVocabInfile.unimplemented)) {
     return ojson(*err);
@@ -273,7 +301,7 @@ ojson runInfile(const eval::ParsedCommand& parsedIn, SessionState& session) {
 
   std::vector<std::string> words;
   std::string pathArg;
-  if (!splitUsing(quoteAwareWords(preCommaArgs(parsed.raw)), &words, &pathArg)) {
+  if (!splitUsing(dropQualifierWords(quoteAwareWords(preCommaArgs(parsed.raw))), &words, &pathArg)) {
     return ioSyntax("infile: missing the file. Usage: infile varlist using \"file\" [, clear]");
   }
   if (auto err = requireEmptyOrClear(parsed, session)) return *err;
@@ -284,6 +312,29 @@ ojson runInfile(const eval::ParsedCommand& parsedIn, SessionState& session) {
     return runDictionaryRead("infile", pathArg, parsed, session);
   }
 
+  std::string resolved = resolveUserPath(session, pathArg);
+  std::string shown = typedUserPath(pathArg);
+  assumeSuffix(&resolved, &shown, ".raw");
+  if (!pathExists(resolved)) return ioErrorRc("file " + shown + " not found", 601);
+  auto bytes = readWholeFile(resolved);
+  if (!bytes.has_value()) return ioError("infile: cannot read " + shown, "data_io");
+  return file_command_detail::infileFromBytes(words, *bytes, resolved, parsed, session);
+}
+
+namespace file_command_detail {
+
+// The free-format reader proper: `words` is the varlist spec (types, names,
+// `_skip(#)`), `bytes` the data, `resolved` what becomes c(filename). Shared by
+// `infile varlist using f` and a dictionary whose entries state no widths.
+ojson infileFromBytes(const std::vector<std::string>& words, const std::string& dataBytes,
+                      const std::string& resolved, const eval::ParsedCommand& parsed,
+                      SessionState& session) {
+  long long byVariable = 0;
+  if (auto bv = optStr(parsed.opts, "byvariable")) {
+    if (!parseStrictInt(*bv, &byVariable) || byVariable < 1)
+      return ioErrorRc("option byvariable() incorrectly specified", 198);
+  }
+  const bool automatic = hasFlag(parsed.opts, "automatic");
   // -- the varlist spec ----------------------------------------------------
   std::vector<InfileSlot> slots;
   {
@@ -332,17 +383,11 @@ ojson runInfile(const eval::ParsedCommand& parsedIn, SessionState& session) {
   {
     std::set<std::string> seen;
     for (const auto& n : names) {
-      if (!seen.insert(n).second) return ioSyntax("infile: variable " + n + " named twice");
+      if (!seen.insert(n).second) return ioErrorRc("variable " + n + " already defined", 110);
     }
   }
 
-  std::string resolved = resolveUserPath(session, pathArg);
-  std::string shown = typedUserPath(pathArg);
-  assumeSuffix(&resolved, &shown, ".raw");
-  if (!pathExists(resolved)) return ioErrorRc("file " + shown + " not found", 601);
-  auto bytes = readWholeFile(resolved);
-  if (!bytes.has_value()) return ioError("infile: cannot read " + shown, "data_io");
-
+  const std::string* bytes = &dataBytes;
   std::vector<char> quoted;
   const std::vector<std::string> values = freeFormatValues(*bytes, &quoted);
 
@@ -352,27 +397,31 @@ ojson runInfile(const eval::ParsedCommand& parsedIn, SessionState& session) {
     table.names.push_back(s.name);
     table.isFactor.push_back(s.isString ? 1 : 0);
   }
-  // The record loop. A trailing PARTIAL record is padded with missing, which is
-  // what Stata does (it warns; PIET says so in a display line below).
-  const size_t nRec = width == 0 ? 0 : (values.size() + width - 1) / width;
+  // The record loop. A trailing PARTIAL record is padded with missing and
+  // counted, with Stata's note "(eof not at end of obs)". With byvariable(#)
+  // the file holds # values of the first variable, then # of the next, and so
+  // on: # records, and values past the last variable are not read.
+  const size_t perVar = byVariable > 0 ? static_cast<size_t>(byVariable) : 0;
+  const size_t nRec = perVar > 0 ? perVar : (width == 0 ? 0 : (values.size() + width - 1) / width);
   bool padded = false;
+  std::vector<std::string> notes;
   for (size_t r = 0; r < nRec; ++r) {
     std::vector<std::string> row;
-    size_t v = r * width;
+    size_t position = 0;  // which variable slot of the record this value is
     for (const auto& s : slots) {
       if (s.skip > 0) {
-        v += static_cast<size_t>(s.skip);
+        position += static_cast<size_t>(s.skip);
         continue;
       }
+      const size_t v = perVar > 0 ? position * perVar + r : r * width + position;
+      ++position;
       if (v >= values.size()) {
         row.emplace_back();  // "" == missing
-        padded = true;
-        ++v;
+        padded = padded || perVar == 0;
         continue;
       }
       const std::string& tok = values[v];
       const bool wasQuoted = quoted[v] != 0;
-      ++v;
       if (s.isString) {
         row.push_back(tok);
         continue;
@@ -383,17 +432,57 @@ ojson runInfile(const eval::ParsedCommand& parsedIn, SessionState& session) {
       }
       double d = 0.0;
       if (!parseStrictDouble(tok, &d)) {
-        return ioError("infile: `" + tok + "` cannot be read as a number for variable " + s.name +
-                       " (declare it a string with a `str#` prefix if it is text)");
+        // Not a number: the value is missing and Stata says so, naming the
+        // variable and the observation (bank abbcfdfded46f287). Under
+        // `automatic` the text would become a value label, which is not built.
+        if (automatic)
+          return ioError("infile: `" + tok + "` is not a number for variable " + s.name +
+                         "; building value labels from such text (option automatic) is not "
+                         "implemented in this build");
+        notes.push_back("'" + tok + "' cannot be read as a number for " + s.name + "[" +
+                        std::to_string(r + 1) + "]");
+        row.emplace_back();
+        continue;
       }
       row.push_back(eval::pythonFloatRepr(d));
     }
     table.rows.push_back(std::move(row));
   }
+  // `in` names the observations to keep, `if` the condition on what was read.
+  if (parsed.inRange.has_value() && !parsed.inRange->empty()) {
+    const int64_t nRead = static_cast<int64_t>(table.rows.size());
+    InRangeBounds rr = parseInRangeBounds(*parsed.inRange, nRead);
+    if (!rr.ok && parsed.inRange->find_first_of("lL-") == std::string::npos)
+      rr = parseInRangeBounds(*parsed.inRange, std::numeric_limits<int32_t>::max());
+    if (!rr.ok) {
+      InRangeFilterResult fr;
+      fr.ok = false;
+      fr.refusal = rr.refusal;
+      return inRangeRejectError(fr, *parsed.inRange, "infile");
+    }
+    const int64_t a = std::min<int64_t>(rr.a - 1, nRead);
+    const int64_t b = std::min<int64_t>(rr.b, nRead);
+    std::vector<std::vector<std::string>> kept(
+        table.rows.begin() + static_cast<std::ptrdiff_t>(a),
+        table.rows.begin() + static_cast<std::ptrdiff_t>(std::max(a, b)));
+    table.rows = std::move(kept);
+  }
 
   std::string hbin;
   if (auto err = writeAndConvert(session, table, "infile", &hbin)) return *err;
   adoptLoadedFrame(session, hbin, resolved);
+  if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) {
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilter(session, *session.currentHbin(), parsed.ifExpr, std::nullopt);
+    } catch (const CobraError& ce) {
+      return ioError(cobraErrorMessage(ce), ce.code);
+    }
+    if (fr.dataPath != *session.currentHbin()) {
+      session.load(fr.dataPath);
+      session.invalidateDatastore();
+    }
+  }
 
   // The DECLARED types are metadata this build records but does not enforce --
   // the frame is f64/factor throughout. Recording them is what makes a later
@@ -404,12 +493,16 @@ ojson runInfile(const eval::ParsedCommand& parsedIn, SessionState& session) {
   }
 
   ojson out = ojson::array();
-  if (padded) {
-    out.push_back(displayBlock("(infile: the last record was short — the missing values were "
-                               "filled with `.`)"));
+  if (!notes.empty()) {
+    std::string text;
+    for (const auto& note : notes) text += (text.empty() ? "" : "\n") + note;
+    out.push_back(displayBlock(text));
   }
+  if (padded) out.push_back(displayBlock("(eof not at end of obs)"));
   out.push_back(mutationResult(session, "infile"));
   return out;
 }
+
+}  // namespace file_command_detail
 
 }  // namespace piet::handlers

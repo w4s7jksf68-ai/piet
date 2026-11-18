@@ -127,3 +127,21 @@ Format: <project> | <version/commit> | <license> | <our file(s)> | <scope>
     `ritest` (randomization inference), derived from ritest.ado. License: GPL
     v3 as stated in the SSC listing (the GitHub repository has no LICENSE
     file). Notice: 71-ritest-GPL-3.0.txt.
+
+  ICU (International Components for Unicode; Unicode, Inc.) | 78 (i18n/csrsbcs.cpp trigram data) | Unicode-3.0 |
+    piet/native/src/fileio/charset_guess.cpp |
+    The 15 language trigram lists (ISO-8859-1: en da de es fr it nl no pt sv;
+    ISO-8859-2: cs hu pl ro; ISO-8859-9: tr) that score plain-ASCII text for
+    r(encoding) of `import delimited`, as data. The scoring and the choice
+    among scores are this project's own, written from measured behaviour.
+    License: Unicode License v3 (GPL-compatible permissive). Notice:
+    72-icu-charset-data-Unicode-3.0.txt.
+
+  zlib (Jean-loup Gailly, Mark Adler) | 1.3.1 (deflate.c, trees.c) | Zlib |
+    piet/native/src/fileio/deflate.cpp |
+    The deflate algorithm as zlib runs it (hash chains, greedy and lazy
+    matching with the per-level limits, block closing, Huffman tree building and
+    the choice among stored, fixed and dynamic blocks), so that the size of a
+    compressed entry is the size zlib-based zippers produce. Checked byte for
+    byte against zlib's output. License: the zlib license. Notice:
+    73-zlib-Zlib.txt.

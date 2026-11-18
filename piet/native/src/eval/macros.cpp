@@ -76,6 +76,60 @@ bool isMatrixVerbLine(const std::string& line) {
          verb == "matlist";
 }
 
+// A graph command line (twoway, graph, and the plot types), after any capture / quietly prefixes.
+// Stata reads a bare `r(name)` that stands where an OPTION NAME can stand -- at the top level of the
+// line, after its first comma, as a word of its own -- as that option, not as a stored result:
+// `twoway scatter y x, r(line)` is recast(line) (bank: StataBE rc 0), so the pass below leaves it.
+bool isGraphCommandLine(const std::string& line) {
+  static const std::set<std::string> kPrefix = {"cap",  "capt", "captu", "captur", "capture", "n",      "no",
+                                                "noi",  "nois", "noisi", "noisil", "noisily", "qui",    "quie",
+                                                "quiet", "quietl", "quietly"};
+  static const std::set<std::string> kGraph = {
+      "graph", "gr", "twoway", "tw", "scatter", "sc", "line", "connected", "area", "bar", "spike", "dropline",
+      "dot", "rcap", "rcapsym", "rspike", "rline", "rarea", "rbar", "pcspike", "pcarrow", "pcbarrow", "pccapsym",
+      "pcscatter", "tsline", "tsrline", "xtline", "lfit", "qfit", "lfitci", "qfitci", "function", "histogram",
+      "hist", "kdensity", "lowess", "lpoly", "binscatter", "cdfplot", "coefplot", "marginsplot", "event_plot",
+      "scatteri"};
+  size_t i = 0;
+  for (;;) {
+    i = line.find_first_not_of(" \t", i);
+    if (i == std::string::npos) return false;
+    size_t j = i;
+    while (j < line.size() && (std::isalnum(static_cast<unsigned char>(line[j])) != 0 || line[j] == '_')) ++j;
+    std::string w = line.substr(i, j - i);
+    for (auto& c : w) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (kGraph.count(w) != 0) return j >= line.size() || line[j] == ' ' || line[j] == '\t' || line[j] == ',';
+    if (kPrefix.count(w) == 0) return false;
+    i = j;
+    if (i < line.size() && line[i] == ':') ++i;
+  }
+}
+
+// True when the text at `at` stands where an option name can stand (see isGraphCommandLine): outside every
+// parenthesis and quote, after the line's first top-level comma, at the start of a word.
+bool atOptionNamePosition(const std::string& line, size_t at) {
+  int depth = 0;
+  bool afterComma = false;
+  char quote = 0;
+  for (size_t i = 0; i < at && i < line.size(); ++i) {
+    const char c = line[i];
+    if (quote != 0) {
+      if (c == quote) quote = 0;
+      continue;
+    }
+    if (c == '"') quote = c;
+    else if (c == '(') ++depth;
+    else if (c == ')' && depth > 0) --depth;
+    else if (c == ',' && depth == 0) afterComma = true;
+  }
+  if (!afterComma || depth != 0 || quote != 0) return false;
+  size_t b = at;
+  while (b > 0 && std::isspace(static_cast<unsigned char>(line[b - 1]))) --b;
+  if (b == 0) return false;
+  const char prev = line[b - 1];
+  return prev == ',' || prev == ')' || std::isalnum(static_cast<unsigned char>(prev)) != 0 || prev == '_';
+}
+
 // W2AK: an `estadd` line (after any capture/noisily/quietly prefixes). estadd
 // reads `r(name)` ITSELF -- `estadd r(mean)` posts e(mean) (estadd)
 // and `estadd scalar r(sd)` posts e(sd) (:249-255) -- so the bare r() pass
@@ -301,6 +355,36 @@ using namespace macro_detail;
 // ---------------------------------------------------------------------------
 // has_macro_refs
 
+namespace {
+// A backtick reference whose text is no macro name, which expandPass expands
+// (to nothing, or to the name before trailing blanks): `'`, ` x'`, `x '`,
+// `1*0'`. Mirrors the rule there.
+bool hasNamelessLocalRef(const std::string& s) {
+  for (size_t t = s.find('`'); t != std::string::npos; t = s.find('`', t + 1)) {
+    size_t j = t + 1;
+    if (j < s.size() && s[j] == '\'') {
+      if (!(t > 0 && s[t - 1] == '`')) return true;
+      continue;
+    }
+    const size_t nameStart = j;
+    if (j < s.size() && (isIdentStart(s[j]) || std::isdigit(static_cast<unsigned char>(s[j])))) {
+      ++j;
+      while (j < s.size() && isIdentChar(s[j])) ++j;
+    }
+    if (j >= s.size() || s[j] == '\'') continue;
+    const size_t q = s.find('\'', j);
+    if (q == std::string::npos) continue;
+    const std::string between = s.substr(j, q - j);
+    if (between.find_first_of("`\"$:()=[]{},\\") != std::string::npos) continue;
+    if (j > nameStart && between.find_first_not_of(" \t") == std::string::npos) return true;
+    if (j == nameStart ? (s[j] == ' ' || s[j] == '\t')
+                       : std::strchr("*+-/^~!<>&|", s[j]) != nullptr)
+      return true;
+  }
+  return false;
+}
+}  // namespace
+
 bool hasMacroRefs(const std::string& rawLine) {
   // A3: every macro reference this function can report needs one of exactly
   // three characters to be present — a backtick (`local'), a dollar ($global,
@@ -314,6 +398,9 @@ bool hasMacroRefs(const std::string& rawLine) {
   // `label var m "Risk Aversion \$(r)\$"` stores `Risk Aversion $(r)$`
   // (w2ao_label_family.log:176). A line carrying one is the expander's to rewrite.
   if (rawLine.find("\\$") != std::string::npos) return true;
+  // ... and `\`` the escape for a literal backtick (StataBE 19.5: `display
+  // "<\`x'>"` prints <`x'>, truth bank cell 07e085704dd9c678).
+  if (rawLine.find("\\`") != std::string::npos) return true;
   // P2-PERF ARC-A/A3-b: the same pre-filter argument, applied PER PATTERN
   // rather than once for all seven. The blanket guard above lets a line
   // through on any one of three characters and then runs all seven regexes,
@@ -326,6 +413,7 @@ bool hasMacroRefs(const std::string& rawLine) {
   const bool dollar = rawLine.find('$') != std::string::npos;
   std::smatch m;
   if (tick && hasLocalMacroRef(rawLine)) return true;  // EXPRLAYER-7: was reLocalRef()
+  if (tick && hasNamelessLocalRef(rawLine)) return true;  // `'`, ` x'`, `1*0'`, `x '`
   // EM3a: `macval(NAME)' is a local reference too (expandPass splices it).
   if (tick && rawLine.find("`macval(") != std::string::npos) {
     for (size_t t = rawLine.find("`macval("); t != std::string::npos;
@@ -343,7 +431,12 @@ bool hasMacroRefs(const std::string& rawLine) {
   // bare two-character literal — "r(" and "e(" both occur inside ordinary
   // identifiers (`scalar(`, `subinstr(`, `true(`, `size(`), and every one of
   // those was buying a full regex scan.
-  if (hasBareRParen(rawLine) && std::regex_search(rawLine, m, reRRef())) return true;
+  if (hasBareRParen(rawLine) && std::regex_search(rawLine, m, reRRef())) {
+    // a graph line's `r(name)` in option-name position is the option, not a reference (isGraphCommandLine)
+    if (!isGraphCommandLine(rawLine)) return true;
+    for (std::sregex_iterator it(rawLine.begin(), rawLine.end(), reRRef()), end; it != end; ++it)
+      if (!atOptionNamePosition(rawLine, static_cast<size_t>(it->position(0)))) return true;
+  }
   if (hasBareEParen(rawLine) && std::regex_search(rawLine, m, reERef())) return true;
   if (tick && rawLine.find("s(") != std::string::npos &&
       std::regex_search(rawLine, m, reSRefDelim()))
@@ -362,6 +455,51 @@ bool hasMacroRefs(const std::string& rawLine) {
 }
 
 namespace piet::eval::macro_detail {
+
+// The `=exp' references of a line that are ready to evaluate: one whose
+// expression still holds a macro reference waits for the pass that expands
+// it, so the innermost goes first (StataBE 19.5 `=`=1+1'*3' is 6, vs-stata
+// bank aef702d7b76ad699), and a compound-quoted string `"..."' inside the
+// expression is part of it (`=wordcount(`"a b c"')' is 3, 92ce6048108ca970).
+// Returns {whole reference, expression} pairs, left to right.
+std::vector<std::pair<std::string, std::string>> findReadyArithMacros(const std::string& line) {
+  std::vector<std::pair<std::string, std::string>> out;
+  size_t pos = 0;
+  while ((pos = line.find("`=", pos)) != std::string::npos) {
+    size_t k = pos + 2;
+    int compound = 0;
+    bool ready = true, closed = false;
+    for (; k < line.size(); ++k) {
+      const char c = line[k];
+      if (c == '`') {
+        if (k + 1 < line.size() && line[k + 1] == '"') {
+          ++compound;
+          ++k;
+          continue;
+        }
+        ready = false;  // a macro reference inside
+        break;
+      }
+      if (c == '"' && compound > 0 && k + 1 < line.size() && line[k + 1] == '\'') {
+        --compound;
+        ++k;
+        continue;
+      }
+      if (c == '\'' && compound == 0) {
+        closed = true;
+        break;
+      }
+    }
+    if (ready && closed && k > pos + 2) {
+      out.emplace_back(line.substr(pos, k + 1 - pos), line.substr(pos + 2, k - pos - 2));
+      pos = k + 1;
+    } else {
+      pos += 2;
+    }
+  }
+  return out;
+}
+
 
 
 // name-binding-display-literals: the messages of inline `=exp' references that
@@ -488,7 +626,7 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
   // so the ordinary macro loop was paying a full regex scan per line to learn
   // that.
   for (const auto& [full, inner] : line.find("`=") != std::string::npos
-                                       ? findAll(reArithMacro(), line)
+                                       ? findReadyArithMacros(line)
                                            : std::vector<std::pair<std::string, std::string>>{}) {
     std::smatch m;
     // `=e(N)'` / `=r(mean)'` inside a double-quoted string: the e()/r() layers
@@ -500,6 +638,20 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
     // inner text only (no macro reference left); a posted matrix stays for the
     // matrix layer.
     std::string innerSub = inner;
+    // A compound-quoted string inside the expression, `"..."', is the string
+    // it quotes: written plainly when it holds no double quote of its own
+    // (`=wordcount(`"a b c"')' is 3, vs-stata bank 92ce6048108ca970).
+    for (size_t cq = innerSub.find("`\""); cq != std::string::npos; cq = innerSub.find("`\"", cq)) {
+      const size_t close = innerSub.find("\"'", cq + 2);
+      if (close == std::string::npos) break;
+      const std::string body = innerSub.substr(cq + 2, close - cq - 2);
+      if (body.find_first_of("\"`") != std::string::npos) {
+        cq += 2;
+        continue;
+      }
+      innerSub.replace(cq, close + 2 - cq, "\"" + body + "\"");
+      cq += body.size() + 2;
+    }
     if (innerSub.find('`') == std::string::npos && innerSub.find('$') == std::string::npos &&
         (std::regex_search(innerSub, m, reERef()) || std::regex_search(innerSub, m, reRRef()))) {
       bool matrixLeft = false;
@@ -690,7 +842,22 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
         if (on) *l = restoreStringLiterals(*l, *sp);
       }
     } rRestore{&line, &rSpans, barePass};
+    const bool graphLine = barePass && isGraphCommandLine(line);
     for (const auto& [full, name] : findAll(*rx, line)) {
+      if (graphLine) {
+        const size_t gat = line.find(full);
+        if (gat != std::string::npos && atOptionNamePosition(line, gat)) continue;
+      }
+      // `local x : r(scalars)` (and `: r(macros)`, `: r(matrices)`): the
+      // argument of the extended macro function that lists r()'s names, not a
+      // value. Read as one, it became `.` and the line `local x : .` was r(101)
+      // `. not allowed` (StataBE 19.5 answers the names, as for `: e(scalars)`).
+      if (barePass && (name == "scalars" || name == "macros" || name == "matrices")) {
+        const size_t at = line.find(full);
+        size_t b = at;
+        while (b > 0 && std::isspace(static_cast<unsigned char>(line[b - 1]))) --b;
+        if (at != std::string::npos && b > 0 && line[b - 1] == ':') continue;
+      }
       // B4-W3b: on a MATRIX verb, an r-class matrix reference is left in
       // place, exactly as the e() layer below leaves e(b) for the matrix layer
       // ("splicing it here would take e(b) away from the matrix layer"). It was
@@ -966,20 +1133,122 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
           continue;
         }
       }
+      // `*' -- the positional arguments `1' `2' ... `n' as they stand now,
+      // blank-joined (StataBE 19.5, truth bank macro shift: `*' is "a b c d e",
+      // then "b c d e" after `macro shift`, "d e" after `macro shift 2`). It
+      // used to stay unexpanded and the tokenizer's net refused the line.
+      if (j + 1 < line.size() && line[j] == '*' && line[j + 1] == '\'') {
+        std::string all;
+        for (int k = 1;; ++k) {
+          const std::string* pv = session.locals.find(std::to_string(k));
+          if (pv == nullptr) break;
+          if (k > 1) all += ' ';
+          all += *pv;
+        }
+        out.append(line, i, tick - i);
+        out += all;
+        i = j + 2;
+        spliced = true;
+        continue;
+      }
+      // `++NAME' / `--NAME' / `NAME++' / `NAME--': NAME's numeric value moved
+      // by one, before or after the value is put in the line (StataBE 19.5,
+      // vs-stata bank 8747c2306677c1b8: with i 5, `<`++i'> <`i'>` is <6> <6>
+      // and `<`i++'> <`i'>` <6> <7>; 70b12ed292a72de5 1.5 -> 2.5). A value
+      // that is no number prints "type mismatch", an undefined NAME "local
+      // macro `NAME' not found", and either expands to nothing at rc 0, NAME
+      // unchanged (d83d142609e8f4f1, c97305269960b8fa).
+      {
+        bool pre = false;
+        int step = 0;
+        size_t ns = j;
+        if (j + 1 < line.size() && (line[j] == '+' || line[j] == '-') && line[j + 1] == line[j]) {
+          pre = true;
+          step = line[j] == '+' ? 1 : -1;
+          ns = j + 2;
+        }
+        size_t ne = ns;
+        if (ne < line.size() && isIdentStart(line[ne])) {
+          ++ne;
+          while (ne < line.size() && isIdentChar(line[ne])) ++ne;
+        }
+        if (!pre && ne > ns && ne + 2 < line.size() && (line[ne] == '+' || line[ne] == '-') &&
+            line[ne + 1] == line[ne] && line[ne + 2] == '\'') {
+          step = line[ne] == '+' ? 1 : -1;
+        }
+        const size_t close = pre ? ne : ne + 2;
+        if (step != 0 && ne > ns && close < line.size() && line[close] == '\'') {
+          const std::string incName = line.substr(ns, ne - ns);
+          const std::string* cur = session.locals.find(incName);
+          const std::optional<double> f =
+              cur != nullptr && !cur->empty() ? pythonFloat(*cur) : std::nullopt;
+          if (f.has_value() && std::isfinite(*f)) {
+            const auto text = [](double v) {
+              return pyIsInteger(v) ? pythonIntStrFromDouble(v) : pythonFloatRepr(v);
+            };
+            const double next = *f + step;
+            out.append(line, i, tick - i);
+            out += pre ? text(next) : *cur;
+            session.locals.set(incName, text(next));
+            i = close + 1;
+            spliced = true;
+            continue;
+          }
+          noteInlineFailure(cur == nullptr || cur->empty()
+                                ? "local macro `" + incName + "' not found"
+                                : std::string("type mismatch"));
+          out.append(line, i, tick - i);
+          i = close + 1;
+          spliced = true;
+          continue;
+        }
+      }
       const size_t nameStart = j;
       if (j < line.size() && isIdentStart(line[j])) {  // Unicode names: shared rule
         ++j;
         while (j < line.size() && isIdentChar(line[j])) ++j;
       } else if (j < line.size() && std::isdigit(static_cast<unsigned char>(line[j]))) {
+        // a local name may begin with a digit (`1abc'), not only `1'
         ++j;
-        while (j < line.size() && std::isdigit(static_cast<unsigned char>(line[j]))) ++j;
+        while (j < line.size() && isIdentChar(line[j])) ++j;
+      }
+      // A name followed by blanks before the quote is that name (`x '` is x's
+      // value); text that is no name at all -- nothing (`'`), a leading blank
+      // (` x'`), or a name with an operator after it (`1*0'`, left by an
+      // inner `=1') -- is a macro no one can define: it expands to nothing
+      // (StataBE 19.5, vs-stata bank 7efa329f445c9cc0, bde0ba834f75df5d,
+      // 4775ed1a74a9c220).
+      size_t nameEnd = std::string::npos;  // set when blanks sit before the quote
+      if (j < line.size() && line[j] != '\'') {
+        const size_t q = line.find('\'', j);
+        const std::string between =
+            q == std::string::npos ? std::string() : line.substr(j, q - j);
+        const bool plain = q != std::string::npos &&
+                           between.find_first_of("`\"$:()=[]{},\\") == std::string::npos;
+        if (plain && j > nameStart && between.find_first_not_of(" \t") == std::string::npos) {
+          nameEnd = j;
+          j = q;  // trailing blanks: the name before them
+        } else if (plain && (j == nameStart ? (line[j] == ' ' || line[j] == '\t')
+                                            : std::strchr("*+-/^~!<>&|", line[j]) != nullptr)) {
+          out.append(line, i, tick - i);
+          i = q + 1;
+          spliced = true;
+          continue;
+        }
+      } else if (j == nameStart && j < line.size() && line[j] == '\'' &&
+                 !(tick > 0 && line[tick - 1] == '`')) {
+        out.append(line, i, tick - i);  // `': empty
+        i = j + 1;
+        spliced = true;
+        continue;
       }
       if (j == nameStart || j >= line.size() || line[j] != '\'') {
         out.append(line, i, tick + 1 - i);  // not a reference: copy through the backtick
         i = tick + 1;
         continue;
       }
-      const std::string name = line.substr(nameStart, j - nameStart);
+      const std::string name =
+          line.substr(nameStart, (nameEnd == std::string::npos ? j : nameEnd) - nameStart);
       const std::string* v = session.locals.find(name);
       // BUG-294: an UNDEFINED macro reference expands to the empty string at
       // rc 0 — measured against Stata 19.5 IC (`display "[\`nosuchlocal']"` ->
@@ -1035,13 +1304,24 @@ namespace piet::eval::macro_detail {
 
 // LBL-DOLLAR: Stata's `\$` escape -- a literal dollar that is never a global
 // reference. It travels as the verbatim-dollar sentinel and decodes to `$`.
+// `\`` is the same escape for a backtick (never a local reference; it travels
+// as the verbatim-tick sentinel and decodes to a backtick): StataBE 19.5
+// `display "<\`x'>"` prints <`x'>. A doubled backslash right before a backtick
+// or dollar is ONE backslash and the reference after it expands: `local y Y`,
+// `display "<\\`y'>"` prints <\Y> (truth bank cell 1481986558168cf0), which
+// is how a Windows path keeps its separator before a macro. Any other backslash,
+// a doubled one included (`display "<a\\b>"` prints <a\\b>), is literal.
 std::string encodeDollarEscapes(const std::string& s) {
-  if (s.find("\\$") == std::string::npos) return s;
+  if (s.find("\\$") == std::string::npos && s.find("\\`") == std::string::npos) return s;
   std::string out;
   out.reserve(s.size());
+  const auto isRefChar = [](char c) { return c == '$' || c == '`'; };
   for (size_t i = 0; i < s.size(); ++i) {
-    if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '$') {
-      out += kVerbatimDollar;
+    if (s[i] == '\\' && i + 1 < s.size() && isRefChar(s[i + 1])) {
+      out += s[i + 1] == '$' ? kVerbatimDollar : kVerbatimTick;
+      ++i;
+    } else if (s[i] == '\\' && i + 2 < s.size() && s[i + 1] == '\\' && isRefChar(s[i + 2])) {
+      out += '\\';  // the escaped backslash; the reference after it expands
       ++i;
     } else {
       out += s[i];

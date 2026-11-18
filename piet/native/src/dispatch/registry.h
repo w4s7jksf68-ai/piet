@@ -213,6 +213,84 @@ std::string communityGateMessage(const CommunityName& cn);
 // diffed against the source by eye.
 const std::vector<CommandSpec>& commandRegistry();
 
+// ---------------------------------------------------------------------------
+// STATA'S OWN SYNTAX, per command: what real Stata refuses, independent of what
+// PIET implements. CommandSpec above describes PIET (allowInRange = "PIET has
+// an `in` filter here"); these two tables describe Stata, so a line Stata
+// refuses gets Stata's return code instead of PIET's "not supported in this
+// version" r(198) -- which stays the answer only where Stata ACCEPTS the form
+// and this engine lacks it. A row exists only where the fact has a citable
+// source (the command's ado `syntax` statement or help diagram, confirmed by
+// the StataBE 19.5 truth bank of 2026-11-10); a command with no row keeps
+// PIET's own gates. Keyed by resolveCanonical() -- the canonical name, or a
+// community-package spelling as typed (`reghdfe`, not PIET-native `feols`);
+// read by eval/tokenizer.cpp (qualifiers, lead, options) and
+// dispatch/stage_validation.cpp (replay).
+
+// The qualifiers a command's Stata syntax takes. A qualifier outside them is
+// Stata's r(101): "if not allowed", "in range not allowed", "weights not
+// allowed", "<type>s not allowed".
+struct StataQualifiers {
+  const char* canonical;
+  bool takesIf;
+  bool takesIn;
+  // nullptr: no statement here (PIET's own weight policy decides); "": the
+  // syntax takes no weight at all; otherwise the legal full type names,
+  // space-separated.
+  const char* weights;
+  // Under `version` below legacyBelow (a set caller version, 0 < v <
+  // legacyBelow), the command's ado parses an older syntax whose legal weights
+  // are legacyWeights instead (ologit's `if _caller() < 19 { local aw aw }`,
+  // qreg's `vc <= 12` branch). 0 = no such branch.
+  double legacyBelow = 0;
+  const char* legacyWeights = nullptr;
+  // The return code of these refusals: r(101), but a built-in that parses its
+  // own line answers r(197) (`error 111 in 1/5`, vs-stata bank 48fd40e7455e6945).
+  int refusalRc = 101;
+};
+const StataQualifiers* findStataQualifiers(const std::string& canonical);
+
+// Commands whose Stata varlist takes no factor-variable and/or no time-series
+// operators, so a token like `i.x`, `x#y`, `9.2f` or `L.x` in their varlist is
+// Stata's r(101) before any variable is looked up. Only commands with that
+// refusal in evidence (StataBE 19.5: "factor-variable and time-series operators
+// not allowed" -- both refused -- or "factor-variable operators not allowed" --
+// ts operators taken). Every other command keeps its own answer: most take one
+// or both kinds, and a PIET gap there is PIET's to word.
+struct StataOperators {
+  const char* canonical;
+  bool refusesFactor;
+  bool refusesTimeSeries;
+};
+const StataOperators* findStataOperators(const std::string& canonical);
+
+// What a command's Stata syntax requires BEFORE its options. Stata reads a line
+// left to right, so with nothing before the comma it refuses the missing lead
+// (`sort , stable` r(100) "varlist required") before it looks at any option.
+struct StataLead {
+  const char* canonical;
+  // The refusal when nothing precedes the comma and no option is given
+  // (nullptr: the bare command runs, or this table does not say).
+  const char* bare;
+  int bareRc;
+  // The refusal when nothing precedes the comma and an option is given -- the
+  // same as `bare` for a required lead; "options not allowed" first for the
+  // built-ins that parse the comma first (keep, drop, count, ...).
+  const char* withOptions;
+  int withOptionsRc;
+  // An estimation command: an empty lead replays the last results, and with
+  // none in memory Stata answers r(301) "last estimates not found". With
+  // results in memory the arm decides.
+  bool replay;
+  // The syntax takes no options: with the lead present, any option is r(101)
+  // "options not allowed".
+  bool noOptions;
+  // `if` and `in` are part of the lead (drop/keep: "varlist, if exp, or in
+  // range required").
+  bool qualifiersAreLead;
+};
+const StataLead* findStataLead(const std::string& canonical);
+
 // A3 (BETA campaign, BS-096): case-sensitive lookup by canonical name OR any
 // abbreviation spelling. Callers must lowercase `lowerName` first — every
 // canonical/abbrev spelling in commandRegistry() is already lowercase,
@@ -259,6 +337,20 @@ const CommandSpec* findByName(const std::string& lowerName);
 // would silently kill both. `reghdfe` is the only spelling this exemption
 // currently reaches (every other community name is its own canonical).
 std::string resolveCanonical(const std::string& lowerName);
+
+// True iff `typed` (as typed: command words are case-sensitive) is one of a
+// row's declared abbreviations AND a strict
+// prefix of that row's canonical name -- an abbreviation of Stata's own command
+// (the lists above are the spellings measured against StataBE; a community
+// name or an alias such as `feols`/`reghdfe` is not a prefix and is excluded).
+// Stata resolves such a word to its command BEFORE it looks at the programs in
+// memory: `program define so ... end` then `so` runs `sort`, which answers
+// r(100) "varlist required" (truth bank, 85 `syntaxopt` cells). Only Stata's
+// command abbreviations shadow a program; an exact canonical name does not,
+// and neither does a spelling that is an ado-file shim of its own in Stata's
+// ado/base (`reg`, `desc`, `ren`, `levels` ...): a program in memory comes
+// before the ado path.
+bool isStataCommandAbbreviation(const std::string& typed);
 
 // ---------------------------------------------------------------------------
 // PREFIX registry (FULL FUNCTIONAL CHECK, 2026-08-05).

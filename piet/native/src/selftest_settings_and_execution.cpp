@@ -4,6 +4,187 @@
 #include "selftest_cases.h"
 
 
+// ── tabulate's table-size limits (r(134) "too many values") ─────────────────
+// User ruling 2026-11-12: the limits are Stata/SE and MP's (12,000 rows one-way,
+// 1,200 x 80 two-way; summarize() 375 cells in every edition), and each one can
+// be raised in Settings. This pins the four defaults (the ruling's lock), each
+// limit at its boundary through the real dispatcher, the Settings path (a
+// persisted number applies to the next command, 0 gives Stata's limit back) and
+// the ceilings a limit cannot be raised past.
+void testTableSizeLimits() {
+  std::printf("[selftest] --- tabulate table-size limits (Settings) ---\n");
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::path tmp = fs::temp_directory_path() / "piet_native_selftest_tablimits";
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp, ec);
+  const std::string settingsFile = (tmp / "settings.json").u8string();
+  // The caller's own isolation file, if any, is put back at the end.
+  const char* priorEnv = std::getenv("PIET_SETTINGS_FILE");
+  const std::string priorSettingsFile = priorEnv != nullptr ? priorEnv : "";
+#ifndef _WIN32
+  setenv("PIET_SETTINGS_FILE", settingsFile.c_str(), 1);
+#else
+  _putenv_s("PIET_SETTINGS_FILE", settingsFile.c_str());
+#endif
+  piet::settings::invalidateTableLimitsCache();
+
+  // The defaults: nothing persisted -> Stata/SE and MP's limits.
+  {
+    const piet::settings::TableLimits t = piet::settings::tableLimits();
+    check(t.onewayMaxRows == 12000 && t.twowayMaxRows == 1200 && t.twowayMaxCols == 80 &&
+              t.summarizeMaxCells == 375,
+          "table limits: with nothing set they are Stata/SE and MP's (12000, 1200 x 80, 375)");
+    auto j = nlohmann::json::parse(piet::routes::settingsGet("{}").json);
+    check(j.value("tab_oneway_max_rows", -1) == 0 && j.value("tab_twoway_max_rows", -1) == 0 &&
+              j.value("tab_twoway_max_cols", -1) == 0 && j.value("tab_summarize_max_cells", -1) == 0,
+          "table limits: a fresh store reports every limit as 0 (Stata's)");
+    check(j.contains("table_limit_defaults") &&
+              j["table_limit_defaults"].value("tab_oneway_max_rows", 0) == 12000 &&
+              j["table_limit_defaults"].value("tab_twoway_max_rows", 0) == 1200 &&
+              j["table_limit_defaults"].value("tab_twoway_max_cols", 0) == 80 &&
+              j["table_limit_defaults"].value("tab_summarize_max_cells", 0) == 375,
+          "table limits: settings.get names Stata's limits for the Settings panel");
+  }
+
+  auto firstError = [](const nlohmann::ordered_json& blocks) -> nlohmann::ordered_json {
+    for (const auto& b : blocks)
+      if (b.is_object() && b.value("type", std::string()) == "error") return b;
+    return nlohmann::ordered_json();
+  };
+  piet::SessionState session(tmp.u8string());
+  // r(134) "too many values", or no error at all.
+  auto tooMany = [&](const std::string& cmd) {
+    const auto err = firstError(piet::dispatch(cmd, session));
+    return !err.is_null() && err.value("message", std::string()) == "too many values" &&
+           piet::eval::coarseRc(err) == "134";
+  };
+  auto runs = [&](const std::string& cmd) { return firstError(piet::dispatch(cmd, session)).is_null(); };
+  auto set = [](const char* key, const nlohmann::json& value) {
+    nlohmann::json body;
+    body[key] = value;
+    return piet::routes::settingsSet(body.dump()).ok;
+  };
+
+  (void)piet::dispatch("clear", session);
+  (void)piet::dispatch("set obs 12001", session);
+  (void)piet::dispatch("generate x = _n", session);
+  (void)piet::dispatch("generate two = mod(_n, 2)", session);
+  (void)piet::dispatch("generate c81 = mod(_n, 81)", session);
+  (void)piet::dispatch("generate r1201 = mod(_n, 1201)", session);
+  (void)piet::dispatch("generate g376 = mod(_n, 376)", session);
+  (void)piet::dispatch("generate a20 = mod(_n, 20)", session);
+  (void)piet::dispatch("generate b19 = mod(floor(_n/20), 19)", session);
+
+  // Each limit at its boundary, with Stata's limits in force.
+  check(runs("tabulate x if x <= 12000"), "table limits: a one-way table of 12,000 rows is drawn");
+  check(tooMany("tabulate x"), "table limits: a one-way table of 12,001 rows is r(134)");
+  check(runs("tabulate two c81 if c81 < 80"), "table limits: a two-way table of 80 columns is drawn");
+  check(tooMany("tabulate two c81"), "table limits: a two-way table of 81 columns is r(134)");
+  check(runs("tabulate r1201 two if r1201 < 1200"), "table limits: a two-way table of 1,200 rows is drawn");
+  check(tooMany("tabulate r1201 two"), "table limits: a two-way table of 1,201 rows is r(134)");
+  check(runs("tabulate g376 if g376 < 375, summarize(x)"),
+        "table limits: tabulate, summarize() over 375 groups is drawn");
+  check(tooMany("tabulate g376, summarize(x)"), "table limits: tabulate, summarize() over 376 groups is r(134)");
+  check(tooMany("tabulate a20 b19, summarize(x)"),
+        "table limits: a two-way tabulate, summarize() of 20 x 19 = 380 cells is r(134)");
+
+  // Raised in Settings: the persisted number applies to the very next command.
+  check(set("tab_twoway_max_cols", 100) && runs("tabulate two c81"),
+        "table limits: tab_twoway_max_cols 100 -> the 81-column table is drawn");
+  check(tooMany("tabulate r1201 two") && tooMany("tabulate x"),
+        "table limits: raising one limit leaves the others where they were");
+  check(set("tab_twoway_max_rows", 5000) && runs("tabulate r1201 two"),
+        "table limits: tab_twoway_max_rows 5000 -> the 1,201-row table is drawn");
+  check(set("tab_oneway_max_rows", 20000) && runs("tabulate x"),
+        "table limits: tab_oneway_max_rows 20000 -> the 12,001-row table is drawn");
+  check(set("tab_summarize_max_cells", 400) && runs("tabulate g376, summarize(x)") &&
+            runs("tabulate a20 b19, summarize(x)"),
+        "table limits: tab_summarize_max_cells 400 -> both summarize() tables are drawn");
+  {
+    piet::settings::Settings s = piet::settings::load();  // a fresh read off disk
+    check(s.tabOnewayMaxRows == 20000 && s.tabTwowayMaxRows == 5000 && s.tabTwowayMaxCols == 100 &&
+              s.tabSummarizeMaxCells == 400,
+          "table limits: the four numbers are persisted");
+    // A new process reads them back: drop the cache as a restart would.
+    piet::settings::invalidateTableLimitsCache();
+    check(piet::settings::tableLimits().twowayMaxCols == 100 && runs("tabulate two c81"),
+          "table limits: a persisted limit is read back from the settings file");
+  }
+
+  // A lowered limit is a limit too; 0 or a negative number is Stata's again.
+  check(set("tab_twoway_max_cols", 20) && tooMany("tabulate two c81 if c81 < 21") &&
+            runs("tabulate two c81 if c81 < 20"),
+        "table limits: tab_twoway_max_cols 20 -> a 21-column table is r(134), 20 columns draw");
+  check(set("tab_twoway_max_cols", 0) && tooMany("tabulate two c81") && runs("tabulate two c81 if c81 < 80"),
+        "table limits: 0 gives Stata's limit back (80 columns)");
+  check(set("tab_oneway_max_rows", -5) && piet::settings::load().tabOnewayMaxRows == 0 &&
+            tooMany("tabulate x"),
+        "table limits: a negative number is stored as 0 (Stata's limit)");
+  check(set("tab_twoway_max_rows", "many") && piet::settings::load().tabTwowayMaxRows == 5000,
+        "table limits: a value that is not a whole number leaves the limit as it was");
+  // Another field's settings.set does not disturb the limits.
+  check(set("provenance_hash", false) && piet::settings::load().tabSummarizeMaxCells == 400 &&
+            runs("tabulate g376, summarize(x)"),
+        "table limits: a settings.set for another field keeps them");
+
+  // The ceilings. A limit is stored no higher than its ceiling, however it is
+  // written, and rows x columns of a two-way table stays within the cell ceiling
+  // even when both limits allow more (resource bounds: piet/settings.h).
+  {
+    auto j = nlohmann::json::parse(piet::routes::settingsGet("{}").json);
+    check(j.contains("table_limit_ceilings") &&
+              j["table_limit_ceilings"].value("tab_oneway_max_rows", 0) == 1000000 &&
+              j["table_limit_ceilings"].value("tab_twoway_max_rows", 0) == 1000000 &&
+              j["table_limit_ceilings"].value("tab_twoway_max_cols", 0) == 1000000 &&
+              j["table_limit_ceilings"].value("tab_summarize_max_cells", 0) == 200000,
+          "table limits: settings.get names each limit's ceiling (1,000,000 cells; summarize() 200,000)");
+  }
+  check(set("tab_twoway_max_rows", 5000000) && piet::settings::load().tabTwowayMaxRows == 1000000 &&
+            piet::settings::tableLimits().twowayMaxRows == 1000000,
+        "table limits: a number above the ceiling is stored as the ceiling");
+  check(set("tab_summarize_max_cells", 5000000) && piet::settings::load().tabSummarizeMaxCells == 200000,
+        "table limits: the summarize() limit has its own, lower ceiling");
+  check(set("tab_twoway_max_cols", nlohmann::json::parse("18446744073709551615")) &&
+            piet::settings::load().tabTwowayMaxCols == 1000000,
+        "table limits: a number too large for int64 is the ceiling, not 0");
+  check(set("tab_oneway_max_rows", nlohmann::json::parse("1e20")) &&
+            piet::settings::load().tabOnewayMaxRows == 1000000,
+        "table limits: a huge number written as a float is the ceiling");
+  check(set("tab_oneway_max_rows", nlohmann::json::parse("300.0")) &&
+            piet::settings::load().tabOnewayMaxRows == 300,
+        "table limits: a whole number written as a float (300.0) is that number");
+  check(set("tab_oneway_max_rows", 1.5) && piet::settings::load().tabOnewayMaxRows == 300,
+        "table limits: a fraction leaves the limit as it was");
+  // rows and columns are both allowed 1,000,000 now; the table itself is not.
+  (void)piet::dispatch("clear", session);
+  (void)piet::dispatch("set obs 1001", session);
+  (void)piet::dispatch("generate r = _n", session);
+  (void)piet::dispatch("generate c = _n", session);
+  check(tooMany("tabulate r c"),
+        "table limits: a 1,001 x 1,001 table is r(134) with both limits at 1,000,000 (more than 1,000,000 cells)");
+  check(runs("tabulate r c if r <= 300"),
+        "table limits: a 300 x 300 table is drawn with the limits raised");
+
+  if (priorSettingsFile.empty()) {
+#ifndef _WIN32
+    unsetenv("PIET_SETTINGS_FILE");
+#else
+    _putenv_s("PIET_SETTINGS_FILE", "");
+#endif
+  } else {
+#ifndef _WIN32
+    setenv("PIET_SETTINGS_FILE", priorSettingsFile.c_str(), 1);
+#else
+    _putenv_s("PIET_SETTINGS_FILE", priorSettingsFile.c_str());
+#endif
+  }
+  // Stata's limits for every case that runs after this one, whatever the user's
+  // own settings file says.
+  piet::settings::setTableLimits(piet::settings::Settings{});
+  fs::remove_all(tmp, ec);
+}
+
 // ── 2.2.0 item D: settings persistence round-trip (SPEC II-1/II-2) ───────────
 // settings.set persists a partial; a FRESH settings::load() reads it back off
 // disk (not the in-memory echo); settings.get reports detected system info;

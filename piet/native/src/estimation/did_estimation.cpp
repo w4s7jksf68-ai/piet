@@ -30,6 +30,7 @@
 #include "piet/scratch_seq.h"
 #include "piet/stata_format.h"
 #include "estimation_internal.h"
+#include "core/distributions.h"  // stata_invnormal (level())
 #include "estimators/posthest.h"  // cecon::margins_parse_at (header-inline)
 
 #include "extended_estimation_internal.h"
@@ -81,7 +82,8 @@ ojson coefRowM4(const std::string& name, const ojson& att, const ojson& se) {
 // an estimation block for the requested aggregate.
 // csdidToEstimationM4: hoisted below the anonymous block (R2) — TU c consumes it.
 
-void cacheCsdidModel(SessionState& session, const std::vector<std::string>& argv, const ojson& raw) {
+void cacheCsdidModel(SessionState& session, const std::vector<std::string>& argv, const ojson& raw,
+                     const std::string& esampleValues) {
   auto optFor = [&](const std::string& flag) -> std::optional<std::string> {
     for (size_t i = 0; i < argv.size(); ++i) {
       if (argv[i] == flag && i + 1 < argv.size()) return argv[i + 1];
@@ -121,6 +123,9 @@ void cacheCsdidModel(SessionState& session, const std::vector<std::string>& argv
   // vcov makes setLastModel erase both.
   lm.vcov = "";
   lm.result = raw;
+  // e(sample): the engine's union of the cell samples (cmds_panel.cpp); the
+  // mask column first, then setLastModel (BUG-518 order).
+  if (!esampleValues.empty()) (void)esampleInstallOnHead(session, esampleValues, *lm.result, lm);
   session.setLastModel(lm);
 }
 
@@ -357,7 +362,9 @@ void postCsdidPostingM4(SessionState& session, const CsdidPostingM4& P, const st
   const size_t K = P.names.size();
   eval::EvalMatrix b;
   b.data.push_back(P.b);
-  b.rownames = {"y1"};
+  // csdid.ado posts e(b) through `ereturn post` (row y1) and keeps the cells'
+  // vector as `ereturn matrix b_attgt` (row r1; vs-stata bank 56c8eb59).
+  b.rownames = {bName == "b" ? "y1" : "r1"};
   b.colnames = P.names;
   eval::EvalMatrix V;
   for (size_t i = 0; i < K; ++i)
@@ -367,6 +374,90 @@ void postCsdidPostingM4(SessionState& session, const CsdidPostingM4& P, const st
   V.colnames = P.names;
   setE(bName, std::move(b));
   setE(vName, std::move(V));
+}
+
+namespace {
+
+std::string csdidNum(double v) {
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.17g", v);
+  return buf;
+}
+
+}  // namespace
+
+// csdid.ado's cell bookkeeping (vs-stata bank 56c8eb59 `csdid y, ivar(sid)
+// time(year) gvar(gvar)`): e(glev) / e(tlev) the cohorts and target periods,
+// e(neqr) the number of cohorts, e(rif) the name each cell's RIF variable got
+// (`_g<g>_<time1>_<t>`, time1 the base after a pre-period cell moved it to t;
+// `_blank_` for a cell drdid could not fit), e(gtt) one row per cell [cohort,
+// min(base,t), max(base,t), drdid's rc, its e(N), the controls, the treated] —
+// each fitted cell holds 2 rows per sampled unit. A cell the engine could not
+// fit has an rc this build does not know, so e(gtt) is posted only when every
+// cell was fitted.
+void postCsdidCellContractM4(SessionState& session, const ojson& raw, bool long2) {
+  if (!raw.is_object() || !raw.contains("cells") || !raw["cells"].is_array() ||
+      !raw.contains("glev") || !raw.contains("tlev"))
+    return;
+  auto setS = [&session](const std::string& n, const std::string& v) {
+    session.eval.setEString(n, v);
+    session.noteEOnFit(n);
+  };
+  std::string glev, tlev;
+  for (const auto& g : raw["glev"])
+    if (g.is_number()) glev += (glev.empty() ? "" : " ") + csdidNum(g.get<double>());
+  // The engine's long2 grid starts at time0 itself (an eligible long-difference
+  // target); csdid.ado's e(tlev) is the periods after time0 either way (bank
+  // 8f8fd7ba `csdid ..., long2`: 1983 .. 1988).
+  bool first = true;
+  for (const auto& t : raw["tlev"]) {
+    const bool skip = long2 && first;
+    first = false;
+    if (skip || !t.is_number()) continue;
+    tlev += (tlev.empty() ? "" : " ") + csdidNum(t.get<double>());
+  }
+  setS("glev", glev);
+  setS("tlev", tlev);
+  setS("properties", "b V");
+  session.eval.setEScalar("neqr", static_cast<double>(raw["glev"].size()));
+  session.noteEOnFit("neqr");
+  std::string rif;
+  eval::EvalMatrix gtt;
+  gtt.colnames = {"cohort", "t0", "t1", "error", "N", "N_cntr", "N_trt"};
+  bool allOk = true;
+  for (const auto& c : raw["cells"]) {
+    const double g = c.value("g", 0.0), base = c.value("base", 0.0), t = c.value("t", 0.0);
+    const bool ok = c.value("ok", false);
+    if (long2 && base == t) continue;  // csdid.ado skips time1 == j under long2
+    std::string name;
+    if (!ok) {
+      name = "_blank_";
+    } else if (long2) {
+      name = "_g" + csdidNum(g) + "_" + csdidNum(std::min(base, t)) + "_" + csdidNum(std::max(base, t));
+    } else {
+      name = "_g" + csdidNum(g) + "_" + csdidNum(t < g ? t : base) + "_" + csdidNum(t);
+    }
+    rif += (rif.empty() ? "" : " ") + name;
+    if (!ok) {
+      allOk = false;
+      continue;
+    }
+    const double n = static_cast<double>(c.value("n_cell", 0LL));
+    const double ntr = static_cast<double>(c.value("n_trt", 0LL));
+    gtt.rownames.push_back("r" + std::to_string(gtt.rownames.size() + 1));
+    gtt.data.push_back({g, std::min(base, t), std::max(base, t), 0.0, 2 * n, 2 * (n - ntr), 2 * ntr});
+  }
+  setS("rif", rif);
+  if (allOk && !gtt.data.empty()) {
+    for (auto& kv : session.eval.eMatrices)
+      if (kv.first == "gtt") {
+        kv.second = gtt;
+        session.noteEOnFit("gtt");
+        return;
+      }
+    session.eval.eMatrices.emplace_back("gtt", std::move(gtt));
+    session.noteEOnFit("gtt");
+  }
 }
 
 namespace extended_fit_detail {
@@ -504,6 +595,7 @@ ojson runCsdid(const eval::ParsedCommand& parsed, SessionState& session) {
 
   std::optional<std::string> ivar, time, gvar, method, comparison, pscoretrim, window;
   bool long2 = false;
+  double csdidLevel = 95.0;
   std::string agg;
   for (const auto& [k, v] : parsed.opts) {
     if (k == "ivar" && !v.isBool) ivar = v.strValue;
@@ -521,6 +613,20 @@ ojson runCsdid(const eval::ParsedCommand& parsed, SessionState& session) {
     // e(control_group) "Not yet Treated"). PIET's `comparison()` stays.
     if (k == "notyet") comparison = std::string("notyet");
     if (k == "agg" && !v.isBool) agg = trimM4(v.strValue);
+    // csdid.ado `Level(int 95)`: an integer level; it moves only the printed
+    // interval and r(table)'s ll / ul / crit (vs-stata bank 1ae70ce8
+    // `csdid ..., level(90)`: r(table) crit 1.6448536).
+    if (k == "level") {
+      const std::string a = v.isBool ? std::string() : trimM4(v.strValue);
+      char* end = nullptr;
+      const long lv = std::strtol(a.c_str(), &end, 10);
+      if (a.empty() || end == nullptr || *end != '\0' || lv < 10 || lv > 99)
+        return engineErrorBlockM4("Option `level(" + a + ")` is not an integer level between 10 "
+                                  "and 99, which is all csdid's Level(int) takes in this version "
+                                  "of PIET.",
+                                  "unsupported_option");
+      csdidLevel = static_cast<double>(lv);
+    }
   }
   // FU-23 (BUG-757): cluster() by shape, w2l_vce_shape.log. A bare `cluster`
   // and an empty `cluster()` are ignored (csdid_bare_cluster/_empty_cluster rc 0,
@@ -635,9 +741,13 @@ ojson runCsdid(const eval::ParsedCommand& parsed, SessionState& session) {
   argv.push_back("--tidy");
 
   ojson raw;
+  std::string esampleValues;
   try {
-    raw = runCobraJsonM4(argv);
+    std::vector<std::string> fitArgs = argv;
+    esampleValues = esampleFitArgs(session, fitArgs, std::string(), 0);
+    raw = runCobraJsonM4(fitArgs);
   } catch (const CobraError& ce) {
+    if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
     // csdid_ctl_cluster_id2: a cluster variable that varies within a panel is
     // r(498) "panels are not nested within clusters". The engine detects it
     // (apps/cmds/cmds_panel.cpp, "is not nested within --ivar") but its
@@ -663,10 +773,29 @@ ojson runCsdid(const eval::ParsedCommand& parsed, SessionState& session) {
                               "engine_error");
   }
   if (posting.has_value()) block["coeftable"] = csdidPostedCoeftableM4(*posting);
+  if (csdidLevel != 95.0 && block.contains("coeftable") && block["coeftable"].is_array()) {
+    const double crit = cecon::stata_invnormal(1.0 - (1.0 - csdidLevel / 100.0) / 2.0);
+    for (auto& row : block["coeftable"]) {
+      if (!row.contains("b") || !row["b"].is_number() || !row.contains("se") ||
+          !row["se"].is_number())
+        continue;
+      const double b = row["b"].get<double>(), se = row["se"].get<double>();
+      row["ci_lo"] = b - crit * se;
+      row["ci_hi"] = b + crit * se;
+    }
+  }
+  // The level the table was printed at, carried whatever it is: csdid's own
+  // default is a literal 95 that `set level` does not move, so r(table) and
+  // r(level) read it from here rather than from the session's c(level).
+  block["level"] = csdidLevel;
   block["agg"] = agg;
   // eb-order T-P3 part 0: the block is written AFTER the fresh setLastModel
   // (inside cacheCsdidModel), which clears the previous fit's block.
-  cacheCsdidModel(session, argv, raw);
+  if (!raw.is_object() || !raw.contains("esample_n")) {
+    if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
+    esampleValues.clear();
+  }
+  cacheCsdidModel(session, argv, raw, esampleValues);
   session.lastEstBlock = block;
   if (posting.has_value()) postCsdidPostingM4(session, *posting);
   // e(b_attgt)/e(V_attgt) carry the cells whatever agg() posted (csdid).
@@ -693,6 +822,7 @@ ojson runCsdid(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   session.noteEOnFit("b_attgt");
   session.noteEOnFit("V_attgt");
+  postCsdidCellContractM4(session, raw, long2);
   return block;
 }
 

@@ -6,6 +6,8 @@
 #include "estimators/ols.h"
 #include "estimators/liml.h"
 #include "estimators/reg3.h"
+#include "estimators/posthest.h"  // chi2_pvalue (reg3 per-equation tests)
+#include "core/collinear.h"       // collinear_keep_mask (reg3 equation rank check)
 #include "inference/wildboot.h"
 // feols.h/iv2sls.h/fepois.h: cmd_feols/cmd_iv/cmd_fepois below only call the
 // shared run_feols/run_iv/run_fepois(_multi) wrappers (apps/cmds/common.cpp),
@@ -123,6 +125,14 @@ int cmd_iv(const std::vector<std::string>& a) {
     std::vector<std::string> insts = split_csv(z);
     std::vector<std::string> ys = split_csv(y);
     bool gmm = has(a, "--gmm");
+    // --gmm-efficient-vce (with --gmm): ivreg2 gmm2s's (X'Z W Z'X)^-1 variance.
+    const bool gmm_efficient_vce = has(a, "--gmm-efficient-vce");
+    // --inst-collin-check: ivregress's check of the excluded instruments against
+    // [endog exog constant] (no absorbed effects, single outcome).
+    const bool inst_collin_check = has(a, "--inst-collin-check");
+    if (gmm_efficient_vce && (!gmm || ys.size() > 1))
+        throw EngineError("bad_input",
+                          "iv: --gmm-efficient-vce requires --gmm and a single outcome --y");
     bool small = has(a, "--small");  // Stata `ivregress ..., small`; default = asymptotic
     // --no-intercept: Stata `ivregress ..., noconstant` (w2d_uncovered.log
     // ivregress_nocons_ctl). Absorbed effects already exclude the constant, and a
@@ -209,7 +219,7 @@ int cmd_iv(const std::vector<std::string>& a) {
         out = run_iv(kp.data, y, xs, endogs, insts, split_csv(opt(a, "--fe")), vcov, clusters,
                      gmm, &tsm, drop_singleton, mask_p, small, savefirst, savefprefix, es_p,
                      emit_v, multiway_subset_factors, no_intercept, weight_var, wkind,
-                     multiway_no_psd_fix, dofminus_fe);
+                     multiway_no_psd_fix, dofminus_fe, gmm_efficient_vce, inst_collin_check);
     emit_esample(esreq, "iv", data, keepif, kp.active, esrows, out);
     emit(out, opt(a, "--out"));
     return 0;
@@ -488,7 +498,8 @@ json run_fepois_emit_v(const std::string& data, const std::string& y,
                        bool emit_v, const std::string& d_out = std::string(),
                        const std::string& d_name = std::string(),
                        const cecon::TsMeta* ts = nullptr,
-                       const std::vector<char>* if_mask = nullptr);
+                       const std::vector<char>* if_mask = nullptr, bool stata_ml = false,
+                       bool exposure = false, int ml_maxiter = 300);
 
 int cmd_fepois(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), y = opt(a, "--y"), xcsv = opt(a, "--x");
@@ -574,10 +585,16 @@ int cmd_fepois(const std::vector<std::string>& a) {
                                opt(a, "--offset"), vcov_type,
                                split_csv(opt(a, "--cluster")), drop_zero_fe, scale_x2);
     } else {
+        // --exposure E: Stata's exposure(E), the offset ln(E) (run_fepois_emit_v).
+        const std::string expo = opt(a, "--exposure");
+        if (!expo.empty() && !opt(a, "--offset").empty())
+            throw EngineError("bad_input", "fepois: only one of offset() or exposure() can be specified");
         out = run_fepois_emit_v(data, y, split_csv(xcsv), split_csv(opt(a, "--fe")),
-                                opt(a, "--offset"), vcov_type,
+                                expo.empty() ? opt(a, "--offset") : expo, vcov_type,
                                 split_csv(opt(a, "--cluster")), drop_zero_fe, scale_x2,
-                                weight_var, wkind, emit_v, d_out, d_name, &tsm, mask_p);
+                                weight_var, wkind, emit_v, d_out, d_name, &tsm, mask_p,
+                                has(a, "--stata-ml"), !expo.empty(),
+                                has(a, "--iterate") ? std::stoi(opt(a, "--iterate")) : 300);
     }
     emit(out, opt(a, "--out"));
     return 0;
@@ -830,7 +847,10 @@ int cmd_liml(const std::vector<std::string>& a) {
                              "[--x EXOG] [--fuller A] [--small] [--keepif EXPR] [--out f.json]\n");
         return 2;
     }
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    // e(sample) (ivregress liml): the listwise sample over the --data rows, as `iv` writes it.
+    const EsampleRequest esreq = esample_request(a, "liml");
+    const std::string src_data = data, keepif = opt(a, "--keepif");
+    data = maybe_keepif(data, keepif);
     bool small = has(a, "--small");
     double fuller = std::stod(opt(a, "--fuller", "0"));
     const Dataset& ds = acquire_data(data);
@@ -902,6 +922,67 @@ int cmd_liml(const std::vector<std::string>& a) {
     }
     // --emit-v (BUG-1196): the fit's full covariance, in the coefficients' order.
     if (has(a, "--emit-v")) add_e_v(out, names, r.vcov);
+    // ivregress liml's e(rmse) = sqrt(RSS/N) (the asymptotic scale, as `iv` sends it),
+    // the depvar's centred TSS, e(rank) and the Wald chi2 of the slopes on the fit's V
+    // (every coefficient but the constant; `iv`'s keys, so PIET posts them alike).
+    // New keys only: the existing ones are unchanged.
+    {
+        const int K = static_cast<int>(names.size());
+        double rss = 0, sum = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            double fit = 0;
+            for (int c = 0; c < p; ++c) fit += r.beta[static_cast<size_t>(c)] * Y[static_cast<int64_t>(c) * n + i];
+            for (int c = 0; c < kx1; ++c) fit += r.beta[static_cast<size_t>(p + c)] * X1[static_cast<int64_t>(c) * n + i];
+            const double e = yv[static_cast<size_t>(i)] - fit;
+            rss += e * e;
+            sum += yv[static_cast<size_t>(i)];
+        }
+        const double ybar = sum / static_cast<double>(n);
+        double tss = 0;
+        for (int64_t i = 0; i < n; ++i) tss += (yv[static_cast<size_t>(i)] - ybar) * (yv[static_cast<size_t>(i)] - ybar);
+        out["depvar"] = y;
+        out["k_vars"] = K;
+        out["rmse"] = std::sqrt(rss / static_cast<double>(n));
+        out["tss_centred"] = tss;
+        // Wald chi2 = b_s' V_s^-1 b_s over the K-1 slopes (Gauss-Jordan on V_s).
+        const int q = K - 1;
+        if (q > 0 && static_cast<int>(r.vcov.size()) == K * K) {
+            std::vector<double> A(static_cast<size_t>(q) * (q + 1));
+            for (int i = 0; i < q; ++i) {
+                for (int j = 0; j < q; ++j) A[static_cast<size_t>(i) * (q + 1) + j] = r.vcov[static_cast<size_t>(i) * K + j];
+                A[static_cast<size_t>(i) * (q + 1) + q] = r.beta[static_cast<size_t>(i)];
+            }
+            bool ok = true;
+            for (int c = 0; c < q && ok; ++c) {
+                int piv = c;
+                for (int i = c + 1; i < q; ++i)
+                    if (std::fabs(A[static_cast<size_t>(i) * (q + 1) + c]) > std::fabs(A[static_cast<size_t>(piv) * (q + 1) + c])) piv = i;
+                if (!(std::fabs(A[static_cast<size_t>(piv) * (q + 1) + c]) > 0)) { ok = false; break; }
+                for (int j = 0; j <= q; ++j) std::swap(A[static_cast<size_t>(c) * (q + 1) + j], A[static_cast<size_t>(piv) * (q + 1) + j]);
+                const double d = A[static_cast<size_t>(c) * (q + 1) + c];
+                for (int j = 0; j <= q; ++j) A[static_cast<size_t>(c) * (q + 1) + j] /= d;
+                for (int i = 0; i < q; ++i) {
+                    if (i == c) continue;
+                    const double f = A[static_cast<size_t>(i) * (q + 1) + c];
+                    for (int j = 0; j <= q; ++j) A[static_cast<size_t>(i) * (q + 1) + j] -= f * A[static_cast<size_t>(c) * (q + 1) + j];
+                }
+            }
+            if (ok) {
+                double chi2 = 0;
+                for (int i = 0; i < q; ++i) chi2 += r.beta[static_cast<size_t>(i)] * A[static_cast<size_t>(i) * (q + 1) + q];
+                if (std::isfinite(chi2)) {
+                    out["chi2"] = chi2;
+                    out["chi2_df"] = q;
+                }
+            }
+        }
+    }
+    if (esreq.active()) {
+        EsampleRows rows;
+        rows.keep = keep;
+        rows.loaded = &ds;
+        emit_esample(esreq, "liml", src_data, keepif, false, rows, out);
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }
@@ -912,7 +993,8 @@ int cmd_reg3(const std::vector<std::string>& a) {
     std::vector<std::string> eqspecs = opt_all(a, "--eq");
     if (data_missing(data) || eqspecs.size() < 2) {
         std::fprintf(stderr, "usage: cobra reg3 --data f.hbin --eq \"y1=x1,x2\" --eq \"y2=x3\" "
-                             "[--method sure|3sls] [--exog Z1,Z2] [--keepif EXPR] [--out f.json]\n"
+                             "[--method sure|3sls] [--exog Z1,Z2] [--keepif EXPR] "
+                             "[--esample-out PATH [--esample-index COL --esample-n N]] [--out f.json]\n"
                              "  SUR (default) or 3SLS (RHS vars that are also a depvar are endogenous).\n");
         return 2;
     }
@@ -934,7 +1016,9 @@ int cmd_reg3(const std::vector<std::string>& a) {
     for (auto& rl : rhs) for (auto& v : rl) if (!is_dep(v)) add_inst(v);
     for (auto& v : split_csv(opt(a, "--exog"))) if (!v.empty()) add_inst(v);
 
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    const EsampleRequest esreq = esample_request(a, "reg3");
+    const std::string src_data = data, keepif = opt(a, "--keepif");
+    data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
     int64_t n_raw = ds.n_rows();
     // gather all variables for a joint listwise sample
@@ -964,12 +1048,36 @@ int cmd_reg3(const std::vector<std::string>& a) {
         for (int64_t t = 0; t < n; ++t) eqs[i].Z[static_cast<int64_t>(k - 1) * n + t] = 1.0;
         eqs[i].names.push_back("(intercept)");
     }
+    // A regressor collinear with the constant and the earlier regressors of its own
+    // equation is omitted by Stata (o. in e(b), the rank and each equation's test count
+    // the rest). This estimator has no omitted-column bookkeeping, and fitting the
+    // singular system yields an arbitrary split of the coefficients and an unbounded
+    // e(V), so the equation is refused by name instead of fitted.
+    for (int i = 0; i < M; ++i) {
+        std::vector<double> Zc(static_cast<size_t>(n) * eqs[i].k);
+        const int last = eqs[i].k - 1;  // the constant is scanned first, then the regressors in order
+        std::copy(eqs[i].Z.begin() + static_cast<int64_t>(last) * n, eqs[i].Z.begin() + static_cast<int64_t>(last + 1) * n, Zc.begin());
+        std::copy(eqs[i].Z.begin(), eqs[i].Z.begin() + static_cast<int64_t>(last) * n, Zc.begin() + n);
+        const std::vector<char> keep = collinear_keep_mask(Zc.data(), n, eqs[i].k);
+        for (int c = 1; c < eqs[i].k; ++c)
+            if (!keep[static_cast<size_t>(c)])
+                throw EngineError("unsupported",
+                                  "reg3/sureg: regressor " + eqs[i].names[static_cast<size_t>(c - 1)] +
+                                      " of equation " + deps[i] +
+                                      " is collinear with the constant and the equation's earlier "
+                                      "regressors; Stata omits it, which this version does not implement");
+    }
     int kw = static_cast<int>(instv.size()) + 1;
     std::vector<double> W(static_cast<size_t>(n) * kw, 0.0);
     for (int c = 0; c + 1 < kw; ++c) { auto col = getcol(instv[c]); std::copy(col.begin(), col.end(), W.data() + static_cast<int64_t>(c) * n); }
     for (int64_t t = 0; t < n; ++t) W[static_cast<int64_t>(kw - 1) * n + t] = 1.0;
 
-    Reg3Result r = reg3_fit(eqs, n, W, kw);
+    // --isure (sureg isure / reg3 ireg3): iterate the FGLS to convergence, at most
+    // --iterate passes (Stata's c(maxiter) 300 by default), tolerance --tolerance (1e-6).
+    const bool isure = has(a, "--isure");
+    const int iter_max = isure ? std::max(1, std::stoi(opt(a, "--iterate", "300"))) : 0;
+    const double iter_tol = std::stod(opt(a, "--tolerance", "1e-6"));
+    Reg3Result r = reg3_fit(eqs, n, W, kw, iter_max, iter_tol);
     if (!r.ok) { std::fprintf(stderr, "reg3: estimation failed (collinear / underidentified?).\n"); return 1; }
     json eqsj = json::array();
     for (int i = 0; i < M; ++i) {
@@ -991,6 +1099,89 @@ int cmd_reg3(const std::vector<std::string>& a) {
     for (int i = 0; i < M; ++i) { json row = json::array(); for (int j = 0; j < M; ++j) row.push_back(r.Sigma[static_cast<size_t>(i) * M + j]); sig.push_back(row); }
     json out = {{"estimator", "reg3"}, {"method", threesls ? "3sls" : "sure"}, {"n_obs", n},
                 {"n_equations", M}, {"equations", eqsj}, {"sigma", sig}};
+    if (isure) {
+        out["ic"] = r.ic;
+        out["converged"] = r.converged;
+    }
+    // Per-equation statistics and the system log likelihood as reg3's ado posts them
+    // (new keys only): each equation's RSS from the final coefficients and the ACTUAL
+    // regressors, its centred TSS (every equation carries the constant), the Wald
+    // chi2 of its slopes on the system V and their count, and
+    // ll = -N/2 (M ln(2 pi) + ln det(E'E/N) + M) on the final residuals E.
+    {
+        std::vector<std::vector<double>> res(static_cast<size_t>(M));
+        json st = json::array();
+        bool ok = true;
+        for (int i = 0; i < M && ok; ++i) {
+            const int k = eqs[i].k, o = r.koff[i];
+            res[i].resize(static_cast<size_t>(n));
+            double rss = 0, sum = 0;
+            for (int64_t t = 0; t < n; ++t) {
+                double f = 0;
+                for (int c = 0; c < k; ++c) f += eqs[i].Z[static_cast<int64_t>(c) * n + t] * r.beta[static_cast<size_t>(o + c)];
+                res[i][static_cast<size_t>(t)] = eqs[i].y[static_cast<size_t>(t)] - f;
+                rss += res[i][static_cast<size_t>(t)] * res[i][static_cast<size_t>(t)];
+                sum += eqs[i].y[static_cast<size_t>(t)];
+            }
+            const double ybar = sum / static_cast<double>(n);
+            double tss = 0;
+            for (int64_t t = 0; t < n; ++t) tss += (eqs[i].y[static_cast<size_t>(t)] - ybar) * (eqs[i].y[static_cast<size_t>(t)] - ybar);
+            // Wald chi2 of the slopes (the constant alone when it is the only term)
+            std::vector<int> idx;
+            for (int c = 0; c + 1 < k; ++c) idx.push_back(o + c);
+            if (idx.empty()) idx.push_back(o + k - 1);
+            const int q = static_cast<int>(idx.size());
+            std::vector<double> A(static_cast<size_t>(q) * (q + 1));
+            for (int a = 0; a < q; ++a) {
+                for (int b = 0; b < q; ++b) A[static_cast<size_t>(a) * (q + 1) + b] = r.vcov[static_cast<size_t>(idx[a]) * r.koff[M] + idx[b]];
+                A[static_cast<size_t>(a) * (q + 1) + q] = r.beta[static_cast<size_t>(idx[a])];
+            }
+            for (int c = 0; c < q && ok; ++c) {
+                int piv = c;
+                for (int a = c + 1; a < q; ++a)
+                    if (std::fabs(A[static_cast<size_t>(a) * (q + 1) + c]) > std::fabs(A[static_cast<size_t>(piv) * (q + 1) + c])) piv = a;
+                if (!(std::fabs(A[static_cast<size_t>(piv) * (q + 1) + c]) > 0)) { ok = false; break; }
+                for (int b = 0; b <= q; ++b) std::swap(A[static_cast<size_t>(c) * (q + 1) + b], A[static_cast<size_t>(piv) * (q + 1) + b]);
+                const double d = A[static_cast<size_t>(c) * (q + 1) + c];
+                for (int b = 0; b <= q; ++b) A[static_cast<size_t>(c) * (q + 1) + b] /= d;
+                for (int a = 0; a < q; ++a) {
+                    if (a == c) continue;
+                    const double f = A[static_cast<size_t>(a) * (q + 1) + c];
+                    for (int b = 0; b <= q; ++b) A[static_cast<size_t>(a) * (q + 1) + b] -= f * A[static_cast<size_t>(c) * (q + 1) + b];
+                }
+            }
+            double chi2 = 0;
+            for (int a = 0; a < q; ++a) chi2 += r.beta[static_cast<size_t>(idx[a])] * A[static_cast<size_t>(a) * (q + 1) + q];
+            st.push_back({{"rss", rss}, {"tss", tss}, {"chi2", chi2}, {"df", q},
+                          {"p", chi2_pvalue(chi2, static_cast<double>(q))}});
+        }
+        // det(E'E/N) by Gaussian elimination
+        std::vector<double> E(static_cast<size_t>(M) * M);
+        for (int i = 0; i < M; ++i)
+            for (int j = 0; j < M; ++j) {
+                double s2 = 0;
+                for (int64_t t = 0; t < n; ++t) s2 += res[i][static_cast<size_t>(t)] * res[j][static_cast<size_t>(t)];
+                E[static_cast<size_t>(i) * M + j] = s2 / static_cast<double>(n);
+            }
+        double det = 1;
+        for (int c = 0; c < M && ok; ++c) {
+            int piv = c;
+            for (int a = c + 1; a < M; ++a)
+                if (std::fabs(E[static_cast<size_t>(a) * M + c]) > std::fabs(E[static_cast<size_t>(piv) * M + c])) piv = a;
+            if (!(std::fabs(E[static_cast<size_t>(piv) * M + c]) > 0)) { ok = false; break; }
+            if (piv != c) { for (int b = 0; b < M; ++b) std::swap(E[static_cast<size_t>(c) * M + b], E[static_cast<size_t>(piv) * M + b]); det = -det; }
+            det *= E[static_cast<size_t>(c) * M + c];
+            for (int a = c + 1; a < M; ++a) {
+                const double f = E[static_cast<size_t>(a) * M + c] / E[static_cast<size_t>(c) * M + c];
+                for (int b = c; b < M; ++b) E[static_cast<size_t>(a) * M + b] -= f * E[static_cast<size_t>(c) * M + b];
+            }
+        }
+        if (ok && det > 0) {
+            const double nd = static_cast<double>(n), Md = static_cast<double>(M);
+            out["eq_stats"] = st;
+            out["ll"] = -0.5 * (nd * Md * std::log(2.0 * 3.14159265358979323846) + nd * std::log(det) + nd * Md);
+        }
+    }
     // --emit-v: the stacked system covariance (K x K, cross-equation blocks
     // included), named `depvar:coef` in e(b)'s order with the intercept spelled
     // `_cons` -- Stata's reg3/sureg e(V) stripe (`y:x1 y:x2 y:_cons x3:x2 x3:_cons`).
@@ -1001,6 +1192,13 @@ int cmd_reg3(const std::vector<std::string>& a) {
                 vn.push_back(deps[i] + ":" +
                              (eqs[i].names[c] == "(intercept)" ? std::string("_cons") : eqs[i].names[c]));
         add_e_v(out, vn, r.vcov, nullptr);
+    }
+    // e(sample): the joint listwise sample every equation was fitted on.
+    if (esreq.active()) {
+        EsampleRows rows;
+        rows.keep = keep;
+        rows.loaded = &ds;
+        emit_esample(esreq, "reg3", src_data, keepif, false, rows, out);
     }
     emit(out, opt(a, "--out"));
     return 0;

@@ -89,7 +89,31 @@ ojson runLabmask(const eval::ParsedCommand& parsed, SessionState& session) {
 
   const int64_t n = ds.nRows();
   const ColView num = viewOf(ds, numvar);
-  const std::vector<std::string> text = columnAsStrings(ds, *valuesVar);
+  std::vector<std::string> text = columnAsStrings(ds, *valuesVar);
+  if (hasFlag(parsed.opts, "decode")) {
+    // decode: the text of each observation is the value label of the values variable at its
+    // value (a number with no label there is its own text, as decode gives it).
+    if (ds.dtype(*valuesVar) == "factor")
+      return utilErrorRc("type mismatch", 109);
+    const auto li = session.varLblname.find(*valuesVar);
+    if (li == session.varLblname.end() || li->second.empty())
+      return utilErrorRc("variable " + *valuesVar + " has no value label attached", 182);
+    const auto def = session.labelDefs.find(li->second);
+    const ColView vv = viewOf(ds, *valuesVar);
+    for (int64_t i = 0; i < n; ++i) {
+      if (cellMissing(vv, i)) {
+        text[static_cast<size_t>(i)].clear();
+        continue;
+      }
+      const double v = vv.d[i];
+      std::string key = v == std::floor(v) ? std::to_string(static_cast<long long>(v)) : numText(v);
+      if (def != session.labelDefs.end()) {
+        const auto t = def->second.find(key);
+        if (t != def->second.end()) key = t->second;
+      }
+      text[static_cast<size_t>(i)] = key;
+    }
+  }
 
   // Two things must hold before a single label is defined: every code is an
   // integer, and every observation with the same code carries the same text.
@@ -166,175 +190,148 @@ ojson runLabmask(const eval::ParsedCommand& parsed, SessionState& session) {
 }
 
 // ===========================================================================
-// renvarlab
-// ===========================================================================
-//
-// A rename LOOP over runRename, with every target name validated before the
-// first rename happens -- a collision on the third variable must not leave the
-// first two renamed. The package's label-driven renaming (derive each new name
-// from the variable's LABEL) is refused by the vocabulary rather than
-// approximated: that is a different derivation of the names, not an option on
-// this one.
-ojson runRenvarlab(const eval::ParsedCommand& parsed, SessionState& session) {
-  if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabRenvarlab.known,
-                                            kVocabRenvarlab.unimplemented))
-    return ojson(*err);
-  if (!session.hasData()) return ojson(eval::noDataLoaded());
-
-  const std::string prefix = optStr(parsed.opts, "prefix").value_or(std::string());
-  const std::string suffix = optStr(parsed.opts, "suffix").value_or(std::string());
-  const bool upper = hasFlag(parsed.opts, "upper");
-  const bool lower = hasFlag(parsed.opts, "lower");
-  if (upper && lower)
-    return utilSyntax("renvarlab: `upper` and `lower` cannot both be given.");
-  if (prefix.empty() && suffix.empty() && !upper && !lower)
-    return utilSyntax(
-        "renvarlab: nothing to do -- give at least one of prefix(), suffix(), upper, lower.");
-
-  Datastore* dsp = nullptr;
-  try {
-    dsp = session.datastore();
-  } catch (const std::exception& e) {
-    return utilError(std::string("renvarlab: ") + e.what(), "data_io");
-  }
-  if (dsp == nullptr) return ojson(eval::noDataLoaded());
-
-  std::vector<std::string> vars;
-  if (parsed.varlist.empty()) {
-    vars = dsp->names();
-  } else {
-    // expandVarlist is the ONE place the wildcard/hyphen varlist grammar lives.
-    loops::VarlistExpandResult ex = loops::expandVarlist(joinWith(parsed.varlist, " "), session);
-    if (ex.isError) return ex.error;
-    vars = ex.tokens;
-  }
-  if (vars.empty()) return utilError("renvarlab: no variables to rename");
-
-  const std::set<std::string> renaming(vars.begin(), vars.end());
-  std::set<std::string> taken;
-  for (const auto& nm : dsp->names()) {
-    if (renaming.count(nm) == 0) taken.insert(nm);
-  }
-
-  std::vector<std::pair<std::string, std::string>> plan;
-  std::set<std::string> targets;
-  for (const auto& nm : vars) {
-    std::string out = prefix + nm + suffix;
-    if (upper) out = upperAscii(out);
-    if (lower) out = lowerOf(out);
-    if (out == nm) continue;  // nothing to do for this one
-    if (!strutil::isValidStataIdentifier(out))
-      return utilSyntax("renvarlab: `" + nm + "' would become `" + out +
-                        "', which is not a legal variable name -- " +
-                        strutil::stataIdentifierRuleText());
-    if (taken.count(out) != 0)
-      return utilError("renvarlab: `" + nm + "' would become `" + out +
-                           "', which already exists and is not itself being renamed.",
-                       "bad_input");
-    if (!targets.insert(out).second)
-      return utilError("renvarlab: two variables would both become `" + out + "'.", "bad_input");
-    plan.emplace_back(nm, out);
-  }
-  if (plan.empty()) return silent();
-
-  std::vector<std::string> fromNames, toNames;
-  for (const auto& [from, to] : plan) {
-    ojson r = runRename(from, to, session);
-    if (const ojson* e = firstError(r)) return *e;
-    fromNames.push_back(from);
-    toNames.push_back(to);
-  }
-  // BUG-452 (2026-09-07, AER scope 2 K1b): this used to return silent() and
-  // SWALLOW every runRename's mutationResult, so a command that rewrites the
-  // variable plane published nothing at all -- the consumer of the block stream
-  // never learned the names changed. It went unseen because renvarlab's freeze
-  // row is `no_fixture`: the capture gates can only watch what a command emits
-  // ([[gates-watch-production-not-absence]]). Found when the identical swallow
-  // in the new `tolower` made ITS freeze golden pin the preamble's varlist.
-  // ONE block for the whole plan, with the complete new/dropped pair, rather
-  // than one per rename.
-  return mutationResult(session, "rename", toNames, fromNames);
-}
-
-// ===========================================================================
 // splitvallabels
 // ===========================================================================
 //
-// Chops a value label's texts at whitespace boundaries into pieces of at most
-// length() characters and publishes them as r(relabel) -- the string a graph
-// command's `relabel()` option takes verbatim. Read-only: it never touches the
-// label plane it reads.
+//     splitvallabels varname [if] [in] [, length(#) nobreak recode vals(numlist) local(macname)]
+//
+// Breaks the value-label text of every value the variable takes (in the rows selected) into
+// lines of at most length() characters (default 15) -- at blanks, and a word longer than that
+// is itself cut into length()-sized pieces unless nobreak -- and publishes them as
+// r(relabel), the string a graph command's relabel() option takes: for each value
+//     `` code `" `"line"' `"line"' "' ``
+// with an empty second line (`""`) for a text that fits on one. vals() keeps only the values
+// listed; recode numbers the values 1, 2, ... in order instead of their own codes; local()
+// also leaves the string (without its leading blank) in a local macro. A variable without a
+// value label leaves nothing. Read-only: the label plane is not touched.
 ojson runSplitvallabels(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabSplitvallabels.known,
                                             kVocabSplitvallabels.unimplemented))
     return ojson(*err);
   if (parsed.varlist.size() != 1)
-    return utilSyntax("splitvallabels: syntax is `splitvallabels varname [, length(#)]`");
+    return ojson(eval::errorBlock("syntax_error", "varlist required", std::nullopt, std::nullopt,
+                                  std::nullopt, "r(100)"));
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
   const std::string var = parsed.varlist[0];
+  Datastore* ds0 = session.datastore();
+  if (ds0 == nullptr || !ds0->has(var))
+    return utilErrorRc("variable " + var + " not found", 111);
 
-  long long length = 12;  // splitvallabels.ado's own default
+  long long length = 15;
   if (auto lv = optStr(parsed.opts, "length")) {
-    if (!parseStrictInt(*lv, &length) || length < 1)
-      return utilSyntax("splitvallabels: length() requires a whole number of at least 1, got `" +
-                        *lv + "'");
+    if (!parseStrictInt(trimOf(*lv), &length) || length < 1)
+      return utilErrorRc("length() invalid", 198);
   }
-
-  // The variable's value label, from the session's label plane. valueLabels is
-  // the resolved per-variable map; when a variable was attached to a label set
-  // that has since been (re)defined, varLblname + labelDefs is the same answer
-  // from its two halves.
-  std::map<long long, std::string> codes;
-  auto vlIt = session.valueLabels.find(var);
-  if (vlIt != session.valueLabels.end()) {
-    for (const auto& [code, text] : vlIt->second) codes.emplace(static_cast<long long>(code), text);
-  } else {
-    auto lnIt = session.varLblname.find(var);
-    if (lnIt != session.varLblname.end()) {
-      auto defIt = session.labelDefs.find(lnIt->second);
-      if (defIt != session.labelDefs.end()) {
-        for (const auto& [codeStr, text] : defIt->second) {
-          long long c = 0;
-          if (parseStrictInt(codeStr, &c)) codes.emplace(c, text);
-        }
-      }
+  const bool nobreak = hasFlag(parsed.opts, "nobreak");
+  const bool recode = hasFlag(parsed.opts, "recode");
+  std::set<double> keepVals;
+  bool haveVals = false;
+  if (auto vv = optStr(parsed.opts, "vals")) {
+    haveVals = true;
+    for (const auto& w : splitWs(*vv)) {
+      double d = 0;
+      if (!parseStrictDouble(w, &d)) return utilErrorRc("vals() invalid", 198);
+      keepVals.insert(d);
     }
   }
-  if (codes.empty())
-    return utilError("splitvallabels: `" + var +
-                     "' has no value label attached, so there is nothing to split.");
 
+  // The value-label set attached to the variable.
+  std::map<long long, std::string> codes;
+  auto lnIt = session.varLblname.find(var);
+  if (lnIt != session.varLblname.end() && !lnIt->second.empty()) {
+    auto defIt = session.labelDefs.find(lnIt->second);
+    if (defIt != session.labelDefs.end()) {
+      for (const auto& [codeStr, text] : defIt->second) {
+        long long c = 0;
+        if (parseStrictInt(codeStr, &c)) codes.emplace(c, text);
+      }
+    }
+  } else if (auto vlIt = session.valueLabels.find(var); vlIt != session.valueLabels.end()) {
+    for (const auto& [code, text] : vlIt->second) codes.emplace(static_cast<long long>(code), text);
+  }
+  if (lnIt == session.varLblname.end() && codes.empty()) return silent();
+
+  // The values the variable takes in the rows selected.
+  ReadScope scope(session, parsed, {var}, "splitvallabels", true);
+  if (scope.failed()) return scope.error().is_null() ? ojson(eval::noDataLoaded()) : scope.error();
+  Datastore* ds = scope.get();
+  std::set<double> values;
+  if (ds->dtype(var) == "f64") {
+    const cecon::Column& col = ds->col(var);
+    const double* d = col.f64();
+    for (int64_t i = 0; i < ds->nRows(); ++i)
+      if (!std::isnan(d[i])) values.insert(d[i]);
+  } else {
+    return utilErrorRc("type mismatch", 109);
+  }
+
+  auto utf8len = [](const std::string& s) {
+    size_t n = 0;
+    for (unsigned char c : s)
+      if ((c & 0xC0) != 0x80) ++n;
+    return n;
+  };
+  auto cutChars = [&](const std::string& w, size_t n) {  // first n characters
+    size_t i = 0, k = 0;
+    while (i < w.size() && k < n) {
+      ++i;
+      while (i < w.size() && (static_cast<unsigned char>(w[i]) & 0xC0) == 0x80) ++i;
+      ++k;
+    }
+    return i;
+  };
   auto chop = [&](const std::string& text) {
-    // Greedy packing at WHITESPACE boundaries: a word longer than length() is
-    // its own piece rather than being cut mid-word (the option is a target, not
-    // a hard truncation -- `nobreak`, which would suppress the chopping
-    // entirely, is the refused option).
+    std::vector<std::string> toks;
+    for (const auto& w : splitWs(text)) {
+      if (nobreak || static_cast<long long>(utf8len(w)) <= length) {
+        toks.push_back(w);
+        continue;
+      }
+      std::string rest = w;
+      while (static_cast<long long>(utf8len(rest)) > length) {
+        const size_t at = cutChars(rest, static_cast<size_t>(length));
+        toks.push_back(rest.substr(0, at));
+        rest = rest.substr(at);
+      }
+      if (!rest.empty()) toks.push_back(rest);
+    }
     std::vector<std::string> pieces;
     std::string cur;
-    for (const auto& w : splitWs(text)) {
-      if (cur.empty()) {
-        cur = w;
-      } else if (static_cast<long long>(cur.size() + 1 + w.size()) <= length) {
-        cur += " " + w;
-      } else {
+    for (const auto& w : toks) {
+      if (cur.empty()) cur = w;
+      else if (static_cast<long long>(utf8len(cur) + 1 + utf8len(w)) <= length) cur += " " + w;
+      else {
         pieces.push_back(cur);
         cur = w;
       }
     }
     if (!cur.empty()) pieces.push_back(cur);
-    if (pieces.empty()) pieces.emplace_back();
     return pieces;
   };
 
   std::string relabel;
-  for (const auto& [code, text] : codes) {
-    if (text.find('"') != std::string::npos)
-      return utilError("splitvallabels: the label text for code " + std::to_string(code) +
-                       " contains a double quote, which cannot travel inside r(relabel).");
-    if (!relabel.empty()) relabel += " ";
-    relabel += std::to_string(code);
-    for (const auto& p : chop(text)) relabel += " \"" + p + "\"";
+  long long k = 0;
+  for (double v : values) {
+    if (haveVals && keepVals.count(v) == 0) continue;
+    ++k;
+    const long long code = static_cast<long long>(v);
+    std::string text;
+    auto it = v == std::floor(v) ? codes.find(code) : codes.end();
+    if (it != codes.end()) text = it->second;
+    else text = numText(v);
+    std::vector<std::string> pieces = chop(text);
+    relabel += " " + std::to_string(recode ? k : code) + " `\" ";
+    for (const auto& p : pieces) relabel += "`\"" + p + "\"' ";
+    if (pieces.size() <= 1) relabel += "\"\" ";
+    relabel += "\"'";
   }
+  eval::replaceRClass(session.eval);
   session.eval.rStrings.set("relabel", relabel);
+  eval::declareRPosted(session.eval, "splitvallabels", {"relabel"});
+  if (auto lm = optStr(parsed.opts, "local")) {
+    const std::string name = trimOf(*lm);
+    if (!name.empty()) session.eval.locals.set(name, relabel.empty() ? relabel : relabel.substr(1));
+  }
   return silent();
 }
 

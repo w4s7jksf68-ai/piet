@@ -77,6 +77,10 @@ struct IvResult {
     std::vector<double> se;
     std::vector<double> vcov_matrix;
     std::string vcov_type;
+    // ivregress's e(V_modelbased) under a one-way robust or cluster VCE: the 2SLS
+    // bread (Xhat'Xhat)^-1 on the rescaled [aw]/[pw] rows, unscaled (fits without
+    // absorbed effects only; empty otherwise, which keeps every other reply byte-identical).
+    std::vector<double> vcov_modelbased;
 
     double ssr = 0;
     double sigma2 = 0;

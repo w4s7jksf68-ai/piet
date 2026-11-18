@@ -29,11 +29,35 @@ bool route_results(std::string& cmd,
     // `find(cmdTyped) + size()` arithmetic did.
     std::string rawArgs = rawArgsAfterCmd(parsed.raw);
     ojson shown = ojson(handleDisplay(rawArgs, session));
+    // What the line shows: its SMCL drawn as text (renderSmclText), unless
+    // `_asis` turned SMCL off.
+    int linesize = 80;
+    if (auto ls = resolveCValue("linesize", session); ls.has_value() && !ls->isString) {
+      try {
+        linesize = std::stoi(ls->text);
+      } catch (...) {
+      }
+    }
+    // The SMCL as typed stays in `smcl` for an SMCL log, which writes it as
+    // SMCL (session_logs.cpp); a text log, the console and the app show `text`.
+    if (shown.value("type", std::string()) == "display" && shown.contains("text") &&
+        shown["text"].is_string() && !shown.value("asis", false)) {
+      const std::string typed = shown["text"].get<std::string>();
+      const std::string drawn = renderSmclText(typed, linesize);
+      if (drawn != typed) {
+        shown["text"] = drawn;
+        shown["smcl"] = typed;
+      }
+    }
+    shown.erase("asis");
     if (shown.value("type", std::string()) == "error") {
       // The pieces printed before the failing one (handleDisplay's partial_text).
       if (isDisplayLine(rawCmd)) {
-        if (auto partial = displayPartialBlock(rawArgsAfterCmd(rawCmd), shown, session, true))
+        if (auto partial = displayPartialBlock(rawArgsAfterCmd(rawCmd), shown, session, true)) {
+          if (partial->contains("text") && (*partial)["text"].is_string())
+            (*partial)["text"] = renderSmclText((*partial)["text"].get<std::string>(), linesize);
           blocks.push_back(*partial);
+        }
       }
       shown.erase("partial_text");
     }
@@ -56,9 +80,16 @@ bool route_results(std::string& cmd,
   // inside string comparisons. parsed.raw is the same source the `if`-qualifier
   // scanner already worked from, so the two agree on where the claim ends.
   if (cmd == "assert") {
-    if (auto err = eval::rejectUnknownOptions(parsed.opts, {})) {
+    if (auto err = eval::rejectUnknownOptions(parsed.opts, {"rc0", "null", "fast"})) {
       blocks.push_back(ojson(*err));
       return true;
+    }
+    bool assertRc0 = false, assertNull = false, assertFast = false;
+    for (const auto& [k, v] : parsed.opts) {
+      const bool on = v.isBool ? v.boolValue : true;
+      if (k == "rc0" && on) assertRc0 = true;
+      if (k == "null" && on) assertNull = true;
+      if (k == "fast" && on) assertFast = true;
     }
     // EM11: a claim holding a compound-quoted literal (a string with a '"' in it)
     // is a constant the engine's lexer cannot read; the expression layer can.
@@ -111,7 +142,42 @@ bool route_results(std::string& cmd,
       blocks.push_back(ojson(eval::engineError("assert: no expression given", "syntax_error")));
       return true;
     }
+    // [D] assert: `null` makes an assertion that checks no observation (an if / in that excludes
+    // them all) return code 8, where it is 0 by default.
+    if (assertNull && (parsed.ifExpr.has_value() || parsed.inRange.has_value())) {
+      const std::string savedLeaf = session.leafCmdExpanded;
+      std::string countLine = "quietly count";
+      if (parsed.ifExpr.has_value()) countLine += " if " + *parsed.ifExpr;
+      if (parsed.inRange.has_value()) countLine += " in " + *parsed.inRange;
+      const eval::OrderedFloatDict savedR = session.eval.rValues;
+      (void)dispatch(countLine, session);
+      const double* nSample = session.eval.rValues.find("N");
+      const bool emptySample = nSample != nullptr && *nSample == 0;
+      session.eval.rValues = savedR;
+      session.leafCmdExpanded = savedLeaf;
+      if (emptySample) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error", "assertion is null", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(8)")));
+        return true;
+      }
+    }
     ojson ar = handlers::runAssert(claim, session, parsed.ifExpr, parsed.inRange);
+    // fast stops at the first contradiction, so it has no count to report; rc0 reports the
+    // assertion as false and returns 0.
+    if (ar.is_object() && ar.value("type", std::string()) == "error" &&
+        ar.value("reason", std::string()) == "r(9)" &&
+        ar.value("message", std::string()).find("assertion is false") != std::string::npos) {
+      std::string msg = ar.value("message", std::string());
+      if (assertFast) msg = "assertion is false";
+      if (assertRc0) {
+        ojson shown;
+        shown["type"] = "display";
+        shown["text"] = msg;
+        ar = std::move(shown);
+      } else if (assertFast) {
+        ar["message"] = msg;
+      }
+    }
     // Silent success returns an empty array; pushing that would put a non-block
     // into the block list (same guard the `matrix` arm above uses).
     if (!(ar.is_array() && ar.empty())) blocks.push_back(ar);
@@ -129,20 +195,52 @@ bool route_results(std::string& cmd,
   // had while the whole command sat behind the guard.
   if (cmd == "ereturn") {
     if (!parsed.varlist.empty() && lower(parsed.varlist[0]) == "list") {
-      if (!session.hasData()) {
-        blocks.push_back(ojson(eval::noDataLoaded()));
-        return true;
-      }
       if (auto err = eval::rejectUnknownOptions(parsed.opts, {})) {
         blocks.push_back(ojson(*err));
         return true;
       }
-      blocks.push_back(ojson(handlers::runEreturnList(session)));
+      // With no data in memory, as with no estimates, there is nothing to list:
+      // StataBE prints nothing at rc 0 (runEreturnList answers an empty array).
+      ojson listed = ojson(handlers::runEreturnList(session));
+      if (!(listed.is_array() && listed.empty())) blocks.push_back(std::move(listed));
       return true;
     }
     // One block or an empty array (silent success) -- never pushed as an array.
     ojson r = handlers::runEreturn(parsed, session);
     if (!(r.is_array() && r.empty())) blocks.push_back(r);
+    return true;
+  }
+
+
+  // `sreturn list` and `sreturn clear` outside an sclass program (`sreturn
+  // local` is program.cpp's). Both had no row at all and answered r(199) "not
+  // supported", so `capture noisily sreturn list` failed where StataBE lists
+  // s() -- or prints nothing when s() is empty -- at rc 0.
+  if (cmd == "sreturn") {
+    const std::string sub = parsed.varlist.empty() ? "" : lower(parsed.varlist[0]);
+    if (sub == "list" || sub == "clear") {
+      if (auto err = eval::rejectUnknownOptions(parsed.opts, {})) {
+        blocks.push_back(ojson(*err));
+        return true;
+      }
+      if (parsed.varlist.size() > 1) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+      if (sub == "clear") {
+        handlers::clearSreturn(session);
+        return true;
+      }
+      ojson listed = ojson(handlers::runSreturnList(session));
+      if (!(listed.is_array() && listed.empty())) blocks.push_back(std::move(listed));
+      return true;
+    }
+    // Any other form is one PIET does not implement, named as an unknown
+    // subcommand (the `return` arm's wording below).
+    blocks.push_back(ojson(eval::unsupportedCommand(
+        "sreturn " + sub, std::nullopt, std::nullopt, "piet_gap",
+        eval::UnsupportedCommandKind::kUnknownSubcommand)));
     return true;
   }
 
@@ -155,7 +253,8 @@ bool route_results(std::string& cmd,
         blocks.push_back(ojson(*err));
         return true;
       }
-      blocks.push_back(ojson(handlers::runReturnList(session)));
+      ojson listed = ojson(handlers::runReturnList(session));
+      if (!(listed.is_array() && listed.empty())) blocks.push_back(std::move(listed));
       return true;
     }
     if (sub == "clear") {
@@ -168,6 +267,25 @@ bool route_results(std::string& cmd,
       if (session.progCallDepth == 0) return true;
       eval::replaceRClass(session.eval);
       eval::declareRPosted(session.eval, "return clear", {});  // r() is empty (D.3.13)
+      // It also drops what this program has already returned ([P] return:
+      // "return clear clears r()", the staged results included): a `return
+      // scalar/local/matrix` before it must not reach the caller. e()/s()
+      // staging (escalar, slocal) is not r() and stays.
+      auto& mats = session.eval.matrices;
+      for (auto it = session.returnStaging.begin(); it != session.returnStaging.end();) {
+        const std::string& kind = it->second.first;
+        if (kind == "scalar" || kind == "local" || kind == "matrix") {
+          if (kind == "matrix") {
+            const std::string key = it->second.second;
+            mats.erase(std::remove_if(mats.begin(), mats.end(),
+                                      [&](const auto& kv) { return kv.first == key; }),
+                       mats.end());
+          }
+          it = session.returnStaging.erase(it);
+        } else {
+          ++it;
+        }
+      }
       return true;
     }
     if (sub == "add") {
@@ -204,6 +322,27 @@ bool route_results(std::string& cmd,
   }
 
   if (cmd == "svmat") {
+    {
+      // svmat takes no qualifier or weight, and reads whatever follows the matrix as a matrix
+      // name too: `svmat M if ...`, `svmat M in 1/2`, `svmat M [aw=w]`, a bare `svmat` and
+      // `svmat , opt` are all r(111) "matrix <word> not found" (vs-stata bank).
+      std::string word;
+      bool refused = false;
+      if (parsed.ifExpr.has_value()) { word = "if"; refused = true; }
+      else if (parsed.inRange.has_value()) { word = "in"; refused = true; }
+      else if (parsed.weightType.has_value()) {
+        word = "[" + *parsed.weightType + "=" + parsed.weightVar.value_or("") + "]";
+        refused = true;
+      } else if (parsed.varlist.empty()) {
+        if (!parsed.opts.empty()) word = parsed.opts.front().first;
+        refused = true;
+      }
+      if (refused) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error", "matrix " + word + " not found",
+                                                std::nullopt, std::nullopt, std::nullopt, "r(111)")));
+        return true;
+      }
+    }
     blocks.push_back(ojson(handlers::runSvmat(parsed, session)));
     return true;
   }
@@ -255,6 +394,47 @@ bool route_results(std::string& cmd,
         estSubIs(lower(parsed.varlist[0]), "table", 3)) {
       std::vector<std::string> tabNames(parsed.varlist.begin() + 1, parsed.varlist.end());
       blocks.push_back(ojson(handlers::runEstimatesTable(tabNames, parsed.opts, session)));
+      return true;
+    }
+    // estimates.ado Change: `estimates change [name], title(...)` rewrites a stored model's title
+    // (vs-stata bank 76a85d8f: `estimates dir` then lists `renamed`).
+    if ((cmd == "est" || cmd == "estimates") && !parsed.varlist.empty() &&
+        lower(parsed.varlist[0]) == "change") {
+      std::optional<std::string> newTitle;
+      for (const auto& [k, v] : parsed.opts) {
+        if (k == "title" && !v.isBool) {
+          newTitle = dequoteEstTitle(v.strValue);
+        } else {
+          blocks.push_back(ojson(eval::errorBlock("unsupported_option", "option `" + k + "` not allowed")));
+          return true;
+        }
+      }
+      std::vector<std::string> ops(parsed.varlist.begin() + 1, parsed.varlist.end());
+      SessionState::EstNamelist ex =
+          session.expandEstimatesNamelist(ops.empty() ? std::vector<std::string>{"."} : ops);
+      if (ex.rc != 0) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error", ex.message, std::nullopt, std::nullopt,
+                                                std::nullopt, "r(" + std::to_string(ex.rc) + ")")));
+        return true;
+      }
+      if (ex.names.size() != 1) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error", "too many names specified", std::nullopt,
+                                                std::nullopt, std::nullopt, std::string("r(198)"))));
+        return true;
+      }
+      if (!newTitle.has_value()) return true;  // nothing to change
+      if (ex.names[0] == ".") {
+        blocks.push_back(ojson(eval::unsupportedOption(
+            "change", "estimates change of the active, unstored results is not implemented in this version of PIET")));
+        return true;
+      }
+      if (ojson* sn = session.estimatesGetMutable(ex.names[0])) (*sn)["title"] = *newTitle;
+      return true;
+    }
+    if ((cmd == "est" || cmd == "estimates") && !parsed.varlist.empty() &&
+        lower(parsed.varlist[0]) == "stats") {
+      std::vector<std::string> statNames(parsed.varlist.begin() + 1, parsed.varlist.end());
+      blocks.push_back(ojson(handlers::runEstimatesStats(statNames, parsed.opts, session)));
       return true;
     }
     // BS-097 as amended by B4-W3b. The net used to be ONE empty set applied
@@ -478,9 +658,24 @@ bool route_results(std::string& cmd,
     }
     std::optional<std::string> name;
     if (!parsed.varlist.empty()) name = parsed.varlist[0];
+    std::vector<std::pair<std::string, double>> addedSc;
+    if (storeOpts.addscalars.has_value()) {
+      std::vector<ojson> notes;
+      const auto aerr = applyEststoAddscalars(*storeOpts.addscalars, session, &notes, &addedSc);
+      for (auto& nb : notes) blocks.push_back(std::move(nb));
+      if (aerr.has_value()) {
+        blocks.push_back(*aerr);
+        return true;
+      }
+    }
     blocks.push_back(
         ojson(handlers::runEststo(name, storeOpts.title, session, storeOpts.autoPrefix)));
     pushEstStoreMutation(blocks.back(), blocks, session);
+    for (const auto& [k, v] : addedSc) {
+      if (ojson* sn = session.estimatesGetMutable(session.activeEstimatesName)) {
+        if (sn->contains("escalars") && (*sn)["escalars"].is_object()) (*sn)["escalars"][k] = v;
+      }
+    }
     return true;
   }
 

@@ -170,6 +170,8 @@ bool interceptInputBlock(SessionState& session,
     ojson& blocks,
     const std::string& rawCmd);
 
+bool interceptDelimit(ojson& echo, ojson& blocks, const std::string& rawCmd);
+
 bool interceptMata(SessionState& session,
     ojson& blocks,
     const std::string& rawCmd);
@@ -231,6 +233,7 @@ bool noteConditionProfile(std::string& cmd,
 
 bool resolveCommandOptions(std::string& cmd,
     eval::ParsedCommand& parsed,
+    SessionState& session,
     ojson& blocks);
 
 bool checkCommunityCommand(std::string& cmdTyped,
@@ -294,5 +297,15 @@ bool requireCommandData(std::string& cmd,
 bool checkCommandArity(std::string& cmd,
     std::string& cmdTyped,
     eval::ParsedCommand& parsed,
+    ojson& blocks);
+
+// An estimation arm's refusal of a string variable in its varlist, answered
+// with Stata's code for the command (stage_validation.cpp).
+void stampStringVarlistRc(const std::string& cmd, const eval::ParsedCommand& parsed,
+                          ojson& blocks);
+
+bool checkStataLead(std::string& cmd,
+    eval::ParsedCommand& parsed,
+    SessionState& session,
     ojson& blocks);
 }

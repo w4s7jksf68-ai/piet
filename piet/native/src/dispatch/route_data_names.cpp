@@ -16,6 +16,17 @@ bool route_data_names(std::string& cmd,
 
 
   if (cmd == "rename" || cmd == "ren") {
+    if (parsed.ifExpr.has_value() || parsed.inRange.has_value()) {
+      // rename.ado reads no if/in: "syntax error", r(198) (vs-stata bank 8026de9d0f85092f)
+      blocks.push_back(ojson(eval::errorBlock(
+          "syntax_error",
+          "syntax error\n    Syntax is\n        rename  oldname    newname   [, renumber[(#)] "
+          "addnumber[(#)] sort ...]\n        rename (oldnames) (newnames) [, renumber[(#)] "
+          "addnumber[(#)] sort ...]\n        rename  oldnames              , "
+          "{upper|lower|proper}",
+          std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+      return true;
+    }
     // BUG-336 (batch 2): known set measured from the handler body -- runRename takes no options; Stata rename has none on the 1:1 form either.
     if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabRename.known, kVocabRename.unimplemented)) {
       blocks.push_back(ojson(*err));
@@ -318,9 +329,151 @@ bool route_data_names(std::string& cmd,
       }
       return true;
     }
+    // rename.ado's group form with plain names: `rename (a b) (c d)` renames
+    // each old name to the new name in the same place, as one permutation (the
+    // mapping is checked whole before anything moves).
+    {
+      const std::string spec = rawArgsAfterCmd(parsed.raw);
+      static const std::regex reGroups(R"(^\s*\(([^()]*)\)\s*\(([^()]*)\)\s*(,.*)?$)");
+      std::smatch gm;
+      if (std::regex_match(spec, gm, reGroups)) {
+        auto words = [](const std::string& t) {
+          std::vector<std::string> w;
+          std::istringstream iss(t);
+          for (std::string x; iss >> x;) w.push_back(x);
+          return w;
+        };
+        std::vector<std::string> olds = words(gm.str(1)), news = words(gm.str(2));
+        bool plain = !olds.empty();
+        for (const auto& w : olds) plain = plain && w.find_first_of("*?#-=") == std::string::npos;
+        for (const auto& w : news) plain = plain && w.find_first_of("*?#-=") == std::string::npos;
+        if (plain && renumberStart.has_value()) {
+          // renumber/addnumber number the new names through a `#` they lack here.
+          blocks.push_back(ojson(eval::errorBlock(
+              "syntax_error",
+              "missing # specifier in newname\n    You specified newname " + joinSpace(news) +
+                  ", and you specified option " +
+                  (std::any_of(parsed.opts.begin(), parsed.opts.end(),
+                               [](const auto& kv) { return kv.first == "addnumber"; })
+                       ? std::string("addnumber")
+                       : std::string("renumber")) +
+                  ".",
+              std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+          return true;
+        }
+        if (plain) {
+          if (olds.size() != news.size()) {
+            blocks.push_back(ojson(eval::errorBlock(
+                "syntax_error",
+                std::to_string(news.size()) + " new variable name" + (news.size() == 1 ? "" : "s") +
+                    " but " + std::to_string(olds.size()) + " old variable name" +
+                    (olds.size() == 1 ? "" : "s"),
+                std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+            return true;
+          }
+          if (!session.hasData()) {
+            blocks.push_back(ojson(eval::noDataLoaded()));
+            return true;
+          }
+          if (auto err = handlers::resolveByKeyNames(session, olds)) {
+            blocks.push_back(*err);
+            return true;
+          }
+          // rename.ado checks the whole mapping before anything moves: an old
+          // name given twice (after abbreviation) is r(198) "1 existing
+          // variable specified repeatedly in oldname" (confirm_names_unique).
+          {
+            std::map<std::string, int> count;
+            for (const auto& o : olds) ++count[o];
+            int repeated = 0;
+            std::string first;
+            for (const auto& o : olds)
+              if (count[o] > 1 && first.empty()) first = o;
+            for (const auto& [o, c] : count) repeated += c > 1 ? 1 : 0;
+            if (repeated > 0) {
+              const std::string pl = repeated == 1 ? "" : "s";
+              std::vector<std::string> targets;
+              for (size_t i = 0; i < olds.size() && i < news.size(); ++i)
+                if (olds[i] == first) targets.push_back(news[i]);
+              std::string list;
+              for (size_t i = 0; i < targets.size(); ++i)
+                list += (i == 0 ? "" : (i + 1 == targets.size() ? " and " : ", ")) + targets[i];
+              blocks.push_back(ojson(eval::errorBlock(
+                  "syntax_error",
+                  std::to_string(repeated) + " existing variable" + pl +
+                      " specified repeatedly in oldname" + pl + "\n    " +
+                      (repeated == 1 ? "You" : "For instance, you") + " requested " + first +
+                      " be renamed to " + std::to_string(count[first]) + " different names: " +
+                      list + ".",
+                  std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+              return true;
+            }
+          }
+          std::vector<std::string> names;
+          if (const auto* card = session.shadowVarlistIfCurrent()) {
+            for (const auto& info : *card) names.push_back(info.name);
+          } else if (Datastore* rds = session.datastore()) {
+            names = rds->names();
+          }
+          std::set<std::string> seenNew;
+          for (size_t i = 0; i < news.size(); ++i) {
+            if (!seenNew.insert(news[i]).second) {
+              blocks.push_back(ojson(eval::errorBlock(
+                  "engine_error", "1 new name specified repeatedly in newname", std::nullopt,
+                  std::nullopt, std::nullopt, "r(198)")));
+              return true;
+            }
+            if (!strutil::isValidStataIdentifier(news[i])) {
+              blocks.push_back(ojson(eval::errorBlock("syntax_error", news[i] + " invalid name",
+                                                      std::nullopt, std::nullopt, std::nullopt,
+                                                      "r(198)")));
+              return true;
+            }
+            const bool movedAway = std::find(olds.begin(), olds.end(), news[i]) != olds.end();
+            if (std::find(names.begin(), names.end(), news[i]) != names.end() && !movedAway) {
+              blocks.push_back(ojson(eval::errorBlock(
+                  "engine_error", "1 variable already exists: " + news[i], std::nullopt,
+                  std::nullopt, std::nullopt, "r(110)")));
+              return true;
+            }
+          }
+          // Two passes through reserved names (a swap is a valid mapping); a
+          // failure part-way renames everything back, so the dataset is
+          // either fully renamed or untouched.
+          std::vector<std::pair<std::string, std::string>> done;  // (from, to) applied
+          auto rollBack = [&]() {
+            for (auto it = done.rbegin(); it != done.rend(); ++it)
+              (void)handlers::runRename(it->second, it->first, session);
+          };
+          auto step = [&](const std::string& from, const std::string& to) {
+            ojson r = handlers::runRename(from, to, session);
+            if (r.is_object() && r.value("type", std::string()) == "error") {
+              rollBack();
+              blocks.push_back(r);
+              return false;
+            }
+            done.emplace_back(from, to);
+            return true;
+          };
+          for (size_t i = 0; i < olds.size(); ++i) {
+            if (olds[i] == news[i]) continue;
+            if (!step(olds[i], "__gren_" + std::to_string(i))) return true;
+          }
+          for (size_t i = 0; i < olds.size(); ++i) {
+            if (olds[i] == news[i]) continue;
+            if (!step("__gren_" + std::to_string(i), news[i])) return true;
+          }
+          return true;
+        }
+      }
+    }
     if (parsed.varlist.size() != 2) {
-      blocks.push_back(
-          ojson(eval::engineError("rename requires exactly two names: `rename old new`")));
+      // StataBE 19.5 answers every such line r(198) (vs-stata bank: `rename
+      // price`, `rename (price mpg weight) v#, addnumber`, `rename (price mpg
+      // weight), addnumber` and their abbreviations).
+      blocks.push_back(ojson(eval::errorBlock("syntax_error",
+                                              "rename requires exactly two names: `rename old new`",
+                                              std::nullopt, std::nullopt, std::nullopt, "r(198)")));
       return true;
     }
     // `replace` on the 1:1 form is accepted (aer_w2 w2b_dataio
@@ -403,13 +556,34 @@ bool route_data_names(std::string& cmd,
   // varlist expansion passes it through, so the %fmt is the LAST token or the
   // FIRST one. No %fmt at all is `format [varlist]`, which lists the formats.
   if (cmd == "format") {
-    if (auto err = eval::rejectUnknownOptions(parsed.opts, {})) {
-      blocks.push_back(ojson(*err));
-      return true;
+    // A comma inside the format token is part of the format, not the start of
+    // an option list: `%9,2f` (comma decimal point), `%tdDay,_Month_dd,_CCYY`
+    // (a date mask), and `%9.2f,` (a trailing comma, which makes the format
+    // invalid: r(120)). The tokenizer cut the line at that comma; the format is
+    // taken back whole from the raw line (vs-stata bank 5e917e3336e02fe8,
+    // 9822301cdd1860c3, bfe2543015c54582, f25f934536642595).
+    std::vector<std::string> toksFmt = parsed.varlist;
+    std::string gluedFmt;
+    if (!parsed.opts.empty() && !toksFmt.empty() && !toksFmt.back().empty() &&
+        toksFmt.back()[0] == '%') {
+      const size_t at = parsed.raw.rfind(toksFmt.back() + ",");
+      if (at != std::string::npos) {
+        size_t end = at;
+        while (end < parsed.raw.size() && !std::isspace(static_cast<unsigned char>(parsed.raw[end])))
+          ++end;
+        gluedFmt = parsed.raw.substr(at, end - at);
+        toksFmt.back() = gluedFmt;
+      }
+    }
+    if (gluedFmt.empty()) {
+      if (auto err = eval::rejectUnknownOptions(parsed.opts, {})) {
+        blocks.push_back(ojson(*err));
+        return true;
+      }
     }
     std::vector<std::string> fmtVarlist;
     std::string fmt;
-    const std::vector<std::string>& toks = parsed.varlist;
+    const std::vector<std::string>& toks = toksFmt;
     size_t nPct = 0;
     for (const auto& t : toks)
       if (!t.empty() && t[0] == '%') ++nPct;
@@ -421,6 +595,12 @@ bool route_data_names(std::string& cmd,
     } else if (nPct == 1 && toks.front()[0] == '%' && toks.size() > 1) {
       fmt = toks.front();
       fmtVarlist.assign(toks.begin() + 1, toks.end());
+    } else if (nPct == 1 && toks.size() == 1) {
+      // A format and no variable: r(100) "varlist required" (vs-stata bank
+      // `format %9.2f`).
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "varlist required", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(100)")));
+      return true;
     } else {
       blocks.push_back(ojson(eval::errorBlock(
           "syntax_error", "format: syntax is `format varlist %fmt` or `format %fmt varlist`",
@@ -431,6 +611,19 @@ bool route_data_names(std::string& cmd,
     // `format` prints nothing); pushing it as a block would make downstream
     // block processing call .value("type") on an array, which throws. Guard
     // it exactly like the other silent handlers (matrix/label/log arms).
+    // A numeric display format names its digits after the point (`%9g` is no
+    // format), and only f and g take the comma suffix: `format price %9g` and
+    // `format price %10.2ec` are r(120) "invalid %format" (vs-stata bank
+    // 7f870b6678eef902, acc0d173e3394509).
+    {
+      static const std::regex reNoPoint(R"(^%-?0?[0-9]+[efg]c?$)", std::regex::icase);
+      static const std::regex reEc(R"(^%-?0?[0-9]+\.[0-9]+ec$)", std::regex::icase);
+      if (std::regex_match(fmt, reNoPoint) || std::regex_match(fmt, reEc)) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid %format", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(120)")));
+        return true;
+      }
+    }
     ojson fr = handlers::runFormat(fmtVarlist, fmt, session);
     if (!(fr.is_array() && fr.empty())) blocks.push_back(fr);
     return true;
@@ -503,6 +696,19 @@ bool route_data_names(std::string& cmd,
         if (p != std::string::npos) p = rawArgs.find_first_not_of(" \t", p);
       }
       std::string text = (p == std::string::npos) ? "" : trimWs(rawArgs.substr(p));
+      // `label variable varname ["label"]` and nothing else: a second word before
+      // the quoted label, or a qualifier, is r(198) "invalid syntax" (vs-stata
+      // bank 788bc09ca62dd054 `label variable price mpg "two"`, ef1c17581b07352f
+      // `label variable price "x" if foreign`).
+      if (parsed.ifExpr.has_value() || parsed.inRange.has_value() ||
+          (!text.empty() && text.front() != '"' && text.front() != '`' && text.front() != '\'' &&
+           text.find('"') != std::string::npos) ||
+          (text.size() > 1 && text.front() == '"' && text.find('"', 1) != std::string::npos &&
+           !trimWs(text.substr(text.find('"', 1) + 1)).empty())) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
       // EM9: an outer compound pair `"..."' is stripped too (`label var x `"the "x"
       // var"'`, w2af_macro_text_file.log:1560; w2ao lb_var_lab_cq log:124).
       if (eval::startsCompound(text, 0) && eval::compoundSpanEnd(text, 0) == text.size()) {
@@ -608,6 +814,17 @@ bool route_data_names(std::string& cmd,
     }
     if (sub == "list") {
       std::vector<std::string> names(parsed.varlist.begin() + 1, parsed.varlist.end());
+      // The words are label names: one that is no name is r(198) "X invalid
+      // name" before any is looked up (vs-stata bank 6b6a7e7e66c80849 `label
+      // list lb 1`).
+      for (const auto& nm : names) {
+        if (nm.find_first_of("*?") == std::string::npos && !strutil::isValidStataIdentifier(nm)) {
+          blocks.push_back(ojson(eval::errorBlock("syntax_error", nm + " invalid name",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(198)")));
+          return true;
+        }
+      }
       ojson ll = ojson(handlers::runLabelList(names, session));
       if (ll.is_array()) {
         for (auto& b : ll) blocks.push_back(b);
@@ -636,6 +853,26 @@ bool route_data_names(std::string& cmd,
         text = text.substr(2, text.size() - 4);  // EM9, as `label variable`
       } else if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
         text = text.substr(1, text.size() - 2);
+      }
+      // A dataset label holds 80 characters: a longer text is cut there, with
+      // the note Stata prints (vs-stata bank 476490665286d96f).
+      {
+        size_t chars = 0, cut = text.size();
+        for (size_t i = 0; i < text.size(); ++i) {
+          if ((static_cast<unsigned char>(text[i]) & 0xC0) == 0x80) continue;
+          if (chars == 80) {
+            cut = i;
+            break;
+          }
+          ++chars;
+        }
+        if (cut < text.size()) {
+          text.resize(cut);
+          ojson note;
+          note["type"] = "display";
+          note["text"] = "note: label truncated to 80 characters";
+          blocks.push_back(note);
+        }
       }
       session.dataLabel = text;
       return true;  // silent success, as `label variable` is
@@ -683,16 +920,43 @@ bool route_data_names(std::string& cmd,
       blocks.push_back(ojson(*err));
       return true;
     }
-    // BUG-373: Stata publishes the label-set names it walked as r(names).
-    ojson lbBlk = ojson(handlers::runLabelbook(parsed.varlist, session));
-    if (lbBlk.value("type", std::string()) != "error") {
-      std::string names;
-      for (const auto& kv : session.labelDefs) {
-        if (!names.empty()) names += " ";
-        names += kv.first;
+    // The names are value-label names: one that is no label set is r(111)
+    // "value label NAME not found" (vs-stata bank `labelbook zznotalabel`), and
+    // a word that is no name r(198) "X invalid name" (`labelbook *lbl`).
+    for (const auto& nm : parsed.varlist) {
+      if (!strutil::isValidStataIdentifier(nm)) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", nm + " invalid name", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(198)")));
+        return true;
       }
-      session.eval.rStrings.set("names", names);
+      if (session.labelDefs.count(nm) == 0) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error", "value label " + nm + " not found",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(111)")));
+        return true;
+      }
     }
+    // The report and the r() lists (names, gaps, numeric, blanks, null, nuniq,
+    // nuniq_sh, notused) are the handler's.
+    handlers::LabelbookOptions lbOpt;
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "alpha") lbOpt.alpha = true;
+      else if (k == "detail") lbOpt.detail = true;
+      else if (k == "problems") lbOpt.problems = true;
+      else if (k == "length" || k == "list") {
+        long long n = 0;
+        try {
+          n = std::stoll(strutil::trim(v.strValue));
+        } catch (const std::exception&) {
+          blocks.push_back(ojson(eval::errorBlock("syntax_error", k + "() invalid", std::nullopt,
+                                                  std::nullopt, std::nullopt, "r(198)")));
+          return true;
+        }
+        if (k == "length") lbOpt.length = static_cast<int>(std::max<long long>(std::min<long long>(n, 100000), -1));
+        else lbOpt.list = n;
+      }
+    }
+    ojson lbBlk = ojson(handlers::runLabelbook(parsed.varlist, session, lbOpt));
     blocks.push_back(std::move(lbBlk));
     return true;
   }

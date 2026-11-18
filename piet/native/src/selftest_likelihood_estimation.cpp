@@ -79,11 +79,13 @@ void testD2BS069Tobit() {
     }
   }
 
-  // Neither ll() nor ul() given -> honest reject (Stata itself requires at
-  // least one; cobra's own usage banner says the same).
+  // Neither ll() nor ul() given: Stata fits it (gsem's uncensored normal model;
+  // vs-stata bank fa235e5d `tobit mpg weight` rc 0, iteration 0 -195.38869), so
+  // PIET does too (this leg used to pin a refusal on the premise that Stata
+  // requires a limit).
   (void)piet::dispatch("capture tobit income beertax spirits", session);
-  check(session.eval.locals.get("_rc", "") != "0",
-        "D2/BS-069: `tobit` with neither ll() nor ul() honestly rejects");
+  check(session.eval.locals.get("_rc", "") == "0",
+        "D2/BS-069: `tobit` with neither ll() nor ul() fits (Stata's uncensored model)");
 
   // SUPERSEDED 2026-08-07 (BUG-202 + BUG-274). This leg used to pin the honest REFUSAL, on the
   // premise that "cobra's tobit has no --level surface at all". That premise was true when it was
@@ -217,20 +219,33 @@ void testD2BS070Heckman() {
                 std::to_string(est->value("n_selected", -1)));
       check(est->value("depvar", std::string()) == "inc_obs",
             "D2c: depvar is \"inc_obs\" (cobra heckman's raw JSON carries no depvar of its own)");
+      // outcome + selection, then Stata's /mills section (lambda, rho, sigma; the
+      // table of vs-stata bank b6e7e050 `heckman ..., select(...) twostep`)
       check(est->contains("outcomes") && est->at("outcomes").is_array() &&
-                est->at("outcomes").size() == 2,
-            "D2c: block carries a two-equation outcomes[] array (outcome + selection), reusing "
-            "D1 reg3's adapter shape");
+                est->at("outcomes").size() == 3 &&
+                est->at("outcomes")[1].value("depvar", std::string()) == "high" &&
+                est->at("outcomes")[2].value("depvar", std::string()) == "/mills",
+            "D2c: block carries the outcome and selection equations and the /mills section "
+            "in outcomes[], reusing D1 reg3's adapter shape");
     }
   }
 
-  // Stata's DEFAULT (no `twostep`) is full MLE — not supported by the
-  // engine (two-step Heckit only, live-verified) — honest reject rather
-  // than silently answering an MLE request with two-step numbers.
-  (void)piet::dispatch("capture heckman inc_obs beertax, select(high = spirits unemp)", session);
-  check(session.eval.locals.get("_rc", "") != "0",
-        "D2/BS-070: `heckman ..., select(...)` with no `twostep` (Stata's default full-MLE) "
-        "honestly rejects");
+  // Stata's DEFAULT (no `twostep`) is full MLE, which the engine fits (vs-stata bank
+  // fdeed49b). The two-step start of this design is not concave; ml's nr steps
+  // through it (m-marquardt) to the likelihood's interior maximum, ll -1144.5736
+  // (athrho -1.7092: an independent maximisation of the same likelihood, gradient
+  // < 5e-6 and -H positive definite there) -- never the two-step numbers above.
+  {
+    (void)piet::dispatch("capture heckman inc_obs beertax, select(high = spirits unemp)", session);
+    check(session.eval.locals.get("_rc", "") == "0",
+          "D2/BS-070: `heckman ..., select(...)` full ML fits from a non-concave start");
+    (void)piet::dispatch("local heckll = e(ll)", session);
+    const std::string llText = session.eval.locals.get("heckll", "");
+    char* end = nullptr;
+    const double llv = std::strtod(llText.c_str(), &end);
+    check(!llText.empty() && end != nullptr && *end == '\0' && std::abs(llv - (-1144.5736)) < 1e-3,
+          "D2/BS-070: full-ML heckman reaches the maximum, e(ll) ~= -1144.5736, got " + llText);
+  }
 
   // select() missing entirely -> honest reject.
   (void)piet::dispatch("capture heckman inc_obs beertax, twostep", session);
@@ -549,10 +564,19 @@ void testD3BS073Poisson() {
         "D3/BS-073: `poisson ..., absorb(...)` honestly rejects (real Stata's poisson has no "
         "absorb() option)");
 
-  // noconstant/level() never forwarded (engine masking-bug precedent).
+  // level(#) is served by PIET, never forwarded to the engine (masking-bug
+  // precedent): the reported interval and r(table) at the level (vs-stata bank
+  // e140142b `poisson fatal beertax unemp, level(90)`: r(table) crit 1.6448536).
   (void)piet::dispatch("capture poisson cnt beertax unemp, level(90)", session);
-  check(session.eval.locals.get("_rc", "") != "0",
-        "D3/BS-073: `poisson ..., level(90)` honestly rejects (engine masking-bug precedent)");
+  check(session.eval.locals.get("_rc", "") == "0",
+        "D3/BS-073: `poisson ..., level(90)` runs (bank e140142b rc 0)");
+  {
+    const auto* rt = session.eval.findClassMatrix('r', "table");
+    check(rt != nullptr && rt->data.size() == 9 && !rt->data[7].empty() &&
+              std::fabs(rt->data[7][0] - 1.6448536269514722) < 1e-9,
+          "D3/BS-073: `poisson ..., level(90)` posts r(table) at 90% (crit 1.6448536)");
+  }
+  // noconstant is never forwarded (engine masking-bug precedent).
   (void)piet::dispatch("capture poisson cnt beertax unemp, noconstant", session);
   check(session.eval.locals.get("_rc", "") != "0",
         "D3/BS-073: `poisson ..., noconstant` honestly rejects (engine masking-bug precedent)");
@@ -823,13 +847,17 @@ void testD3BS075XtPoisXtLogit() {
     }
   }
 
-  // RE/bare all honest-reject (engine has no random-effects/PA form).
+  // `, re` and the bare command (Stata's default) fit the gamma random-effects model
+  // (vs-stata bank 98510dbe `xtpoisson fatal beertax unemp, re` and f8d5160a
+  // `xtpoisson fatal beertax unemp`, both rc 0). These legs used to pin a refusal on
+  // the premise that the engine had no RE xtpoisson; it has, and on this design its
+  // ml iteration steps through the non-concave start (m-marquardt) to the maximum.
   (void)piet::dispatch("capture xtpoisson cnt beertax unemp, re", session);
-  check(session.eval.locals.get("_rc", "") != "0",
-        "D3/BS-075: `xtpoisson ..., re` honestly rejects (engine has no RE xtpoisson)");
+  check(session.eval.locals.get("_rc", "") == "0",
+        "D3/BS-075: `xtpoisson ..., re` fits the gamma random-effects model");
   (void)piet::dispatch("capture xtpoisson cnt beertax unemp", session);
-  check(session.eval.locals.get("_rc", "") != "0",
-        "D3/BS-075: bare `xtpoisson ...` (Stata's own RE default) honestly rejects");
+  check(session.eval.locals.get("_rc", "") == "0",
+        "D3/BS-075: bare `xtpoisson ...` fits Stata's default random-effects model");
   (void)piet::dispatch("capture xtlogit hi2 beertax unemp, re", session);
   check(session.eval.locals.get("_rc", "") != "0",
         "D3/BS-075: `xtlogit ..., re` honestly rejects (engine has no RE xtlogit)");

@@ -215,8 +215,10 @@ ojson runStrdist(const eval::ParsedCommand& parsed, SessionState& session) {
   const std::string target = genName.empty() ? std::string("strdist") : genName;
   if (auto err = strdistNewVar(session, target)) return *err;
 
+  std::optional<std::string> numericVar;  // strdist takes string variables only
   auto columnOf = [&](const std::string& nm) -> std::optional<std::vector<std::string>> {
     if (!ds->has(nm)) return std::nullopt;
+    if (ds->dtype(nm) != "factor" && !numericVar.has_value()) numericVar = nm;
     return columnAsStrings(*ds, nm);
   };
   std::vector<std::string> left, right;
@@ -244,6 +246,10 @@ ojson runStrdist(const eval::ParsedCommand& parsed, SessionState& session) {
     right = *c2;
   }
 
+  if (numericVar.has_value())
+    return utilErrorRc("numeric variables not allowed in varlist;\n" + *numericVar +
+                           " is a numeric variable",
+                       109);
   // `if`/`in` are NOT accepted, and the registry row says so rather than this
   // handler silently ignoring them. The package marks rows out with a `touse`
   // and writes only into it, so an excluded row keeps a missing -- a real
@@ -261,6 +267,10 @@ ojson runStrdist(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = writeColumn(session, ds->path(), target, cells, "f64", true, &outPath))
     return *err;
   session.load(outPath);
+  // The ado ends `return scalar d = r(d)` on every path; the variable path's
+  // subroutine posts no r(d), so Stata's r(d) is missing (vs-stata truth bank:
+  // `strdist make make2` leaves r(d) `.` and r(strdist) "strdist").
+  session.eval.rValues.set("d", std::numeric_limits<double>::quiet_NaN());
   session.eval.rStrings.set("strdist", target);
   blocks.push_back(mutationResult(session, "gen", {target}, {}));
   return blocks;

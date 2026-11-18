@@ -31,7 +31,7 @@ nlohmann::ordered_json runTestCmd(const std::string& expr, SessionState& session
 // coefficient names (not the dataset's variables — a coefficient is what can be
 // constrained), after which it delegates to runTestCmd unchanged.
 nlohmann::ordered_json runTestparm(const std::vector<std::string>& varlist,
-                                   SessionState& session);
+                                   SessionState& session, bool equal = false);
 nlohmann::ordered_json runLincom(const std::string& expr, SessionState& session,
                                  const std::vector<std::pair<std::string, eval::OptValue>>& opts = {});
 nlohmann::ordered_json runNlcom(const std::string& expr, SessionState& session,
@@ -81,7 +81,13 @@ std::optional<nlohmann::ordered_json> runMarginsGrid(
 void postGlmDydxRClass(SessionState& session, const nlohmann::ordered_json& block,
                        const std::vector<std::string>& names, const std::vector<double>& b,
                        const std::vector<std::vector<double>>& V, const nlohmann::ordered_json& tableRows,
-                       const std::string& xvars, bool cluster);
+                       const std::string& xvars, bool cluster,
+                       const std::vector<std::vector<double>>* jacobian = nullptr);
+// Called by the router around runGlmMargins: the fit's e() half of margins'
+// r() set, read while e() is still the glm's (postGlmDydxRClass consumes it;
+// the router clears it after, so a refused glm margins leaves nothing behind).
+void captureGlmMarginsFit(SessionState& session);
+void clearGlmMarginsFit();
 
 // `predict [NEWVAR] [, xb|resid|residuals|fe]` — reconstructs the last model
 // and calls cobra predict; unsupported statistics (cooksd/leverage/hat/...)
@@ -93,7 +99,12 @@ void postGlmDydxRClass(SessionState& session, const nlohmann::ordered_json& bloc
 nlohmann::ordered_json runPredict(const std::vector<std::string>& varlist,
                                    const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                    SessionState& session,
-                                   const std::optional<std::string>& ifExpr = std::nullopt);
+                                   const std::optional<std::string>& ifExpr = std::nullopt,
+                                   const std::vector<std::pair<std::string, eval::OptValue>>* typedOpts = nullptr);
+
+// heckman's mills(newvar) / nshazard(newvar): the nonselection hazard of the fit
+// just posted, over e(sample) (prediction.cpp).
+nlohmann::ordered_json runHeckmanMillsVar(SessionState& session, const std::string& name);
 
 // `estat SUBCMD [...]` — two families: (i) hettest/ovtest/vif/dwatson/
 // bgodfrey/archlm rewrite to the equivalent top-level diagnostic command

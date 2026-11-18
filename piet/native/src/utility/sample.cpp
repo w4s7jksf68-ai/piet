@@ -29,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include "piet/datastore.h"   // marksample: which varlist members are strings
 #include "piet/dispatcher.h"  // marksample / tsspell cond(): a dispatched `generate`
 #include "piet/eval/errors.h"
 #include "piet/eval/tokenizer.h"
@@ -72,15 +73,26 @@ ojson runMarksample(const eval::ParsedCommand& parsed, SessionState& session) {
   if (minted == nullptr || minted->empty())
     return utilError("marksample: could not mint a temporary variable name", "internal");
 
+  // [P] mark, rules 5-6: a numeric variable of `varlist` marks out its
+  // missing values; a string variable marks out EVERY observation unless
+  // `strok` is given, and then only its "" ones (truth bank scoping
+  // marksample_string_var_default `pm make price` -> 0, marksample_strok -> 71).
+  const bool strok = hasFlag(parsed.opts, "strok");
   std::string cond = "1";
   if (!hasFlag(parsed.opts, "novarlist")) {
     const std::string* vl = session.eval.locals.find("varlist");
     const std::vector<std::string> vars = vl ? splitWs(*vl) : std::vector<std::string>();
+    Datastore* ds = session.datastore();
     if (!vars.empty()) {
       cond.clear();
       for (const auto& v : vars) {
+        const bool isStr = ds != nullptr && ds->has(v) && ds->dtype(v) != "f64";
+        if (isStr && !strok) {
+          cond = "0";
+          break;
+        }
         if (!cond.empty()) cond += " & ";
-        cond += "!missing(" + v + ")";
+        cond += isStr ? "(" + v + " != \"\")" : "!missing(" + v + ")";
       }
     }
   }
@@ -96,7 +108,10 @@ ojson runMarksample(const eval::ParsedCommand& parsed, SessionState& session) {
     std::string w = *eL;
     const size_t eq = w.find('=');
     if (eq != std::string::npos) w = w.substr(eq + 1);
-    cond = "(" + cond + ") & !missing(" + w + ") & (" + w + ") != 0";
+    // Rule 1, which `zeroweight` deletes: a zero weight marks the row out
+    // (truth bank scoping marksample_zeroweight: 50 without, 74 with).
+    cond = "(" + cond + ") & !missing(" + w + ")";
+    if (!hasFlag(parsed.opts, "zeroweight")) cond += " & (" + w + ") != 0";
   }
   std::string qual;
   if (ifL != nullptr && !ifL->empty()) qual += " " + *ifL;

@@ -9,9 +9,11 @@
 #pragma once
 #include "core/threads.h"
 #include <cmath>
+#include <functional>
 #include <vector>
 
 #include "core/linalg.h"
+#include "estimators/logit.h"  // MlObjective, ml_newton_path: Stata's ml iteration
 
 namespace cecon {
 
@@ -26,6 +28,11 @@ struct TobitResult {
     bool converged = false;
     bool ok = false;
     std::vector<double> vcov;   // (k+1)*(k+1) in (β, lnσ) metric
+    // Stata's iteration (gsem's ml in the (β, var) metric from its starting values):
+    // the log likelihood at iterations 0..iters, and the final point's gradient in
+    // that metric (β..., var).
+    std::vector<double> ilog;
+    std::vector<double> grad_var;
 };
 
 namespace tob {
@@ -180,6 +187,65 @@ inline double ll_grad_w(const double* X, int64_t n, int k, const double* y,
     }
     return LL;
 }
+
+// The analytic Hessian of the (weighted) log likelihood at theta = (β, lnσ),
+// np x np row-major, the observed information's negative. Per row, with the
+// residual scale sc (aweight; 1 otherwise) and weight lw:
+//   uncensored  z = sc(y-xb)/σ:  ββ -(sc/σ)² xx', βθ -2 z (sc/σ) x, θθ -2 z²
+//   left  a = sc(ll-xb)/σ, λ = φ(a)/Φ(a):  ββ -(sc/σ)² λ(a+λ) xx',
+//         βθ (sc/σ) λ (1 - a(a+λ)) x, θθ λ a (1 - a(a+λ))
+//   right a = sc(ul-xb)/σ, δ = φ(a)/(1-Φ(a)):  ββ -(sc/σ)² δ(δ-a) xx',
+//         βθ -(sc/σ) δ (1 + a(δ-a)) x, θθ -δ a (1 + a(δ-a))
+// (the second derivatives of ll_grad_w's terms). The numerical Hessian it
+// replaces was off by ~1e-7 relative where x's scale makes the β step coarse.
+inline void hess_w(const double* X, int64_t n, int k, const double* y,
+                   const std::vector<int8_t>& cls, double ll_lim, double ul_lim,
+                   const std::vector<double>& theta, const double* lw, const double* sc,
+                   std::vector<double>& H) {
+    const int np = k + 1;
+    H.assign(static_cast<size_t>(np) * np, 0.0);
+    const double sigma = std::exp(theta[k]);
+    std::vector<double> xi(k);
+    for (int64_t i = 0; i < n; ++i) {
+        const double wl = lw ? lw[i] : 1.0, si = sc ? sc[i] : 1.0, r = si / sigma;
+        double xb = 0;
+        for (int p = 0; p < k; ++p) {
+            xi[p] = X[static_cast<int64_t>(p) * n + i];
+            xb += xi[p] * theta[p];
+        }
+        double hbb, hbt, htt;
+        if (cls[i] == 0) {
+            const double z = si * (y[i] - xb) / sigma;
+            hbb = -r * r;
+            hbt = -2.0 * z * r;
+            htt = -2.0 * z * z;
+        } else if (cls[i] == 1) {
+            const double a = si * (ll_lim - xb) / sigma;
+            double Phi = ncdf(a);
+            if (Phi < 1e-300) Phi = 1e-300;
+            const double lam = npdf(a) / Phi, q = 1.0 - a * (a + lam);
+            hbb = -r * r * lam * (a + lam);
+            hbt = r * lam * q;
+            htt = lam * a * q;
+        } else {
+            const double a = si * (ul_lim - xb) / sigma;
+            double Sv = 1.0 - ncdf(a);
+            if (Sv < 1e-300) Sv = 1e-300;
+            const double del = npdf(a) / Sv, q = 1.0 + a * (del - a);
+            hbb = -r * r * del * (del - a);
+            hbt = -r * del * q;
+            htt = -del * a * q;
+        }
+        hbb *= wl; hbt *= wl; htt *= wl;
+        for (int p = 0; p < k; ++p) {
+            for (int q2 = 0; q2 <= p; ++q2) H[static_cast<size_t>(p) * np + q2] += hbb * xi[p] * xi[q2];
+            H[static_cast<size_t>(k) * np + p] += hbt * xi[p];
+        }
+        H[static_cast<size_t>(k) * np + k] += htt;
+    }
+    for (int p = 0; p < np; ++p)
+        for (int q2 = 0; q2 < p; ++q2) H[static_cast<size_t>(q2) * np + p] = H[static_cast<size_t>(p) * np + q2];
+}
 }  // namespace tob
 
 // Robust (sandwich) VCE for a converged tobit_fit result. V = factor * bread *
@@ -196,7 +262,8 @@ inline double ll_grad_w(const double* X, int64_t n, int k, const double* y,
 inline std::vector<double> tobit_robust_vcov(const double* X, int64_t n, int k, const double* y,
                                              bool has_ll, double ll_lim, bool has_ul, double ul_lim,
                                              const TobitResult& r, double factor,
-                                             const double* mw = nullptr, const double* sc = nullptr) {
+                                             const double* mw = nullptr, const double* sc = nullptr,
+                                             const std::vector<int64_t>* cluster = nullptr) {
     const int np = k + 1;
     if (static_cast<int>(r.vcov.size()) != np * np || !r.ok) return {};
     std::vector<int8_t> cls(static_cast<size_t>(n), 0);
@@ -212,7 +279,19 @@ inline std::vector<double> tobit_robust_vcov(const double* X, int64_t n, int k, 
     else
         tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, theta, nullptr, &S);
     std::vector<double> meat(static_cast<size_t>(np) * np, 0.0);
-    la::xtx(S.data(), n, np, meat.data());
+    if (cluster != nullptr && static_cast<int64_t>(cluster->size()) == n) {
+        // vce(cluster): the rows' scores summed within each cluster
+        int64_t G = 0;
+        for (int64_t c : *cluster) G = std::max<int64_t>(G, c + 1);
+        std::vector<double> Sg(static_cast<size_t>(G) * np, 0.0);  // col-major G x np
+        for (int64_t i = 0; i < n; ++i)
+            for (int p = 0; p < np; ++p)
+                Sg[static_cast<size_t>(p) * G + static_cast<size_t>((*cluster)[static_cast<size_t>(i)])] +=
+                    S[static_cast<size_t>(p) * n + i];
+        la::xtx(Sg.data(), G, np, meat.data());
+    } else {
+        la::xtx(S.data(), n, np, meat.data());
+    }
     std::vector<double> V(static_cast<size_t>(np) * np, 0.0), tmp(static_cast<size_t>(np) * np, 0.0);
     la::sandwich(r.vcov.data(), meat.data(), np, factor, V.data(), tmp.data());
     return V;
@@ -221,9 +300,11 @@ inline std::vector<double> tobit_robust_vcov(const double* X, int64_t n, int k, 
 // X is col-major n*k (intercept included). has_ll/has_ul gate left/right censoring.
 // lw/sc (BUG-1544): a weighted fit's likelihood weights and aweight scale, as
 // tob::ll_grad_w reads them; nullptr for both is the unweighted fit.
+// maxiter: Stata's iterate(#) (< 0: the default c(maxiter) 300).
 inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
                              bool has_ll, double ll_lim, bool has_ul, double ul_lim,
-                             const double* lw = nullptr, const double* sc = nullptr) {
+                             const double* lw = nullptr, const double* sc = nullptr,
+                             int maxiter = -1) {
     TobitResult r;
     std::vector<int8_t> cls(n, 0);
     for (int64_t i = 0; i < n; ++i) {
@@ -233,18 +314,24 @@ inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
     }
     r.n = n;
     int np = k + 1;
-    // start: OLS β over all obs, σ = sd of residuals. A weighted fit starts from the
-    // least squares on rows scaled by sqrt(lw*sc^2), its precision-weighted fit.
+    // Starting values (Stata's tobit, which fits gsem): least squares of the depvar
+    // CLAMPED to its limits (a left-censored row at ll, a right-censored one at ul)
+    // and the variance rss/N of that fit (vs-stata bank 8328f8b5 `tobit mpg weight,
+    // ll(17)`: Iteration 0 log likelihood -170.32555, the value at this point). A
+    // weighted fit starts from the least squares on rows scaled by sqrt(lw*sc^2),
+    // its precision-weighted fit.
     const bool weighted = lw != nullptr || sc != nullptr;
     std::vector<double> theta(np, 0.0);
     {
-        std::vector<double> Xv, yv;
+        std::vector<double> Xv, yv(y, y + n);
+        for (int64_t i = 0; i < n; ++i) {
+            if (cls[i] == 1) yv[static_cast<size_t>(i)] = ll_lim;
+            else if (cls[i] == 2) yv[static_cast<size_t>(i)] = ul_lim;
+        }
         const double* Xs = X;
-        const double* ys = y;
         double sv = static_cast<double>(n);
         if (weighted) {
             Xv.assign(X, X + static_cast<size_t>(n) * k);
-            yv.assign(y, y + n);
             sv = 0;
             for (int64_t i = 0; i < n; ++i) {
                 const double si = sc ? sc[i] : 1.0, v = (lw ? lw[i] : 1.0) * si * si, rt = std::sqrt(v);
@@ -253,8 +340,8 @@ inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
                 for (int p = 0; p < k; ++p) Xv[static_cast<size_t>(p) * n + i] *= rt;
             }
             Xs = Xv.data();
-            ys = yv.data();
         }
+        const double* ys = yv.data();
         std::vector<double> XtX(static_cast<size_t>(k) * k), Xty(k);
         la::xtx(Xs, n, k, XtX.data());
         la::xtv(Xs, n, k, ys, Xty.data());
@@ -274,34 +361,82 @@ inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
                         : tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, th, gr);
     };
 
+    // Stata's iteration: ml's modified Newton-Raphson (ml_newton_path: step halving,
+    // forward extension, the tol/ltol/nrtol stop) in the (β, var) metric gsem fits
+    // tobit's residual variance in (bank 8328f8b5: iterations 1..4 -164.66209
+    // -164.25472 -164.25438 -164.25438, which this path reproduces; the (β, lnσ)
+    // or (β, σ) metric takes other steps). Its log is e(ilog) and its count e(ic).
+    struct VarMetric final : MlObjective {
+        const std::function<double(const std::vector<double>&, std::vector<double>*)>& f;
+        const std::function<void(const std::vector<double>&, std::vector<double>&)>& hessian;
+        int k;
+        VarMetric(const std::function<double(const std::vector<double>&, std::vector<double>*)>& fn,
+                  const std::function<void(const std::vector<double>&, std::vector<double>&)>& hf,
+                  int kk) : f(fn), hessian(hf), k(kk) {}
+        // (β, var) -> the ll and its (β, var) gradient through (β, lnσ = ln(var)/2)
+        double at(const std::vector<double>& b, std::vector<double>* g) {
+            if (!(b[static_cast<size_t>(k)] > 0.0) || !std::isfinite(b[static_cast<size_t>(k)]))
+                return -HUGE_VAL;
+            std::vector<double> th(b);
+            th[static_cast<size_t>(k)] = 0.5 * std::log(b[static_cast<size_t>(k)]);
+            const double v = f(th, g);
+            if (g) (*g)[static_cast<size_t>(k)] /= 2.0 * b[static_cast<size_t>(k)];
+            return v;
+        }
+        double loglik(const std::vector<double>& b) override { return at(b, nullptr); }
+        double evaluate(const std::vector<double>& b, std::vector<double>& g,
+                        std::vector<double>& A) override {
+            // ll and gradient in (β, var); A = -H in (β, var) from the analytic
+            // (β, lnσ) Hessian: θ = ln(var)/2, dθ/dvar = 1/(2 var), d²θ/dvar² = -1/(2 var²)
+            const size_t m = b.size();
+            g.assign(m, 0.0);
+            const double ll = at(b, &g);
+            A.assign(m * m, 0.0);
+            if (!std::isfinite(ll)) return ll;
+            const double v = b[static_cast<size_t>(k)];
+            std::vector<double> th(b);
+            th[static_cast<size_t>(k)] = 0.5 * std::log(v);
+            std::vector<double> Hq;
+            hessian(th, Hq);
+            const double d1 = 1.0 / (2.0 * v), d2 = -1.0 / (2.0 * v * v);
+            const double gth = g[static_cast<size_t>(k)] * 2.0 * v;  // dll/dθ
+            for (size_t i = 0; i < m; ++i)
+                for (size_t j = 0; j < m; ++j) {
+                    double h = Hq[i * m + j];
+                    if (i == static_cast<size_t>(k)) h *= d1;
+                    if (j == static_cast<size_t>(k)) h *= d1;
+                    if (i == static_cast<size_t>(k) && j == static_cast<size_t>(k)) h += gth * d2;
+                    A[i * m + j] = -h;
+                }
+            return ll;
+        }
+    };
+    const std::function<double(const std::vector<double>&, std::vector<double>*)> llf = llg;
+    const std::function<void(const std::vector<double>&, std::vector<double>&)> hesf =
+        [&](const std::vector<double>& th, std::vector<double>& Hq) {
+            tob::hess_w(X, n, k, y, cls, ll_lim, ul_lim, th, lw, sc, Hq);
+        };
+    VarMetric vm(llf, hesf, k);
+    MlMaxOptions mopt;
+    mopt.maxiter = maxiter >= 0 ? maxiter : 300;
+    std::vector<double> start(theta);
+    start[static_cast<size_t>(k)] = std::exp(2.0 * theta[static_cast<size_t>(k)]);
+    MlPath path = ml_newton_path(vm, start, mopt);
+    r.ilog = path.ilog;
+    if (path.failed || path.b.size() != static_cast<size_t>(np) || !(path.b[static_cast<size_t>(k)] > 0.0))
+        return r;
+    theta = path.b;
+    theta[static_cast<size_t>(k)] = 0.5 * std::log(path.b[static_cast<size_t>(k)]);
+    const bool path_converged = path.converged;
+
     std::vector<double> grad(np);
     int it = 0;
     std::vector<double> H(static_cast<size_t>(np) * np);
-    for (; it < 200; ++it) {
+    // A converged path continues to the MLE (BUG-1550, below); iterate(#)'s cap,
+    // reached first, stops where ml stopped.
+    for (; path_converged && it < 200; ++it) {
         double LL = llg(theta, &grad);
-        // numerical Hessian = d(grad)/d(theta), central difference.
-        // Column j reads only theta and j and writes only H[:, j] -- no accumulator is
-        // shared between columns -- so evaluating them concurrently returns the
-        // identical matrix, with no summation order to reorder. These 2*np full-data
-        // gradient passes are what a Newton step costs here. (PERFSWEEP H.)
-        parallel_for(np, [&](int64_t jj) {
-            const int j = static_cast<int>(jj);
-            thread_local std::vector<double> gp, gm, tp, tm;
-            gp.resize(static_cast<size_t>(np));
-            gm.resize(static_cast<size_t>(np));
-            double h = 1e-6 * (std::fabs(theta[j]) + 1.0);
-            tp = theta; tm = theta;
-            tp[j] += h; tm[j] -= h;
-            llg(tp, &gp);
-            llg(tm, &gm);
-            for (int i = 0; i < np; ++i)
-                H[static_cast<size_t>(i) * np + j] = (gp[i] - gm[i]) / (2 * h);
-        }, threads_for_work(static_cast<int64_t>(np) * n));
-        for (int i = 0; i < np; ++i)
-            for (int j = i + 1; j < np; ++j) {
-                double s = 0.5 * (H[static_cast<size_t>(i) * np + j] + H[static_cast<size_t>(j) * np + i]);
-                H[static_cast<size_t>(i) * np + j] = H[static_cast<size_t>(j) * np + i] = s;
-            }
+        hesf(theta, H);  // the analytic Hessian (tob::hess_w)
         // step = -H^{-1} grad  (H is negative definite at a max => -H pos def)
         std::vector<double> negH(static_cast<size_t>(np) * np);
         for (size_t i = 0; i < negH.size(); ++i) negH[i] = -H[i];
@@ -332,32 +467,37 @@ inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
             }
         }
         theta = cand;
-        if (smax <= 1e-10) { ++it; r.converged = true; break; }
+        if (smax <= 1e-10) { ++it; break; }
     }
-    r.iters = it;
+    r.iters = path.ic;
+    r.converged = path_converged;
     // final LL + observed-information VCE in (β, lnσ)
     double LL = llg(theta, &grad);
-    parallel_for(np, [&](int64_t jj) {  // same column-independence as the loop's Hessian
-        const int j = static_cast<int>(jj);
-        thread_local std::vector<double> gp, gm, tp, tm;
-        gp.resize(static_cast<size_t>(np));
-        gm.resize(static_cast<size_t>(np));
-        double h = 1e-6 * (std::fabs(theta[j]) + 1.0);
-        tp = theta; tm = theta;
-        tp[j] += h; tm[j] -= h;
-        llg(tp, &gp);
-        llg(tm, &gm);
-        for (int i = 0; i < np; ++i) H[static_cast<size_t>(i) * np + j] = (gp[i] - gm[i]) / (2 * h);
-    }, threads_for_work(static_cast<int64_t>(np) * n));
-    for (int i = 0; i < np; ++i)
-        for (int j = i + 1; j < np; ++j) {
-            double s = 0.5 * (H[static_cast<size_t>(i) * np + j] + H[static_cast<size_t>(j) * np + i]);
-            H[static_cast<size_t>(i) * np + j] = H[static_cast<size_t>(j) * np + i] = s;
-        }
+    hesf(theta, H);
     std::vector<double> V(static_cast<size_t>(np) * np);
     for (size_t i = 0; i < V.size(); ++i) V[i] = -H[i];
-    if (la::spd_inverse(V.data(), np) != 0) return r;
+    std::vector<double> bv(theta);
+    bv[static_cast<size_t>(k)] = std::exp(2.0 * theta[static_cast<size_t>(k)]);
+    if (!path_converged) {
+        // Stopped short of the maximum (iterate(#)): the variance is the inverse of
+        // -H in the (β, var) metric ml iterated in, which differs from the (β, lnσ)
+        // one's where the gradient is not 0; carried here in the (β, lnσ) metric
+        // (V_lnσ = J V_var J', d lnσ / d var = 1 / (2 var)).
+        std::vector<double> gq, A;
+        vm.evaluate(bv, gq, A);
+        V = A;
+        if (la::spd_inverse(V.data(), np) != 0) return r;
+        const double d = 1.0 / (2.0 * bv[static_cast<size_t>(k)]);
+        for (int i = 0; i < np; ++i) {
+            V[static_cast<size_t>(i) * np + k] *= d;
+            V[static_cast<size_t>(k) * np + i] *= d;
+        }
+    } else if (la::spd_inverse(V.data(), np) != 0) {
+        return r;
+    }
     r.vcov = V;
+    r.grad_var.assign(static_cast<size_t>(np), 0.0);
+    vm.at(bv, &r.grad_var);
     r.beta.assign(theta.begin(), theta.begin() + k);
     r.se.resize(k);
     for (int c = 0; c < k; ++c) r.se[c] = std::sqrt(std::max(0.0, V[static_cast<size_t>(c) * np + c]));

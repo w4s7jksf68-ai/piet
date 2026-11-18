@@ -29,6 +29,7 @@
 #include "piet/scratch_seq.h"
 #include "piet/stata_format.h"
 #include "estimation_internal.h"
+#include "postestimation/rtable_internal.h"  // stataColumns: a factor fit's e(b) columns
 #include "estimators/posthest.h"  // cecon::margins_parse_at (header-inline)
 
 #include "extended_estimation_internal.h"
@@ -63,9 +64,38 @@ ojson runTobit(const eval::ParsedCommand& parsed, SessionState& session) {
       if (!v.isBool) ulVal = v.strValue;
     }
   }
-  if (!sawLl && !sawUl) {
-    return engineErrorBlockM4("syntax_error: tobit requires at least one of ll()/ul()",
-                              "syntax_error");
+  // Neither ll() nor ul(): Stata fits the uncensored normal model by maximum
+  // likelihood (gsem's gaussian regress; vs-stata bank fa235e5d `tobit mpg weight`:
+  // Limits -inf / +inf, var(e.mpg) 11.50634 = rss / N).
+
+  // ll(#) above ul(#): Stata's r(198) "observations with ll() > ul() not allowed"
+  // (vs-stata bank 3218474c `tobit mpg weight, ll(30) ul(17)`); the engine's MLE
+  // failed on it at rc 1.
+  if (llVal.has_value() && ulVal.has_value()) {
+    char* e1 = nullptr;
+    char* e2 = nullptr;
+    const std::string a = trimM4(*llVal), b = trimM4(*ulVal);
+    const double lo = std::strtod(a.c_str(), &e1), hi = std::strtod(b.c_str(), &e2);
+    if (!a.empty() && !b.empty() && e1 != nullptr && *e1 == '\0' && e2 != nullptr && *e2 == '\0' &&
+        lo > hi)
+      return stataRefusalM4b("observations with ll() > ul() not allowed", 198);
+  }
+
+  // ll(varname) / ul(varname): Stata's per-observation limits (vs-stata bank 631a18de
+  // `tobit mpg weight, ll(lo)`). The engine takes one number per limit, and the
+  // value reached it as text it could not read (rc 1 "stod: no conversion"):
+  // refused by name.
+  for (const auto* lim : {&llVal, &ulVal}) {
+    if (!lim->has_value()) continue;
+    const std::string t = trimM4(**lim);
+    char* e = nullptr;
+    (void)std::strtod(t.c_str(), &e);
+    if (!t.empty() && (e == nullptr || *e != '\0'))
+      return engineErrorBlockM4("Option `" + std::string(lim == &llVal ? "ll" : "ul") + "(" + t +
+                                    ")` with a variable or expression is valid Stata that this "
+                                    "version of PIET does not implement for `tobit`: only a number "
+                                    "is supported.",
+                                "unsupported_option");
   }
 
   std::vector<std::string> argv = {"tobit", "--y", y, "--x", joinCommaM4(xs)};
@@ -138,6 +168,20 @@ ojson runTobit(const eval::ParsedCommand& parsed, SessionState& session) {
   for (const auto& [k, v] : parsed.opts) {
     if (k != "vce" && k != "robust") continue;
     const std::string want = v.isBool ? std::string("robust") : lowerM4(v.strValue);
+    // vce(cluster V): the engine's --cluster (scores summed within V, G/(G-1))
+    {
+      std::istringstream is(v.isBool ? std::string() : v.strValue);
+      std::string w0, cv, extra;
+      is >> w0 >> cv >> extra;
+      const std::string w0l = lowerM4(w0);
+      static const std::regex reVar(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
+      if (k == "vce" && w0l.size() >= 2 && std::string("cluster").compare(0, w0l.size(), w0l) == 0 &&
+          !cv.empty() && extra.empty() && std::regex_match(cv, reVar)) {
+        argv.push_back("--cluster");
+        argv.push_back(cv);
+        continue;
+      }
+    }
     if (want != "robust") {
       return engineErrorBlockM4(
           "vce(" + want + ") is not supported for `tobit` in this engine; vce(robust) is",
@@ -170,11 +214,28 @@ ojson runTobit(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
 
+  // iterate(#): ml's iteration cap (vs-stata bank 04017236 `tobit y mpg weight,
+  // ll(0) iterate(2)`: e(converged) 0 at the second iterate).
+  for (const auto& [k, v] : parsed.opts) {
+    if (k != "iterate") continue;
+    const std::string val = trimM4(v.isBool ? std::string() : v.strValue);
+    char* end = nullptr;
+    const double d = std::strtod(val.c_str(), &end);
+    if (val.empty() || end == nullptr || *end != '\0' || !(d >= 0 && d <= 16000) ||
+        d != std::floor(d))
+      return engineErrorBlockM4("option iterate() must be an integer from 0 to 16000 in this build "
+                                "(got `" + (v.isBool ? std::string() : v.strValue) + "`)",
+                                "unsupported_option");
+    argv.push_back("--iterate");
+    argv.push_back(std::to_string(static_cast<int>(d)));
+    break;
+  }
+
   // BUG-233: the one copy of this vocabulary now lives in the file-scope
   // registration block (see top of file); this binding keeps every existing
   // use — including the reject net below — reading the same set.
   const std::unordered_set<std::string>& kKnown = kVocabTobit.known;
-  if (auto err = eval::rejectUnknownOptions(parsed.opts, kKnown)) {
+  if (auto err = eval::rejectUnknownOptions(parsed.opts, kKnown, kVocabTobit.unimplemented)) {
     return *err;
   }
 
@@ -187,6 +248,16 @@ ojson runTobit(const eval::ParsedCommand& parsed, SessionState& session) {
   try {
     raw = runCobraJsonM4(argv);
   } catch (const CobraError& ce) {
+    // The engine's "not implemented" forms (vce(cluster) under an fweight or
+    // aweight, or with fewer clusters than parameters; Stata fits both, vs-stata
+    // bank 8dcb229c) are this build's named r(198) refusal, not an engine error.
+    if (ce.code == "unsupported") {
+      std::string what = cobraErrorStrM4(ce);
+      static const std::regex reTag(R"(^\s*\[[a-z_]+\]\s*(tobit:\s*)?)");
+      what = std::regex_replace(what, reTag, "");
+      return engineErrorBlockM4("`tobit`: " + what + " in this version of PIET (valid Stata).",
+                                "unsupported_option");
+    }
     return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
   }
 
@@ -218,11 +289,65 @@ ojson runTobit(const eval::ParsedCommand& parsed, SessionState& session) {
   if (raw.contains("e_V") && raw.contains("coefs") && raw.contains("variance") &&
       raw["variance"].is_number()) {
     std::vector<AncillaryEbColM4> cols;
-    if (depvarEqColsM4(y, raw["coefs"], "b", cols)) {
+    bool ok = depvarEqColsM4(y, raw["coefs"], "b", cols);
+    // A factor-variable fit: Stata's columns are those r(table) lays out, a base
+    // level a structural 0 (vs-stata bank dda72913 `tobit mpg weight i.rep78,
+    // ll(17)`: `mpg:weight mpg:1b.rep78 .. mpg:5.rep78 mpg:_cons /var(e.mpg)`). An
+    // engine-omitted column is not named here: nothing is posted then.
+    if (!ok && block.contains("coeftable") && block["coeftable"].is_array()) {
+      std::vector<rtable_detail::RtCol> rc;
+      bool placed = false;
+      try {
+        placed = rtable_detail::stataColumns(session, *session.lastModel(), block["coeftable"], rc);
+      } catch (const std::exception&) {
+        placed = false;
+      }
+      if (placed) {
+        ok = true;
+        cols.clear();
+        for (const auto& c : rc) {
+          if (c.row == nullptr) {
+            cols.push_back({y + ":" + c.name, std::string(), 0.0});
+            continue;
+          }
+          const std::string en = c.row->value("name", std::string());
+          const ojson& bv = c.row->contains("b") ? (*c.row)["b"] : ojson();
+          const ojson& sv = c.row->contains("se") ? (*c.row)["se"] : ojson();
+          if (en.empty() || !bv.is_number() ||
+              (bv.get<double>() == 0.0 && sv.is_number() && sv.get<double>() == 0.0)) {
+            ok = false;
+            break;
+          }
+          const bool cons = en == "(intercept)" || en == "_cons";
+          cols.push_back({y + ":" + (cons ? std::string("_cons") : c.name), en, bv.get<double>()});
+        }
+      }
+    }
+    if (ok) {
       const std::string var = "/var(e." + y + ")";
       cols.push_back({var, var, raw["variance"].get<double>()});
       (void)postAncillaryEbM4(session, raw, cols);
     }
+  }
+  // The residual variance's row, as Stata's table prints it after the
+  // coefficients (`var(e.mpg)`: no test, the interval on the log scale) and as
+  // r(table) carries it (`/var(e.mpg)`, t and p `.b`).
+  if (raw.contains("variance") && raw["variance"].is_number() && raw.contains("se_variance") &&
+      raw["se_variance"].is_number() && raw.contains("variance_ci") &&
+      raw["variance_ci"].is_array() && raw["variance_ci"].size() == 2 &&
+      session.lastEstBlock.has_value() && (*session.lastEstBlock).contains("coeftable") &&
+      (*session.lastEstBlock)["coeftable"].is_array()) {
+    ojson row;
+    row["name"] = "/var(e." + y + ")";
+    row["b"] = raw["variance"];
+    row["se"] = raw["se_variance"];
+    row["t"] = nullptr;
+    row["p"] = nullptr;
+    row["ci_lo"] = raw["variance_ci"][0];
+    row["ci_hi"] = raw["variance_ci"][1];
+    row["ci_log"] = true;
+    (*session.lastEstBlock)["coeftable"].push_back(row);
+    block = *session.lastEstBlock;
   }
   return block;
 }

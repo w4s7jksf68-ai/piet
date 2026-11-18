@@ -19,12 +19,12 @@ const piet::eval::OptVocab& kVocabEstadd = piet::eval::registerOptVocab(
 
 const piet::eval::OptVocab& kVocabEstpost = piet::eval::registerOptVocab(
     {"estpost"},
-    {{"statistics", "stat", "stats", "columns", "by", "listwise", "nototal", "quietly", "detail"},
-     // `elabels` asks for by-group VALUE LABELS in the posted matrix names.
-     // Declared unimplemented rather than accepted: accepting it would name the
-     // rows by their numeric codes while the user asked for labels, and the
-     // difference is invisible in the resulting table.
-     {"casewise", "missing", "elabels", "escal"}});
+    {{"statistics", "stat", "stats", "columns", "by", "listwise", "casewise", "nototal", "quietly", "detail",
+      // tabstat's by-group handling: `missing` makes a missing by-value a group of its own and
+      // `elabels` names every group by its value and saves the labels in e(labels)
+      // (vs-stata bank 6542bb10, 14c66079).
+      "missing", "elabels"},
+     {"escal"}});
 
 
 const piet::eval::OptVocab& kVocabEstout = piet::eval::registerOptVocab(
@@ -65,10 +65,19 @@ const piet::eval::OptVocab& kVocabEstout = piet::eval::registerOptVocab(
       "end", "lastend", "mgroups", "labcol2", "incelldelimiter", "interaction", "hlinechar",
       "lz", "nolz", "abbrev", "noabbrev", "wrap", "nowrap", "omitted", "noomitted",
       "baselevels", "nobaselevels", "nolegend", "type", "notype", "matrix", "showtabs",
-      "noshowtabs", "outfilenoteoff", "nooutfilenoteoff", "level"},
-     {"transpose", "wide", "eform", "equations", "margin", "discrete", "dropped", "dmarker",
-      "msign", "stardrop", "starkeep", "stardetach", "topfile", "bottomfile", "defaults",
-      "smcltags", "smclrules", "smclmidrules", "smcleqrules"}});
+      "noshowtabs", "outfilenoteoff", "nooutfilenoteoff", "level", "dmarker", "msign",
+      "stardrop", "starkeep", "margin", "nomargin", "discrete", "nodiscrete", "eform",
+      "noeform", "equations", "topfile", "bottomfile",
+      // The screen form's smcl style already switches all four on (estout: defaults smcl ->
+      // smcltags, smclrules, and through it smclmidrules and smcleqrules), so spelling one is
+      // a no-op there; any other style or a `using` file would change the text and is refused
+      // by name in runEstout (vs-stata bank 46aec76d, f9f7a396, b06f4ec7, 6dc98d73).
+      "smcltags", "smclrules", "smclmidrules", "smcleqrules", "stardetach", "dropped"},
+     {"transpose", "wide", "defaults"},
+     // MoreOptions spells Label and NOLabel with the capitals L and NOL: `l` and `nol`
+     // are theirs alone (legend, lz need two letters; nolegend, nolz more), which the
+     // unique-prefix rule cannot tell (vs-stata bank b4d3851c, 08c7be76).
+     {{"l", "label"}, {"nol", "nolabel"}, {"c", "cells"}}});
 
 // `esttab`'s option vocabulary is NOT registered here. It has exactly one owner
 // (`esttab_block.cpp`'s kVocabEsttab), because a command whose option set is
@@ -106,9 +115,15 @@ const piet::eval::OptVocab& kVocabOutreg2 = piet::eval::registerOptVocab(
       // BUG-1467: `se` is the positive form of outreg2's noSE option (the
       // default; listed so it is not read as an abbreviation of `seeout`), and
       // `nose` drops the standard-error rows (outreg2 se_skip).
-      "se", "nose"},
-     {"word", "alpha", "e", "sideway", "paren", "bracket", "onecol", "seeout", "symbol",
-      "title"}});
+      "se", "nose",
+      // pvalue, bracket, paren()/parenthesis() and bracket(): outreg2.ado's own statistics options
+      // (vs-stata bank 64eb4ba9, 93e5a3cb, cf08e52b, df9fe134)
+      "pvalue", "bracket", "parenthesis", "ci", "cdec"},
+     {"word", "alpha", "e", "sideway", "onecol", "seeout", "symbol",
+      "title", "beta", "eform", "skip", "long", "sum", "dta"},
+     // Pvalue (`p`), Onecol (`o`): the capitals of outreg2's syntax line
+     {{"p", "pvalue"}, {"o", "onecol"}, {"par", "parenthesis"}, {"pare", "parenthesis"},
+      {"paren", "parenthesis"}}});
 
 
 const piet::eval::OptVocab& kVocabTexsave = piet::eval::registerOptVocab(
@@ -119,15 +134,22 @@ const piet::eval::OptVocab& kVocabTexsave = piet::eval::registerOptVocab(
       "size", "width", "marker", "label", "location", "geometry", "landscape", "nonames",
       "autonumber", "rowsep", "sw", "noendash", "delimiter", "preamble", "headlines",
       "tablelines", "headerlines2", "footlines", "rowstretch", "rowheight", "colwidth",
-      "headersep", "dataonly"},
-     {"bold", "italics", "underline", "slanted", "smallcaps", "sansserif", "monospace",
-      "emphasis", "valuelabels", "decimalalign"}});
+      "headersep", "dataonly", "bold", "italics", "underline", "slanted", "smallcaps",
+      "sansserif", "monospace", "emphasis", "decimalalign", "valuelabels"},
+     {}});
 
 
 // `force` is texdoc's "overwrite even if the file is open" flag; `cmdstrip` and
 // friends belong to `texdoc do`/`texdoc stlog`, which this build does not run.
 const piet::eval::OptVocab& kVocabTexdoc = piet::eval::registerOptVocab(
-    {"texdoc"}, {{"replace", "append", "force"}, {"cmdstrip", "gropts", "nolog", "nooutput"}});
+    {"texdoc"},
+    {{"replace", "append", "force", "nologdir", "logdir", "nologall", "logall", "noprefix", "prefix",
+      "nostpath", "stpath", "nodo", "do", "nolog", "log", "nocmdlog", "cmdlog", "nobeamer",
+      "beamer", "noverbatim", "verbatim", "nohardcode", "hardcode", "nokeep", "keep", "nocustom",
+      "custom", "nocmdstrip", "cmdstrip", "nolbstrip", "lbstrip", "nogtstrip", "gtstrip",
+      "nomatastrip", "matastrip", "nooutput", "output", "noltrim", "ltrim", "gropts", "grdir",
+      "alert", "tag", "nocertify", "certify", "linesize"},
+     {}});
 
 
 // `tex` (texdoc's line verb) takes no options at all: everything after the
@@ -162,19 +184,28 @@ const piet::eval::OptVocab& kVocabFrmttable = piet::eval::registerOptVocab(
      // unrecognised. `multicol()` is the tex span option paper 004 pairs with
      // replay (gb).
      {"merge", "append", "varlabels", "substat", "annotate", "asymbol", "coljust", "hlines",
-      "doubles", "multicol", "addrows"}});
+      "doubles", "multicol", "addrows"},
+     // frmttable's syntax line spells Statmat(), Note() and Title() with the capitals
+     // S, N, T: the shortest spelling that is theirs alone. Several no... and s...
+     // options share these prefixes (noBLankrows, SDec, ...), which the unique-prefix
+     // rule cannot tell apart (vs-stata bank 3cef0e2c, 094ed42e, 635d981c, 305082d0).
+     {{"n", "note"}, {"no", "note"}, {"s", "statmat"}, {"st", "statmat"}, {"t", "title"}}});
 
 
 const piet::eval::OptVocab& kVocabRegsave = piet::eval::registerOptVocab(
     {"regsave"},
-    {{"replace", "append", "ci", "se", "pval", "tstat", "addlabel", "level", "cmdline"},
-     {"table", "detail", "format", "asterisk", "covar", "autoid", "saveold"}});
+    {{"replace", "append", "ci", "se", "nose", "pval", "tstat", "addlabel", "level", "cmdline", "autoid",
+      "double", "detail", "covar"},
+     {"table", "saveold", "rtable", "df", "addvar", "coefmat", "varmat"}});
 
 
 const piet::eval::OptVocab& kVocabParmest = piet::eval::registerOptVocab(
     {"parmest"},
-    {{"saving", "norestore", "list", "omit", "label", "idnum", "idstr", "level", "replace"},
-     {"format", "escal", "eform", "flist", "elist", "stars", "rename", "bmat", "vmat"}});
+    {{"saving", "norestore", "fast", "list", "omit", "label", "idnum", "idstr", "level", "eform",
+      "rename", "format", "flist", "escal", "emac", "stars", "bmatrix", "vmatrix"},
+     {"frame", "dfmatrix", "dof", "msetype", "empty", "ylabel",
+      "pupper", "plower", "clnumber", "mcompare", "mcomci", "evec", "erows", "ecols", "float",
+      "nodouble", "nozerop", "nullvalue"}});
 
 
 const piet::eval::OptVocab& kVocabMat2txt = piet::eval::registerOptVocab(
@@ -182,7 +213,7 @@ const piet::eval::OptVocab& kVocabMat2txt = piet::eval::registerOptVocab(
 
 
 const piet::eval::OptVocab& kVocabErepost = piet::eval::registerOptVocab(
-    {"erepost"}, {{"rename"}, {"esample", "noesample", "cmd", "properties"}});
+    {"erepost"}, {{"rename", "noesample", "properties", "obs", "dof", "esample", "cmd"}, {"nob", "nov", "se", "drop"}});
 
 
 // `tabout` is refused at the ARM (dispatcher.cpp), so it never reaches a

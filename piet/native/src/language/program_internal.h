@@ -22,6 +22,9 @@ inline std::string trim(const std::string& s) { return strutil::trim(s); }
 inline std::string lower(std::string s) { return strutil::lower(std::move(s)); }
 
 // Bind `syntax SPEC` against the local `0' (defined in program_syntax.cpp).
-bool bindSyntax(const std::string& specIn, SessionState& session, ojson* err);
+// On success *note may hold a display block to show ("(analytic weights
+// assumed)" for a `[w=...]` the spec's first weight type answered).
+bool bindSyntax(const std::string& specIn, SessionState& session, ojson* err,
+                ojson* note = nullptr);
 
 }  // namespace piet::program::program_detail

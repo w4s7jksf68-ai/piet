@@ -367,6 +367,19 @@ FvPart parse_fvpart(const Dataset& ds, const std::string& s, bool bare_factor,
 std::vector<FvTerm> parse_fvterms(const Dataset& ds, const std::vector<std::string>& names,
                                   const ExtraCols* extra = nullptr, bool bare_factor = false) {
     std::vector<FvTerm> terms;
+    // A factor interacted with itself is that factor (Stata: `regress price
+    // i.foreign#i.foreign mpg` posts `0b.foreign 1.foreign mpg _cons`, bank
+    // 12299eb3): a repeated factor part is dropped from the term, and a term left
+    // with one part is a main effect. Continuous parts repeat (`c.x#c.x` is x^2).
+    auto collapse_self = [](FvTerm& t) {
+        for (size_t a = 0; a < t.parts.size(); ++a)
+            for (size_t b = a + 1; b < t.parts.size();)
+                if (t.parts[a].factor && t.parts[b].factor && t.parts[a].name == t.parts[b].name)
+                    t.parts.erase(t.parts.begin() + static_cast<long>(b));
+                else
+                    ++b;
+        if (t.parts.size() == 1) t.pure_interaction = false;
+    };
     for (const auto& nm : names) {
         if (nm.find("##") != std::string::npos) {
             std::vector<std::string> ops = split_on(nm, "##");
@@ -383,12 +396,11 @@ std::vector<FvTerm> parse_fvterms(const Dataset& ds, const std::vector<std::stri
                 for (int mask = 1; mask < (1 << m); ++mask) {
                     if (__builtin_popcount(static_cast<unsigned>(mask)) != sz) continue;
                     FvTerm t;
-                    std::string sig;
                     for (int b = 0; b < m; ++b)
-                        if (mask & (1 << b)) {
-                            t.parts.push_back(parts[static_cast<size_t>(b)]);
-                            sig += (parts[b].factor ? "i:" : "c:") + parts[b].name + "#";
-                        }
+                        if (mask & (1 << b)) t.parts.push_back(parts[static_cast<size_t>(b)]);
+                    collapse_self(t);
+                    std::string sig;
+                    for (const auto& pt : t.parts) sig += (pt.factor ? "i:" : "c:") + pt.name + "#";
                     if (std::find(seen.begin(), seen.end(), sig) != seen.end()) continue;
                     seen.push_back(sig);
                     terms.push_back(std::move(t));
@@ -397,6 +409,7 @@ std::vector<FvTerm> parse_fvterms(const Dataset& ds, const std::vector<std::stri
             FvTerm t;
             t.pure_interaction = true;  // standalone # → full cross minus all-base cell
             for (const auto& o : split_on(nm, "#")) t.parts.push_back(parse_fvpart(ds, o, true, extra));
+            collapse_self(t);
             terms.push_back(std::move(t));
         } else {
             FvTerm t;
@@ -490,6 +503,8 @@ struct LevelPlan {
     double requested_base = 0.0;      // valid when base_absent
     double used_base = 0.0;           // the level actually used as base
 };
+static thread_local bool g_ibn_no_intercept = false;
+
 static LevelPlan resolve_levels(const FvPart& part, const std::vector<double>& levels) {
     const int K = static_cast<int>(levels.size());
     LevelPlan plan; plan.base_idx = -1;
@@ -519,6 +534,10 @@ static LevelPlan resolve_levels(const FvPart& part, const std::vector<double>& l
             break;
         }
         case FvBase::None:
+            if (g_ibn_no_intercept) {         // ibn. without an intercept: no base at all
+                plan.emit = cand;
+                return plan;
+            }
             base = cand.back();               // ibn. → drop last for collinearity
             break;
         case FvBase::Lowest:
@@ -1286,6 +1305,11 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
     return md;
 }
 
+IbnNoInterceptScope::IbnNoInterceptScope(bool on) : prev(g_ibn_no_intercept) {
+    if (on) g_ibn_no_intercept = true;
+}
+IbnNoInterceptScope::~IbnNoInterceptScope() { g_ibn_no_intercept = prev; }
+
 IvModelData build_iv_model(const Dataset& ds, const std::string& yname,
                            const std::vector<std::string>& exog,
                            const std::vector<std::string>& endog,
@@ -1294,6 +1318,7 @@ IvModelData build_iv_model(const Dataset& ds, const std::string& yname,
                            const std::vector<std::string>& clusternames,
                            const TsMeta* ts, bool drop_singleton,
                            const std::vector<char>* row_mask, bool no_intercept) {
+    IbnNoInterceptScope ibn_scope(no_intercept && fenames.empty());
     const int64_t N = ds.n_rows();
     // TS pre-pass over exog, endog, instruments (shared side-table so a var lagged
     // in more than one list materializes once per token).

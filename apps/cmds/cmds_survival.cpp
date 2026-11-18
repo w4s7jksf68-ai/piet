@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
+#include <map>
+
 #include "common.h"
 #include "commands.h"
 #include "core/distributions.h"
@@ -53,16 +55,23 @@ struct StSample {
     std::vector<std::string> names;
     std::vector<int32_t> cl_codes;  // dense 0..n_clusters-1, empty when no --cluster
     int n_clusters = 0;
+    std::vector<int32_t> strata_codes;  // one code per stratum (strata vars combined), empty = none
+    int n_strata = 0;
     double time_at_risk = 0;
     int64_t n_fail = 0;
     bool multi_record = false;  // any row enters after t = 0 (delayed entry)
 };
 
 StSample load_st(const Dataset& ds, const char* cmd, const std::vector<std::string>& xs,
-                 const std::string& cluster_var) {
+                 const std::string& cluster_var,
+                 const std::vector<std::string>& strata_vars = {}) {
     require_st(ds, cmd);
     std::vector<std::string> cl;
     if (!cluster_var.empty()) cl.push_back(cluster_var);
+    // The strata variables ride load_glm's grouping-column pass (the same listwise
+    // deletion Stata's `mark(STrata ...)` applies), after the cluster variable.
+    const size_t strata_at = cl.size();
+    for (const auto& v : strata_vars) cl.push_back(v);
     GlmInputs g = load_glm(ds, cmd, kT, xs, cl);
     const double* raw_t0 = require_num(ds, cmd, kT0);
     const double* raw_t = require_num(ds, cmd, kT);
@@ -98,7 +107,24 @@ StSample load_st(const Dataset& ds, const char* cmd, const std::vector<std::stri
         if (s.d[static_cast<size_t>(q)] != 0.0) ++s.n_fail;
         if (raw_t0[row] > 0.0) s.multi_record = true;
     }
-    if (!g.cluster.empty()) {
+    if (!strata_vars.empty()) {
+        // One stratum per distinct combination of the strata variables' codes.
+        std::map<std::vector<int32_t>, int32_t> combo;
+        s.strata_codes.resize(static_cast<size_t>(s.n));
+        for (int64_t q = 0; q < s.n; ++q) {
+            std::vector<int32_t> key;
+            for (size_t v = 0; v < strata_vars.size(); ++v) {
+                const int32_t c = g.cluster[strata_at + v].codes[static_cast<size_t>(sel[static_cast<size_t>(q)])];
+                if (c < 0) throw EngineError("bad_input", std::string(cmd) + ": strata variable has a missing value");
+                key.push_back(c);
+            }
+            auto it = combo.find(key);
+            if (it == combo.end()) it = combo.emplace(key, static_cast<int32_t>(combo.size())).first;
+            s.strata_codes[static_cast<size_t>(q)] = it->second;
+        }
+        s.n_strata = static_cast<int>(combo.size());
+    }
+    if (!cluster_var.empty()) {
         // load_glm's cluster codes are dense over ITS kept rows; the `_st` filter
         // can leave a level empty, so re-densify over the rows that survived.
         const auto& F = g.cluster[0];
@@ -168,6 +194,7 @@ int cmd_stset(const std::vector<std::string>& a) {
         {"n_excluded_after_failure", r.n_excl_after_failure},
         {"n_excluded_negative_time", r.n_excl_negative},
         {"n_excluded_zero_length", r.n_excl_zero_length},
+        {"n_excluded_same_instant", r.n_excl_same_instant},
         {"n_remaining", r.n_kept},
         {"n_subjects", r.n_subjects},
         {"n_failures", r.n_failures},
@@ -243,22 +270,37 @@ std::string parse_vce(const std::vector<std::string>& a, const char* cmd,
 
 }  // namespace
 
-// cobra stcox --data f.hbin --x X1,X2 [--vce iid|robust|cluster] [--cluster C] [--level P] ...
+// cobra stcox --data f.hbin --x X1,X2 [--vce iid|robust|cluster] [--cluster C] [--level P]
+//             [--ties breslow|efron] [--strata S1,S2] ...
 int cmd_stcox(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), xcsv = opt(a, "--x"), cluster_var = opt(a, "--cluster");
     if (data_missing(data) || xcsv.empty()) {
         std::fprintf(stderr,
                      "usage: cobra stcox --data f.hbin --x X1,X2 [--vce iid|robust|cluster] "
-                     "[--cluster C] [--level P] [--keepif EXPR] [--out f.json]\n"
+                     "[--cluster C] [--level P] [--ties breslow|efron|exactp|exactm] [--strata S1,S2] "
+                     "[--keepif EXPR] [--out f.json]\n"
                      "  Cox proportional hazards on stset data (needs _t0/_t/_d/_st): partial\n"
                      "  likelihood with delayed entry, risk set { i : _t0_i < t <= _t_i }, Breslow\n"
-                     "  ties. Coefficients are reported as hazard ratios exp(b); z and P>|z| are\n"
-                     "  computed in the raw b metric.\n"
+                     "  ties (Efron's approximation with --ties efron). Coefficients are reported\n"
+                     "  as hazard ratios exp(b); z and P>|z| are computed in the raw b metric.\n"
+                     "  --strata S1,S2   a separate baseline hazard per combination (risk sets\n"
+                     "                   within stratum), Stata's strata().\n"
                      "  --vce cluster --cluster ID   Lin-Wei robust: efficient score residuals\n"
                      "                               summed within cluster (Stata vce(cluster ID)).\n");
         return 2;
     }
+    const std::string ties_opt = opt(a, "--ties", "breslow");
+    if (ties_opt != "breslow" && ties_opt != "efron" && ties_opt != "exactp" && ties_opt != "exactm")
+        throw EngineError("bad_input",
+                          "stcox: --ties must be breslow, efron, exactp or exactm (got " + ties_opt + ")");
+    const std::vector<std::string> strata_vars = split_csv(opt(a, "--strata"));
     const std::string vce = parse_vce(a, "stcox", cluster_var);
+    // The robust/cluster sandwich reads the Breslow score residuals of one risk-set
+    // structure; with Efron ties or strata they are other quantities, not computed here.
+    if ((vce == "robust" || vce == "cluster") && (ties_opt != "breslow" || !strata_vars.empty()))
+        throw EngineError("bad_input",
+                          "stcox: a robust/cluster VCE together with efron ties or strata is not "
+                          "implemented");
     const double level = std::stod(opt(a, "--level", "95"));
     if (level < 10.0 || level > 99.99)
         throw EngineError("bad_input", "stcox: --level must be in [10, 99.99]");
@@ -266,14 +308,19 @@ int cmd_stcox(const std::vector<std::string>& a) {
 
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
-    StSample s = load_st(ds, "stcox", split_csv(xcsv), cluster_var);
+    StSample s = load_st(ds, "stcox", split_csv(xcsv), cluster_var, strata_vars);
     if (s.n == 0) { std::fprintf(stderr, "stcox: no rows in the analysis sample.\n"); return 1; }
     // The partial likelihood conditions the intercept away, so the Cox design is
     // load_glm's WITHOUT its trailing intercept column.
     const int k = s.k - 1;
     if (k <= 0) throw EngineError("bad_input", "stcox: at least one covariate is required");
 
-    CoxResult r = cox_fit(s.X.data(), s.n, k, s.t0.data(), s.t.data(), s.d.data());
+    const CoxTies ties = ties_opt == "efron"    ? CoxTies::Efron
+                         : ties_opt == "exactp" ? CoxTies::Exactp
+                         : ties_opt == "exactm" ? CoxTies::Exactm
+                                                : CoxTies::Breslow;
+    CoxResult r = cox_fit(s.X.data(), s.n, k, s.t0.data(), s.t.data(), s.d.data(),
+                          s.strata_codes.empty() ? nullptr : s.strata_codes.data(), ties);
     if (!r.ok) throw EngineError("bad_input", r.err.empty() ? "stcox: fit failed" : r.err);
 
     std::vector<double> V = r.vcov;
@@ -317,7 +364,11 @@ int cmd_stcox(const std::vector<std::string>& a) {
                 // Breslow == every exact method while each tie set is a singleton,
                 // which is what Stata's "Cox regression with no ties" header asserts.
                 // Reported from a real tie SCAN so the header can never over-claim.
-                {"ties", r.n_tied_failures == 0 ? "none" : "breslow"},
+                // Stata's e(ties) words: breslow, efron, partial (exactp).
+                {"ties", r.n_tied_failures == 0 ? std::string("none")
+                         : ties_opt == "exactp"  ? std::string("partial")
+                         : ties_opt == "exactm"  ? std::string("marginal")
+                                                 : ties_opt},
                 {"n_obs", s.n},
                 {"n_dropped_missing", s.n_st - s.n},
                 {"n_failures", s.n_fail},
@@ -328,6 +379,7 @@ int cmd_stcox(const std::vector<std::string>& a) {
                 {"iters", r.iters},
                 {"level", level}};
     if (!cluster_var.empty()) out["n_subjects"] = s.n_clusters;
+    if (!strata_vars.empty()) out["n_strata"] = s.n_strata;
     std::vector<int> idx(static_cast<size_t>(k));
     for (int c = 0; c < k; ++c) idx[static_cast<size_t>(c)] = c;
     add_wald(out, r.beta, V, k, idx);
@@ -462,6 +514,18 @@ int cmd_streg(const std::vector<std::string>& a) {
         std::vector<double> theta = r.beta;
         theta.push_back(r.ln_p);
         add_wald(out, theta, V, np, idx);
+    }
+    // With the default VCE Stata's streg header and e(chi2) are the likelihood-ratio
+    // statistic against the constant-only Weibull fit (ln p free), as for stcox above:
+    // bank ed95841f `streg age i.drug, distribution(weibull)` LR chi2(3)
+    // 37.0667007250652 = 2(e(ll) - e(ll_0)), where the Wald said 33.37.
+    if (vce == "iid" && !idx.empty()) {
+        const double lr = 2.0 * (r.ll - r.ll_null);
+        const int df = static_cast<int>(idx.size());
+        out["chi2"] = lr;
+        out["chi2_df"] = df;
+        out["p_chi2"] = chi2_pvalue(lr, static_cast<double>(df));
+        out["chi2type"] = "LR";
     }
     if (cluster_on_id) { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
     out["coefs"] = coefs;

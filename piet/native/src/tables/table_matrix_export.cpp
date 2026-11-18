@@ -3,6 +3,7 @@
 // table matrix export.
 #include "tables_internal.h"
 #include "estout_internal.h"
+#include <set>
 namespace piet::handlers::table_detail {
 
 
@@ -242,9 +243,26 @@ using namespace table_detail;
 
 
 ojson runFrmttable(const eval::ParsedCommand& parsed, SessionState& session) {
+  // statmat(), sdec(), ctitles(), rtitles(), title() and note() take a string: typed without
+  // one, the option is r(198) "incorrectly specified" (vs-stata bank 111c03cb, 9bb58105, f8c3708e).
+  for (const auto& [k, v] : parsed.opts) {
+    if (v.isBool && (k == "statmat" || k == "sdec" || k == "ctitles" || k == "rtitles" ||
+                     k == "title" || k == "note")) {
+      return tblErrorRc("option " + k + " incorrectly specified", 198);
+    }
+  }
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabFrmttable.known,
                                             kVocabFrmttable.unimplemented)) {
     return ojson(*err);
+  }
+  // syntax matches each declared option once: a second spelling of an option already given
+  // (`statmat(A) s(e)`) matches nothing and is r(198) "option s() not allowed" (vs-stata bank
+  // b28db729).
+  {
+    std::set<std::string> seen;
+    for (const auto& [k, v] : parsed.opts) {
+      if (!v.isBool && !seen.insert(k).second) return tblErrorRc("option " + k + "() not allowed", 198);
+    }
   }
   std::vector<std::string> words = parsed.varlist;
   const std::optional<std::string> usingPath = takeUsing(words);
@@ -273,6 +291,12 @@ ojson runFrmttable(const eval::ParsedCommand& parsed, SessionState& session) {
       return tblErrorRc("frmttable: the stored table could not be read", 198);
     }
   } else {
+    // Without a statmat() and with nothing else to build a table from, frmttable
+    // reaches its display routine with an empty table: Mata's r(3301) "subscript
+    // invalid" (vs-stata bank ec7c2646).
+    if (parsed.opts.empty() && !usingPath.has_value()) {
+      return tblErrorRc("FrmtDisplay():  3301  subscript invalid", 3301);
+    }
     return tblSyntax("frmttable: statmat(MATRIX) or replay is required by this build -- the "
                      "forms that build a table WITHOUT one (addrows) need frmttable's accumulator, "
                      "which is not implemented");

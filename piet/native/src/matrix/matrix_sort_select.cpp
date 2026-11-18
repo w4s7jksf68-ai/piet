@@ -43,6 +43,7 @@
 // 198/199 travels in the `reason` channel as "r(NNN)" (RC); both command tokens register
 // their vocabularies at namespace scope (VOCABULARY); matsort replaces r() itself
 // (R-CLASS) -- it is an rclass program, so a failed matsort leaves r() empty.
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
@@ -372,6 +373,17 @@ std::optional<ojson> selectAxis(const std::string& spec, const std::vector<std::
     NumlistOutcome nl = positiveIntNumlist(spec, extent);
     if (nl.rc == 0) {
       for (long long v : nl.values) picked->push_back(static_cast<size_t>(v - 1));
+      // matselrc is no r-class program: the r() its own `numlist` call leaves
+      // stays, r(numlist) of the last list read (the rows when both are given;
+      // vs-stata bank 8752e86cc9ecd554 c(1 2) '1 2', a148ec39b2541814 row(2)
+      // col(2/3) '2').
+      std::string joined;
+      for (long long v : nl.values) joined += (joined.empty() ? "" : " ") + std::to_string(v);
+      eval::replaceRClass(session.eval);
+      if (!joined.empty()) session.eval.rStrings.set("numlist", joined);
+      eval::declareRPosted(session.eval, "numlist",
+                           joined.empty() ? std::vector<std::string>{}
+                                          : std::vector<std::string>{"numlist"});
       return std::nullopt;
     }
     if (nl.rc == 127) return matError("invalid numlist has missing values", 127);
@@ -422,8 +434,43 @@ namespace {
 ojson matsortCore(const eval::ParsedCommand& parsed, SessionState& session) {
   // `args` takes no options: `matsort X 1, d` is r(101) "options not allowed" (review st_mat2
   // comma).
-  if (!parsed.opts.empty()) return matError("options not allowed", 101);
-  const std::vector<std::string> w = words(trimCopy(parsed.argText));
+  std::vector<std::string> w = words(trimCopy(parsed.argText));
+  if (!parsed.opts.empty() || parsed.ifExpr.has_value() || parsed.inRange.has_value()) {
+    // `args` reads the words as typed, a comma or `if` included: a quoted word
+    // ends at its closing quote, so `"up",` is `up` then `,` and the comma is
+    // the fourth argument (StataBE 19.5: `matsort A 1 "up", zz` and `matsort A
+    // 1 "up" if 1` are r(198) "Replace option must be either replace or
+    // rankonly: ,|if", `matsort , zz` ", is not a matrix"; vs-stata bank
+    // 5081f902644cc169, 6f0cccc92c59f796, 590d985213b1cc0b). A comma glued to
+    // an unquoted word keeps the r(101) above.
+    std::string line = trimCopy(parsed.raw);
+    line = line.substr(std::min(line.size(), line.find_first_of(" \t,") == std::string::npos
+                                                 ? line.size()
+                                                 : line.find_first_of(" \t,")));
+    std::vector<std::string> typed;
+    bool glued = false;
+    for (size_t k = 0; k < line.size();) {
+      if (std::isspace(static_cast<unsigned char>(line[k]))) {
+        ++k;
+        continue;
+      }
+      if (line[k] == '"') {
+        const size_t close = line.find('"', k + 1);
+        const size_t end = close == std::string::npos ? line.size() : close;
+        typed.push_back(line.substr(k + 1, end - k - 1));
+        k = end + 1;
+        continue;
+      }
+      size_t e = k;
+      while (e < line.size() && !std::isspace(static_cast<unsigned char>(line[e]))) ++e;
+      const std::string t = line.substr(k, e - k);
+      if (t.find(',') != std::string::npos && t != ",") glued = true;
+      typed.push_back(t);
+      k = e;
+    }
+    if (glued) return matError("options not allowed", 101);
+    w = typed;
+  }
   const std::string matname = w.size() > 0 ? w[0] : std::string();
   const std::string sortcolText = w.size() > 1 ? w[1] : std::string("1");
   std::string dir = w.size() > 2 ? w[2] : std::string("u");

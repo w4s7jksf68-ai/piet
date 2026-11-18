@@ -96,6 +96,22 @@ ojson runDrdid(const eval::ParsedCommand& parsed, SessionState& session) {
     if (k == "dripw" && v.isBool && v.boolValue) sawDripw = true;
     if (kOtherMethods.count(k) && v.isBool && v.boolValue) otherMethodsSeen.push_back(k);
   }
+  // drdid.ado: more than one of drimp dripw reg stdipw ipw ipwra all is
+  // `error 1` after "Only one option allowed, more than 1 selected." (vs-stata
+  // bank d5df4e4c `drdid y beertax, ivar(sid) time(year) treatment(tgrp) ipw reg`),
+  // once syntax has its required time() and treatment().
+  {
+    static const std::set<std::string> kEstimators = {"drimp", "dripw", "reg",  "stdipw",
+                                                      "ipw",   "ipwra", "all"};
+    int nEst = 0;
+    for (const auto& [k, v] : parsed.opts)
+      if (kEstimators.count(k) && v.isBool && v.boolValue) ++nEst;
+    if (nEst > 1 && timeVar.has_value() && !timeVar->empty() && treatVar.has_value() &&
+        !treatVar->empty())
+      return ojson(eval::errorBlock("engine_error",
+                                    "Only one option allowed, more than 1 selected.",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(1)"));
+  }
   if (!ivar.has_value() || ivar->empty()) {
     return engineErrorBlockM4(
         "drdid requires `ivar(varname)` — e.g. `drdid y x, ivar(id) time(t) treatment(d) dripw`.",

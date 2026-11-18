@@ -317,11 +317,16 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
     // ---- 2. Drop K=0 or K=T panels, and size<2 panels.
     std::vector<std::vector<int64_t>> usable;
     for (const auto& rs : rows_per_g) {
-        if (rs.size() < 2) { ++R.n_dropped_size; continue; }
+        if (rs.size() < 2) {
+            ++R.n_dropped_size;
+            R.n_dropped_obs += static_cast<int64_t>(rs.size());
+            continue;
+        }
         double sy = 0;
         for (int64_t r : rs) sy += y_in[r];
         if (sy <= 0 || sy >= static_cast<double>(rs.size())) {
             ++R.n_dropped_const;
+            R.n_dropped_obs += static_cast<int64_t>(rs.size());
             continue;
         }
         usable.push_back(rs);
@@ -532,9 +537,11 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
     };
 
     R.beta = xtlogit_fe_start(X.data(), N, k, y.data(), ll_only);
+    R.ll_0 = ll_only(std::vector<double>(static_cast<size_t>(k), 0.0));
 
     double ll = 0.0;
     if (!full_eval(ll)) { R.converged = false; R.iters = 0; return R; }
+    R.ilog.push_back(ll);
     bool conv = false;
     int ic = 0;
     while (ic < maxit && !conv) {
@@ -570,6 +577,7 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
         const double ll_old = ll;
         if (!full_eval(ll)) { R.converged = false; R.iters = ic + 1; return R; }
         ++ic;
+        R.ilog.push_back(ll);
         std::copy(negH.begin(), negH.end(), negH_inv.begin());
         double nr = std::numeric_limits<double>::infinity();
         if (la::spd_inverse(negH_inv.data(), k) == 0) {
@@ -587,6 +595,7 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
     R.iters = ic;
     R.loglik = ll;
     R.converged = conv;
+    R.gradient = score;
 
     // ---- Final pass: per-group score for cluster-robust SE.
     for (int64_t i = 0; i < N; ++i) {

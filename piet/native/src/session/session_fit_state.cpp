@@ -36,6 +36,13 @@ void SessionState::setLastModelEsample(LastModel::EsampleState state, unsigned l
     lastModel_->dataPath = std::move(dataPath);
   }
 
+void SessionState::patchLastModelResult(const std::string& key, const nlohmann::ordered_json& value) {
+    if (lastModel_.has_value() && lastModel_->result.has_value() && lastModel_->result->is_object())
+      (*lastModel_->result)[key] = value;
+    if (eval.lastModelResult.has_value() && eval.lastModelResult->is_object())
+      (*eval.lastModelResult)[key] = value;
+  }
+
 void SessionState::pinPreInstallHead() {
     if (currentHbin_.has_value() && !currentHbin_->empty()) {
       preInstallPins_.push_back(*currentHbin_);

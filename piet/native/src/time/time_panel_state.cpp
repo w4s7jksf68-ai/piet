@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "piet/cobra_runner.h"
+#include "piet/eval/result_order.h"  // orderRResults: tsset/xtset list r() as Stata does
 #include "piet/eval/errors.h"
 #include "piet/eval/exprfns.h"  // BUG-540: stataMissingWithKind — `.a`-`.z` identity in matrix literals
 #include "piet/eval/macros.h"
@@ -308,6 +309,81 @@ std::optional<ojson> tsBadFormatOption(const TsDeclare& d) {
   return engineErrorBlockRc(d.format + " not found", 111);
 }
 
+// tsset.ado's delta(): terms `# [unit]` joined by blanks or `+`, each unit worded for the time
+// variable's scale (%tc in milliseconds; days or weeks for %td; one word for the other
+// scales). Returns the delta in the variable's own steps.
+std::optional<ojson> tsParseDeltaText(const std::string& text, char unit, double* out) {
+  auto generic = [&]() {
+    return engineErrorBlockRc("invalid argument in delta(): " + text, 198);
+  };
+  auto wrongUnit = [&]() {
+    return engineErrorBlockRc(std::string("option delta(") + text + ") invalid for %t" + unit +
+                                  " time variable",
+                              198);
+  };
+  std::vector<std::string> t;
+  {
+    std::string cur;
+    auto flush = [&]() {
+      if (!cur.empty()) t.push_back(cur);
+      cur.clear();
+    };
+    for (char c : text) {
+      if (c == ' ' || c == '\t') flush();
+      else if (c == '+' || c == '(' || c == ')') {
+        flush();
+        t.emplace_back(1, c);
+      } else cur += c;
+    }
+    flush();
+  }
+  if (t.empty()) {
+    *out = 1.0;
+    return std::nullopt;
+  }
+  double d = 0.0;
+  for (size_t i = 0; i < t.size(); ++i) {
+    if (t[i] == "+") continue;
+    if (t[i] == "(" || t[i] == ")") return generic();
+    char* end = nullptr;
+    double toadd = std::strtod(t[i].c_str(), &end);
+    if (end == t[i].c_str() || *end != '\0' || std::isnan(toadd)) return generic();
+    int cas = 0;
+    const std::string s = i + 1 < t.size() ? t[i + 1] : std::string();
+    if (s == "seconds" || s == "secs" || s == "second" || s == "sec") cas = 1;
+    else if (s == "minutes" || s == "mins" || s == "minute" || s == "min") cas = 2;
+    else if (s == "hours" || s == "hour") cas = 3;
+    else if (s == "days" || s == "day") cas = 4;
+    else if (s == "weeks" || s == "week") cas = 5;
+    else if (s == "months" || s == "month") cas = 6;
+    else if (s == "quarters" || s == "quarter") cas = 7;
+    else if (s == "halfyears" || s == "halfyear") cas = 8;
+    else if (s == "years" || s == "year") cas = 9;
+    else if (!s.empty()) return generic();
+    if (cas != 0) {
+      if (unit == 'c' || unit == 'C') {
+        static const double kMult[] = {0, 1000.0, 60000.0, 3600000.0, 86400000.0, 604800000.0};
+        if (cas > 5) return wrongUnit();
+        toadd *= kMult[cas];
+      } else if (unit == 'd') {
+        // only `days` is valid here: a week count is scaled by 7 and then refused all
+        // the same, so `delta(1 week)` on a %td variable is the unit error
+        if (cas != 4) return wrongUnit();
+      } else if ((unit == 'w' && cas != 5) || (unit == 'm' && cas != 6) ||
+                 (unit == 'q' && cas != 7) || (unit == 'h' && cas != 8) ||
+                 (unit == 'y' && cas != 9)) {
+        return wrongUnit();
+      } else if (unit != 'w' && unit != 'm' && unit != 'q' && unit != 'h' && unit != 'y') {
+        return wrongUnit();
+      }
+      ++i;
+    }
+    d += toadd;
+  }
+  *out = d;
+  return std::nullopt;
+}
+
 std::optional<ojson> tsBadDelta(double delta) {
   std::string complaint;
   if (delta == 0) complaint = "zero";
@@ -418,7 +494,11 @@ ojson runTsDeclare(const TsDeclare& d, SessionState& session, const std::string&
     }
   }
 
-  const double delta = d.delta.value_or(1.0);
+  double delta = d.delta.value_or(1.0);
+  if (!d.deltaText.empty()) {
+    if (auto refusal = tsParseDeltaText(d.deltaText, tsScaleLetter(chosenFormat), &delta))
+      return *refusal;
+  }
   if (auto refusal = tsBadDelta(delta)) return *refusal;
   const TsStepTally steps = tsTallySteps(ids, times, rows, delta);
   if (steps.repeated) {
@@ -426,12 +506,12 @@ ojson runTsDeclare(const TsDeclare& d, SessionState& session, const std::string&
                                              : "repeated time values in sample",
                               451);
   }
-  if (steps.belowDelta)
+  if (steps.belowDelta && !d.force)
     return engineErrorBlockRc("time values with period less than delta() found", 451);
 
   session.panelvar = d.panelvar;
   session.timevar = d.timevar;
-  session.delta = d.delta;
+  session.delta = d.deltaText.empty() ? d.delta : std::optional<double>(delta);
   session.writeTsChars();
 
   // Rows with a missing panel id count for gaps, repeats and balance, not edges.
@@ -443,6 +523,19 @@ ojson runTsDeclare(const TsDeclare& d, SessionState& session, const std::string&
   const std::string balanceWord = ids != nullptr ? tsBalanceWord(ids, times, rows) : "";
 
   std::vector<std::string> posted;
+  if (d.noQuery) {
+    // noquery: tsset.ado runs no Query, so only the delta, the format and the names come back.
+    tsPostScalar(session, posted, "tdelta", delta);
+    tsPostText(session, posted, "timevar", d.timevar);
+    tsPostText(session, posted, "tsfmt", chosenFormat);
+    if (chosenFormat.size() > 2) tsPostText(session, posted, "unit1", chosenFormat.substr(2, 1));
+    const std::string unitWord0 = tsUnitWord(d.period, chosenFormat);
+    if (!unitWord0.empty()) tsPostText(session, posted, "unit", unitWord0);
+    if (ids != nullptr) tsPostText(session, posted, "panelvar", *d.panelvar);
+    eval::orderRResults(session.eval, {"tdelta", "panelvar", "timevar", "unit", "unit1", "tsfmt"});
+    eval::declareRPosted(session.eval, rCmd, std::move(posted));
+    return ojson::array();
+  }
   tsPostScalar(session, posted, "tdelta", delta);
   tsPostScalar(session, posted, "tmin", tsPostable(firstTime));
   tsPostScalar(session, posted, "tmax", tsPostable(lastTime));
@@ -462,6 +555,11 @@ ojson runTsDeclare(const TsDeclare& d, SessionState& session, const std::string&
     tsPostText(session, posted, "panelvar", *d.panelvar);
     tsPostText(session, posted, "balanced", balanceWord);
   }
+  // Stata lists them `tdelta tmax tmin gaps imax imin` and `panelvar timevar
+  // unit unit1 tsfmt tdeltas tmaxs tmins balanced` (vs-stata truth bank).
+  eval::orderRResults(session.eval, {"tdelta", "tmax", "tmin", "gaps", "imax", "imin",
+                                     "panelvar", "timevar", "unit", "unit1", "tsfmt", "tdeltas",
+                                     "tmaxs", "tmins", "balanced"});
   eval::declareRPosted(session.eval, rCmd, std::move(posted));
 
   // The labels align on the colon; the panel label can widen the column past
@@ -473,8 +571,13 @@ ojson runTsDeclare(const TsDeclare& d, SessionState& session, const std::string&
            ": " + body;
   };
   std::string report = warning;
-  if (ids != nullptr) report += reportLine(panelCaption, *d.panelvar + " (" + balanceWord + ")") + "\n";
-  std::string timeBody = d.timevar + ", " + firstText + " to " + lastText;
+  if (ids != nullptr)
+    report += reportLine(panelCaption,
+                         (d.panelAlias.empty() ? *d.panelvar : d.panelAlias) + " (" + balanceWord +
+                             ")") +
+              "\n";
+  std::string timeBody = (d.timeAlias.empty() ? d.timevar : d.timeAlias) + ", " + firstText +
+                         " to " + lastText;
   if (steps.offBeat == 1) timeBody += ", but with a gap";
   else if (steps.offBeat > 1) timeBody += ", but with gaps";
   report += reportLine("Time variable", timeBody) + "\n" + reportLine("Delta", stepPhrase);
@@ -519,6 +622,7 @@ ojson runXtsetPanelOnly(const std::string& ivar, SessionState& session, bool dec
   tsPostText(session, posted, "balanced", balanceWord);
   tsPostScalar(session, posted, "imin", tsPostable(lowId));
   tsPostScalar(session, posted, "imax", tsPostable(highId));
+  eval::orderRResults(session.eval, {"imax", "imin", "panelvar", "balanced"});
   eval::declareRPosted(session.eval, "xtset", std::move(posted));
 
   return tsEchoBlock(std::string(static_cast<size_t>(look.indent), ' ') + look.panelLabel +

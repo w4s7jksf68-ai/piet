@@ -27,6 +27,7 @@
 #include "piet/cobra_runner.h"
 #include "piet/column_fetch.h"
 #include "piet/datastore.h"
+#include "piet/dispatcher.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/mutation_result.h"
@@ -193,6 +194,63 @@ ojson runGstats(const eval::ParsedCommand& parsed, SessionState& session) {
   // different sentence from "PIET has not built this yet" and the only one that
   // points at a typo.
   return gstatsRefusal(sub, eval::UnsupportedCommandKind::kUnknownSubcommand);
+}
+
+// gtools' gstats leaves r(J), r(minJ) and r(maxJ) (the sample is one group), and for winsor the
+// cut points r(cutlow) / r(cuthigh). Called after a successful run, once r() is captured.
+void gstatsPublishGroupResults(const eval::ParsedCommand& parsed, SessionState& session) {
+  if (parsed.varlist.empty() || !session.hasData()) return;
+  const std::string sub = strutil::lower(parsed.varlist[0]);
+  const bool isWinsor = sub == "winsor";
+  if (!isWinsor && sub != "sum" && sub != "summarize") return;
+  gtoolsPublishGroups(session, {}, parsed.ifExpr, parsed.inRange, false, /*postN=*/false, "gstats");
+  if (!isWinsor) {
+    // summarize's detail results are always stored (percentiles, skewness, kurtosis), and the
+    // four smallest and largest values; all of the last variable.
+    std::vector<std::string> sources(parsed.varlist.begin() + 1, parsed.varlist.end());
+    if (sources.empty()) return;
+    const std::string last = sources.back();
+    Datastore* ds = session.datastore();
+    if (ds == nullptr || !ds->has(last)) return;
+    const eval::OrderedFloatDict kept = session.eval.rValues;
+    const std::string savedLeaf = session.leafCmdExpanded;
+    std::string line = "quietly summarize " + last;
+    if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) line += " if " + *parsed.ifExpr;
+    if (parsed.inRange.has_value() && !parsed.inRange->empty()) line += " in " + *parsed.inRange;
+    line += ", detail";
+    (void)piet::dispatch(line, session);
+    session.leafCmdExpanded = savedLeaf;
+    eval::OrderedFloatDict detail = session.eval.rValues;
+    session.eval.rValues = kept;
+    // The inner command moved the "this command wrote it" mark: write the kept results again.
+    for (const auto& item : kept.items()) session.eval.rValues.set(item.first, item.second);
+    std::vector<std::string> names;
+    for (const char* k : {"p1", "p5", "p10", "p25", "p50", "p75", "p90", "p95", "p99", "skewness",
+                          "kurtosis"}) {
+      if (const double* v = detail.find(k)) {
+        session.eval.rValues.set(k, *v);
+        names.push_back(k);
+      }
+    }
+    eval::declareRPosted(session.eval, "gstats", names);
+    gtoolsPublishExtremes(session, last, parsed.ifExpr, parsed.inRange);
+    return;
+  }
+  double lo = kGstatsWinsorCutLo, hi = kGstatsWinsorCutHi;
+  for (const auto& kv : parsed.opts) {
+    if (kv.first != "cuts" || kv.second.isBool) continue;
+    const std::vector<std::string> parts = splitWords(kv.second.strValue);
+    if (parts.size() == 2) {
+      double a = 0.0, b = 0.0;
+      if (parseDoubleStrict(parts[0], &a) && parseDoubleStrict(parts[1], &b)) {
+        lo = a;
+        hi = b;
+      }
+    }
+  }
+  session.eval.rValues.set("cutlow", lo);
+  session.eval.rValues.set("cuthigh", hi);
+  eval::declareRPosted(session.eval, "gstats", {"J", "minJ", "maxJ", "cutlow", "cuthigh"});
 }
 
 }  // namespace piet::handlers

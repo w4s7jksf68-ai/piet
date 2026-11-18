@@ -333,6 +333,7 @@ MarginsResult margins_poisson(const double* X, int64_t n, int k,
             for (int e = 0; e < k; ++e)
                 s += Jrow[static_cast<size_t>(d)] * V[e * k + d] * Jrow[static_cast<size_t>(e)];
         R.se[static_cast<size_t>(c)] = std::sqrt(std::max(0.0, s));
+        R.J.push_back(Jrow);
     }
     return R;
 }
@@ -373,6 +374,7 @@ MarginsResult margins_logit(const double* X, int64_t n, int k,
             for (int e = 0; e < k; ++e)
                 s += Jrow[static_cast<size_t>(d)] * V[e * k + d] * Jrow[static_cast<size_t>(e)];
         R.se[static_cast<size_t>(c)] = std::sqrt(std::max(0.0, s));
+        R.J.push_back(Jrow);
     }
     return R;
 }
@@ -411,6 +413,7 @@ MarginsResult margins_probit(const double* X, int64_t n, int k,
             for (int e = 0; e < k; ++e)
                 s += Jrow[static_cast<size_t>(d)] * V[e * k + d] * Jrow[static_cast<size_t>(e)];
         R.se[static_cast<size_t>(c)] = std::sqrt(std::max(0.0, s));
+        R.J.push_back(Jrow);
     }
     return R;
 }

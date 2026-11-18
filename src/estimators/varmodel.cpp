@@ -134,7 +134,8 @@ constexpr double kPi = 3.14159265358979323846;
 }  // namespace
 
 VarResult var_fit(const double* Y, const double* time, int64_t n,
-                  const std::vector<std::string>& names, int lags, int irf_steps, double delta) {
+                  const std::vector<std::string>& names, int lags, int irf_steps, double delta,
+                  const char* in_sample) {
     VarResult r;
     const int K = static_cast<int>(names.size());
     r.K = K;
@@ -150,7 +151,8 @@ VarResult var_fit(const double* Y, const double* time, int64_t n,
     // tsset semantics: a row enters when its own values AND the values at
     // time - 1*delta ... time - p*delta are all present and non-missing. Gaps are
     // respected (the rows around a gap simply fail the lookup), so the sample is
-    // not merely "drop the first p rows".
+    // not merely "drop the first p rows". An `if`/`in` (in_sample) restricts the
+    // rows that enter, never the rows a lag is read from.
     std::map<long long, int64_t> at;
     for (int64_t i = 0; i < n; ++i) {
         const double t = time[i];
@@ -171,6 +173,7 @@ VarResult var_fit(const double* Y, const double* time, int64_t n,
     std::vector<int64_t> lr(static_cast<size_t>(p));
     rows.reserve(at.size());
     for (const auto& kv : at) {
+        if (in_sample != nullptr && !in_sample[kv.second]) continue;
         if (!complete(kv.second)) continue;
         bool ok = true;
         for (int j = 1; j <= p; ++j) {
@@ -186,6 +189,7 @@ VarResult var_fit(const double* Y, const double* time, int64_t n,
     }
     const int64_t T = static_cast<int64_t>(rows.size());
     r.n_obs = T;
+    r.sample_rows = rows;
     if (T <= m) {
         r.fail = VarResult::TOO_FEW;
         return r;
@@ -221,6 +225,12 @@ VarResult var_fit(const double* Y, const double* time, int64_t n,
 
     std::vector<double> XtXi(static_cast<size_t>(m) * m);
     la::xtx(X.data(), T, m, XtXi.data());
+    r.xtx = XtXi;
+    for (size_t q = 1; q < rows.size(); ++q) {
+        const long long a = std::llround(time[rows[q - 1]] / delta);
+        const long long b = std::llround(time[rows[q]] / delta);
+        if (b - a > 1) ++r.n_gaps;
+    }
     if (la::spd_inverse(XtXi.data(), m) != 0) {
         r.fail = VarResult::SINGULAR;
         return r;

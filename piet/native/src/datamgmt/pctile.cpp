@@ -41,6 +41,7 @@
 #include "piet/eval/pyvalue.h"  // pythonFloatRepr -- round-trippable CSV numerics
 #include "piet/eval/session.h"
 #include "piet/eval/tokenizer.h"
+#include "piet/loops.h"  // expandNumlist: percentiles() takes a numlist
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
@@ -112,6 +113,49 @@ double stataWeightedPercentile(const std::vector<std::pair<double, double>>& sor
 
 }  // namespace
 
+// The `altdef` rule, [D] pctile "Methods and formulas" (d.pdf p.776): with
+// x(1..n) ascending, i = floor((n+1)p/100) and h = (n+1)p/100 - i, the p-th
+// percentile is (1-h) x(i) + h x(i+1), where x(0) is x(1) and x(n+1) is x(n).
+// Unweighted only: Stata refuses altdef with weights (r(198)).
+//
+// `sorted` must be ascending and free of missing.
+double stataAltdefPercentile(const std::vector<double>& sorted, double p) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+  const int64_t n = static_cast<int64_t>(sorted.size());
+  if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+  const double P = static_cast<double>(n + 1) * p / 100.0;
+  const double fl = std::floor(P);
+  const double h = P - fl;
+  const auto at = [&](int64_t j) {
+    if (j < 1) j = 1;
+    if (j > n) j = n;
+    return sorted[static_cast<size_t>(j - 1)];
+  };
+  const int64_t i = static_cast<int64_t>(fl);
+  return (1.0 - h) * at(i) + h * at(i + 1);
+}
+
+namespace {
+
+// pctile/xtile's `[type] newvar` (`syntax newvarname`): an optional storage type
+// before the name, spelled as generate reads one (case matters: `Byte` is a
+// name). The type word goes to *type ("" when absent); the name is left in
+// *name for the caller's own checks.
+void splitTypedNewvar(const std::string& typed, std::string* type, std::string* name) {
+  std::vector<std::string> words = splitWs(typed);
+  type->clear();
+  if (words.size() == 2 && strutil::isStorageTypeWord(words[0])) {
+    *type = words[0];
+    *name = words[1];
+    return;
+  }
+  *name = trimOf(typed);
+}
+
+}  // namespace
+
 // ===========================================================================
 // pctile / _pctile
 // ===========================================================================
@@ -131,12 +175,18 @@ std::optional<std::vector<double>> percentileList(
   }
   std::vector<double> out;
   if (pOpt.has_value()) {
-    // A numlist may be comma- or space-separated; both spellings appear in the
-    // corpus and Stata accepts either.
+    // percentiles() takes a numlist: comma- or space-separated numbers and the
+    // `a(s)b` / `a/b` ranges (StataBE 19.5: p(10(10)90) is nine percentiles).
+    // The ranges are expanded by the shared numlist expander forvalues uses.
     std::string spec = *pOpt;
     for (char& c : spec)
       if (c == ',') c = ' ';
-    for (const auto& t : splitWs(spec)) {
+    std::vector<std::string> elements;
+    if (!loops::expandNumlist(spec, &elements)) {
+      *err = rsErrorRc(verb + ": invalid numlist in percentiles(): `" + *pOpt + "'", 121);
+      return std::nullopt;
+    }
+    for (const auto& t : elements) {
       double v = 0.0;
       if (!parseStrictDouble(t, &v)) {
         *err = rsSyntax(verb + ": `" + t + "' in percentiles() is not a number");
@@ -282,17 +332,26 @@ ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
   const std::string joined = joinWith(parsed.varlist, " ");
   const size_t eq = joined.find('=');
   if (eq == std::string::npos)
-    return rsSyntax("pctile: syntax is `pctile newvar = varname, nquantiles(#) | percentiles(list) "
-                    "[genp(newvar2)]`");
-  const std::string newvar = trimOf(joined.substr(0, eq));
+    return rsSyntax("pctile: syntax is `pctile [type] newvar = varname, nquantiles(#) "
+                    "[genp(newvar2) altdef]`");
+  // `pctile [type] newvar = exp` (pctile.ado: `syntax newvarname(gen) =/exp`):
+  // the new variable is created as the declared type, else c(type), and each
+  // percentile is stored into it (`replace q = r(r#)`), so a float result
+  // holds the float-rounded percentile.
+  std::string typeToken, newvar;
+  splitTypedNewvar(joined.substr(0, eq), &typeToken, &newvar);
   const std::string src = trimOf(joined.substr(eq + 1));
   if (newvar.empty() || src.empty())
-    return rsSyntax("pctile: syntax is `pctile newvar = varname, nquantiles(#) | percentiles(list) "
-                    "[genp(newvar2)]`");
+    return rsSyntax("pctile: syntax is `pctile [type] newvar = varname, nquantiles(#) "
+                    "[genp(newvar2) altdef]`");
   ojson guard = newVarGuard(session, "pctile", newvar);
   if (!guard.is_null()) return guard;
   // BUG-1120: `pctile _skip = x' is "_skip not allowed" r(101) (StataBE 19.5).
   if (newvar == "_skip" || newvar == "_all") return rsErrorRc(newvar + " not allowed", 101);
+  const bool altdef = hasFlag(parsed.opts, "altdef");
+  // pctile.ado's first check after syntax.
+  if (altdef && hasWeight(parsed))
+    return rsErrorRc("altdef option cannot be used with weights", 198);
   const std::optional<std::string> genp = optStr(parsed.opts, "genp");
   if (genp.has_value()) {
     ojson g2 = newVarGuard(session, "pctile", *genp);
@@ -314,6 +373,18 @@ ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
     sorted = sortedValues(session, "pctile", src, &err);
     if (!sorted.has_value()) return err;
   }
+  // A str# declaration creates a string variable the percentiles cannot be
+  // stored into (`replace q = r(r1)`: type mismatch).
+  if (!typeToken.empty() && !storage::isNumericType(typeToken))
+    return rsErrorRc("type mismatch", 109);
+  const std::string storeType = storage::resolveCreateType(session, typeToken);
+  const auto storeKind = [](const std::string& t) {
+    if (t == "byte") return cecon::StoreType::Byte;
+    if (t == "int") return cecon::StoreType::Int;
+    if (t == "long") return cecon::StoreType::Long;
+    if (t == "float") return cecon::StoreType::Float;
+    return cecon::StoreType::Double;
+  };
 
   Datastore* ds = nullptr;
   try {
@@ -323,15 +394,37 @@ ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   if (ds == nullptr) return ojson(eval::noDataLoaded());
   const int64_t n = ds->nRows();
+  // pctile.ado: nquantiles() above _N + 1 is r(198) "nquantiles() must be less
+  // than or equal to number of observations plus one" (vs-stata bank
+  // 63438804235153fa `pctile pc = price, nq(100)` on 74 observations).
+  if (!optStrAny(parsed.opts, {"percentiles", "p"}).has_value() &&
+      static_cast<int64_t>(pcts->size()) + 1 > n + 1)
+    return rsErrorRc("nquantiles() must be less than or equal to number of observations plus one",
+                     198);
 
   // Row i holds percentile i; every row past the list is MISSING -- `.`, never
   // 0, which would read as a real percentile of zero.
+  // genp() is `gen float genp = 100*_n/nq` (pctile.ado): float-rounded.
   std::vector<std::string> cells(static_cast<size_t>(n));
   std::vector<std::string> pcells(static_cast<size_t>(n));
+  std::vector<double> values;
+  for (size_t i = 0; i < pcts->size(); ++i)
+    values.push_back(weighted ? stataWeightedPercentile(weighted->sorted, (*pcts)[i])
+                     : altdef ? stataAltdefPercentile(*sorted, (*pcts)[i])
+                              : stataPercentile(*sorted, (*pcts)[i]));
+  // pctile.ado fills the variable one `replace q = r(r#) in #` at a time, and
+  // `replace` PROMOTES an integer type that cannot hold the value (byte/int ->
+  // float on a fraction, long -> double; byte -> int -> long on overflow:
+  // storage::promotedType, the lattice `replace` itself uses). So a declared
+  // `byte`/`int`/`long` ends as the narrowest type that took every value, each
+  // value stored at the type in force when it arrived.
+  std::string finalType = storeType;
   for (size_t i = 0; i < pcts->size() && static_cast<int64_t>(i) < n; ++i) {
-    cells[i] = numCell(weighted ? stataWeightedPercentile(weighted->sorted, (*pcts)[i])
-                                : stataPercentile(*sorted, (*pcts)[i]));
-    pcells[i] = numCell((*pcts)[i]);
+    const double v = values[i];
+    if (!std::isnan(v) && storage::isIntegerType(finalType))
+      finalType = storage::promotedType(finalType, v != std::floor(v), v, v);
+    cells[i] = numCell(cecon::frame_detail::round_to_store(v, storeKind(finalType)));
+    pcells[i] = numCell(cecon::frame_detail::round_to_store((*pcts)[i], cecon::StoreType::Float));
   }
 
   std::string cur = *session.currentHbin();
@@ -345,6 +438,26 @@ ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
     newVars.push_back(*genp);
   }
   session.load(cur);
+  // pctile is not r-class: the r() it leaves is its last internal `_pctile`'s,
+  // r(r1)..r(r#) unrounded. Up to nq(1001) that is one call; past it pctile.ado
+  // batches the percentiles (its `j` counter): the first call takes 1,000, each
+  // later one 999 (j restarts at 1 and is incremented before the next value),
+  // and the last batch is what r() holds.
+  eval::replaceRClass(session.eval);
+  {
+    const size_t total = values.size();
+    const size_t first = total <= 1000 ? 0 : 1000 + 999 * ((total - 1000 - 1) / 999);
+    std::vector<std::string> posted;
+    for (size_t i = first; i < total; ++i) {
+      posted.push_back("r" + std::to_string(i - first + 1));
+      session.eval.rValues.set(posted.back(), values[i]);
+    }
+    // The whole set, so a read of an r(r#) past it is `.` as in Stata.
+    eval::declareRPosted(session.eval, "pctile", posted);
+  }
+  storage::recordCreateType(session, newvar, typeToken, finalType);
+  session.setVarLabel(newvar, "percentiles of " + src);
+  if (genp.has_value()) storage::recordCreateType(session, *genp, "float", "float");
   return mutationResult(session, "pctile", newVars);
 }
 
@@ -357,9 +470,23 @@ ojson runPctileR(const eval::ParsedCommand& parsed, SessionState& session) {
   if (parsed.varlist.size() != 1)
     return rsSyntax("_pctile: syntax is `_pctile varname, nquantiles(#) | percentiles(list)`");
 
+  const bool altdef = hasFlag(parsed.opts, "altdef");
+  if (altdef && hasWeight(parsed))
+    return rsErrorRc("altdef option cannot be used with weights", 198);
   ojson err;
   auto pcts = percentileList(parsed.opts, "_pctile", 2, &err);
   if (!pcts.has_value()) return err;
+  // A string variable has no observation _pctile can use: StataBE 19.5 prints
+  // "no observations", leaves r() empty and exits 0 (`_pctile make, nq(4)` on
+  // auto, rc 0, `return list` empty) -- not the r(2000) pctile/xtile give.
+  if (!hasWeight(parsed)) {
+    ReadFrame rf(session, {parsed.varlist[0]});
+    Datastore* ds = rf.get();
+    if (ds != nullptr && ds->has(parsed.varlist[0]) && ds->dtype(parsed.varlist[0]) == "factor") {
+      eval::replaceRClass(session.eval);
+      return displayBlock("no observations");
+    }
+  }
   std::optional<std::vector<double>> sorted;
   std::optional<WeightedValues> weighted;
   if (hasWeight(parsed)) {
@@ -381,16 +508,78 @@ ojson runPctileR(const eval::ParsedCommand& parsed, SessionState& session) {
     if (!session.eval.rValues.contains(k)) break;
     session.eval.rValues.erase(k);
   }
-  for (size_t i = 0; i < pcts->size(); ++i) {
-    session.eval.rValues.set("r" + std::to_string(i + 1),
+  // Posted rN first and r1 last, so `: r(scalars)` and `return list` (newest
+  // first) list r1 r2 ... rN as Stata does (vs-stata truth bank).
+  std::vector<std::string> posted;
+  for (size_t i = pcts->size(); i-- > 0;) {
+    posted.push_back("r" + std::to_string(i + 1));
+    session.eval.rValues.set(posted.back(),
                              weighted ? stataWeightedPercentile(weighted->sorted, (*pcts)[i])
+                             : altdef ? stataAltdefPercentile(*sorted, (*pcts)[i])
                                       : stataPercentile(*sorted, (*pcts)[i]));
   }
+  eval::declareRPosted(session.eval, "_pctile", posted);
   // Deliberately NO r(N): Stata's `_pctile` stores r(r1)..r(rN) and nothing
   // else, and publishing an extra scalar would let a do-file read a number this
   // command does not promise.
   // Stata's `_pctile` prints nothing.
   return silent();
+}
+
+long long xtileDistinctCutpoints(const std::vector<double>& values,
+                                 const std::vector<double>* weights, long long nq, bool altdef) {
+  std::vector<double> sorted;
+  std::vector<std::pair<double, double>> pairs;
+  for (size_t row = 0; row < values.size(); ++row) {
+    if (std::isnan(values[row])) continue;
+    if (weights != nullptr) {
+      const double w = (*weights)[row];
+      if (std::isnan(w) || !(w > 0.0)) continue;
+      pairs.emplace_back(values[row], w);
+    } else {
+      sorted.push_back(values[row]);
+    }
+  }
+  std::sort(sorted.begin(), sorted.end());
+  std::stable_sort(pairs.begin(), pairs.end(),
+                   [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                     return a.first < b.first;
+                   });
+  std::set<double> cuts;
+  for (long long k = 1; k < nq; ++k) {
+    const double p = 100.0 * static_cast<double>(k) / static_cast<double>(nq);
+    const double c = weights != nullptr ? stataWeightedPercentile(pairs, p)
+                     : altdef           ? stataAltdefPercentile(sorted, p)
+                                        : stataPercentile(sorted, p);
+    if (!std::isnan(c)) cuts.insert(c);
+  }
+  return static_cast<long long>(cuts.size());
+}
+
+std::optional<ojson> storeXtileAltdef(SessionState& session, const std::string& target,
+                                      const std::vector<double>& values, long long nq) {
+  std::vector<double> sorted;
+  for (double v : values)
+    if (!std::isnan(v)) sorted.push_back(v);
+  std::sort(sorted.begin(), sorted.end());
+  std::vector<double> cut;
+  for (long long k = 1; k < nq; ++k)
+    cut.push_back(stataAltdefPercentile(sorted, 100.0 * static_cast<double>(k) /
+                                                    static_cast<double>(nq)));
+  std::vector<std::string> cells(values.size());
+  for (size_t row = 0; row < values.size(); ++row) {
+    if (std::isnan(values[row])) continue;
+    long long category = 1;
+    for (double c : cut)
+      if (values[row] > c) ++category;
+    cells[row] = std::to_string(category);
+  }
+  (void)session.datastore();  // the head file appendColumn extends
+  std::string written;
+  if (auto failed = appendColumn(session, *session.currentHbin(), target, cells, "f64", &written))
+    return *failed;
+  session.load(written);
+  return std::nullopt;
 }
 
 // xtile with [aw=]/[fw=]/[pw=]: xtile takes the cutpoints from

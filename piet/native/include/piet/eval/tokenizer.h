@@ -144,9 +144,20 @@ std::string removeWeightClause(const std::string& text);
 // on rejection (matches Python's raise semantics exactly).
 ParsedCommand tokenize(const std::string& line);
 
+// The caller's `version` (SessionState::callerVersion, 0 = none set) that
+// tokenize() judges a command's Stata syntax under on this thread: a few ados
+// parse an older syntax below a version (registry.h StataQualifiers::
+// legacyBelow). The dispatcher sets it before each tokenize of a line.
+void setTokenizeCallerVersion(double version);
+
 // Strip comments and join /// continuations in a .do source string. Returns
-// one (possibly empty) output line per input line.
+// one (possibly empty) output line per input line; a `#delimit ;` stretch is
+// read into one line per statement first.
 std::vector<std::string> preprocessDo(const std::string& source);
+
+// A `#delimit` line (`#d` .. `#delimit`): true when it makes `;` the statement
+// delimiter, false for `#delimit cr`, nullopt for any other line.
+std::optional<bool> delimitDirective(const std::string& line);
 
 }  // namespace piet::eval
 

@@ -277,6 +277,7 @@ ojson runTostring(const std::string& varname, bool doReplace,
   struct RenderPass {
     std::vector<std::string> strings;
     bool irreversible = false;
+    int64_t nBad = 0;  // rows whose string does not read back (the ado's `count if v != real(temp)`)
     std::vector<char> rowBad;  // per row, filled only when asked for (trackRows)
     size_t maxLen = 1;
   };
@@ -315,12 +316,13 @@ ojson runTostring(const std::string& varname, bool doReplace,
         rendered = eval::applyStataFmt(v, rfmt);
         // The ado's reversibility test: `count if v != real(temp)` (real()
         // ignores the pad).
-        if (!p.irreversible || trackRows) {
+        {
           const std::string bare = trim(rendered);
           std::optional<double> back;
           if (bare.find('_') == std::string::npos) back = eval::pythonFloat(bare);
           if (!back.has_value() || *back != v) {
             p.irreversible = true;
+            ++p.nBad;
             if (trackRows) p.rowBad[static_cast<size_t>(r)] = 1;
           }
         }
@@ -384,6 +386,14 @@ ojson runTostring(const std::string& varname, bool doReplace,
   }
   std::vector<std::string>& outStrings = pass.strings;
   const size_t maxLen = pass.maxLen;
+  if (opts.stataGate) {
+    // The ado's `qui count if v != real(temp)` is the last count it runs for
+    // this variable, so its result is what r(N) holds afterwards, whether the
+    // variable converts or is skipped as irreversible.
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", static_cast<double>(pass.nBad));
+    eval::declareRPosted(session.eval, "tostring", {"N"});
+  }
   if (pass.irreversible && !opts.force) {
     // w2b_dataio.log tostring_nofmt_ctl / tostring_gen_fmt / _gen_nofmt_ctl:
     // "big cannot be converted reversibly; no replace", rc 0, big unchanged.

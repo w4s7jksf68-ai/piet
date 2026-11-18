@@ -213,6 +213,13 @@ static void svgTitle(std::vector<std::string>& lines, const std::string& title, 
 }
 
 
+// A string member that is absent or JSON null (a bar block carries "title": null) reads as `dflt`;
+// nlohmann's value() throws type_error 302 on a null instead.
+static std::string jstr(const ojson& obj, const char* key, const std::string& dflt = std::string()) {
+  const auto it = obj.find(key);
+  return (it == obj.end() || !it->is_string()) ? dflt : it->get<std::string>();
+}
+
 static double jnum(const ojson& v, double dflt = 0.0) {
   if (v.is_null()) return dflt;
   try {
@@ -251,8 +258,8 @@ static std::string buildSvgSeriesPlot(const ojson& block, bool asMarkers) {
   auto xr = paddedRangeG(jnum(block.value("x_min", ojson(0.0))), jnum(block.value("x_max", ojson(1.0))));
   auto yr = paddedRangeG(jnum(block.value("y_min", ojson(0.0))), jnum(block.value("y_max", ojson(1.0))));
   std::vector<std::string> lines = {"<svg viewBox=\"0 0 520 360\" xmlns=\"http://www.w3.org/2000/svg\">"};
-  svgTitle(lines, block.value("title", std::string()));
-  svgFrameAndAxes(lines, xr, yr, block.value("x_label", std::string()), block.value("y_label", std::string()));
+  svgTitle(lines, jstr(block, "title"));
+  svgFrameAndAxes(lines, xr, yr, jstr(block, "x_label"), jstr(block, "y_label"));
   lines.push_back("  <clipPath id=\"sc\"><rect x=\"" + fmtNum(kSvgML, "%.0f") + "\" y=\"" +
                    fmtNum(kSvgMT, "%.0f") + "\" width=\"" + fmtNum(kSvgPlotW, "%.0f") + "\" height=\"" +
                    fmtNum(kSvgPlotH, "%.0f") + "\"/></clipPath>");
@@ -310,8 +317,8 @@ static std::string buildSvgScatter(const ojson& block) {
   auto xr = paddedRangeG(jnum(block.value("x_min", ojson(0.0))), jnum(block.value("x_max", ojson(1.0))));
   auto yr = paddedRangeG(jnum(block.value("y_min", ojson(0.0))), jnum(block.value("y_max", ojson(1.0))));
   std::vector<std::string> lines = {"<svg viewBox=\"0 0 520 360\" xmlns=\"http://www.w3.org/2000/svg\">"};
-  svgTitle(lines, block.value("title", std::string()));
-  svgFrameAndAxes(lines, xr, yr, block.value("x_label", std::string()), block.value("y_label", std::string()));
+  svgTitle(lines, jstr(block, "title"));
+  svgFrameAndAxes(lines, xr, yr, jstr(block, "x_label"), jstr(block, "y_label"));
   ojson pts = block.value("points", ojson::array());
   double r = pts.size() > 2000 ? 1.3 : (pts.size() > 500 ? 1.8 : 2.4);
   lines.push_back("  <clipPath id=\"gc\"><rect x=\"" + fmtNum(kSvgML, "%.0f") + "\" y=\"" +
@@ -339,8 +346,8 @@ static std::string buildSvgHistogram(const ojson& block) {
   double yMax = yMaxRaw > 0 ? yMaxRaw : 1.0;
   std::pair<double, double> yr = {0.0, yMax * 1.08};
   std::vector<std::string> lines = {"<svg viewBox=\"0 0 520 360\" xmlns=\"http://www.w3.org/2000/svg\">"};
-  svgTitle(lines, block.value("title", std::string()));
-  svgFrameAndAxes(lines, xr, yr, block.value("x_label", std::string()), block.value("y_label", std::string()));
+  svgTitle(lines, jstr(block, "title"));
+  svgFrameAndAxes(lines, xr, yr, jstr(block, "x_label"), jstr(block, "y_label"));
   double baseY = svgSy(0, yr.first, yr.second);
   for (const auto& b : block.value("bins", ojson::array())) {
     double bx0 = svgSx(jnum(b["x0"]), xr.first, xr.second);
@@ -364,8 +371,8 @@ static std::string buildSvgLine(const ojson& block) {
   auto xr = paddedRangeG(jnum(block.value("x_min", ojson(0.0))), jnum(block.value("x_max", ojson(1.0))));
   auto yr = paddedRangeG(jnum(block.value("y_min", ojson(0.0))), jnum(block.value("y_max", ojson(1.0))));
   std::vector<std::string> lines = {"<svg viewBox=\"0 0 520 360\" xmlns=\"http://www.w3.org/2000/svg\">"};
-  svgTitle(lines, block.value("title", std::string()));
-  svgFrameAndAxes(lines, xr, yr, block.value("x_label", std::string()), block.value("y_label", std::string()));
+  svgTitle(lines, jstr(block, "title"));
+  svgFrameAndAxes(lines, xr, yr, jstr(block, "x_label"), jstr(block, "y_label"));
   ojson pts = block.value("points", ojson::array());
   if (!pts.empty()) {
     std::string d;
@@ -427,8 +434,8 @@ static std::string buildSvgTwoway(const ojson& block) {
   }
   std::vector<std::string> lines = {"<svg viewBox=\"0 0 " + fmtNum(viewW, "%.0f") +
                                      " 360\" xmlns=\"http://www.w3.org/2000/svg\">"};
-  svgTitle(lines, block.value("title", std::string()), viewW);
-  svgFrameAndAxes(lines, xr, yr, block.value("x_label", std::string()), block.value("y_label", std::string()),
+  svgTitle(lines, jstr(block, "title"), viewW);
+  svgFrameAndAxes(lines, xr, yr, jstr(block, "x_label"), jstr(block, "y_label"),
                   false, false, plotW);
 
   lines.push_back("  <clipPath id=\"tw-clip\"><rect x=\"" + fmtNum(kSvgML, "%.0f") + "\" y=\"" +
@@ -656,14 +663,14 @@ static std::string buildSvgMarginsplot(const ojson& block) {
   int n = static_cast<int>(pts.size());
 
   std::vector<std::string> lines = {"<svg viewBox=\"0 0 520 360\" xmlns=\"http://www.w3.org/2000/svg\">"};
-  svgTitle(lines, block.value("title", std::string()));
+  svgTitle(lines, jstr(block, "title"));
 
   // Categorical x axis: one evenly-spaced slot per AME term (1..n); numeric
   // x tick text suppressed -- the term-name labels below take its place
   // (graph.js's identical suppressXTickLabels rationale).
   auto xr = paddedRangeG(0.5, n + 0.5, 0.05, 0.05);
   auto yr = paddedRangeG(jnum(block.value("y_min", ojson(0.0))), jnum(block.value("y_max", ojson(1.0))), 0.05, 0.05);
-  svgFrameAndAxes(lines, xr, yr, block.value("x_label", std::string()), block.value("y_label", std::string()),
+  svgFrameAndAxes(lines, xr, yr, jstr(block, "x_label"), jstr(block, "y_label"),
                   /*suppressXTickLabels=*/true, /*suppressYTickLabels=*/false);
   auto [x0, x1] = xr;
   auto [y0, y1] = yr;
@@ -733,7 +740,7 @@ static std::string buildSvgCoefplot(const ojson& block) {
   }
 
   std::vector<std::string> lines = {"<svg viewBox=\"0 0 520 360\" xmlns=\"http://www.w3.org/2000/svg\">"};
-  svgTitle(lines, block.value("title", std::string()));
+  svgTitle(lines, jstr(block, "title"));
 
   int n = static_cast<int>(rows.size());
 
@@ -760,7 +767,7 @@ static std::string buildSvgCoefplot(const ojson& block) {
   xhi = std::max(xhi, 0.0);
   auto xr = paddedRangeG(xlo, xhi, 0.05, 0.05);
   auto yr = paddedRangeG(0.5, n + 0.5, 0.05, 0.05);
-  svgFrameAndAxes(lines, xr, yr, block.value("x_label", std::string("Coefficient estimate")), std::string(),
+  svgFrameAndAxes(lines, xr, yr, jstr(block, "x_label", "Coefficient estimate"), std::string(),
                   /*suppressXTickLabels=*/false, /*suppressYTickLabels=*/true);
   auto [x0, x1] = xr;
   auto [y0, y1] = yr;
@@ -831,7 +838,7 @@ static std::string buildSvgCombine(const ojson& block) {
                      fmtNum(totalH, "%.0f") + "\" fill=\"" + bg + "\"/>");
   }
 
-  std::string title = block.value("title", std::string());
+  std::string title = jstr(block, "title");
   if (!title.empty()) {
     lines.push_back("  <text x=\"" + fmtNum(totalW / 2) + "\" y=\"20\" text-anchor=\"middle\" " +
                      "font-size=\"13\" font-weight=\"bold\" fill=\"#111\">" + svgEscape(title) + "</text>");
@@ -875,6 +882,98 @@ static std::string buildSvgCombine(const ojson& block) {
 }
 
 
+// `graph bar|hbar`: the block carries "bars" [{value, series, category[, supercategory]}]. One
+// slot per (supercategory, category) in order of appearance, one bar per series in a slot (the
+// segments of one column under `stack`); a null value (an empty cell) draws nothing.
+static std::string buildSvgBar(const ojson& block) {
+  static const char* kBarColors[] = {"#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"};
+  const bool horizontal = block.value("horizontal", false);
+  const bool stack = block.value("stack", false);
+  std::vector<std::string> slotKeys, slotLabels, seriesNames;
+  struct Cell { size_t slot, series; double v; };
+  std::vector<Cell> cells;
+  for (const auto& b : block.value("bars", ojson::array())) {
+    const std::string cat = jstr(b, "category");
+    const std::string sup = jstr(b, "supercategory");
+    const std::string key = sup + "\x1f" + cat;
+    size_t slot = std::find(slotKeys.begin(), slotKeys.end(), key) - slotKeys.begin();
+    if (slot == slotKeys.size()) {
+      slotKeys.push_back(key);
+      slotLabels.push_back(sup.empty() ? cat : sup + "/" + cat);
+    }
+    const std::string ser = jstr(b, "series");
+    size_t si = std::find(seriesNames.begin(), seriesNames.end(), ser) - seriesNames.begin();
+    if (si == seriesNames.size()) seriesNames.push_back(ser);
+    if (b.contains("value") && b["value"].is_number()) cells.push_back({slot, si, b["value"].get<double>()});
+  }
+  const size_t nSlots = std::max<size_t>(slotKeys.size(), 1);
+  const size_t nSer = std::max<size_t>(seriesNames.size(), 1);
+  double vMin = 0.0, vMax = 0.0;
+  std::vector<double> stackTop(nSlots, 0.0);
+  for (const auto& c : cells) {
+    if (stack) {
+      stackTop[c.slot] += c.v;
+      vMax = std::max(vMax, stackTop[c.slot]);
+      vMin = std::min(vMin, stackTop[c.slot]);
+    } else {
+      vMax = std::max(vMax, c.v);
+      vMin = std::min(vMin, c.v);
+    }
+  }
+  if (vMax == vMin) vMax = vMin + 1.0;
+  const std::pair<double, double> vr = {vMin, vMax + (vMax - vMin) * 0.05};
+  const std::pair<double, double> sr = {0.0, static_cast<double>(nSlots)};
+  std::vector<std::string> lines;
+  lines.push_back("<svg viewBox=\"0 0 " + fmtNum(kSvgW, "%.0f") + " " + fmtNum(kSvgH, "%.0f") +
+                  "\" xmlns=\"http://www.w3.org/2000/svg\">");
+  svgTitle(lines, jstr(block, "title"));
+  if (horizontal) svgFrameAndAxes(lines, vr, sr, jstr(block, "ytitle"), std::string(), false, true);
+  else svgFrameAndAxes(lines, sr, vr, std::string(), jstr(block, "ytitle"), true, false);
+  std::vector<double> stackRun(nSlots, 0.0);
+  for (const auto& c : cells) {
+    const double slotW = 1.0 / static_cast<double>(stack ? 1 : nSer);
+    const double a0 = static_cast<double>(c.slot) + 0.1 + (stack ? 0.0 : 0.8 * slotW * static_cast<double>(c.series));
+    const double a1 = a0 + (stack ? 0.8 : 0.8 * slotW);
+    const double base = stack ? stackRun[c.slot] : 0.0;
+    const double top = base + c.v;
+    if (stack) stackRun[c.slot] = top;
+    const std::string color = kBarColors[c.series % 6];
+    double x, y, w, h;
+    if (horizontal) {
+      x = std::min(svgSx(base, vr.first, vr.second), svgSx(top, vr.first, vr.second));
+      w = std::fabs(svgSx(top, vr.first, vr.second) - svgSx(base, vr.first, vr.second));
+      y = svgSy(a1, sr.first, sr.second);
+      h = std::fabs(svgSy(a1, sr.first, sr.second) - svgSy(a0, sr.first, sr.second));
+    } else {
+      x = svgSx(a0, sr.first, sr.second);
+      w = svgSx(a1, sr.first, sr.second) - x;
+      y = std::min(svgSy(base, vr.first, vr.second), svgSy(top, vr.first, vr.second));
+      h = std::fabs(svgSy(top, vr.first, vr.second) - svgSy(base, vr.first, vr.second));
+    }
+    lines.push_back("  <rect x=\"" + fmtNum(x, "%.2f") + "\" y=\"" + fmtNum(y, "%.2f") + "\" width=\"" +
+                    fmtNum(w, "%.2f") + "\" height=\"" + fmtNum(h, "%.2f") + "\" fill=\"" + color +
+                    "\" fill-opacity=\"0.85\"/>");
+  }
+  for (size_t i = 0; i < slotLabels.size(); ++i) {
+    const double mid = static_cast<double>(i) + 0.5;
+    if (horizontal) {
+      lines.push_back("  <text x=\"" + fmtNum(kSvgML - 9, "%.0f") + "\" y=\"" +
+                      fmtNum(svgSy(mid, sr.first, sr.second) + 3.5) + "\" text-anchor=\"end\" font-size=\"10\" fill=\"#444\">" +
+                      svgEscape(slotLabels[i]) + "</text>");
+    } else {
+      lines.push_back("  <text x=\"" + fmtNum(svgSx(mid, sr.first, sr.second)) + "\" y=\"" +
+                      fmtNum(kSvgMT + kSvgPlotH + 18, "%.0f") + "\" text-anchor=\"middle\" font-size=\"10\" fill=\"#444\">" +
+                      svgEscape(slotLabels[i]) + "</text>");
+    }
+  }
+  lines.push_back("</svg>");
+  std::string out;
+  for (auto& l : lines) { out += l; out += "\n"; }
+  if (!out.empty()) out.pop_back();
+  return out;
+}
+
+
 static std::string buildSvgDispatch(const ojson& block) {
   std::string kind = block.value("kind", std::string("scatter"));
   if (kind == "histogram") return buildSvgHistogram(block);
@@ -888,6 +987,7 @@ static std::string buildSvgDispatch(const ojson& block) {
   if (kind == "graph_combine") return buildSvgCombine(block);
   if (kind == "marginsplot") return buildSvgMarginsplot(block);
   if (kind == "coefplot") return buildSvgCoefplot(block);
+  if (kind == "bar" && block.contains("bars")) return buildSvgBar(block);
   return buildSvgScatter(block);
 }
 

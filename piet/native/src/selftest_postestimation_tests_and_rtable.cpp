@@ -349,16 +349,18 @@ void testW2cPostest() {
     if (s.lastEstBlock.has_value())
       for (const auto& row : (*s.lastEstBlock)["coeftable"])
         if (row.value("name", std::string()) == "x1") bx1 = row.value("b", std::nan(""));
-    check(T != nullptr && colsOf(T) == "x1 x2 _cons" && T->rownames[2] == "z" &&
+    // Columns named as e(b) names them, the depvar as the equation (vs-stata bank
+    // e70606b9 `probit foreign mpg weight`: r(table) `foreign:mpg ...`).
+    check(T != nullptr && colsOf(T) == "d:x1 d:x2 d:_cons" && T->rownames[2] == "z" &&
               rel(T->data[0][0], std::exp(bx1), 1e-12) && T->data[8][0] == 1.0,
           "W2C(postest): r(table) after `logistic` (following a regress) is the logistic table: "
-          "columns `x1 x2 _cons`, b = exp(_b[x1]), eform 1. Got columns `" + colsOf(T) + "`");
+          "columns `d:x1 d:x2 d:_cons`, b = exp(_b[x1]), eform 1. Got columns `" + colsOf(T) + "`");
   }
   {
     (void)piet::dispatch("quietly regress y x1 x2", s);
     (void)piet::dispatch("quietly logit d x1 x2 i.c, or", s);
     const auto* T = rTable(s);
-    check(T != nullptr && colsOf(T) == "x1 x2 0b.c 1.c 2.c 3.c _cons" && T->data[0][2] == 1.0 &&
+    check(T != nullptr && colsOf(T) == "d:x1 d:x2 d:0b.c d:1.c d:2.c d:3.c d:_cons" && T->data[0][2] == 1.0 &&
               std::isnan(T->data[1][2]) && T->data[8][2] == 1.0 &&
               rel(T->data[4][0], T->data[0][0] * std::exp(-1.959963984540054 * T->data[1][0] /
                                                            T->data[0][0]), 1e-9),
@@ -417,7 +419,9 @@ void testW2cPostest() {
     (void)piet::dispatch("quietly regress y x1 x2 i.c", s);
     (void)piet::dispatch("quietly poisson y x1 x2 i.c", s);
     const auto* T = rTable(s);
-    bool ok = T != nullptr && colsOf(T) == "x1 x2 0b.c 1.c 2.c 3.c _cons" && T->rownames[2] == "z";
+    // (bank 7e0e14c8 `poisson rep78 mpg weight`: r(table) `rep78:mpg ...`)
+    bool ok = T != nullptr && colsOf(T) == "y:x1 y:x2 y:0b.c y:1.c y:2.c y:3.c y:_cons" &&
+              T->rownames[2] == "z";
     for (size_t j = 0; ok && j < T->colnames.size(); ++j) {
       if (j == 2) continue;
       const double b = T->data[0][j], se = T->data[1][j], z = T->data[2][j];
@@ -430,14 +434,14 @@ void testW2cPostest() {
               "2*normal(-|z|), ll/ul = b -/+ invnormal(.975)*se, crit 1.959964, df missing");
   }
   {
-    // A block whose intervals disagree with its declared reference posts nothing
-    // (tobit prints t intervals and publishes no df_r) -- and the previous model's
-    // table is not left behind.
+    // tobit posts its own r(table) as e(b) lays it out, the variance row last (vs-stata
+    // bank 8328f8b5 `tobit mpg weight, ll(17)`: r(table) `mpg:weight mpg:_cons
+    // /var(e.mpg)`) -- and the previous model's table is not left behind.
     (void)piet::dispatch("quietly regress y x1 x2 i.c", s);
     (void)piet::dispatch("quietly tobit y x1 x2, ll(5)", s);
-    check(rTable(s) == nullptr,
-          "W2C(postest): after `tobit` no r(table) is served (not the preceding regress table). "
-          "Got columns `" + colsOf(rTable(s)) + "`");
+    check(rTable(s) != nullptr && colsOf(rTable(s)) == "y:x1 y:x2 y:_cons /var(e.y)",
+          "W2C(postest): after `tobit` r(table) is tobit's own (not the preceding regress "
+          "table). Got columns `" + colsOf(rTable(s)) + "`");
   }
   {
     // The level is declared, not inferred: under `set level 90` a posted table must be
@@ -1486,13 +1490,15 @@ void testW2cPostest() {
               msg.rfind("margins: marginal effects (dydx) after a linear model are not supported.", 0) == 0,
           "W2C(postest/FU-326): `margins, dydx(x1)` after tobit -- r(198), message unchanged "
           "(main: _rc 1). Got _rc `" + rc + "` `" + msg + "`");
-    // FU-437: an estat subcommand PIET does not serve after a non-csdid fit is r(198).
+    // FU-437, superseded: `estat ic` after regress is served (Stata's default
+    // estat handler; vs-stata bank 383e5bb3: rc 0, r(S) 1 x 6 `N ll0 ll df AIC BIC`).
     (void)piet::dispatch("quietly regress y x1 x2", g);
     (void)piet::dispatch("capture quietly estat ic", g);
     const std::string rcIc = shown(g, "display _rc").second;
-    check(rcIc == "198",
-          "W2C(postest/FU-437): `regress` then `capture quietly estat ic` -- _rc 198 (main: 1). "
-          "Got `" + rcIc + "`");
+    const std::string sCols = shown(g, "display colsof(r(S))").second;
+    check(rcIc == "0" && sCols == "6",
+          "W2C(postest/FU-437): `regress` then `capture quietly estat ic` -- _rc 0, r(S) 1 x 6. "
+          "Got `" + rcIc + "` cols `" + sCols + "`");
   }
 
   {

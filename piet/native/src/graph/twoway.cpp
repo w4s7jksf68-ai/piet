@@ -180,6 +180,36 @@ static ojson layerScatter(Datastore& ds, const std::vector<std::string>& varlist
 }
 
 
+// pcspike / pcarrow: `y1 x1 y2 x2` -> one segment (x1, y1) -> (x2, y2) per observation
+// ([G-2] graph twoway pcspike). Drawn as the segments of pci/pcarrowi; a row with a missing
+// coordinate has no segment.
+static ojson layerPcData(Datastore& ds, const twoway::LayerSpec& spec, int layerIdx, const std::string& pt) {
+  const auto& vl = spec.varlist;
+  if (vl.size() < 4) {
+    std::string listed;
+    for (const auto& v : vl) listed += (listed.empty() ? "" : " ") + v;
+    return ojson{{"_refusal", stataRefusal(pt + " requires 4 variables: " + listed, 102)}};
+  }
+  if (vl.size() > 4) return ojson{{"_refusal", stataRefusal("too many variables specified", 103)}};
+  for (const auto& v : vl) {
+    if (!ds.has(v)) return ojson{{"_error", "variable " + v + " not found"}};
+  }
+  const auto y1 = numericColumn(ds, vl[0]), x1 = numericColumn(ds, vl[1]);
+  const auto y2 = numericColumn(ds, vl[2]), x2 = numericColumn(ds, vl[3]);
+  ojson pc = ojson::array();
+  for (size_t i = 0; i < y1.size(); ++i) {
+    if (!std::isfinite(y1[i]) || !std::isfinite(x1[i]) || !std::isfinite(y2[i]) || !std::isfinite(x2[i])) continue;
+    pc.push_back(ojson::array({x1[i], y1[i], x2[i], y2[i]}));
+  }
+  ojson out;
+  out["kind"] = pt == "pcarrow" ? "pcarrowi" : "pci";
+  out["pc"] = pc;
+  out["style"] = twoway::layerStyle(spec.opts, layerIdx, "line");
+  out["n"] = static_cast<int64_t>(pc.size());
+  return out;
+}
+
+
 // ---------------------------------------------------------------------------
 // serset-twoway FIT: what the lfit and qfit plots and their ci forms compute
 // ([G-2] graph twoway lfit, qfit, lfitci, qfitci). `regress y x [x2] [w] if touse`,
@@ -659,7 +689,7 @@ static ojson layerRangeOrBase(Datastore& ds, const twoway::LayerSpec& spec, int 
 // sorted by x, its own serset (w2al tf_fn_miss log:2919-2928, tf_fn_rangevar
 // :2948-2952). No expression: `expression required`, r(100) (tf_r_fn_empty); an
 // unknown function: `error in expression: <exp>`, r(133) (tf_r_fn_badfn).
-static ojson layerFunction(SessionState& session, Datastore& ds, const twoway::LayerSpec& spec, int layerIdx,
+static ojson layerFunction(SessionState& session, Datastore* dsp, const twoway::LayerSpec& spec, int layerIdx,
                     std::optional<serset::Serset>* sersetOut) {
   std::string expr = trimG(spec.rawArgs);
   if (expr.empty()) return ojson{{"_refusal", stataRefusal("expression required", 100)}};
@@ -686,8 +716,8 @@ static ojson layerFunction(SessionState& session, Datastore& ds, const twoway::L
   double lo = 0.0, hi = 1.0;
   if (auto rv = optLast(opts, "range")) {
     const auto toks = splitWsG(*rv);
-    if (toks.size() == 1 && ds.has(toks[0])) {
-      const auto col = numericColumn(ds, toks[0]);
+    if (toks.size() == 1 && dsp != nullptr && dsp->has(toks[0])) {
+      const auto col = numericColumn(*dsp, toks[0]);
       double mn = kNaN, mx = kNaN;
       for (double v : col) {
         if (std::isnan(v)) continue;
@@ -744,7 +774,22 @@ static ojson layerFunction(SessionState& session, Datastore& ds, const twoway::L
         if (std::regex_search(raised, m, reRc)) {
           rc = std::atoi(m.str(1).c_str());
         } else {
-          rc = 133;  // an undefined name: Stata's `unknown function` for a call
+          // an undefined function call is Stata's r(133) `unknown function`; a bare name that is
+          // neither x nor a function (and so no variable of the data, or no data at all) is r(111)
+          rc = 133;
+          static const std::regex reName(R"([A-Za-z_][A-Za-z0-9_]*)");
+          for (std::sregex_iterator it(expr.begin(), expr.end(), reName), end; it != end; ++it) {
+            const size_t at = static_cast<size_t>(it->position());
+            const size_t after = at + static_cast<size_t>(it->length());
+            if (at > 0 && (std::isdigit(static_cast<unsigned char>(expr[at - 1])) || expr[at - 1] == '.')) continue;
+            size_t nx = after;
+            while (nx < expr.size() && std::isspace(static_cast<unsigned char>(expr[nx]))) ++nx;
+            if (nx < expr.size() && expr[nx] == '(') continue;  // a function call
+            const std::string nm = it->str();
+            if (nm == xname || nm == "_pi") continue;
+            rc = 111;
+            break;
+          }
         }
       }
       return ojson{{"_refusal", stataRefusal("error in expression: " + expr, rc)}};
@@ -1413,7 +1458,16 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
                       const std::optional<std::string>& globalIf,
                       std::vector<serset::PlotSpec>* sersetPlots,
                       const std::optional<std::string>& globalIn) {
-  if (dsPtr == nullptr) return ojson(eval::noDataLoaded());
+  // `function`, `scatteri`, `pci` and `pcarrowi` plot values the command line gives, so they
+  // run with no dataset in memory (bank: `twoway function y = x^2, range(-3 3)` rc 0, c(N) 0).
+  {
+    bool dataFree = !layers.empty();
+    for (const auto& spec : layers) {
+      const std::string ptl = strutil::lower(spec.plottype);
+      if (ptl != "function" && ptl != "scatteri" && ptl != "pci" && ptl != "pcarrowi") dataFree = false;
+    }
+    if (dsPtr == nullptr && !dataFree) return ojson(eval::noDataLoaded());
+  }
   if (layers.empty()) return engineErrorBlockG("twoway: no layers specified", "syntax_error");
   if (auto err = rejectByFacet(globalOpts)) return *err;  // BS-052: by() is whole-graph, never per-layer
 
@@ -1429,7 +1483,7 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
       "scatter", "line",  "connected", "lfit",   "qfit",    "lfitci",     "qfitci",
       "rarea",   "histogram", "kdensity", "rcap", "rcapsym", "rspike", "rline",
       "rconnected", "rscatter", "area", "spike", "dropline", "bar", "function", "scatteri",
-      "pci", "pcarrowi"};
+      "pci", "pcarrowi", "pcspike", "pcarrow"};
   for (const auto& spec : layers) {
     std::string pt = spec.plottype;
     std::transform(pt.begin(), pt.end(), pt.begin(),
@@ -1485,9 +1539,27 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
       if (auto err = eval::rejectUnknownOptions(globalOpts, lv->known, lv->unimplemented)) {
         return ojson(*err);
       }
+      // addplot() is an option of histogram and kdensity, not of twoway itself: on a statement with no such
+      // layer it is r(198) (bank: `scatter price mpg || , addplot(lfit price mpg)`)
+      for (const auto& kv : globalOpts) {
+        if (kv.first != "addplot") continue;
+        bool owner = false;
+        for (const auto& spec : layers)
+          if (spec.plottype == "histogram" || spec.plottype == "kdensity") owner = true;
+        if (!owner) return stataRefusal("option addplot() not allowed", 198);
+      }
       for (const auto& spec : layers) {
         if (auto err = eval::rejectUnknownOptions(spec.opts, lv->known, lv->unimplemented)) {
           return ojson(*err);
+        }
+        if (auto err = graphStyleWordRefusal(spec.opts)) return *err;
+        // The vocabulary above is the union over every plot type; an option some
+        // type owns and this one does not is r(198) on this one (vs-stata bank).
+        for (const auto& kv : spec.opts) {
+          if (plotTypeRefusesOption(spec.plottype, kv.first)) {
+            return stataRefusal("option " + kv.first + (kv.second.isBool ? "" : "()") + " not allowed",
+                                198);
+          }
         }
       }
     }
@@ -1510,7 +1582,7 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
       if (pt == "kdensity") legal = {"fweight", "aweight"};
       if (legal.count(spec.weightType) == 0) return stataRefusal(spec.weightType + "s not allowed", 101);
       const std::string wv = trimG(spec.weightExp);
-      if (!dsPtr->has(wv)) return stataRefusal(wv + " not found", 111);
+      if (dsPtr == nullptr || !dsPtr->has(wv)) return stataRefusal(wv + " not found", 111);
     }
     {
       const std::string ptl = strutil::lower(spec.plottype);
@@ -1523,6 +1595,12 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
                             109);
       }
     }
+  }
+
+  // mlabel(varlist) names variables of the data (vs-stata bank).
+  for (const auto& spec : layers) {
+    if (dsPtr == nullptr) break;
+    if (auto err = mlabelVarlistRefusal(session, *dsPtr, spec.opts)) return *err;
   }
 
   ojson renderedLayers = ojson::array();
@@ -1550,7 +1628,7 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
       const bool li = spec.inRange.has_value() && !spec.inRange->empty();
       const bool gi = globalIn.has_value() && !globalIn->empty();
       if (li || gi) {
-        const int64_t nAll = dsPtr->nRows();
+        const int64_t nAll = dsPtr != nullptr ? dsPtr->nRows() : 0;
         long long a = 1, b = nAll;
         for (const auto* r : {li ? &*spec.inRange : nullptr, gi ? &*globalIn : nullptr}) {
           if (r == nullptr) continue;
@@ -1577,7 +1655,9 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
     std::string tmpPath;
     std::unique_ptr<Datastore> tmpDs;
     bool filterFailed = false;
-    if (effectiveIn.has_value()) {
+    if (dsPtr == nullptr) {
+      // no dataset: only data-free plot types reach here, and they read no rows
+    } else if (effectiveIn.has_value()) {
       try {
         InRangeFilterResult fr = applyIfAndInFilter(session, dsPtr->path(), effectiveIf, effectiveIn);
         if (!fr.ok) return inRangeRejectError(fr, *effectiveIn, "twoway");
@@ -1610,7 +1690,7 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
     // serset-twoway WT: the layer's weight over the layer sample.
     std::vector<double> layerW;
     const std::vector<double>* layerWp = nullptr;
-    if (!spec.weightType.empty() && layerDs->has(trimG(spec.weightExp))) {
+    if (!spec.weightType.empty() && layerDs != nullptr && layerDs->has(trimG(spec.weightExp))) {
       layerW = numericColumn(*layerDs, trimG(spec.weightExp));
       layerWp = &layerW;
     }
@@ -1637,7 +1717,7 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
     } else if (pt == "function" || pt == "scatteri" || pt == "pci" || pt == "pcarrowi") {
       // serset-twoway FN / SCI: their own serset each, never shared.
       std::optional<serset::Serset> oneSet;
-      lyr = pt == "function" ? layerFunction(session, *layerDs, spec, static_cast<int>(idx), &oneSet)
+      lyr = pt == "function" ? layerFunction(session, layerDs, spec, static_cast<int>(idx), &oneSet)
                              : layerScatteri(spec, static_cast<int>(idx), &oneSet);
       if (lyr.contains("_refusal")) return lyr["_refusal"];
       if (!lyr.contains("_error") && oneSet.has_value() && sersetPlots != nullptr) {
@@ -1649,6 +1729,9 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
                pt == "rconnected" || pt == "rscatter" || pt == "area" || pt == "spike" ||
                pt == "dropline" || pt == "bar") {
       lyr = layerRangeOrBase(*layerDs, spec, static_cast<int>(idx), pt);
+      if (lyr.contains("_refusal")) return lyr["_refusal"];
+    } else if (pt == "pcspike" || pt == "pcarrow") {
+      lyr = layerPcData(*layerDs, spec, static_cast<int>(idx), pt);
       if (lyr.contains("_refusal")) return lyr["_refusal"];
     } else if (pt == "rarea") {
       lyr = layerRarea(*layerDs, spec.varlist, spec.opts, static_cast<int>(idx));
@@ -1686,7 +1769,7 @@ ojson runTwowayLayers(Datastore* dsPtr, SessionState& session,
       continue;
     }
 
-    if (sersetPlots != nullptr) {
+    if (sersetPlots != nullptr && layerDs != nullptr) {
       if (auto ps = layerDataPlotSpec(session, *layerDs, spec, pt)) sersetPlots->push_back(std::move(*ps));
     }
 

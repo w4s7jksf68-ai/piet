@@ -3812,16 +3812,28 @@ void testW2ByKeep() {
               "W2 bykeep: `by c: count if x1 > 5` on sorted data gives the same. Got rc " + rc2 +
                   " r(N) " + shown(session, "r(N)"));
     }
-    // Refusals: count takes no varlist and no options; both are r(198), never r(1).
-    // `in` under a by prefix is r(190) for every command (the existing guard).
+    // Refusals: count takes no varlist and no options, and a by prefix does not
+    // change its own syntax answer: a varlist is r(101) "varlist not allowed"
+    // (vs-stata bank 6c4f982fed18e7ae, `count price`) and an option r(101)
+    // "options not allowed" (c69d5acda46a3296 `count, zznotanoption`,
+    // 243576e02c94f73a `count , zzabbrprobe`), as unprefixed; never r(1). Until
+    // the bank this arm pinned r(198) for both, which was PIET's own answer
+    // unprefixed then too. `in` under a by prefix is r(190) for every command
+    // (the existing guard).
     {
       piet::SessionState session(workdir);
       mkE(session);
       const std::string rcVar = rcOf(session, "bysort c: count x1");
       const std::string rcOpt = rcOf(session, "bysort c: count, foo");
       const std::string rcIn = rcOf(session, "bysort c: count in 1/40");
-      bkCheck(rcVar == "198", "W2 bykeep: `bysort c: count x1` is a named refusal, rc 198. Got " + rcVar);
-      bkCheck(rcOpt == "198", "W2 bykeep: `bysort c: count, foo` is a named refusal, rc 198. Got " + rcOpt);
+      const std::string rcVar0 = rcOf(session, "count x1");
+      const std::string rcOpt0 = rcOf(session, "count, foo");
+      bkCheck(rcVar == "101" && rcVar0 == "101",
+              "W2 bykeep: `bysort c: count x1` is r(101) varlist not allowed, as `count x1` is "
+              "(bank 6c4f982fed18e7ae). Got " + rcVar + " (unprefixed " + rcVar0 + ")");
+      bkCheck(rcOpt == "101" && rcOpt0 == "101",
+              "W2 bykeep: `bysort c: count, foo` is r(101) options not allowed, as `count, foo` "
+              "is (bank c69d5acda46a3296). Got " + rcOpt + " (unprefixed " + rcOpt0 + ")");
       bkCheck(rcIn == "190", "W2 bykeep: `bysort c: count in 1/40` keeps the by-prefix `in` refusal, "
                              "rc 190. Got " + rcIn);
     }

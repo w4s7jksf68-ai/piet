@@ -3,6 +3,7 @@
 #include "piet/handlers/data_values.h"
 #include "piet/handlers/observations.h"
 #include "piet/handlers/utility.h"
+#include "piet/eval/exprfns.h"  // kStataMissingSentinel: mdesc's r(percent) on no rows
 
 #include <algorithm>
 #include <cctype>
@@ -279,14 +280,15 @@ ojson runMdesc(const eval::ParsedCommand& parsed, SessionState& session) {
     return ojson(*err);
   if (!session.hasData()) return ojson(eval::noDataLoaded());
 
-  Datastore* dsp = nullptr;
-  try {
-    dsp = session.datastore();
-  } catch (const std::exception& e) {
-    return utilError(std::string("mdesc: ") + e.what(), "data_io");
-  }
-  if (dsp == nullptr) return ojson(eval::noDataLoaded());
-  Datastore& ds = *dsp;
+  // mdesc.ado: `marksample touse, novarlist` -- the if/in sample is the total
+  // of every row, and each variable's missing count is taken inside it
+  // (vs-stata bank: `mdesc rep78 if foreign==1` -> miss 1, total 22).
+  std::vector<std::string> wantCols = parsed.varlist;
+  ReadScope scope(session, parsed, wantCols, "mdesc", true);
+  if (scope.failed())
+    return scope.error().is_null() ? utilError("mdesc: could not read the data", "data_io")
+                                   : scope.error();
+  Datastore& ds = *scope.get();
 
   std::vector<std::string> vars;
   if (auto err = resolveVarlist(ds, "mdesc", parsed.varlist, &vars)) return *err;
@@ -302,23 +304,30 @@ ojson runMdesc(const eval::ParsedCommand& parsed, SessionState& session) {
   oss << std::string(nameW + 1, '-') << "+" << std::string(42, '-') << "\n";
   int64_t lastMiss = 0;
   double lastPct = 0.0;
+  std::string missVars, notMissVars;
   for (const auto& nm : vars) {
-    const int64_t miss = missingCountOf(session, ds, nm);
-    const double pct = (n > 0) ? (100.0 * static_cast<double>(miss) / static_cast<double>(n)) : 0.0;
+    const ColView v = viewOf(ds, nm);
+    int64_t miss = 0;
+    for (int64_t i = 0; i < n; ++i) miss += cellMissing(v, i) ? 1 : 0;
+    const double pct = (n > 0) ? (100.0 * static_cast<double>(miss) / static_cast<double>(n))
+                               : eval::kStataMissingSentinel;
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.2f", pct);
     oss << rightAlign(nm, nameW) << " |" << rightAlign(intText(miss), 12)
-        << rightAlign(intText(n), 12) << rightAlign(std::string(buf), 18) << "\n";
+        << rightAlign(intText(n), 12) << rightAlign(n > 0 ? std::string(buf) : ".", 18) << "\n";
     lastMiss = miss;
     lastPct = pct;
+    if (miss > 0) missVars += (missVars.empty() ? "" : " ") + nm;
+    else notMissVars += (notMissVars.empty() ? "" : " ") + nm;
   }
-  // mdesc.ado leaves r() describing the LAST variable it processed, the same
-  // rule the plan states for distinct's r(ndistinct)/r(N). This is the one
-  // number in this bundle that the P5 pin would flip if the oracle keeps a
-  // whole-table total instead.
+  // mdesc.ado leaves r() describing the LAST variable it processed; the two
+  // lists are its own `return local`s (an empty one is not set).
+  eval::replaceRClass(session.eval);
   session.eval.rValues.set("miss", static_cast<double>(lastMiss));
   session.eval.rValues.set("total", static_cast<double>(n));
   session.eval.rValues.set("percent", lastPct);
+  if (!missVars.empty()) session.eval.rStrings.set("miss_vars", missVars);
+  if (!notMissVars.empty()) session.eval.rStrings.set("notmiss_vars", notMissVars);
   return displayBlock(oss.str());
 }
 

@@ -524,10 +524,11 @@ void testAerB2Strdist() {
                         "strdist p q\nds\n")
                         .blocks) == "p q strdist",
         "B2 strdist: with no gen() the new variable is called `strdist` -- the literal word");
-  check(lastDisplay(run("clear\nset obs 1\ngen x = 1\nstrdist \"abc\" x\n"
+  check(lastDisplay(run("clear\nset obs 1\ngen str3 x = \"abd\"\nstrdist \"abc\" x\n"
                         "quietly summarize strdist\ndisplay r(mean)\n")
                         .blocks) != "",
-        "B2 strdist: a LITERAL paired with a variable is the per-row distance to that literal");
+        "B2 strdist: a LITERAL paired with a (string) variable is the per-row distance to that literal "
+        "(a numeric variable is r(109) in Stata, vs-stata bank 34dcdc24105980f4)");
   check(lastDisplay(run("clear\nset obs 1\ngen str9 p = \"kitten\"\nstrdist \"abc\" p\n"
                         "quietly summarize strdist\ndisplay r(mean)\n")
                         .blocks) == "6",

@@ -5,9 +5,30 @@
 // keep the existing bodies and ownership/lifetime rules out of its shared header.
 #include "piet/session_state.h"
 
+#include <algorithm>
+
 #include "piet/strutil.h"  // globMatch for stored-estimate namelists
 
 namespace piet {
+
+namespace {
+// estimates.ado ClearFields: the live e() stops carrying the store name
+// `name` (e(_estimates_name), posted by results/stored_estimates_commands.cpp
+// at the store) -- the macro and its place in the fit's ordered e(macros).
+void dropEstimatesNameMacro(SessionState& s, const std::string& name) {
+  if (name.empty() || s.eval.eStrings.get("_estimates_name") != name) return;
+  s.eval.setEString("_estimates_name", "");
+  s.eval.setEString("estimates_title", "");  // TitleUpdate with no title
+  if (s.eNameContract.has_value() && s.eNameContract->macros.has_value()) {
+    std::vector<std::string>& m = *s.eNameContract->macros;
+    m.erase(std::remove_if(m.begin(), m.end(),
+                           [](const std::string& n) {
+                             return n == "_estimates_name" || n == "estimates_title";
+                           }),
+            m.end());
+  }
+}
+}  // namespace
 
 std::string SessionState::eststo(const std::optional<std::string>& name, nlohmann::ordered_json snapshot,
                    const std::string& autoPrefix, bool viaEststo) {
@@ -102,7 +123,10 @@ bool SessionState::estimatesDrop(const std::string& name) {
       estimatesModelErase(name);
       // estimates.ado Drop: dropping the name the active e() carries clears
       // e(_estimates_name) (ClearFields); the results themselves stay active.
-      if (activeEstimatesName == name) activeEstimatesName.clear();
+      if (activeEstimatesName == name) {
+        dropEstimatesNameMacro(*this, name);
+        activeEstimatesName.clear();
+      }
       return true;
     }
   }
@@ -115,6 +139,7 @@ void SessionState::estimatesClear() {
     if (kv.second) pinStoredModel(*kv.second, -1);
   }
   estimatesModels.clear();
+  dropEstimatesNameMacro(*this, activeEstimatesName);
   activeEstimatesName.clear();
   eststoSeq = 0;
 }

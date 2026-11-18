@@ -82,6 +82,26 @@ bool route_session(std::string& cmd,
     static const std::regex reSetLevel(R"(\bset\s+(?:level|clevel)\s+(\S+))", std::regex::icase);
     std::string nArg = parsed.varlist.size() > 1 ? parsed.varlist[1] : std::string();
     if (std::regex_search(parsed.raw, m, reSetLevel)) nArg = m.str(1);
+    // StataBE 19.5: a second word is r(101) "varlist not allowed" (vs-stata bank
+    // 869de18c2ec38d83 `set level 90 95`), a number outside [10, 99.99] r(198)
+    // "level() must be between 10 and 99.99 inclusive" (573b159c4597bb3a `set
+    // level 5`).
+    if (parsed.varlist.size() > 2) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "varlist not allowed", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(101)")));
+      return true;
+    }
+    {
+      char* end = nullptr;
+      const double dv = std::strtod(nArg.c_str(), &end);
+      if (!nArg.empty() && end != nullptr && *end == '\0' && (dv < 10.0 || dv > 99.99)) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error",
+                                                "level() must be between 10 and 99.99 inclusive",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
+        return true;
+      }
+    }
     bool ok = false;
     int lv = 0;
     try {
@@ -129,6 +149,15 @@ bool route_session(std::string& cmd,
     if (!ok) {
       blocks.push_back(ojson(eval::engineError(
           "set seed requires an integer argument, e.g. `set seed 12345`.", "unsupported_option")));
+      return true;
+    }
+    // A seed is an integer below 2^31: `set seed 4294967296` is r(198) "'4294967296'
+    // found where integer < 2^31 expected" (vs-stata bank 22d3e801c47e2c73;
+    // 2147483647 and -1 run).
+    if (sv > 2147483647LL) {
+      blocks.push_back(ojson(eval::errorBlock(
+          "syntax_error", "'" + nArg + "' found where integer < 2^31 expected", std::nullopt,
+          std::nullopt, std::nullopt, "r(198)")));
       return true;
     }
     session.seed = sv;
@@ -188,8 +217,12 @@ bool route_session(std::string& cmd,
     }
     const std::string arg = parsed.varlist.size() == 2 ? lower(parsed.varlist[1]) : std::string();
     if (arg != "on" && arg != "off") {
-      blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
-                                              std::nullopt, std::nullopt, "r(198)")));
+      // One word that is neither is r(100) "on or off required" (vs-stata bank
+      // 12a0a77c56108162 `set more maybe`).
+      const bool oneWord = parsed.varlist.size() == 2;
+      blocks.push_back(ojson(eval::errorBlock(
+          "syntax_error", oneWord ? "on or off required" : "invalid syntax", std::nullopt,
+          std::nullopt, std::nullopt, oneWord ? "r(100)" : "r(198)")));
       return true;
     }
     session.moreOn = arg == "on";
@@ -323,6 +356,25 @@ bool route_session(std::string& cmd,
   }
 
 
+  // `set , ...` names no setting: r(199) "-set ,- not allowed; ',' not
+  // recognized" (vs-stata bank e78605e3ff9647fb `set , zzabbrprobe`).
+  if (cmd == "set" && parsed.varlist.empty() && !parsed.opts.empty()) {
+    blocks.push_back(ojson(eval::errorBlock("syntax_error",
+                                            "-set ,- not allowed; ',' not recognized",
+                                            std::nullopt, std::nullopt, std::nullopt, "r(199)")));
+    return true;
+  }
+
+
+  if (cmd == "set" && !parsed.varlist.empty()) {
+    if (auto bad = checkedStataSetWord(parsed, session.hasData())) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", bad->first, std::nullopt,
+                                              std::nullopt, std::nullopt, bad->second)));
+      return true;
+    }
+  }
+
+
   if (cmd == "set" && !parsed.varlist.empty()) {
     // BS-101 (BETA A4): every OTHER `set` subcommand (more, matsize, scheme,
     // trace, linesize, ...; `type` has its own arm above) is a real, common,
@@ -332,7 +384,8 @@ bool route_session(std::string& cmd,
     // non-halting note, so at least it's visible this was recognized and
     // deliberately ignored rather than swallowed without a trace.
     const std::string setName = canonicalSetName(lower(parsed.varlist[0]));
-    if (setName == "rmsg" || setName == "trace" || setName == "varabbrev") {
+    // fvbase is the same on/off shape ([R] set); fvexpand reads the kept word.
+    if (setName == "rmsg" || setName == "trace" || setName == "varabbrev" || setName == "fvbase") {
       // BUG-1330: StataBE 19.5 takes `on` or `off` only: none is r(100) `on or off
       // required`, a second word r(101) `varlist not allowed`, any other word
       // (`ON` too) r(198) `'foo' found where on or off expected`, as is an option
@@ -351,12 +404,55 @@ bool route_session(std::string& cmd,
                      std::string("permanently").compare(0, o.size(), o) != 0))
           bad = {"option " + k + " not allowed", "r(198)"};
       }
+      // `set fvbase off` is a real setting PIET does not honour: every estimator
+      // still keeps a base level, so accepting it would be a silent wrong
+      // r(table) (truth bank cell fbb82749efd9a6e5). Refused by name until
+      // estimation reads it; `set fvbase on` is the default and stays accepted.
+      if (!bad && setName == "fvbase" && parsed.varlist[1] == "off") {
+        blocks.push_back(ojson(eval::engineError(
+            "`set fvbase off` is not implemented in this version of PIET: estimation commands "
+            "always keep a base level.",
+            "unimplemented")));
+        return true;
+      }
       if (bad) {
         blocks.push_back(ojson(eval::errorBlock("syntax_error", bad->first, std::nullopt,
                                                 std::nullopt, std::nullopt, bad->second)));
         return true;
       }
     }
+    // The settings PIET keeps as values for c() (environment/stata_settings.cpp:
+    // linesize, pagesize, maxiter, ...): checked as StataBE 19.5 checks them --
+    // `set linesize 10` is r(198) `linesize must be between 20 and 255` -- and
+    // kept, so `display c(linesize)` reads back what was set. An option but
+    // `permanently` is r(198), as for rmsg above.
+    if (isKeptStataSetting(lower(parsed.varlist[0]))) {
+      for (const auto& [k, v] : parsed.opts) {
+        (void)v;
+        const std::string o = lower(k);
+        if (o.size() < 4 || o.size() > 11 ||
+            std::string("permanently").compare(0, o.size(), o) != 0) {
+          blocks.push_back(ojson(eval::errorBlock("syntax_error", "option " + k + " not allowed",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(198)")));
+          return true;
+        }
+      }
+      bool handled = false;
+      const std::vector<std::string> args(parsed.varlist.begin() + 1, parsed.varlist.end());
+      if (auto bad = storeStataSetting(lower(parsed.varlist[0]), args, session, &handled)) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", bad->message, std::nullopt,
+                                                std::nullopt, std::nullopt,
+                                                "r(" + bad->rc + ")")));
+        return true;
+      }
+      ojson keptNote;
+      keptNote["type"] = "echo";
+      keptNote["text"] = "(set " + parsed.varlist[0] + ": not applicable to PIET — ignored)";
+      blocks.push_back(keptNote);
+      return true;
+    }
+    if (!isFullStataSettingWord(setName)) forgetAbbreviatedSetting(setName, session);
     ojson note;
     note["type"] = "echo";
     note["text"] = "(set " + parsed.varlist[0] + ": not applicable to PIET — ignored)";
@@ -368,7 +464,8 @@ bool route_session(std::string& cmd,
     std::string kept = "1";
     if (setName == "matsize")
       kept = std::to_string(std::stoi(parsed.varlist[1]));
-    else if (setName == "rmsg" || setName == "trace" || setName == "varabbrev")
+    else if (setName == "rmsg" || setName == "trace" || setName == "varabbrev" ||
+             setName == "fvbase")
       kept = parsed.varlist[1];
     session.eval.globals.set(std::string(kSetMarkerPrefix) + setName, kept);
     return true;
@@ -433,6 +530,18 @@ bool route_session(std::string& cmd,
       if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabCompress.known, kVocabCompress.unimplemented)) {
         blocks.push_back(ojson(*err));
         return true;
+      }
+      // nocoalesce only matters to strL variables (compress would otherwise turn them into str#);
+      // without one it changes nothing, and with one this build does not hold them apart.
+      for (const auto& [k, v] : parsed.opts) {
+        (void)v;
+        if (k != "nocoalesce") continue;
+        for (const auto& [nm, vm] : session.varMeta)
+          if (vm.stataType.has_value() && *vm.stataType == "strL") {
+            blocks.push_back(ojson(eval::unsupportedOption(
+                "nocoalesce", "compress, nocoalesce with strL variables in memory is not implemented.")));
+            return true;
+          }
       }
     }
     if (cmd == "compress") {
@@ -519,6 +628,13 @@ bool route_session(std::string& cmd,
 
 
   if (cmd == "pwd") {
+    // `pwd , zzabbrprobe` is r(198) "invalid syntax" (vs-stata bank
+    // 35bb66c555d39ad1), as `pwd junk` is.
+    if (!parsed.opts.empty()) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(198)")));
+      return true;
+    }
     blocks.push_back(ojson(handlers::runPwd(session)));
     return true;
   }
@@ -532,6 +648,22 @@ bool route_session(std::string& cmd,
 
 
   if (cmd == "which") {
+    // `which fname [, all]` (vs-stata bank 2026-11-10): no name is r(198)
+    // "invalid file specification" (`which`, `which , zzabbrprobe`), a second
+    // word r(198) "invalid 'WORD'" (`which regress summarize`, `which mata
+    // mean()`), an option other than `all` r(198) (`which regress,
+    // zznotanoption`).
+    {
+      auto refuse198 = [&](const std::string& msg) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt,
+                                                std::nullopt, "r(198)")));
+        return true;
+      };
+      if (parsed.varlist.empty()) return refuse198("invalid file specification");
+      if (parsed.varlist.size() > 1) return refuse198("invalid '" + parsed.varlist[1] + "'");
+      for (const auto& kv : parsed.opts)
+        if (lower(kv.first) != "all") return refuse198("option " + kv.first + " not allowed");
+    }
     // NAME not found is rc 0 for a command this build routes or a community ado
     // the oracle machine has installed (its ado/plus tree, 2026-10-21), and
     // r(111) otherwise (aer_w2 w2b_dataio which_gxtile/which_gsieve 111,
@@ -585,6 +717,36 @@ bool route_session(std::string& cmd,
 
 
   if (cmd == "ssc") {
+    // ssc's own dispatcher, which runs before anything touches the network: a
+    // bare `ssc` prints the command list and is r(198); a word that is none of
+    // its subcommands is r(198) "invalid subcommand"; `ssc install` without a
+    // package name is r(198) (bank ssc cells 0b163e9589a77188, 5ca11d92ec7b7020,
+    // 019dea7a784a9f1d).
+    {
+      auto sscErr = [&](const std::string& msg) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt,
+                                                std::nullopt, "r(198)")));
+        return true;
+      };
+      if (parsed.varlist.empty()) {
+        return sscErr(
+            "ssc commands are\n    ssc new\n    ssc hot\n\n    ssc describe  pkgname\n"
+            "    ssc describe  letter\n\n    ssc install   pkgname\n    ssc uninstall pkgname\n\n"
+            "    ssc type      filename  (less used)\n    ssc copy      filename  (less used)\n"
+            "see help ssc");
+      }
+      const std::string w = lower(parsed.varlist[0]);
+      auto abbrev = [&](const char* full, size_t minLen) {
+        return w.size() >= minLen && std::string(full).compare(0, w.size(), w) == 0;
+      };
+      const bool isInstall = abbrev("install", 4);
+      const bool known = abbrev("whatsnew", 4) || w == "new" || abbrev("whatshot", 6) || w == "hot" ||
+                         abbrev("describe", 1) || isInstall || w == "uninstall" || w == "copy" ||
+                         w == "cp" || w == "type" || w == "cat";
+      if (!known) return sscErr("ssc " + parsed.varlist[0] + ": invalid subcommand");
+      if (isInstall && parsed.varlist.size() < 2)
+        return sscErr("ssc install: nothing found where package name expected");
+    }
     ojson r = handlers::runSsc(parsed.varlist);
     if (!(r.is_array() && r.empty())) blocks.push_back(r);
     return true;

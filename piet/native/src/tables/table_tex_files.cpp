@@ -48,7 +48,7 @@ ojson runTexsave(const eval::ParsedCommand& parsed, SessionState& session) {
   std::vector<std::string> words = parsed.varlist;
   const std::optional<std::string> usingPath = takeUsing(words);
   if (!usingPath.has_value() || usingPath->empty()) {
-    return tblSyntax("using required");
+    return tblErrorRc("using required", 100);
   }
   Datastore* ds = session.datastore();
   // [varlist]: empty is every variable; `*`, `a-b` expand.
@@ -73,6 +73,18 @@ ojson runTexsave(const eval::ParsedCommand& parsed, SessionState& session) {
   const bool frag = has("frag");
   if (has("varlabels") && !names) {
     return tblErrorRc("option varlabels not allowed with option nonames", 198);
+  }
+  const bool decimalalign = has("decimalalign");
+  const bool valuelabels = has("valuelabels");
+  // Style options, in the order the ado applies them.
+  static const std::vector<std::pair<std::string, std::string>> styleCmds = {
+      {"bold", "\\textbf{"},      {"italics", "\\textit{"},   {"underline", "\\underline{"},
+      {"slanted", "\\textsl{"},   {"smallcaps", "\\textsc{"}, {"sansserif", "\\textsf{"},
+      {"monospace", "\\texttt{"}, {"emphasis", "\\emph{"}};
+  std::map<std::string, std::vector<std::string>> styleWords;
+  for (const auto& [opt, cmd] : styleCmds) {
+    (void)cmd;
+    if (auto v = str(opt.c_str())) styleWords[opt] = eoTokens(*v);
   }
   const std::string delimiter = str("delimiter").has_value() ? sarg("delimiter") : "&";
   const std::string horiz = "\\midrule";
@@ -143,7 +155,7 @@ ojson runTexsave(const eval::ParsedCommand& parsed, SessionState& session) {
   std::string align = sarg("align");
   if (align.empty()) {
     align = "@{}l";
-    for (size_t i = 2; i <= nvars; ++i) align += "C";
+    for (size_t i = 2; i <= nvars; ++i) align += decimalalign ? "S" : "C";
     align += "@{}";
   }
   // ---- header ----------------------------------------------------------------------
@@ -188,6 +200,29 @@ ojson runTexsave(const eval::ParsedCommand& parsed, SessionState& session) {
     title = fixText(title, false);
   }
   // ---- the data, outsheet-style (delimiter, nonames, noquote, nolabel) ------------
+  // texsave's own `if` / `in`: outsheet writes only the selected rows. The
+  // qualifier follows `using FILE`; the expression ends where a trailing
+  // `using` would begin, as it does for outfile.
+  std::unique_ptr<Datastore> filtered;
+  {
+    std::optional<std::string> ifExpr = parsed.ifExpr;
+    if (ifExpr.has_value()) {
+      static const std::regex reUsingTail(R"(\s+using\s.*$)");
+      ifExpr = std::regex_replace(*ifExpr, reUsingTail, "");
+    }
+    if ((ifExpr.has_value() && !ifExpr->empty()) ||
+        (parsed.inRange.has_value() && !parsed.inRange->empty())) {
+      InRangeFilterResult fr;
+      try {
+        fr = applyIfAndInFilter(session, ds->path(), ifExpr, parsed.inRange);
+      } catch (const CobraError& ce) {
+        return tblErrorRc(cobraErrorMessage(ce), 198);
+      }
+      if (!fr.ok) return ojson(inRangeRejectError(fr, parsed.inRange.value_or(std::string()), "texsave"));
+      filtered = std::make_unique<Datastore>(fr.dataPath);
+      ds = filtered.get();
+    }
+  }
   const int64_t n = ds->nRows();
   std::vector<std::string> lines;
   {
@@ -204,7 +239,7 @@ ojson runTexsave(const eval::ParsedCommand& parsed, SessionState& session) {
           const int32_t code = col.codes()[r];
           if (code >= 0) cell = col.levels[static_cast<size_t>(code)];
           if (fix) cell = fixText(cell, false);
-          if (endash) {
+          if (endash && !decimalalign) {
             std::smatch m;
             int guard = 0;
             while (std::regex_search(cell, m, reEndash) && guard++ < 1000) {
@@ -216,9 +251,37 @@ ojson runTexsave(const eval::ParsedCommand& parsed, SessionState& session) {
               cell.replace(at, s1.size(), s2);
             }
           }
+          // bold() ... emphasis(): a string cell holding any of the listed words is wrapped
+          // in the style's command, one option after the other in the ado's order.
+          for (const auto& [opt, cmd] : styleCmds) {
+            for (const auto& word : styleWords[opt]) {
+              if (!word.empty() && cell.find(word) != std::string::npos) cell = cmd + cell + "}";
+            }
+          }
+          // decimalalign: text that is not a number is braced so siunitx leaves it alone.
+          if (decimalalign) {
+            char* endp = nullptr;
+            const std::string t = eoTrim(cell);
+            (void)std::strtod(t.c_str(), &endp);
+            if (t.empty() || *endp != '\0') cell = "{" + cell + "}";
+          }
         } else {
           const double v = col.f64()[r];
           cell = std::isnan(v) ? std::string(".") : eoTrim(eval::applyStataFmt(v, fmts[c]));
+          // valuelabels: a labeled numeric is written as its label (outsheet's default).
+          if (valuelabels && !std::isnan(v)) {
+            const auto lv = session.varLblname.find(cols[c]);
+            if (lv != session.varLblname.end()) {
+              const auto ld = session.labelDefs.find(lv->second);
+              if (ld != session.labelDefs.end()) {
+                auto it = ld->second.find(eval::pythonFloatRepr(v));
+                if (it == ld->second.end() && v == std::floor(v)) {
+                  it = ld->second.find(std::to_string(static_cast<long long>(v)));
+                }
+                if (it != ld->second.end()) cell = it->second;
+              }
+            }
+          }
         }
         line += cell;
       }
@@ -277,6 +340,7 @@ ojson runTexsave(const eval::ParsedCommand& parsed, SessionState& session) {
       put("\\usepackage{tabularx}");
       put("\\usepackage[margin=1in]{geometry}");
       if (has("landscape")) put("\\usepackage{pdflscape}");
+      if (decimalalign) put("\\usepackage{siunitx}");
     }
     putTokens("preamble");
     if (!frag) {
@@ -333,11 +397,64 @@ ojson runTexsave(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   std::string bytes;
   for (const auto& l : out) bytes += l + "\n";
-  return emitTable("texsave", session, userPath, bytes, has("replace"), false);
+  ojson written = emitTable("texsave", session, userPath, bytes, has("replace"), false);
+  if (written.is_object() && written.value("type", "") == "error") return written;
+  // What the ado's last file command leaves in r(). dataonly copies the
+  // filefilter output and stops, so r() is filefilter's own: one occurrence per
+  // data row, the 1-byte end-of-line replaced by " \tabularnewline" + rowsep + eol.
+  // Otherwise the last command is appendfile's `file read` loop, which ends at
+  // end of file and leaves r(eof) = 1 and r(status) = "eof".
+  eval::replaceRClass(session.eval);
+  if (has("dataonly")) {
+    session.eval.rValues.set("occurrences", static_cast<double>(n));
+    session.eval.rValues.set("bytes_from", 1.0);
+    session.eval.rValues.set("bytes_to", static_cast<double>(std::string(" \\tabularnewline").size() +
+                                                              rowsep.size() + 1));
+  } else {
+    session.eval.rValues.set("eof", 1.0);
+    session.eval.rStrings.set("status", "eof");
+  }
+  return written;
 }
 
 
+namespace {
+
+// The document's settings kept between `texdoc init` and `texdoc close`: one
+// global per setting (same cost as the path's `__piet_texdoc_path`).
+const std::string kTexdocSettingPrefix = "__piet_texdoc_s_";
+
+// A bare flag option (`logdir`, as against `logdir(x)`).
+bool texdocBareFlag(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                    const char* key) {
+  const eval::OptValue* v = findOpt(opts, key);
+  return v != nullptr && v->isBool && v->boolValue;
+}
+
+// `sreturn clear`: s() is kept in rStrings under the reserved "\x01s:" lead.
+void texdocClearSClass(SessionState& session) {
+  std::vector<std::string> keys;
+  for (const auto& kv : session.eval.rStrings.items())
+    if (kv.first.compare(0, 3, "\x01s:") == 0) keys.push_back(kv.first);
+  for (const auto& k : keys) session.eval.rStrings.erase(k);
+}
+
+}  // namespace
+
+
 ojson runTexdoc(const eval::ParsedCommand& parsed, SessionState& session) {
+  // The subcommands this build does not run carry options of their own (`texdoc
+  // do d.do, cd nostop init()`); they are refused by name before the options
+  // are judged against init's.
+  if (!parsed.varlist.empty()) {
+    static const std::set<std::string> kNotRunSubs = {"do", "stlog", "local", "graph",
+                                                      "write", "substitute", "append"};
+    const std::string first = strutil::lower(parsed.varlist[0]);
+    if (kNotRunSubs.count(first) != 0)
+      return ojson(eval::unsupportedCommand("texdoc " + first, std::nullopt, std::nullopt,
+                                            "refused:not_implemented_sub",
+                                            eval::UnsupportedCommandKind::kNotImplemented));
+  }
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabTexdoc.known,
                                             kVocabTexdoc.unimplemented)) {
     return ojson(*err);
@@ -362,7 +479,26 @@ ojson runTexdoc(const eval::ParsedCommand& parsed, SessionState& session) {
     }
     const std::string path = session.eval.globals.get(kTexdocPathKey);
     session.eval.globals.erase(kTexdocPathKey);
-    return displayBlock("(texdoc closed " + path + ")");
+    // texdoc close returns the document's settings in s() (sreturn clear first)
+    // and shows where the output went.
+    const std::string shown =
+        session.eval.globals.get(kTexdocSettingPrefix + std::string("docname0"), path);
+    texdocClearSClass(session);
+    static const char* const kOrder[] = {
+        "certify", "custom", "nokeep", "hardcode", "alert", "tag", "verbatim", "cmdlog",
+        "beamer", "nooutput", "noltrim", "gtstrip", "lbstrip", "cmdstrip", "matastrip",
+        "nolog", "nodo", "linesize", "gropts", "grdir", "stpath", "prefix", "logdir", "path",
+        "logall", "basename", "docname"};
+    for (const char* k : kOrder) {
+      const std::string v = session.eval.globals.get(kTexdocSettingPrefix + std::string(k));
+      if (!v.empty()) session.eval.rStrings.set(std::string("\x01s:") + k, v);
+    }
+    std::vector<std::string> gone;
+    for (const auto& kv : session.eval.globals.items())
+      if (kv.first.compare(0, kTexdocSettingPrefix.size(), kTexdocSettingPrefix) == 0)
+        gone.push_back(kv.first);
+    for (const auto& k : gone) session.eval.globals.erase(k);
+    return displayBlock("(texdoc output written to " + shown + ")");
   }
   if (sub != "init") {
     return ojson(eval::unsupportedCommand("texdoc " + sub, std::nullopt, std::nullopt, "piet_gap",
@@ -384,6 +520,32 @@ ojson runTexdoc(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!hasFlag(parsed.opts, "force")) {
     return displayBlock("(texdoc do not running; nothing to do)");
   }
+  // The option rules of texdoc init's syntax line, in the order it checks them.
+  {
+    auto given = [&](const std::string& k) { return findOpt(parsed.opts, k) != nullptr; };
+    auto bad = [&](const std::string& msg) { return tblErrorRc(msg, 198); };
+    if (given("replace") && given("append")) return bad("replace and append not both allowed");
+    if (given("nolog") && given("cmdlog")) return bad("nolog and cmdlog not both allowed");
+    if (given("custom") && given("hardcode")) return bad("custom and hardcode not both allowed");
+    for (const char* opt : {"logdir", "prefix", "stpath"})
+      if (given(opt) && given(std::string("no") + opt))
+        return bad(std::string(opt) + "() and no" + opt + " not both allowed");
+    for (const char* opt : {"logall", "do", "log", "cmdlog", "beamer", "verbatim", "hardcode",
+                            "keep", "custom", "cmdstrip", "lbstrip", "gtstrip", "matastrip",
+                            "output", "ltrim", "certify"})
+      if (given(opt) && given(std::string("no") + opt))
+        return bad(std::string(opt) + " and no" + opt + " not both allowed");
+    if (auto ls = optStr(parsed.opts, "linesize")) {
+      // numlist int max=1 >=40 <=255
+      const std::string t = dequote(*ls);
+      char* endp = nullptr;
+      const double v = std::strtod(t.c_str(), &endp);
+      if (t.empty() || *endp != '\0' || v != std::floor(v) ||
+          t.find_first_of(" \t") != std::string::npos)
+        return tblErrorRc("invalid numlist", 121);
+      if (v < 40 || v > 255) return tblErrorRc("invalid number, outside of allowed range", 125);
+    }
+  }
   const std::string userPath = ensureExt(*path, ".tex");
   const std::string resolved = resolveUserPath(session, userPath);
   const bool replace = hasFlag(parsed.opts, "replace");
@@ -397,7 +559,59 @@ ojson runTexdoc(const eval::ParsedCommand& parsed, SessionState& session) {
     if (!werr.is_null()) return werr;
   }
   session.eval.globals.set(kTexdocPathKey, resolved);
-  return displayBlock("(texdoc opened " + userPath + ")");
+  // The document's settings, as texdoc keeps them until `texdoc close` returns
+  // them in s(): the file's names and the options that were given, derived the
+  // way texdoc's init does (log/graph directories, the prefix of the log files).
+  {
+    namespace fs = std::filesystem;
+    const std::string name = fs::path(userPath).filename().string();
+    const std::string dir0 = fs::path(userPath).parent_path().string();
+    const std::string stem = fs::path(name).stem().string();
+    std::string absDir = fs::path(resolved).parent_path().string();
+    if (absDir.empty() || absDir.back() != '/') absDir += "/";
+    auto word = [&](const char* k) {
+      return findOpt(parsed.opts, k) != nullptr ? std::string(k) : std::string();
+    };
+    auto arg = [&](const char* k) { return optStr(parsed.opts, k).value_or(std::string()); };
+    auto flag = [&](const char* k) { return texdocBareFlag(parsed.opts, k); };
+    std::string logdir;
+    if (!arg("logdir").empty()) logdir = arg("logdir");
+    else if (flag("logdir")) logdir = stem;
+    std::string prefix;
+    if (flag("noprefix")) prefix = "";
+    else if (!arg("prefix").empty()) prefix = arg("prefix");
+    else if (flag("prefix")) prefix = stem + "_";
+    else if (!logdir.empty()) prefix = "";
+    else prefix = stem + "_";
+    std::string stpath;
+    if (!arg("stpath").empty()) stpath = arg("stpath");
+    else if (flag("stpath")) stpath = dir0;
+    // texdoc makes the log and graph directories it is told about.
+    for (const std::string& sub : {logdir, arg("grdir")}) {
+      if (sub.empty()) continue;
+      std::error_code ec;
+      fs::create_directories(
+          cecon::to_native_path(resolveUserPath(session, (dir0.empty() ? "" : dir0 + "/") + sub)),
+          ec);
+    }
+    const std::vector<std::pair<std::string, std::string>> kept = {
+        {"certify", word("certify")},   {"custom", word("custom")},     {"nokeep", word("nokeep")},
+        {"hardcode", word("hardcode")}, {"alert", arg("alert")},        {"tag", arg("tag")},
+        {"verbatim", word("verbatim")}, {"cmdlog", word("cmdlog")},     {"beamer", word("beamer")},
+        {"nooutput", word("nooutput")}, {"noltrim", word("noltrim")},   {"gtstrip", word("gtstrip")},
+        {"lbstrip", word("lbstrip")},   {"cmdstrip", word("cmdstrip")}, {"matastrip", word("matastrip")},
+        {"nolog", word("nolog")},       {"nodo", word("nodo")},         {"linesize", arg("linesize")},
+        {"gropts", arg("gropts")},      {"grdir", arg("grdir")},        {"stpath", stpath},
+        {"prefix", prefix},             {"logdir", logdir},             {"path", absDir},
+        {"logall", word("logall")},     {"basename", name},             {"docname", absDir + name},
+        {"docname0", dir0.empty() ? name : dir0 + "/" + name}};
+    for (const auto& [k, v] : kept) session.eval.globals.set(kTexdocSettingPrefix + k, v);
+  }
+  // texdoc init ends with `sreturn clear`.
+  texdocClearSClass(session);
+  return displayBlock("(texdoc output file is " +
+                      session.eval.globals.get(kTexdocSettingPrefix + std::string("docname0")) +
+                      ")");
 }
 
 

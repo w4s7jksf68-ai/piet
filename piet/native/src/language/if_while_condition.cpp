@@ -295,7 +295,8 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
     const std::string lower = strutil::lower(cleaned);
     if (lower.find("colnumb") != std::string::npos || lower.find("colsof") != std::string::npos ||
         lower.find("rowsof") != std::string::npos || lower.find('[') != std::string::npos ||
-        lower.find("el(") != std::string::npos) {
+        lower.find("el(") != std::string::npos || lower.find("det(") != std::string::npos ||
+        lower.find("trace(") != std::string::npos) {
       // Unicode names: identifier-class boundary, not ASCII `\b` (an Arabic
       // byte is a non-word character to `\b`, so `مcolnumb(` would match).
       static const std::regex reColnumbMat(
@@ -705,7 +706,36 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
           std::nullopt, std::nullopt, std::nullopt, rc);
       return r;
     }
+    // A name that is no variable, scalar or constant is r(111) "NAME not found"
+    // (StataBE 19.5: `if `e' display "x"` with an empty `e' reads `display` as
+    // the condition, vs-stata bank 230912e26615211c).
+    {
+      static const std::string kNameErr = "NameError: name '";
+      const size_t at = outcome.error.find(kNameErr);
+      if (at != std::string::npos) {
+        const size_t b = at + kNameErr.size();
+        const size_t e = outcome.error.find('\'', b);
+        const std::string name = e == std::string::npos ? std::string() : outcome.error.substr(b, e - b);
+        bool isVar = false;
+        if (!name.empty() && session.hasData())
+          if (Datastore* nds = session.datastore()) isVar = nds->has(name);
+        if (!name.empty() && !isVar) {
+          r.error = eval::errorBlock("engine_error", name + " not found",
+                                     std::nullopt, std::nullopt, std::nullopt, "r(111)");
+          return r;
+        }
+      }
+    }
     r.error = errBlock("if/while condition evaluation failed (expr=" + cleaned + ")");
+    return r;
+  }
+  // A condition whose value is a string is r(109) type mismatch (StataBE 19.5:
+  // `if "abc" display "x"`, vs-stata bank 08c686b88955c7ae, 626212ccf4e99240);
+  // Python truthiness read a non-empty string as true.
+  if (outcome.value.isStr()) {
+    r.isError = true;
+    r.error = eval::errorBlock("engine_error", "type mismatch (expr=" + cleaned + ")", std::nullopt,
+                               std::nullopt, std::nullopt, "r(109)");
     return r;
   }
   r.value = outcome.value.truthy();

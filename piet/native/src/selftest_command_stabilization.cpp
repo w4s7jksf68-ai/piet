@@ -59,16 +59,18 @@ void testCommandLayerStabilizationW3() {
       }
       check(session.hasData(), "mission 1/2 setup: auto.hbin fixture loaded");
 
-      // Mission 1: BUG-010 repro — `count gen zzz9 = 1` must name the
-      // dropped tail as a syntax error, NOT silently degrade to `count`.
+      // Mission 1: BUG-010 repro — `count gen zzz9 = 1` must refuse the
+      // dropped tail, NOT silently degrade to `count`. `count`'s syntax takes
+      // no varlist, so the refusal is Stata's r(101) "varlist not allowed"
+      // (StataBE 19.5 truth bank 2026-11-10: `count price` r(101)).
       {
         auto j = runCmd(session, "count gen zzz9 = 1");
         auto errBlock = firstBlockOfType(j, "error");
-        check(errBlock.value("code", std::string()) == "syntax_error",
-              "mission 1: `count gen zzz9 = 1` is a syntax_error, not a silent bare count");
+        check(!errBlock.is_null() && errBlock.value("reason", std::string()) == "r(101)",
+              "mission 1: `count gen zzz9 = 1` is refused (r(101)), not a silent bare count");
         std::string msg = errBlock.value("message", std::string());
-        check(msg.find("gen zzz9 = 1") != std::string::npos,
-              "mission 1: the error names the exact dropped tokens (\"gen zzz9 = 1\")");
+        check(msg == "varlist not allowed",
+              "mission 1: the refusal is Stata's `varlist not allowed`");
         check(!session.datastore()->has("zzz9"),
               "mission 1: `zzz9` was never created (the `gen` never silently ran)");
       }
@@ -174,9 +176,13 @@ void testCommandLayerStabilizationW3() {
             "mission 5: `desc` alias gets the same empty-description treatment");
     }
     {
+      // Stata: `codebook` on an empty dataset is r(2000) "no observations"
+      // (vs-stata bank 302ade60041764f7); it used to be PIET's own no_data_loaded.
       auto j = runCmd(session, "codebook");
-      check(firstBlockOfType(j, "error").value("code", std::string()) == "no_data_loaded",
-            "mission 5: `codebook` with no data is UNCHANGED (still no_data_loaded)");
+      const auto cbErr = firstBlockOfType(j, "error");
+      check(cbErr.value("reason", std::string()) == "r(2000)" &&
+                cbErr.value("message", std::string()).find("no observations") != std::string::npos,
+            "mission 5: `codebook` with no data is Stata's r(2000) no observations");
     }
   }
 
@@ -323,10 +329,23 @@ void testFuzzCampaignBugfixes() {
           "P1-A3: `save out.dta, replace` succeeds over an existing file");
     }
 
+    // StataBE writes a .dta whatever the extension and says so (bank cell
+    // 978a80b21c1fc51e: `save a.zzz` -> "file a.zzz saved as .dta format"); the
+    // bytes on disk are a real format-118 .dta, never another format under the name.
     auto jTxt = runCmd(session, "save out.txt");
-    check(firstBlockOfType(jTxt, "error").value("code", std::string()) == "engine_error",
-          "BUG A: an unrelated extension (`.txt`) is ALSO an honest error, not a silent write");
-    check(!fs::exists(wd + "/out.txt"), "BUG A: no `out.txt` file was written either");
+    check(firstBlockOfType(jTxt, "error").is_null(),
+          "BUG A (bank 978a80b21c1fc51e): an unrelated extension (`.txt`) is saved as .dta, as Stata does");
+    check(lastBlockOfType(jTxt, "echo").value("text", std::string()) ==
+              "file out.txt saved as .dta format",
+          "BUG A: the answer to `save out.txt` says it was saved as .dta format");
+    check(fs::exists(wd + "/out.txt"), "BUG A: `out.txt` was written");
+    {
+      std::ifstream probeTxt(cecon::to_native_path(wd + "/out.txt"), std::ios::binary);
+      std::string headTxt(64, '\0');
+      probeTxt.read(headTxt.data(), static_cast<std::streamsize>(headTxt.size()));
+      check(headTxt.find("<release>118</release>") != std::string::npos,
+            "BUG A: the bytes of `out.txt` are a real Stata format-118 .dta");
+    }
 
     auto jPlain = runCmd(session, "save plainname");
     auto echoResult = lastBlockOfType(jPlain, "echo");
@@ -492,14 +511,17 @@ void testFuzzCampaignBugfixes() {
     session.cwd = wd;
     runCmd(session, "sysuse fatalities, clear");
 
-    auto jBad = runCmd(session, "save f.hbin, nolabel replace");
+    // `nolabel` and `orphans` are implemented since the vs-stata bank round
+    // (save nolabel / orphans cells); `all` (e(sample) written into the file) is
+    // the suboption that is still a named reject, so it carries this leg.
+    auto jBad = runCmd(session, "save f.hbin, all replace");
     auto errBad = firstBlockOfType(jBad, "error");
     check(errBad.value("code", std::string()) == "unsupported_option",
-          "FIX:PIET-SAVE-SUBOPTION-STRICT: `nolabel` is a named unsupported_option reject, not "
+          "FIX:PIET-SAVE-SUBOPTION-STRICT: `all` is a named unsupported_option reject, not "
           "a silent no-op");
-    check(errBad.value("message", std::string()).find("nolabel") != std::string::npos,
+    check(errBad.value("message", std::string()).find("all") != std::string::npos,
           "FIX:PIET-SAVE-SUBOPTION-STRICT: the reject names the actual offending token "
-          "(`nolabel`)");
+          "(`all`)");
     check(!fs::exists(wd + "/f.hbin"),
           "FIX:PIET-SAVE-SUBOPTION-STRICT: no file was written on the honest-reject path");
 

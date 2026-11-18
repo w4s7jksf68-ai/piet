@@ -308,4 +308,87 @@ DemeanReport demean(double* M, int64_t n, int m, const std::vector<Factor>& fe, 
   return rep;
 }
 
+// reghdfe's MAP solver with conjugate-gradient acceleration (method identified from
+// reghdfe's documentation of its defaults and its Hestenes-Stiefel stopping rule):
+//   T(y): symmetric Kaczmarz sweep over the factors 1..G..1, each step subtracting the
+//         (weighted) group means; the projection is y - T-residual.
+//   r = P(y), ssr = sum w r^2, u = r, improvement = sum w y^2; per iteration
+//   v = P(u), alpha = ssr / max(sum w u v, eps), improvement -= alpha ssr,
+//   r -= alpha v, beta = ssr_new / max(ssr, eps), u = r + beta u,
+//   error = sqrt(max over columns of e / max(improvement, eps)) with e = alpha ssr
+//   (0 when below 1e-15); converged when error <= tol.
+// The columns are independent (alpha, beta per column), so the count is the first
+// iteration at which all of them meet the rule.
+int hdfe_map_cg_iterations(const double* M, int64_t n, int m, const std::vector<Factor>& fe,
+                           const double* w, double tol, int maxiter) {
+  const size_t G = fe.size();
+  if (G < 2 || n <= 0 || m <= 0) return 0;
+  const double eps = 2.220446049250313e-16;
+  std::vector<std::vector<double>> denom(G);
+  for (size_t g = 0; g < G; ++g) {
+    denom[g].assign(static_cast<size_t>(fe[g].n_levels), 0.0);
+    for (int64_t i = 0; i < n; ++i) denom[g][fe[g].codes[i]] += w ? w[i] : 1.0;
+  }
+  std::vector<double> sums;
+  auto subtractMeans = [&](std::vector<double>& a, size_t g) {
+    sums.assign(static_cast<size_t>(fe[g].n_levels), 0.0);
+    const int32_t* c = fe[g].codes.data();
+    for (int64_t i = 0; i < n; ++i) sums[c[i]] += (w ? w[i] : 1.0) * a[i];
+    for (size_t l = 0; l < sums.size(); ++l) sums[l] = denom[g][l] > 0 ? sums[l] / denom[g][l] : 0.0;
+    for (int64_t i = 0; i < n; ++i) a[i] -= sums[c[i]];
+  };
+  auto project = [&](const std::vector<double>& y, std::vector<double>& out) {
+    std::vector<double> a(y);
+    for (size_t g = 0; g < G; ++g) subtractMeans(a, g);
+    for (size_t g = G - 1; g-- > 0;) subtractMeans(a, g);
+    out.resize(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) out[i] = y[i] - a[i];
+  };
+  auto wdot = [&](const std::vector<double>& a, const std::vector<double>& b) {
+    long double s = 0;
+    for (int64_t i = 0; i < n; ++i) s += static_cast<long double>((w ? w[i] : 1.0) * a[i] * b[i]);
+    return static_cast<double>(s);
+  };
+  std::vector<std::vector<double>> r(m), u(m), v(m);
+  std::vector<double> ssr(m), improvement(m);
+  for (int c = 0; c < m; ++c) {
+    std::vector<double> y(M + static_cast<size_t>(c) * n, M + static_cast<size_t>(c + 1) * n);
+    // reghdfe standardizes each column first (sd = sqrt((sum x^2 - (sum x)^2/N)/(N-1)),
+    // unweighted, floored at 1e-3); only the 1e-15 zero threshold sees the scale.
+    double s1 = 0, s2 = 0;
+    for (double x : y) {
+      s1 += x;
+      s2 += x * x;
+    }
+    const double nd = static_cast<double>(n);
+    double sd = n > 1 ? std::sqrt((s2 - s1 * s1 / nd) / (nd - 1.0)) : 1.0;
+    if (!std::isfinite(sd)) sd = 1.0;
+    sd = std::max(sd, 1e-3);
+    for (double& x : y) x /= sd;
+    improvement[c] = wdot(y, y);
+    project(y, r[c]);
+    ssr[c] = wdot(r[c], r[c]);
+    u[c] = r[c];
+  }
+  for (int iter = 1; iter <= maxiter; ++iter) {
+    double worst = 0.0;
+    for (int c = 0; c < m; ++c) {
+      project(u[c], v[c]);
+      const double alpha = ssr[c] / std::max(wdot(u[c], v[c]), eps);
+      const double recent = alpha * ssr[c];
+      improvement[c] -= alpha * ssr[c];
+      for (int64_t i = 0; i < n; ++i) r[c][i] -= alpha * v[c][i];
+      const double ssrOld = ssr[c];
+      ssr[c] = wdot(r[c], r[c]);
+      const double beta = ssr[c] / std::max(ssrOld, eps);
+      for (int64_t i = 0; i < n; ++i) u[c][i] = r[c][i] + beta * u[c][i];
+      const double num = std::fabs(recent) < 1e-15 ? 0.0 : recent;
+      const double den = std::isnan(improvement[c]) ? eps : std::max(improvement[c], eps);
+      worst = std::max(worst, num / den);
+    }
+    if (std::sqrt(worst) <= tol) return iter;
+  }
+  return 0;
+}
+
 }  // namespace cecon

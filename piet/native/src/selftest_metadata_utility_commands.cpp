@@ -154,10 +154,16 @@ void testW2T1Meta() {
     w2check(rStr(s, "varlist") == "p1 p2",
             "t1meta findname_varlist (community.log:552 `p1 p2`): a leading varlist restricts "
             "the search. Got `" + rStr(s, "varlist") + "`");
+    // type() selects by storage type (vs-stata bank: `findname, type(numeric)` rc 0; an unknown type word,
+    // cell a00329f5d03ba645 `findname, type(zzz)`, is r(198) "invalid variable type(s)").
     r = run("findname, type(numeric)", s);
+    w2check(r.rc == "0",
+            "t1meta findname type(numeric) is a selector this build reads. Got rc " + r.rc + " `" +
+                r.msg + "`");
+    r = run("findname, type(zzz)", s);
     w2check(r.rc == "198" && has(r.msg, "type"),
-            "t1meta findname refusal: type() is a real findname option this build does not "
-            "implement -- refused by name, not ignored. Got rc " + r.rc + " `" + r.msg + "`");
+            "t1meta findname type(zzz): invalid variable type(s), r(198) (vs-stata bank). Got rc " +
+                r.rc + " `" + r.msg + "`");
   }
 
   // ---- xtdescribe (w2ax_t1_official.do (3)) ------------------------------

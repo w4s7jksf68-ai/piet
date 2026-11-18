@@ -217,6 +217,16 @@ ojson summarizeCoreStatsWeighted(Datastore& ds, const std::optional<std::vector<
     s["sum_w"] = 0.0;
     stats[v] = s;
   }
+  // The rows (and r(), which is the LAST variable's) follow the varlist order,
+  // strings in their place: `summarize make price` posts price's r(N) 74 and
+  // `summarize` on auto foreign's (vs-stata bank); grouping the strings last
+  // made every varlist with a string read r(N) 0.
+  if (!facVars.empty() && !f64Vars.empty()) {
+    ojson ordered = ojson::object();
+    for (const auto& n : names)
+      if (stats.contains(n) && !ordered.contains(n)) ordered[n] = stats[n];
+    stats = std::move(ordered);
+  }
 
   ojson out;
   out["type"] = "summarize";

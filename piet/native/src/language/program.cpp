@@ -7,7 +7,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <filesystem>   // BUG-360: ScopeGuard reaps this call's tempfiles
+#include <functional>   // std::hash: the program archive's definition key
 #include <regex>
 #include <sstream>
 #include <system_error>
@@ -15,10 +17,13 @@
 #include "piet/cclass.h"  // BUG-1330: kVersionLocal
 #include "piet/doexec.h"
 #include "piet/eval/errors.h"
+#include "piet/eval/exprfns.h"  // stataMissingWithKind: `return scalar x = .a`
+#include "piet/eval/gettoken.h"  // tokenizeText: tokenize's split
 #include "piet/eval/macros.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/datastore.h"
 #include "piet/handlers/observations.h"
+#include "piet/handlers/results.h"  // noteEContractName
 #include "piet/loops.h"
 #include "piet/session_state.h"
 #include "piet/strutil.h"
@@ -92,25 +97,20 @@ const std::regex& reEnd() {
   return re;
 }
 
-// `[capture] program drop NAME` — the redefine-idiom drop that PRECEDES a
-// `program define NAME` (see captureProgams doc comment).
-const std::regex& reProgDrop() {
-  // `capt prog drop mht_rw` is the corpus's own spelling of the redefine idiom;
-  // capture's truncations were already accepted here, program's were not.
-  static const std::regex re(
-      R"(^(?:cap(?:t(?:u(?:r(?:e)?)?)?)?\s+)?prog(?:ram)?\s+drop\s+(\w+)\s*$)",
-      std::regex::icase);
-  return re;
-}
-
 }  // namespace
 
-// BUG-342 — see program.h. The prefix is a Stata comment, so a stray sentinel
-// that ever escaped the interception in doexec.cpp would be inert rather than
-// an honest-looking command; and the reserved token can never collide with a
-// user line, since preprocessDo has already stripped every real comment by the
-// time captureProgams inserts these.
-const std::string kProgInstallSentinelPrefix = "* __piet_proginstall__ ";
+// BUG-342 — see program.h. The prefix starts with 0x1C (FS), a byte no Stata
+// source contains (0x1D/0x1E/0x1F already fold mata and input blocks), so it
+// can never collide with a user line.
+//
+// It must NOT be a comment. It used to be `* __piet_proginstall__ NAME`, and a
+// definition inside a brace block (`capture noisily { program define p ... end
+// ... p }`, a loop or `if` body) leaves its sentinel in that block's body,
+// which runBody hands back through executeDoSource -> preprocessDo, where a
+// `*` line is stripped as a comment. The install never ran, and a `clear all`
+// earlier in the file had already emptied the preprocess-time registration, so
+// the call said "command p is not supported" (406 truth-bank cells).
+const std::string kProgInstallSentinelPrefix = "\x1C__piet_proginstall__ ";
 
 bool isProgInstallSentinel(const std::string& line, std::string* nameOut) {
   if (line.compare(0, kProgInstallSentinelPrefix.size(), kProgInstallSentinelPrefix) != 0)
@@ -145,8 +145,8 @@ std::vector<std::string> captureProgams(const std::vector<std::string>& lines, S
       // explicit `define` keyword) dir/list/drop fall through untouched to
       // the normal per-line path at the bottom of this function instead
       // (dispatcher.cpp's own `program dir`/`drop` pre-pass handles those
-      // two at dispatch time; a bare `program list` reaches an honest
-      // unsupported-command gap). The explicit `program define dir` form is
+      // two at dispatch time; `program list` reaches its own arm in
+      // handleProgramManage below). The explicit `program define dir` form is
       // NOT affected — only the ambiguous bare spelling is exempted here.
       static const std::regex reDefineKeyword(R"(^prog(?:ram)?\s+de(?:f(?:ine)?)?\s+)",
                                              std::regex::icase);
@@ -166,32 +166,36 @@ std::vector<std::string> captureProgams(const std::vector<std::string>& lines, S
       // but keep the strip for parity with the oracle's exact transform).
       while (!progOption.empty() && progOption.front() == ',') progOption.erase(progOption.begin());
       while (!progOption.empty() && progOption.back() == ',') progOption.pop_back();
+      // The class may stand anywhere among the header's options ([P] program:
+      // `program define zqb, byable(recall) rclass sortpreserve` is as rclass
+      // as `, rclass`), so every word after the comma is read, not the first.
+      {
+        const size_t comma = stripped.find(',');
+        if (comma != std::string::npos) {
+          std::istringstream words(lower(stripped.substr(comma + 1)));
+          for (std::string w; words >> w;) {
+            while (!w.empty() && w.back() == ',') w.pop_back();
+            if (w == "rclass" || w == "eclass" || w == "sclass" || w == "nclass") {
+              progOption = w;
+              break;
+            }
+          }
+        }
+      }
       bool isRclass = (progOption == "rclass");
       // P4: eclass/sclass — see the kProgClassSentinelPrefix note above for
       // why this can't just be a new ProgramDef bool.
       bool isEclass = (progOption == "eclass");
       bool isSclass = (progOption == "sclass");
 
-      // Redefine idiom: strip a `[capture] program drop NAME` that
-      // immediately precedes this definition (skipping blank/comment
-      // lines). In sequential Stata that drop targets a PRE-EXISTING NAME;
-      // in this pre-pass it would otherwise run LATER (after the defines
-      // are pulled out it becomes adjacent to the driver) and delete the
-      // just-captured program, so it is stripped. A drop AFTER a define
-      // (genuine mid-script undefine) is left in place.
-      long long k = static_cast<long long>(out.size()) - 1;
-      while (k >= 0) {
-        std::string ls = trim(out[static_cast<size_t>(k)]);
-        if (ls.empty() || ls.rfind("*", 0) == 0 || ls.rfind("//", 0) == 0) {
-          --k;
-          continue;
-        }
-        std::smatch md;
-        if (std::regex_search(ls, md, reProgDrop()) && lower(md[1].str()) == lower(progName)) {
-          out.erase(out.begin() + k);
-        }
-        break;
-      }
+      // A `[capture] program drop NAME` right before this definition stays
+      // where it is and runs there: the definition installs at its own
+      // sentinel below (BUG-342), after the drop, so the drop no longer
+      // deletes it. The drop must run, because a second definition of a
+      // standing program is r(110) (doexec's install; StataBE 19.5, vs-stata
+      // bank a2926cbe77e0451e: `program drop zzpa` then `program define zzpa`
+      // redefines it). It used to be stripped here, from when programs were
+      // installed at preprocess time.
 
       // Consume body lines until we hit `end`.
       std::vector<std::string> body;
@@ -222,7 +226,13 @@ std::vector<std::string> captureProgams(const std::vector<std::string>& lines, S
       def.name = progName;
       def.rclass = isRclass;
       def.body = std::move(body);
-      session.programs[progName] = def;
+      // A body with no statement is installed only by its sentinel, which may
+      // decline it (doexec.cpp kInBlockMark: StataBE leaves such a program
+      // undefined inside a brace block), so it is not pre-registered here.
+      bool hasStatement = false;
+      for (const auto& l : def.body)
+        if (!trim(l).empty() && l.rfind(kProgClassSentinelPrefix, 0) != 0) hasStatement = true;
+      if (hasStatement) session.programs[progName] = def;
       // BUG-342: keep an untouched copy that `clear all` / `program drop _all`
       // cannot reach, and leave ONE sentinel where the block stood. Reaching it
       // during execution re-installs the copy, so the definition takes effect at
@@ -231,9 +241,24 @@ std::vector<std::string> captureProgams(const std::vector<std::string>& lines, S
       // path (program dir, a body that calls a program defined further down)
       // behaving exactly as before, and makes the install a no-op re-store in
       // every do-file that never clears the table.
-      session.programArchive[progName] = std::move(def);
+      //
+      // The archive is keyed by the DEFINITION, not the name (name + 0x1C + a
+      // hash of the definition): a do-file that drops and redefines a program
+      // has one sentinel per definition, and each must install its own body.
+      // Keyed by name, every sentinel installed the LAST body in the file, so
+      // `program define p` (v1) ... `p` ... `program drop p` / `program define
+      // p` (v2) ran v2 at the first call.
+      std::string archiveKey;
+      {
+        std::string sig = std::string(def.rclass ? "r" : "-") + "\n";
+        for (const auto& l : def.body) sig += l + "\n";
+        char hex[24];
+        std::snprintf(hex, sizeof(hex), "%zx", std::hash<std::string>{}(sig));
+        archiveKey = progName + '\x1C' + hex;
+      }
+      session.programArchive[archiveKey] = std::move(def);
       ++session.programsEpoch;
-      out.push_back(kProgInstallSentinelPrefix + progName);
+      out.push_back(kProgInstallSentinelPrefix + archiveKey);
       // Body lines consumed; only the sentinel goes to `out`.
       continue;
     }
@@ -399,7 +424,14 @@ void concludeLevel(int callerLevel, SessionState& session, ojson& blocks) {
         if (ds->has(v)) live.push_back(v);
     }
   }
-  if (!live.empty()) (void)handlers::runDrop(live, session);
+  // Dropping temporary variables is no change to the data: c(changed) and
+  // describe's r(changed) stay as they were (StataBE 19.5, vs-stata bank
+  // fe389cbc6b0d0af5: a program's `tempvar t` + `generate `t'` leaves 0).
+  if (!live.empty()) {
+    const bool changed = session.datasetChanged;
+    (void)handlers::runDrop(live, session);
+    session.datasetChanged = changed;
+  }
 }
 
 void concludeLevelAfterThrow(int callerLevel, SessionState& session) noexcept {
@@ -463,6 +495,10 @@ ojson runProgram(const ProgramDef& progDef, const std::string& argstr, SessionSt
   if (!progDef.body.empty() && progDef.body.back().rfind(kProgClassSentinelPrefix, 0) == 0) {
     progClass = progDef.body.back().substr(kProgClassSentinelPrefix.size());
     session.eval.locals.set(kProgClassMarkerKey, progClass);
+  } else if (progDef.rclass) {
+    // The same marker for an rclass program, so `return scalar/local` can tell
+    // it from a program that may not set r() (r(151), see handleReturnStmt).
+    session.eval.locals.set(kProgClassMarkerKey, "rclass");
   }
 
   ojson allBlocks = ojson::array();
@@ -478,7 +514,10 @@ ojson runProgram(const ProgramDef& progDef, const std::string& argstr, SessionSt
       source += progDef.body[i];
     }
     doexec::ExecuteResult result = doexec::executeDoSource(source, session, dispatchFn);
-    allBlocks = result.blocks;
+    // A program's lines are not echoed in Stata: `_continue` joins across the
+    // echo blocks PIET records (doexec::appendJoiningBodyContinue).
+    allBlocks = ojson::array();
+    for (const auto& b : result.blocks) doexec::appendJoiningBodyContinue(allBlocks, b);
     exitCode = result.stoppedAtExitCode;
     // <- guard fires at the end of this block: pop_scope + restore progCallDepth
   } catch (...) {
@@ -533,6 +572,27 @@ ojson runProgram(const ProgramDef& progDef, const std::string& argstr, SessionSt
         session.eval.rValues.set(rname, d);
       } else if (progDef.rclass && kind == "local") {
         session.eval.rStrings.set(rname, val);
+      } else if (kind == "matrix") {
+        // `return matrix`: the parked matrix (handleReturnStmt) becomes r(rname).
+        auto& mats = session.eval.matrices;
+        auto it = std::find_if(mats.begin(), mats.end(),
+                               [&](const auto& kv) { return kv.first == val; });
+        if (it != mats.end()) {
+          eval::EvalMatrix rm = std::move(it->second);
+          mats.erase(it);
+          if (progDef.rclass) {
+            rm.gen = eval::nextStoreGeneration();
+            auto& rmats = session.eval.rMatrices;
+            const std::string rkey = rname;  // a structured binding is not capturable in C++17
+            auto old = std::find_if(rmats.begin(), rmats.end(),
+                                    [&](const auto& kv) { return kv.first == rkey; });
+            if (old != rmats.end()) {
+              old->second = std::move(rm);
+            } else {
+              rmats.emplace_back(rname, std::move(rm));
+            }
+          }
+        }
       } else if (progClass == "eclass" && kind == "escalar") {
         double d = 0.0;
         try {
@@ -544,6 +604,7 @@ ojson runProgram(const ProgramDef& progDef, const std::string& argstr, SessionSt
         // BUG-1064: the next estimation replaces all of e() (StataBE: e(bar) is
         // `.` after the following regress), so the install must drop it too.
         session.noteEOnFit(rname);
+        if (!session.ePostedLive) handlers::noteEContractName(session, rname, 's');
       } else if (progClass == "sclass" && kind == "slocal") {
         session.eval.rStrings.set(kSClassKeyPrefix + rname, val);
       }
@@ -633,9 +694,82 @@ ojson handleProgramManage(const std::string& sub, const std::vector<std::string>
     return b;
   }
 
+  if (sub == "list") {
+    // `program list [names | _all]` ([P] program): a blank line, `NAME[,
+    // class]:`, then the body lines numbered as Stata numbers them at
+    // definition (StataBE 19.5, truth bank programs program_list: `zzpa:` /
+    // `  1. display "line one"`; misc2: `zqb, rclass:` -- the class only, not
+    // byable() or sortpreserve). A name that is no program is r(111).
+    std::vector<std::string> keys;
+    if (names.empty() || (names.size() == 1 && names[0] == "_all")) {
+      for (const auto& [k, v] : session.programs) keys.push_back(k);
+    } else {
+      for (const auto& name : names) {
+        std::optional<std::string> match = findProgram(session, name);
+        if (!match.has_value())
+          return eval::errorBlock("engine_error", "program " + name + " not found", std::nullopt,
+                                  std::nullopt, std::nullopt, std::string("r(111)"));
+        keys.push_back(*match);
+      }
+    }
+    std::string text;
+    for (const auto& k : keys) {
+      const ProgramDef& def = session.programs.at(k);
+      std::string cls = def.rclass ? "rclass" : "";
+      std::vector<std::string> lines;
+      for (const auto& l : def.body) {
+        if (l.rfind(kProgClassSentinelPrefix, 0) == 0) {
+          cls = l.substr(kProgClassSentinelPrefix.size());
+          continue;
+        }
+        const std::string t = trim(l);
+        if (!t.empty()) lines.push_back(t);
+      }
+      text += "\n" + def.name + (cls.empty() ? "" : ", " + cls) + ":\n";
+      for (size_t i = 0; i < lines.size(); ++i)
+        text += "  " + std::to_string(i + 1) + ". " + lines[i] + "\n";
+    }
+    ojson b;
+    b["type"] = "display";
+    b["text"] = text;
+    return b;
+  }
+
   return eval::engineError("program " + sub + ": unknown subcommand");
 }
 
+
+// The value of a `return local` / `sreturn local` written in one of `local`'s
+// computed forms -- `= exp` or `: extended_fcn` -- computed by `local`'s own
+// definition path through a scratch local, so the digits (`= 1/3` is
+// ".3333333333333333") and every extended function are the ones `local` gives.
+// `raw` is the text as typed (handed to that path, which expands it once, as
+// `local` does); `expanded` is it after expansion, consulted only when the `=`
+// or `:` came out of a macro. 1 = *out holds the value; 0 = neither form; -1 =
+// *errBlock holds the error (the rc `local` would give).
+static int localFormValue(const std::string& raw, const std::string& expanded,
+                          SessionState& session, std::string* out, ojson* errBlock) {
+  auto isForm = [](const std::string& s) {
+    return !s.empty() && (s.front() == '=' || s.front() == ':');
+  };
+  if (!isForm(expanded)) return 0;
+  const std::string& src = isForm(raw) ? raw : expanded;
+  static const std::string kScratch = "__piet_retlocal_eq";
+  eval::MacroFnError fe;
+  const bool consumed =
+      eval::tryCaptureDefinition("local " + kScratch + " " + src, session.eval, &fe);
+  if (!consumed || !fe.rc.empty()) {
+    session.eval.locals.erase(kScratch);
+    *errBlock = eval::errorBlock(
+        "syntax_error", fe.message.empty() ? std::string("invalid syntax") : fe.message,
+        std::nullopt, std::nullopt, std::nullopt,
+        "r(" + (fe.rc.empty() ? std::string("198") : fe.rc) + ")");
+    return -1;
+  }
+  *out = session.eval.locals.get(kScratch, "");
+  session.eval.locals.erase(kScratch);
+  return 1;
+}
 
 // ---------------------------------------------------------------------------
 // S7: return scalar/local step-0 handlers
@@ -679,13 +813,19 @@ bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& 
         eval::ExpandResult expanded = eval::expandPass(expr, session.eval);
         if (!expanded.isError) expr = expanded.line;
       }
-      std::optional<std::string> val = eval::evalArith(expr, &session.eval);  // WS-C: return scalar n = b[1,1]
+      bool isString = false;
+      std::optional<std::string> val =
+          eval::evalArith(expr, &session.eval, nullptr, &isString);  // WS-C: return scalar n = b[1,1]
       double floatVal;
       try {
         floatVal = val.has_value() ? std::stod(*val) : std::stod(expr);
       } catch (...) {
         floatVal = std::nan("");
       }
+      // An extended missing value keeps its kind (StataBE: `return scalar t =
+      // .a` lists r(t) as `.a`; truth bank programs return_scalar_missing_string).
+      if (expr.size() == 2 && expr[0] == '.' && expr[1] >= 'a' && expr[1] <= 'z')
+        floatVal = eval::stataMissingWithKind(expr[1] - 'a' + 1);
       // BUG-423 (adjudicated 2026-09-06, User: "버그는 재정하고").
       //
       // AT THE TOP LEVEL THERE IS NOTHING TO RETURN FROM. Bundle B read that as
@@ -705,10 +845,31 @@ bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& 
       // progCallDepth is the discriminator because it is the ONE counter that
       // answers "is a program on the stack" (runProgram increments it around
       // every call, including recursive ones).
-      if (session.progCallDepth == 0) {
+      // Inside a program that is not rclass it is the same r(151) (truth bank
+      // programs return_in_nonrclass: `program define pr2` / `return scalar s
+      // = 1`). The class marker is runProgram's (kProgClassMarkerKey).
+      const std::string* cls = session.eval.locals.find(kProgClassMarkerKey);
+      if (session.progCallDepth == 0 || cls == nullptr || *cls != "rclass") {
         outErrorBlock = eval::errorBlock(
-            "engine_error", "return scalar: non r-class program may not set r()", std::nullopt,
+            "engine_error", "non r-class program may not set r()", std::nullopt,
             std::nullopt, std::nullopt, "r(151)");
+        return true;
+      }
+      // `return scalar` takes no options (StataBE: `return scalar a = 1, zz` is
+      // r(101) "options not allowed"), and its value is numeric: an expression
+      // whose VALUE is a string is r(109) "type mismatch" -- both used to store
+      // a silent `.`. The type is the evaluated one, so a comparison of two
+      // strings (`"`a'" == "`b'"`) is the number it yields; a string literal
+      // the evaluator could not read at all is still a string.
+      if (eval::findUnquotedComma(trim(m[2].str())) >= 0) {
+        outErrorBlock = eval::errorBlock("syntax_error", "options not allowed", std::nullopt,
+                                         std::nullopt, std::nullopt, "r(101)");
+        return true;
+      }
+      const bool quotedLiteral = !expr.empty() && (expr.front() == '"' || expr.rfind("`\"", 0) == 0);
+      if (val.has_value() ? isString : quotedLiteral) {
+        outErrorBlock = eval::errorBlock("engine_error", "type mismatch", std::nullopt,
+                                         std::nullopt, std::nullopt, "r(109)");
         return true;
       }
       // Store the staged value as its canonical string form; runProgram's
@@ -750,6 +911,25 @@ bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& 
       if (eval::hasMacroRefs(val)) {
         eval::ExpandResult expanded = eval::expandDefinitionText(val, session.eval);
         if (!expanded.isError) val = expanded.line;
+        // Stata expands the line before it reads the value, so blanks a macro
+        // brings in front of it are skipped like typed ones (truth bank return
+        // local: `local x : display %5.2f 3.14159` / `return local fmt `x''
+        // gives r(fmt) "3.14", not " 3.14").
+        while (!val.empty() && std::isspace(static_cast<unsigned char>(val.front())))
+          val.erase(val.begin());
+      }
+
+      // `return local NAME = exp` stores the expression's VALUE, as `local NAME
+      // = exp` does (StataBE: `return local b = 0.1` gives r(b) ".1", `= 1/3`
+      // gives ".3333333333333333"); it used to store the text "= 0.1".
+      // `return local NAME : extended_fcn` stores the function's result, as
+      // `local NAME : ...` does (`return local n : word count a b c` is 3).
+      bool evaluated = false;
+      {
+        const std::string raw = m[2].matched ? trim(m[2].str()) : std::string();
+        const int got = localFormValue(raw, val, session, &val, &outErrorBlock);
+        if (got < 0) return true;
+        evaluated = got > 0;
       }
 
       // Strip ONE layer of balanced delimiting quotes, Stata-faithfully:
@@ -759,7 +939,9 @@ bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& 
       // rather than a nested compound-quote artifact (`"…"') that macro
       // hardening would reject. Bare values (no delimiters) pass through
       // as-is.
-      if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+      if (evaluated) {
+        // an expression's value is stored as computed
+      } else if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
         val = val.substr(1, val.size() - 2);
       } else if (val.size() >= 4 && val.rfind("`\"", 0) == 0 && val.substr(val.size() - 2) == "\"'") {
         val = val.substr(2, val.size() - 4);
@@ -768,9 +950,10 @@ bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& 
       // refuses at the top level with r(151) — measured on StataBE 19.5, 2026-09-06
       // — and the comment that used to sit here claiming otherwise was the
       // unmeasured half of the same pair. See the long note on `return scalar`.
-      if (session.progCallDepth == 0) {
+      const std::string* cls = session.eval.locals.find(kProgClassMarkerKey);
+      if (session.progCallDepth == 0 || cls == nullptr || *cls != "rclass") {
         outErrorBlock = eval::errorBlock(
-            "engine_error", "return local: non r-class program may not set r()", std::nullopt,
+            "engine_error", "non r-class program may not set r()", std::nullopt,
             std::nullopt, std::nullopt, "r(151)");
         return true;
       }
@@ -841,6 +1024,98 @@ bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& 
     }
   }
 
+  // `return matrix NAME [=] MATNAME [, copy]` ([P] return): the matrix MOVES
+  // into r(NAME) when the rclass program returns (`copy` leaves the original).
+  // It is taken out of the matrix store now, as Stata does, and parked under a
+  // reserved \x01 key until runProgram's flush installs it (truth bank programs
+  // matrix_return_rowcol_names, return matrix cells).
+  {
+    static const std::regex re(
+        R"(^return\s+mat(?:r(?:i(?:x)?)?)?\s+(.*)$)", std::regex::icase);
+    std::smatch m;
+    if (std::regex_search(stripped, m, re)) {
+      std::string rest = m.str(1);
+      if (eval::hasMacroRefs(rest)) {
+        eval::ExpandResult expanded = eval::expandPass(rest, session.eval);
+        if (!expanded.isError) rest = expanded.line;
+      }
+      const std::string* cls = session.eval.locals.find(kProgClassMarkerKey);
+      if (session.progCallDepth == 0 || cls == nullptr || *cls != "rclass") {
+        outErrorBlock = eval::errorBlock("engine_error", "non r-class program may not set r()",
+                                         std::nullopt, std::nullopt, std::nullopt, "r(151)");
+        return true;
+      }
+      static const std::regex reArgs(
+          R"(^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:=\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:,\s*(.*))?$)");
+      std::smatch a;
+      if (!std::regex_match(rest, a, reArgs)) {
+        outErrorBlock = eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                         std::nullopt, std::nullopt, "r(198)");
+        return true;
+      }
+      const std::string name = a.str(1), src = a.str(2), opt = trim(a.str(3));
+      if (!opt.empty() && lower(opt) != "copy") {
+        outErrorBlock = eval::errorBlock("syntax_error", "option " + opt + " not allowed",
+                                         std::nullopt, std::nullopt, std::nullopt, "r(198)");
+        return true;
+      }
+      auto& mats = session.eval.matrices;
+      auto it = std::find_if(mats.begin(), mats.end(),
+                             [&](const auto& kv) { return kv.first == src; });
+      if (it == mats.end()) {
+        outErrorBlock = eval::errorBlock("engine_error", "matrix " + src + " not found",
+                                         std::nullopt, std::nullopt, std::nullopt, "r(111)");
+        return true;
+      }
+      eval::EvalMatrix parked = it->second;
+      if (opt.empty()) mats.erase(it);
+      const std::string key = std::string("\x01rm:") + name;
+      auto old = std::find_if(mats.begin(), mats.end(),
+                              [&](const auto& kv) { return kv.first == key; });
+      if (old != mats.end()) mats.erase(old);
+      mats.emplace_back(key, std::move(parked));
+      session.returnStaging[name] = {"matrix", key};
+      return true;
+    }
+  }
+
+  // `sreturn clear` / `sreturn list` ([P] return). s() lives in rStrings under
+  // kSClassKeyPrefix; clear drops it (and anything this program staged for
+  // it), list shows it newest first in `return list`'s layout, and nothing at
+  // all when s() is empty (StataBE 19.5, truth bank macro `sreturn`, programs
+  // sclass/sclass_cleared, storedres sreturn_after_rclass). The listing rides
+  // outErrorBlock, which interceptProgramReturn pushes whatever it holds.
+  {
+    static const std::regex re(R"(^sreturn\s+(clear|list)\s*$)", std::regex::icase);
+    std::smatch m;
+    if (std::regex_match(stripped, m, re)) {
+      std::vector<std::pair<std::string, std::string>> sItems;
+      for (const auto& kv : session.eval.rStrings.items())
+        if (kv.first.compare(0, kSClassKeyPrefix.size(), kSClassKeyPrefix) == 0)
+          sItems.emplace_back(kv.first.substr(kSClassKeyPrefix.size()), kv.second);
+      if (lower(m.str(1)) == "clear") {
+        for (const auto& kv : sItems) session.eval.rStrings.erase(kSClassKeyPrefix + kv.first);
+        for (auto it = session.returnStaging.begin(); it != session.returnStaging.end();) {
+          if (it->second.first == "slocal") it = session.returnStaging.erase(it);
+          else ++it;
+        }
+        return true;
+      }
+      if (sItems.empty()) return true;
+      std::string text = "\nmacros:\n";
+      for (auto it = sItems.rbegin(); it != sItems.rend(); ++it) {
+        std::string label = "s(" + it->first + ")";
+        if (label.size() < 22) label = std::string(22 - label.size(), ' ') + label;
+        text += label + " : \"" + it->second + "\"\n";
+      }
+      ojson b;
+      b["type"] = "display";
+      b["text"] = text;
+      outErrorBlock = b;
+      return true;
+    }
+  }
+
   // `sreturn local NAME value` — same staging path as `return local` above
   // (again duplicated, not shared, for the same reason). Gated on the
   // current program being sclass.
@@ -856,13 +1131,19 @@ bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& 
         return true;
       }
       std::string name = m[1].str();
-      std::string val = m[2].matched ? trim(m[2].str()) : std::string();
+      const std::string raw = m[2].matched ? trim(m[2].str()) : std::string();
+      std::string val = raw;
 
       if (eval::hasMacroRefs(val)) {
         eval::ExpandResult expanded = eval::expandDefinitionText(val, session.eval);  // EM3a
         if (!expanded.isError) val = expanded.line;
       }
-      if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+      // `= exp` and `: extended_fcn`, as `local` takes them (return local's twin).
+      const int got = localFormValue(raw, val, session, &val, &outErrorBlock);
+      if (got < 0) return true;
+      if (got > 0) {
+        // an expression's or a function's value is stored as computed
+      } else if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
         val = val.substr(1, val.size() - 2);
       } else if (val.size() >= 4 && val.rfind("`\"", 0) == 0 && val.substr(val.size() - 2) == "\"'") {
         val = val.substr(2, val.size() - 4);
@@ -876,49 +1157,26 @@ bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& 
     }
   }
 
-  // `syntax varlist(min=N)` — minimal subset (P4 task scope: nothing else).
-  // Binds the caller's varlist (Stata's `0', already set by buildArgs from
-  // the program's own argstr) into the local `varlist' after checking the
-  // minimum count; any OTHER `syntax` spec (max=, options, if/in/using,
-  // [...] blocks) is an explicit reject naming what's unsupported — never a
-  // silent partial bind, per the task brief's "a program that silently sees
-  // the wrong varlist produces a wrong regression" warning.
+  // `syntax SPEC` — the general binder (program_syntax.cpp bindSyntax), which
+  // binds what it parses in full and refuses the rest by name. The old
+  // `syntax varlist(min=N)` fast path split `0' on blanks without expanding
+  // or checking the names and answered a short list with r(1); StataBE's
+  // answer is r(102) "too few variables specified" (truth bank tokargs
+  // syntax_varlist_min), which the binder gives. On success the binder may
+  // hand back a display note ("(analytic weights assumed)"); it travels in
+  // outErrorBlock, whose caller (stage_raw_programs.cpp interceptProgramReturn)
+  // pushes whatever block it holds.
   {
-    static const std::regex reVarlistMin(
-        R"(^syntax\s+varlist\s*\(\s*min\s*=\s*(\d+)\s*\)\s*$)", std::regex::icase);
     std::smatch m;
-    if (std::regex_match(stripped, m, reVarlistMin)) {
-      long long minN = 0;
-      try {
-        minN = std::stoll(m.str(1));
-      } catch (...) {
-        minN = 0;
-      }
-      std::string argstr = session.eval.locals.get("0", "");
-      std::istringstream argIss(argstr);
-      std::vector<std::string> vars;
-      std::string tok;
-      while (argIss >> tok) vars.push_back(tok);
-      if (static_cast<long long>(vars.size()) < minN) {
-        outErrorBlock = eval::engineError(
-            "syntax: varlist requires a minimum of " + std::to_string(minN) +
-            " variable(s); " + std::to_string(vars.size()) + " specified.");
-        return true;
-      }
-      std::string joined;
-      for (size_t i = 0; i < vars.size(); ++i) {
-        if (i) joined += " ";
-        joined += vars[i];
-      }
-      session.eval.locals.set("varlist", joined);
-      return true;
-    }
     static const std::regex reSyntaxAny(R"(^syntax\b(.*)$)", std::regex::icase);
     if (std::regex_search(stripped, m, reSyntaxAny)) {
-      // Every other spec: the general binder above (bindSyntax), which binds
-      // what it can parse in full and refuses the rest by name.
       ojson err;
-      if (!bindSyntax(m.str(1), session, &err)) outErrorBlock = err;
+      ojson note;
+      if (!bindSyntax(m.str(1), session, &err, &note)) {
+        outErrorBlock = err;
+      } else if (!note.is_null()) {
+        outErrorBlock = note;
+      }
       return true;
     }
   }
@@ -941,41 +1199,35 @@ bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& 
       std::string rest = m[1].matched ? m.str(1) : std::string();
 
       // Split off a comma-introduced option tail the same quote-aware way
-      // every other Stata command does; `parse()` and friends are not
-      // implemented, so any such tail is an honest reject, not a silent
-      // ignore.
+      // every other Stata command does; tokenize takes parse() (tokenizeText).
       long long commaPos = eval::findUnquotedComma(rest);
       std::string arg = commaPos == -1 ? rest : rest.substr(0, static_cast<size_t>(commaPos));
       std::string optsTail =
           commaPos == -1 ? std::string() : trim(rest.substr(static_cast<size_t>(commaPos) + 1));
-      if (!optsTail.empty()) {
-        outErrorBlock = eval::engineError(
-            "tokenize: options (`, " + optsTail +
-            "`) are not implemented in this engine — only plain whitespace "
-            "splitting of the string argument is supported.");
-        return true;
-      }
 
       arg = trim(arg);
-      // A double-quoted argument's outer quotes are delimiters, not
-      // content — `tokenize one two three` (no quotes) is equally legal
-      // Stata and needs no stripping.
-      if (arg.size() >= 2 && arg.front() == '"' && arg.back() == '"') {
-        arg = arg.substr(1, arg.size() - 2);
-      }
       if (eval::hasMacroRefs(arg)) {
         eval::ExpandResult expanded = eval::expandPass(arg, session.eval);
         if (!expanded.isError) arg = expanded.line;
       }
+      // The string's outer quotes, "..." or `"..."', are delimiters, not
+      // content -- `tokenize one two three` (no quotes) is equally legal.
+      // Only quotes that enclose the whole string: `"a" "b"` is two tokens.
+      if (arg.size() >= 4 && eval::startsCompound(arg, 0) &&
+          eval::compoundSpanEnd(arg, 0) == arg.size()) {
+        arg = arg.substr(2, arg.size() - 4);
+      } else if (arg.size() >= 2 && arg.front() == '"' && arg.find('"', 1) == arg.size() - 1) {
+        arg = arg.substr(1, arg.size() - 2);
+      }
+      std::vector<std::string> toks;
+      if (auto err = eval::tokenizeText(arg, optsTail, toks)) {
+        outErrorBlock = *err;
+        return true;
+      }
 
       for (int i = 1; i <= 20; ++i) session.eval.locals.erase(std::to_string(i));
-      std::istringstream argIss(arg);
-      std::string tok;
-      int idx = 1;
-      while (idx <= 20 && (argIss >> tok)) {
-        session.eval.locals.set(std::to_string(idx), tok);
-        ++idx;
-      }
+      for (size_t k = 0; k < toks.size() && k < 20; ++k)
+        session.eval.locals.set(std::to_string(k + 1), toks[k]);
       return true;
     }
   }

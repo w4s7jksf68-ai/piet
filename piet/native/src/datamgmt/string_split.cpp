@@ -91,18 +91,51 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
                    "' is a numeric variable; split works on string variables (Stata's `force` "
                    "option, which splits the numeric display text, is not implemented here).");
 
-  // parse(): every CHARACTER given is a separator, and EVERY occurrence
-  // separates, so `a--b` under parse("-") yields three parts and the middle one
-  // is empty. With no parse(), the separator is whitespace: consecutive runs
-  // collapse and leading/trailing whitespace is ignored (Stata's default).
+  // split.ado (StataBE 19.5): parse() holds parse STRINGS, the words of its
+  // text (quotes keep a blank: parse(" " "-") is a blank and a hyphen;
+  // parse(zzzzz) is one five-character string, parse(a e) two). With none the
+  // string is a single blank and each remainder is trimmed. Each round cuts
+  // every observation at the leftmost occurrence of any parse string; the round
+  // repeats while some observation has text left, at least once, at most
+  // limit() times. The source is trimmed first.
   const std::optional<std::string> parseOpt = optStrAny(parsed.opts, {"parse", "p"});
-  const std::string sepChars = parseOpt.value_or(std::string());
-  const bool wsMode = !parseOpt.has_value();
+  std::vector<std::string> seps;
+  bool trimParts = false;
+  {
+    const std::string raw = parseOpt.has_value() ? strutil::trim(*parseOpt) : std::string();
+    size_t i = 0;
+    while (i < raw.size()) {
+      if (raw[i] == ' ' || raw[i] == '\t') {
+        ++i;
+        continue;
+      }
+      std::string tok;
+      if (raw.compare(i, 2, "`\"") == 0) {
+        const size_t e = raw.find("\"'", i + 2);
+        tok = raw.substr(i + 2, (e == std::string::npos ? raw.size() : e) - (i + 2));
+        i = e == std::string::npos ? raw.size() : e + 2;
+      } else if (raw[i] == '"') {
+        const size_t e = raw.find('"', i + 1);
+        tok = raw.substr(i + 1, (e == std::string::npos ? raw.size() : e) - (i + 1));
+        i = e == std::string::npos ? raw.size() : e + 1;
+      } else {
+        size_t e = i;
+        while (e < raw.size() && raw[e] != ' ' && raw[e] != '\t') ++e;
+        tok = raw.substr(i, e - i);
+        i = e;
+      }
+      if (!tok.empty()) seps.push_back(tok);
+    }
+    if (seps.empty()) {
+      seps.push_back(" ");
+      trimParts = true;
+    }
+  }
 
   long long limit = -1;
   if (auto lv = optStr(parsed.opts, "limit")) {
-    if (!parseStrictInt(*lv, &limit) || limit < 0)
-      return rsSyntax("split: limit() requires a non-negative whole number, got `" + *lv + "'");
+    if (!parseStrictInt(*lv, &limit) || limit < 1)
+      return rsSyntax("split: limit() requires a positive whole number, got `" + *lv + "'");
   }
   const bool destring = hasFlag(parsed.opts, "destring");
   std::string stub = optStrAny(parsed.opts, {"gen", "generate"}).value_or(var);
@@ -111,47 +144,51 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
                     strutil::stataIdentifierRuleText());
 
   const std::vector<std::string> values = columnAsStrings(*ds, var);
-
-  auto splitOne = [&](const std::string& s) {
-    std::vector<std::string> parts;
-    if (wsMode) {
-      std::string cur;
-      for (char c : s) {
-        if (c == ' ' || c == '\t') {
-          if (!cur.empty()) {
-            parts.push_back(cur);
-            cur.clear();
-          }
-        } else {
-          cur += c;
-        }
-      }
-      if (!cur.empty()) parts.push_back(cur);
-    } else {
-      std::string cur;
-      for (char c : s) {
-        if (sepChars.find(c) != std::string::npos) {
-          parts.push_back(cur);
-          cur.clear();
-        } else {
-          cur += c;
-        }
-      }
-      parts.push_back(cur);
-      // A wholly empty source cell yields no parts at all, not one empty part.
-      if (parts.size() == 1 && parts[0].empty()) parts.clear();
-    }
-    return parts;
+  auto trimBlank = [](const std::string& t) {
+    size_t a = 0, b = t.size();
+    while (a < b && t[a] == ' ') ++a;
+    while (b > a && t[b - 1] == ' ') --b;
+    return t.substr(a, b - a);
   };
-
-  std::vector<std::vector<std::string>> allParts;
-  allParts.reserve(values.size());
-  size_t k = 0;
+  std::vector<std::string> rest;
+  rest.reserve(values.size());
+  bool anyObs = false;
   for (const auto& v : values) {
-    allParts.push_back(splitOne(v));
-    k = std::max(k, allParts.back().size());
+    anyObs = anyObs || !v.empty();
+    rest.push_back(trimBlank(v));
   }
-  if (limit >= 0) k = std::min(k, static_cast<size_t>(limit));
+  if (!anyObs) return rsErrorRc("no observations", 2000);
+
+  std::vector<std::vector<std::string>> allParts(values.size());
+  size_t k = 0;
+  bool go = true;
+  while (go && (limit < 0 || static_cast<long long>(k) < limit)) {
+    ++k;
+    go = false;
+    for (size_t r = 0; r < rest.size(); ++r) {
+      std::string& vw = rest[r];
+      size_t mp = std::string::npos, pl = 0;
+      for (const auto& sp : seps) {
+        const size_t at = vw.find(sp);
+        if (at == std::string::npos) continue;
+        if (mp == std::string::npos || at < mp) {
+          mp = at;
+          pl = sp.size();
+        } else if (at == mp) {
+          pl = sp.size();
+        }
+      }
+      if (mp != std::string::npos) {
+        allParts[r].push_back(vw.substr(0, mp));
+        const std::string after = vw.substr(mp + pl);
+        vw = trimParts ? trimBlank(after) : after;
+      } else {
+        allParts[r].push_back(vw);
+        vw.clear();
+      }
+      go = go || !vw.empty();
+    }
+  }
 
   // Every new name has to be legal and free BEFORE the first write, so a
   // collision on part 3 cannot leave parts 1 and 2 behind.
@@ -223,13 +260,18 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
       session.varMeta[newVars[j]].stataType = partTypes[j];
     }
   }
-  // r(nvars)/r(varlist), the two things a do-file reads back from split. Filled
-  // HERE because the arm does not call captureRFromBlock for this command.
-  session.eval.rValues.set("nvars", static_cast<double>(k));
-  session.eval.rStrings.set("varlist", joinWith(newVars, " "));
-  // split's whole r() set (r(nvars) and r(varlist)), so an r() it does not post reads missing (w2b append_ge(src):
-  // r(sum) after split reads `.`).
-  eval::declareRPosted(session.eval, "split", {"nvars", "varlist"});
+  // split.ado's returns: r(varlist) (the new names, each followed by a blank),
+  // r(nvars) (a macro) and r(k_new) (vs-stata bank: `split make` ->
+  // "make1 make2 make3 ", "3", 3).
+  eval::replaceRClass(session.eval);
+  {
+    std::string vl;
+    for (const auto& nm : newVars) vl += nm + " ";
+    session.eval.rStrings.set("varlist", vl);
+  }
+  session.eval.rStrings.set("nvars", std::to_string(k));
+  session.eval.rValues.set("k_new", static_cast<double>(k));
+  eval::declareRPosted(session.eval, "split", {"varlist", "nvars", "k_new"});
   if (k == 0) {
     // Zero parts (an all-empty column, or limit(0)) is not an error: it is a
     // dataset with nothing to add, and r(nvars)=0 says so.

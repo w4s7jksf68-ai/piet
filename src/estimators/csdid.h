@@ -96,6 +96,7 @@ struct CsdidCellEstimate {
     double att = 0;
     double se = 0;
     int64_t n_cell = 0; // # units used by the DR estimator for this cell
+    int64_t n_trt = 0;  // # of them in cohort g (csdid's e(gtt) N_trt is 2 * n_trt)
     bool ok = true;
 };
 
@@ -152,6 +153,7 @@ struct CsdidRunResult {
 
     int64_t n_units = 0;
     int64_t n_clusters = 0;  // # clusters of the fold (== n_units without a cluster variable)
+    std::vector<int64_t> sample_rows;  // the rows behind n_obs_est (csdid's e(sample))
     int64_t n_obs_est = 0;   // # distinct raw rows used across all (g,t) cell
                              // estimation samples (base+target rows, unioned).
     bool ok = true;

@@ -1110,9 +1110,11 @@ void testW2eFloat() {
             "W2E float egen seq widening (lattice :876): 150 rows -> int, "
             "sq[150] 150 -- got " + s.eval.locals.get("__t0", "") + " " +
                 fmt(have ? sq150 : std::nan("")));
-    w2check(before == "38" && after == "38",
-            "W2E float egen seq: r(N) unchanged across the egen (no dispatch) -- got " + before +
-                " -> " + after);
+    // vs-stata bank (cell 1769036096b9347c, `egen v = seq(), f(10)` on fresh data): the seq ado
+    // leaves r(N) = 0, so the earlier count's 38 does not survive the egen.
+    w2check(before == "38" && after == "0",
+            "W2E float egen seq: r(N) is what the egen's ado leaves (0, vs-stata bank) -- got " +
+                before + " -> " + after);
     (void)run(s, "egen sqg = seq(), by(g)");
     (void)run(s, "local __t0 : type sqg");
     w2check(s.eval.locals.get("__t0", "") == "byte",

@@ -674,6 +674,7 @@ DtaResult read_dta(const std::string& path) {
                     // 8-byte (v,o) reference; decode per format so the key matches
                     // read_strls()'s GSO key exactly (BUG-072).
                     uint64_t key;
+                    uint64_t refV = 0, refO = 0;  // the (variable, observation) referred to
                     if (h.format_version == 117) {
                         // 117: (v:u4, o:u4). The GSO header is read as a plain
                         // little-endian u64 (:363-364), and the data ref has the
@@ -682,6 +683,8 @@ DtaResult read_dta(const std::string& path) {
                         // into `pad`, so any o >= 65536 (observation >= 65536 of a
                         // strL variable) silently missed the GSO and decoded to "".
                         key = c.u64le();
+                        refV = key & 0xFFFFFFFFull;
+                        refO = key >> 32;
                     } else {
                         // 118/119: (v:u2, o:u6) ref. This u32+u16+u16 packing yields
                         // v | (low16(o)<<16) | (mid16(o)<<32), which equals the GSO
@@ -691,9 +694,24 @@ DtaResult read_dta(const std::string& path) {
                         uint32_t o = c.u32le();
                         uint16_t v16 = c.u16le();
                         uint16_t pad = c.u16le();
-                        (void)pad;
                         key = (static_cast<uint64_t>(v16) << 32) | o;
+                        const uint64_t raw = static_cast<uint64_t>(o) |
+                                             (static_cast<uint64_t>(v16) << 32) |
+                                             (static_cast<uint64_t>(pad) << 48);
+                        refV = raw & 0xFFFFull;  // v:u2
+                        refO = raw >> 16;        // o:u6
                     }
+                    // A reference names a cell of this dataset ((0,0) = ""); one
+                    // past the variables or observations is a corrupt file to
+                    // Stata (vs-stata bank 2026-11-10: StataBE 19.5 `use` of the
+                    // 4-observation BUG-072 fixtures whose refs carry o >= 65535
+                    // is r(688) "the strL component of the file is corrupt").
+                    if (!(refV == 0 && refO == 0) &&
+                        (refV < 1 || refV > static_cast<uint64_t>(nvar) || refO < 1 ||
+                         refO > static_cast<uint64_t>(nobs)))
+                        throw EngineError("data_io",
+                                          ".dta file corrupt: the strL component of the file is "
+                                          "corrupt");
                     auto it = gso.find(std::to_string(key));
                     strcols[i][static_cast<size_t>(row)] = (it != gso.end()) ? it->second : std::string();
                     break;

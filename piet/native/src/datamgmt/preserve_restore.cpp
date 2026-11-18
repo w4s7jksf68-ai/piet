@@ -173,6 +173,7 @@ std::optional<ojson> pushPreserveSnapshot(SessionState& session, int level) {
   frame.valueLabels = session.valueLabels;
   frame.dataLabel = session.dataLabel;
   frame.characteristics = session.characteristics;
+  frame.changed = session.datasetChanged;
   frame.level = level;
   session.preserveStack.push_back(std::move(frame));
   return std::nullopt;
@@ -305,6 +306,7 @@ ojson restoreTopFrame(SessionState& session, bool rearm) {
   session.valueLabels = frame.valueLabels;
   session.dataLabel = frame.dataLabel;
   session.characteristics = frame.characteristics;
+  session.datasetChanged = frame.changed;
   // xtset-file-persistence: the preserved char table carries the declaration
   // that was live at `preserve`; restoring the one restores the other.
   session.adoptTsFromChars();

@@ -18,12 +18,20 @@ const piet::eval::OptVocab& kVocabBoottest = piet::eval::registerOptVocab(
     {"boottest"}, {{"reps", "seed", "weighttype", "null",
                                                           "cluster"},
      {}});
+// tobit: nolog / log (the iteration log, which PIET does not print) and iterate(#)
+// (runTobit forwards it); offset() is valid Stata the engine does not fit.
 const piet::eval::OptVocab& kVocabTobit = piet::eval::registerOptVocab(
-    {"tobit"}, {{"ll", "ul", "level", "vce", "robust"},
-     {}});
+    {"tobit"}, {{"ll", "ul", "level", "vce", "robust", "nolog", "log", "iterate"},
+     {"offset"}});
+// heckman: the maximum-likelihood fit reads noconstant, iterate(), vce() / robust and
+// the display-free nolog / log (runHeckmanMl); first (the probit's table),
+// nshazard() / mills() (a new variable) and ml's other options are valid Stata it
+// does not implement.
 const piet::eval::OptVocab& kVocabHeckman = piet::eval::registerOptVocab(
-    {"heckman"}, {{"select", "twostep", "level"},
-     {}});
+    {"heckman"}, {{"select", "twostep", "level", "noconstant", "nolog", "log", "iterate", "vce",
+                   "robust"},
+     {"first", "nshazard", "mills", "offset", "constraints", "technique", "difficult", "from",
+      "score", "noskip", "collinear", "rhosigma", "rhotrunc", "rholimited", "rhoforce"}});
 const piet::eval::OptVocab& kVocabQreg = piet::eval::registerOptVocab(
     {"qreg"}, {{"quantile", "level", "vce"},
      {}});
@@ -63,7 +71,7 @@ const piet::eval::OptVocab& kVocabEstatEvent = piet::eval::registerOptVocab(
     {"estat"}, {{"window", "post"},
      {}});
 const piet::eval::OptVocab& kVocabNewey = piet::eval::registerOptVocab(
-    {"newey"}, {{"lag", "force"},
+    {"newey"}, {{"lag", "force", "level"},
      {}});
 const piet::eval::OptVocab& kVocabPrais = piet::eval::registerOptVocab(
     {"prais"}, {{"corc", "twostep", "rhotype"},
@@ -96,7 +104,7 @@ const piet::eval::OptVocab& kVocabPoisson = piet::eval::registerOptVocab(
      {}});
 const piet::eval::OptVocab& kVocabNbreg = piet::eval::registerOptVocab(
     {"nbreg"}, {{"vce", "vcov", "robust", "cluster", "noconstant",
-      "nocons", "offset", "exposure", "dispersion", "level"},
+      "nocons", "offset", "exposure", "dispersion", "level", "nolog", "log", "iterate", "irr"},
      {}});
 // The two conditionally-built nets: the base literal lives here (one copy), and
 // the registered vocabulary is base + the command-conditional key, so the
@@ -140,8 +148,13 @@ const piet::eval::OptVocab& kVocabCsdid = piet::eval::registerOptVocab(
       "vce", "robust",
       // csdid-notyet-agg: csdid `[notyet]`, `agg(str)` (w2ag log:451 ag_ny,
       // :1040-1272 ag_asimple/aevent/agroup/acal, all rc 0). Unions like vce/robust above.
-      "notyet", "agg"},
-     {}});
+      "notyet", "agg",
+      // csdid.ado `Level(int 95)`: the table's interval (vs-stata bank 1ae70ce8).
+      "level"},
+     {},
+     // Level's capital L makes `l` its minimum abbreviation; a one-letter key is
+     // below the prefix floor (and `l` also prefixes long2), so it is declared.
+     {{"l", "level"}}});
 const piet::eval::OptVocab& kVocabReg3 = piet::eval::registerOptVocab(
     {"reg3"}, {{"sure", "3sls"},
      {}});
@@ -150,9 +163,8 @@ const piet::eval::OptVocab& kVocabReg3 = piet::eval::registerOptVocab(
 // refused by name; level()/noconstant/vce() reach runReg3's own refusals.
 const piet::eval::OptVocab& kVocabSureg = piet::eval::registerOptVocab(
     {"sureg"}, {{"level", "noconstant", "nocons", "vce", "noheader", "notable", "nofooter",
-                 "nolog", "log"},
-                {"isure", "dfk", "dfk2", "small", "corr", "constraints", "iterate",
-                 "tolerance", "trace"}});
+                 "nolog", "log", "isure", "iterate", "tolerance"},
+                {"dfk", "dfk2", "small", "corr", "constraints", "trace"}});
 // FU-23 (BUG-758): `nograph` suppresses boottest's confidence-curve plot; PIET's
 // boottest draws none, so the option has nothing to change. Every boottest arm
 // of w2l_vce_shape.log passes it at rc 0, and this net refused it r(198).
@@ -163,12 +175,20 @@ const piet::eval::OptVocab& kVocabBoottest = piet::eval::registerOptVocab(
     {"boottest"}, {{"reps", "seed", "weighttype", "null",
                                                           "cluster", "nograph", "boottype"},
      {}});
+// tobit: nolog / log (the iteration log, which PIET does not print) and iterate(#)
+// (runTobit forwards it); offset() is valid Stata the engine does not fit.
 const piet::eval::OptVocab& kVocabTobit = piet::eval::registerOptVocab(
-    {"tobit"}, {{"ll", "ul", "level", "vce", "robust"},
-     {}});
+    {"tobit"}, {{"ll", "ul", "level", "vce", "robust", "nolog", "log", "iterate"},
+     {"offset"}});
+// heckman: the maximum-likelihood fit reads noconstant, iterate(), vce() / robust and
+// the display-free nolog / log (runHeckmanMl); first (the probit's table),
+// nshazard() / mills() (a new variable) and ml's other options are valid Stata it
+// does not implement.
 const piet::eval::OptVocab& kVocabHeckman = piet::eval::registerOptVocab(
-    {"heckman"}, {{"select", "twostep", "level"},
-     {}});
+    {"heckman"}, {{"select", "twostep", "level", "noconstant", "nolog", "log", "iterate", "vce",
+                   "robust"},
+     {"first", "nshazard", "mills", "offset", "constraints", "technique", "difficult", "from",
+      "score", "noskip", "collinear", "rhosigma", "rhotrunc", "rholimited", "rhoforce"}});
 const piet::eval::OptVocab& kVocabQreg = piet::eval::registerOptVocab(
     {"qreg"}, {{"quantile", "level", "vce"},
      {}});
@@ -212,7 +232,7 @@ const piet::eval::OptVocab& kVocabEstatEvent = piet::eval::registerOptVocab(
       "estore"},
      {}});
 const piet::eval::OptVocab& kVocabNewey = piet::eval::registerOptVocab(
-    {"newey"}, {{"lag", "force"},
+    {"newey"}, {{"lag", "force", "level"},
      {}});
 const piet::eval::OptVocab& kVocabPrais = piet::eval::registerOptVocab(
     {"prais"}, {{"corc", "twostep", "rhotype"},
@@ -258,8 +278,14 @@ const piet::eval::OptVocab& kVocabPoisson = piet::eval::registerOptVocab(
      {}});
 const piet::eval::OptVocab& kVocabNbreg = piet::eval::registerOptVocab(
     {"nbreg"}, {{"vce", "vcov", "robust", "cluster", "noconstant",
-      "nocons", "offset", "exposure", "dispersion", "level"},
+      "nocons", "offset", "exposure", "dispersion", "level", "nolog", "log", "iterate", "irr"},
      {}});
+// `nolog` / `log`: plain poisson's (and nbreg's) iteration-log switch. PIET prints
+// no iteration log, so the table and results are those of Stata's `nolog` fit
+// (bank 5f9d1097 `poisson fatal beertax unemp, nolog`). poisson's slot only: the
+// shared count-model net also serves ppmlhdfe, whose options are not ml's.
+const piet::eval::OptVocab& kVocabPoissonLog = piet::eval::registerOptVocab(
+    {"poisson"}, {{"nolog", "log", "iterate", "irr"}, {}});
 // The two conditionally-built nets: the base literal lives here (one copy), and
 // the registered vocabulary is base + the command-conditional key, so the
 // dispatcher can canonicalize `offs`/`dri` while the handler's own net keeps
@@ -290,12 +316,20 @@ const piet::eval::OptVocab& kVocabBoottest = piet::eval::registerOptVocab(
     {"boottest"}, {{"reps", "seed", "weighttype", "null",
                                                           "cluster"},
      {}});
+// tobit: nolog / log (the iteration log, which PIET does not print) and iterate(#)
+// (runTobit forwards it); offset() is valid Stata the engine does not fit.
 const piet::eval::OptVocab& kVocabTobit = piet::eval::registerOptVocab(
-    {"tobit"}, {{"ll", "ul", "level", "vce", "robust"},
-     {}});
+    {"tobit"}, {{"ll", "ul", "level", "vce", "robust", "nolog", "log", "iterate"},
+     {"offset"}});
+// heckman: the maximum-likelihood fit reads noconstant, iterate(), vce() / robust and
+// the display-free nolog / log (runHeckmanMl); first (the probit's table),
+// nshazard() / mills() (a new variable) and ml's other options are valid Stata it
+// does not implement.
 const piet::eval::OptVocab& kVocabHeckman = piet::eval::registerOptVocab(
-    {"heckman"}, {{"select", "twostep", "level"},
-     {}});
+    {"heckman"}, {{"select", "twostep", "level", "noconstant", "nolog", "log", "iterate", "vce",
+                   "robust"},
+     {"first", "nshazard", "mills", "offset", "constraints", "technique", "difficult", "from",
+      "score", "noskip", "collinear", "rhosigma", "rhotrunc", "rholimited", "rhoforce"}});
 const piet::eval::OptVocab& kVocabQreg = piet::eval::registerOptVocab(
     {"qreg"}, {{"quantile", "level", "vce"},
      {}});
@@ -342,7 +376,7 @@ const piet::eval::OptVocab& kVocabEstatEvent = piet::eval::registerOptVocab(
     {"estat"}, {{"window", "post"},
      {}});
 const piet::eval::OptVocab& kVocabNewey = piet::eval::registerOptVocab(
-    {"newey"}, {{"lag", "force"},
+    {"newey"}, {{"lag", "force", "level"},
      {}});
 const piet::eval::OptVocab& kVocabPrais = piet::eval::registerOptVocab(
     {"prais"}, {{"corc", "twostep", "rhotype"},
@@ -375,7 +409,7 @@ const piet::eval::OptVocab& kVocabPoisson = piet::eval::registerOptVocab(
      {}});
 const piet::eval::OptVocab& kVocabNbreg = piet::eval::registerOptVocab(
     {"nbreg"}, {{"vce", "vcov", "robust", "cluster", "noconstant",
-      "nocons", "offset", "exposure", "dispersion", "level"},
+      "nocons", "offset", "exposure", "dispersion", "level", "nolog", "log", "iterate", "irr"},
      {}});
 // The two conditionally-built nets: the base literal lives here (one copy), and
 // the registered vocabulary is base + the command-conditional key, so the
@@ -391,6 +425,28 @@ const std::unordered_set<std::string> kDfullerPperronBase = {
 const piet::eval::OptVocab& kVocabDfullerPperron = piet::eval::registerOptVocab(
     {"dfuller", "pperron"},
     {[] { auto s = kDfullerPperronBase; s.insert("drift"); return s; }(), {}});
+// lincom's own net (dispatch/route_postestimation.cpp) accepted every unique
+// prefix of these words but the handler reads the full spelling, so `le(90)` and
+// `ef` were accepted and then dropped: the 95% interval and the linear metric
+// came back (bank 41338389 `lincom mpg - 2*foreign, le(90)` r(ub) -5062.87 at
+// 90%; def07b25 `lincom mpg + weight, ef` r(ub) 1.00921 = exp()). Registering
+// the words lets the dispatcher hand the handler the canonical key. lincom.ado's
+// `syntax` declares Level(cilevel), so `l` is a declared spelling (bank 659439a7
+// `l(90)` rc 0), an alias since it is below the prefix rule's floor.
+// stcox's ties, strata and display-metric words (stcox.ado `syntax`: BREslow
+// EFRon EXACTM EXACTP noHR, and STrata() through _vce_parserun's mark list), so
+// `st(drug)` / `efr` reach the handler as the words it reads (bank 62687ee2
+// `stcox age, st(drug)`, 6ccd1af5 `stcox age i.drug, efr`).
+const piet::eval::OptVocab& kVocabStcox = piet::eval::registerOptVocab(
+    {"stcox"}, {{"nohr", "breslow", "efron", "exactm", "exactp", "strata", "vce", "vcov", "robust",
+                 "cluster", "level"},
+                {"tvc", "texp", "offset", "shared", "frailty", "basehc", "basechazard", "basesurv",
+                 "mgale", "esr", "schoenfeld", "scaledsch"},
+                {}});
+const piet::eval::OptVocab& kVocabLincom = piet::eval::registerOptVocab(
+    {"lincom"}, {{"level", "eform", "or", "hr", "irr", "rrr", "shr", "coef"},
+                 {"post"},
+                 {{"l", "level"}}});
 }
 
 namespace piet::handlers::session_vocab {

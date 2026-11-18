@@ -19,6 +19,7 @@ commands. Each file owns one command family; the declarations are in
 | `sysdir`, `adopath`, `findfile`, ado autoload lookup (`findOnAdopath`), `net`, `ado` | `ado_paths_and_packages.cpp` |
 | `which`, `ssc` (offline answers) | `package_availability.cpp` |
 | `require` grammar and its accept-note | `package_requirements.cpp` |
+| `set NAME #` for the settings kept as values (linesize, pagesize, maxiter, ...), their check, and c(NAME) for them and the edition's fixed limits | `stata_settings.cpp` |
 | `sleep #`, `error #` and its message table | `sleep_and_error_commands.cpp` |
 | Shared reply blocks, quote stripping, cwd, shell-style tokenizer, glob, integer parse | `environment_command_support.cpp`, `environment_command_support.h` |
 

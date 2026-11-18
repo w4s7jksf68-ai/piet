@@ -124,6 +124,49 @@ void esampleDropStoreVars(const std::vector<std::string>& names, SessionState& s
   if (!doomed.empty()) (void)runDrop(doomed, session);
 }
 
+// estimates.ado Store: `ereturn hidden local _estimates_name NAME`. The live
+// e() then carries the store name: `e(_estimates_name)` reads it, and
+// `: e(macros)` lists it first, Stata's macro list being newest-first
+// (StataBE: after `eststo m4: regress ...` e(macros) is `_estimates_name
+// cmdline title ...`). Posted before the store snapshots the e() stores, so
+// `estimates restore` brings it back; the next fit drops it with the rest of
+// the names on top of the fit.
+// A non-empty title() is posted first, as e(estimates_title) (estimates.ado
+// TitleUpdate: `ereturn local estimates_title`), so the list reads
+// `_estimates_name estimates_title cmdline ...`.
+void postEstimatesNameMacro(SessionState& session, const std::string& name,
+                            const std::optional<std::string>& title) {
+  std::vector<std::string> posted;
+  if (title.has_value() && !title->empty()) {
+    session.eval.setEString("estimates_title", *title);
+    session.noteEOnFit("estimates_title");
+    posted.push_back("estimates_title");
+  }
+  session.eval.setEString("_estimates_name", name);
+  session.noteEOnFit("_estimates_name");
+  posted.push_back("_estimates_name");
+  if (session.eNameContract.has_value() && session.eNameContract->macros.has_value()) {
+    std::vector<std::string>& m = *session.eNameContract->macros;
+    for (const auto& n : posted) {
+      m.erase(std::remove(m.begin(), m.end(), n), m.end());
+      m.insert(m.begin(), n);
+    }
+  }
+}
+
+// estimates.ado runs every subcommand that takes a namelist through
+// est_expand, an r-class program: r() is then r(names), the names the
+// subcommand acted on (StataBE: `estimates restore A` leaves r(names) "A";
+// `eststo clear` after `eststo m1` leaves "m1", estimates.ado Drop having
+// expanded it).
+void postEstExpandNames(SessionState& session, const std::vector<std::string>& names) {
+  eval::replaceRClass(session.eval);
+  std::string joined;
+  for (const auto& n : names) joined += (joined.empty() ? "" : " ") + n;
+  if (!joined.empty()) session.eval.rStrings.set("names", joined);
+  session.eval.rClassCmd = "estimates";
+}
+
 }  // namespace
 
 void clearStoredEstimates(SessionState& session) {
@@ -168,9 +211,12 @@ ojson runEststo(const std::optional<std::string>& name,
     const double* nE = session.eval.eScalars.find("N");
     snapshot["n_obs"] = nE != nullptr ? ojson(*nE) : ojson(nullptr);
     snapshot["escalars"] = ojson::object();
+    mergeLiveEScalars(snapshot["escalars"], session);
+    snapshot["emacros"] = emacrosFrom(session);
     snapshot["added"] = emptyAddedBag();
     if (title.has_value()) snapshot["title"] = *title;
     std::string storedName = session.eststo(name, snapshot, autoPrefix, viaEststo);
+    postEstimatesNameMacro(session, storedName, title);
     auto sm = std::make_shared<SessionState::StoredModel>();
     sm->lastModelResult = session.eval.lastModelResult;
     sm->eScalars = session.eval.eScalars;
@@ -248,6 +294,8 @@ ojson runEststo(const std::optional<std::string>& name,
   // 5,725 times), so the bag is picked up HERE rather than by a later `estadd`
   // reaching into the store.
   snapshot["escalars"] = hasEstBlock ? escalarsFrom(*session.lastEstBlock) : ojson::object();
+  if (hasEstBlock) mergeLiveEScalars(snapshot["escalars"], session);
+  snapshot["emacros"] = emacrosFrom(session);  // estout stats(vce): e(vce) of THESE results
 
   // The bag only travels if it still belongs to THIS estimate. `lastEstBlock` is
   // assigned directly by five different TUs, so there is no single place to
@@ -289,6 +337,7 @@ ojson runEststo(const std::optional<std::string>& name,
   // scalars/locals/matrices live there, not in LastModel::result). The e() it
   // came from now carries this name (estimates.ado Store: `ereturn hidden
   // local _estimates_name`), which is what a later `esttab .` expands to.
+  postEstimatesNameMacro(session, storedName, title);
   {
     auto sm = std::make_shared<SessionState::StoredModel>();
     // The LastModel is stashed only when it is the model BEHIND this e()
@@ -302,7 +351,11 @@ ojson runEststo(const std::optional<std::string>& name,
     if (modelMatchesBlock && hasEstBlock) {
       const ojson& blk = *session.lastEstBlock;
       const auto& lm = *session.lastModel();
-      modelMatchesBlock = blk.value("depvar", std::string()) == lm.depvar;
+      // csdid's block names no depvar (its table prints none); its model is the
+      // fit that wrote the block (did_estimation.cpp runCsdid), e(sample) included.
+      modelMatchesBlock = blk.value("depvar", std::string()) == lm.depvar ||
+                          (lm.cobraCmd == "csdid" && blk.value("depvar", std::string()).empty() &&
+                           blk.value("estimator", std::string()) == "csdid");
       if (modelMatchesBlock && lm.result.has_value() && lm.result->is_object() &&
           lm.result->contains("n_obs") && (*lm.result)["n_obs"].is_number() &&
           blk.contains("n_obs") && blk["n_obs"].is_number()) {
@@ -363,6 +416,12 @@ ojson runEststoDirNames(const std::vector<std::string>& namelist, SessionState& 
       if (n != ".") names.push_back(n);  // unstored active results have no dir row
     }
   }
+  // estimates.ado Dir is r-class: r(names) lists the results it shows
+  // (StataBE: `eststo dir` after `eststo m1: regress ...` leaves r(names) "m1").
+  // With nothing to list r() is left alone: eststo.ado's Dir does not run
+  // `estimates dir` at all then (StataBE: `eststo m1: ...`, `eststo clear`,
+  // `eststo dir` keeps the clear's r(names) "m1", cell 057cfa593ca8886e).
+  if (!names.empty()) postEstExpandNames(session, names);
   if (names.empty()) {
     ojson out;
     out["type"] = "display";
@@ -399,6 +458,7 @@ ojson runEststoManage(const std::string& sub, const std::optional<std::string>& 
     // and it was being looked up as a literal store NAME, so it always missed.
     // `_all` means every stored estimate, which is what `clear` already does.
     if (*name == "_all") {
+      postEstExpandNames(session, session.estimatesNames());
       esampleDropStoreVars(session.estimatesNames(), session);  // e(sample) T3
       session.estimatesClear();
       ojson out;
@@ -417,6 +477,7 @@ ojson runEststoManage(const std::string& sub, const std::optional<std::string>& 
     for (std::string t; tss >> t;) toks.push_back(t);
     SessionState::EstNamelist ex = session.expandEstimatesNamelist(toks);
     if (ex.rc != 0) return estNamelistError(ex);
+    postEstExpandNames(session, ex.names);
     esampleDropStoreVars(ex.names, session);  // e(sample) T3: G8b r(111)
     std::string dropped;
     for (const auto& n : ex.names) {
@@ -431,6 +492,8 @@ ojson runEststoManage(const std::string& sub, const std::optional<std::string>& 
   if (sub == "clear") {
     // e(sample) T3: `_est_*` go with the stores (G9b r(111)); the active
     // e(sample) stays (w2_esample.log:1621 G10 `0|28|28|`).
+    // estimates.ado Clear is `Drop _all`: r(names) the names dropped.
+    if (!session.estimatesNames().empty()) postEstExpandNames(session, session.estimatesNames());
     clearStoredEstimates(session);
     ojson out;
     out["type"] = "display";
@@ -450,6 +513,7 @@ ojson runEstimatesRestore(const std::string& name, SessionState& session) {
   // the re-activation below, which renames the active results.
   const bool wasActive = session.activeStoredName() == name;
   const std::optional<LastModel> live = session.lastModel();
+  postEstExpandNames(session, {name});  // estimates.ado Restore: est_expand NAME
   if (!session.estimatesRestore(name)) {
     return ojson(eval::errorBlock(
         "unsupported_option",
@@ -457,6 +521,13 @@ ojson runEstimatesRestore(const std::string& name, SessionState& session) {
         "cannot make active again (no fitted model and no estimation table behind "
         "them); nothing was changed"));
   }
+  // estimates.ado Restore resolves NAME through `est_expand`, an r-class step,
+  // so r() is {r(names): NAME} afterwards and any earlier r() (r(table)
+  // included) is gone (vs-stata truth bank: `estimates restore A` and, after
+  // eststo, `estimates restore f1` leave r(names) "A" / "f1").
+  eval::replaceRClass(session.eval);
+  session.eval.rStrings.set("names", name);  // the name est_expand resolved (route_results.cpp)
+  eval::declareRPosted(session.eval, "estimates", {"names"});
   ojson note;
   note["type"] = "display";
   note["text"] = "(results " + name + " are active now)";
@@ -651,8 +722,21 @@ ojson runEstimatesEsample(bool colon, const std::vector<std::string>& varlistIn,
   // `ereturn repost` takes e(_estimates_name) away; estimates_sample.ado then
   // posts e(_estimates_sample) "user", which the next fit drops.
   session.activeEstimatesName.clear();
+  session.eval.setEString("_estimates_name", "");  // erased with the store name
   session.eval.setEString("_estimates_sample", "user");
   session.noteEOnFit("_estimates_sample");
+  // the fit's ordered e(macros) follow (newest first; StataBE `estimates
+  // esample: if foreign` after `estimates store A`: `_estimates_sample cmdline
+  // title ...`, no `_estimates_name`)
+  if (session.eNameContract.has_value() && session.eNameContract->macros.has_value()) {
+    std::vector<std::string>& m = *session.eNameContract->macros;
+    m.erase(std::remove_if(m.begin(), m.end(),
+                           [](const std::string& n) {
+                             return n == "_estimates_name" || n == "_estimates_sample";
+                           }),
+            m.end());
+    m.insert(m.begin(), "_estimates_sample");
+  }
   ojson out;
   out["type"] = "echo";
   out["text"] = "";

@@ -124,6 +124,29 @@ nlohmann::ordered_json runEgen(const std::string& expr, const std::string& by,
                                 const std::string& storeType = "",
                                 std::string* fixedTypeOut = nullptr, bool gtools = false);
 
+// What egen's own ado program leaves in r() / s() after it has generated `newvar` from
+// `rhs` (= `fn(args)`): see egen.cpp. A no-op for a function with no measured residue.
+void egenPublishResidue(SessionState& session, const std::string& newvar, const std::string& rhs,
+                        const std::string& by, const std::optional<std::string>& ifExpr,
+                        const std::optional<std::string>& inRange,
+                        const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                        const std::string& typeToken);
+
+// gtools' gegen leaves r(N) (observations in if/in), r(J) (groups) and r(minJ) / r(maxJ) (the
+// smallest and largest group's size): `groupVars` are the by() variables, or group()/tag()'s
+// arguments (which drop a group with a missing key unless `dropMissingKeys` is false).
+// No variables: the whole sample is one group. Does nothing when the data cannot be read.
+void gtoolsPublishGroups(SessionState& session, const std::vector<std::string>& groupVars,
+                         const std::optional<std::string>& ifExpr,
+                         const std::optional<std::string>& inRange, bool dropMissingKeys,
+                         bool postN = true, const char* command = "egen");
+
+// The four smallest and four largest non-missing values of `var` over if/in, posted as
+// r(smallest1..4) and r(largest1..4) (missing where fewer values exist).
+void gtoolsPublishExtremes(SessionState& session, const std::string& var,
+                           const std::optional<std::string>& ifExpr,
+                           const std::optional<std::string>& inRange);
+
 // `[bysort VARLIST:] gen/replace newvar = expr` — C++ port of bysort.py's
 // run_bysort_gen (cobra eval --bygen, native _n/_N group-context support).
 // byVars=[] means global (no by()/sort() clause). Called by the dispatcher's
@@ -182,6 +205,21 @@ nlohmann::ordered_json runXtile(const std::string& newvar, const std::string& sr
 nlohmann::ordered_json runXtileWeighted(const std::string& newvar, const std::string& srcvar,
                                         int nq, const std::string& weightVar,
                                         const std::string& weightType, SessionState& session);
+// pctile's `altdef` percentile rule ([D] pctile "Methods and formulas"), shared
+// by pctile, _pctile and xtile (datamgmt/pctile.cpp). `sorted` ascending, no missing.
+double stataAltdefPercentile(const std::vector<double>& sorted, double p);
+// The number of distinct xtile cutpoints over `values` (NaN outside the sample;
+// `weights` non-null for a weighted xtile, NaN where the row is out): the r(N)
+// xtile.ado's last internal `count` leaves (datamgmt/pctile.cpp).
+long long xtileDistinctCutpoints(const std::vector<double>& values,
+                                 const std::vector<double>* weights, long long nq, bool altdef);
+// xtile's altdef categories (datamgmt/pctile.cpp): `values` is exp over every
+// row, NaN outside the marked sample; the new double-valued column `target` is
+// appended and loaded. nullopt on success, else the error block.
+std::optional<nlohmann::ordered_json> storeXtileAltdef(SessionState& session,
+                                                       const std::string& target,
+                                                       const std::vector<double>& values,
+                                                       long long nq);
 nlohmann::ordered_json runIpolate(const std::vector<std::string>& varlist,
                                   const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                   const std::optional<std::string>& ifExpr, SessionState& session);
@@ -223,6 +261,7 @@ struct DestringOpts {
   bool asFloat = false;
   bool dpcomma = false;
   bool percent = false;
+  bool illegal = false;  // ignore("chars", illegal): bytes that are not valid UTF-8 go too
 };
 nlohmann::ordered_json runDestring(const std::string& varname, bool doReplace,
                                     const std::optional<std::string>& genVar,
@@ -283,6 +322,12 @@ nlohmann::ordered_json runWinsor2(SessionState& session, const std::vector<std::
 // the new spline vars missing, unlike real Stata's if-qualified generate-
 // family semantics). See the .cpp header comment for the nknots(#) ENGINE
 // BUG disclosure (flagged for Auto Patcher, not fixed here).
+// `mkspline v1 k1 v2 k2 ... = x` / `mkspline stub # = x [, marginal pctile]`: the linear forms.
+nlohmann::ordered_json runMksplineSegments(
+    SessionState& session, const std::string& lhs, const std::string& srcVar,
+    const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+    const std::vector<char>& inSample);
+
 nlohmann::ordered_json runMkspline(const std::string& stubIn, const std::string& srcVarIn,
                                     const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                     const std::optional<std::string>& ifExpr, SessionState& session);

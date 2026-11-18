@@ -50,6 +50,7 @@ struct StsetResult {
     int64_t n_excl_after_failure = 0;  // "obs. begin on or after (first) failure"
     int64_t n_excl_negative = 0;       // "obs. with negative time"   (_t < _t0)
     int64_t n_excl_zero_length = 0;    // "obs. end on or before enter()" (_t == _t0)
+    int64_t n_excl_same_instant = 0;   // "multiple records at same instant" (id() data)
 
     int64_t n_kept = 0;       // "observations remaining"
     int64_t n_subjects = 0;   // distinct id among kept records
@@ -77,7 +78,7 @@ struct StsetResult {
 StsetResult stset_build(const double* idv, const double* timev, const double* failv, int64_t n);
 
 // ---------------------------------------------------------------------------
-// stcox — Cox proportional hazards, delayed entry, Breslow ties
+// stcox — Cox proportional hazards, delayed entry, Breslow or Efron ties, strata
 // ---------------------------------------------------------------------------
 
 struct CoxResult {
@@ -94,11 +95,22 @@ struct CoxResult {
     std::string err;
 };
 
+// Tie handling: Stata's default `breslow`, `efron`, `exactp` (the exact partial
+// likelihood: a tie set's term is over every subset of the risk set of its size) or
+// `exactm` (the exact marginal likelihood: the probability that the tie set's
+// members fail before the rest of the risk set, evaluated as Stata evaluates it:
+// 15-point Gauss-Laguerre quadrature of its integral form).
+enum class CoxTies { Breslow, Efron, Exactp, Exactm };
+
 // X is col-major n*k with NO intercept column. t0/t/d are the stset columns
 // restricted to the estimation sample (_st == 1 and listwise-complete on X).
 // Requires t > t0 for every row (stset already guarantees that for _st == 1).
+// `strata` (optional, length n): stratum codes -- Stata's strata(): each stratum
+// has its own baseline hazard, so a failure's risk set holds its own stratum's
+// records only and the log partial likelihood is the sum over strata.
 CoxResult cox_fit(const double* X, int64_t n, int k, const double* t0, const double* t,
-                  const double* d);
+                  const double* d, const int32_t* strata = nullptr,
+                  CoxTies ties = CoxTies::Breslow);
 
 // Per-observation EFFICIENT SCORE RESIDUALS at `beta` — the same quantity Stata's
 // `predict, esr` produces, and the meat ingredient for stcox's Lin-Wei robust /

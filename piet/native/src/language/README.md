@@ -10,8 +10,8 @@ This directory holds the do-file language layer: running do-file source, brace b
 | Varlist wildcard/range expansion and the known-variable check | `varlist_expansion.cpp` |
 | Condition text of `if` / `while` evaluated to true/false (`evalBoolExpr`) | `if_while_condition.cpp` |
 | Legacy `for` statement (`for X in ...`, `for var`, `for new`) | `legacy_for_command.cpp` |
-| `program define` capture, calling a program, `program drop` / `dir`, `return` / `ereturn` / `sreturn` statements, program-exit cleanup | `program.cpp` |
-| `syntax` binding against the local `0` (varlist, options, `if` / `in` / `using`) | `program_syntax.cpp` |
+| `program define` capture, calling a program, `program drop` / `dir` / `list`, `return` / `ereturn` / `sreturn` statements, program-exit cleanup | `program.cpp` |
+| `syntax` binding against the local `0` (varlist / new varlist / namelist / anything, options, `if` / `in` / `using` / `=exp` / weights) | `program_syntax.cpp` |
 | `c(name)` values and `c()` substitution in expressions | `cclass.cpp` |
 | `display` statement: items, directives, `_request()`, verbatim fallback | `display_command.cpp` |
 | `%fmt` number rendering shared by `display` and `file write` | `display_number_format.cpp` |

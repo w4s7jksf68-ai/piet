@@ -12,7 +12,7 @@ which routes the non-`esttab` commands, then open the owner of the command.
 | `esttab ... using FILE` and the screen form: translation of esttab options into an estout spec (`esttabImpl`) | `table_esttab.cpp` |
 | `estout` command, `matrix()` mode, `r()` posted by the writer | `table_estout.cpp` |
 | estout cell/label/star/stats grammar (`cells()`, `varlabels()`, `star()`, `stats()`) | `estout_grammar.cpp` |
-| estout model values, row selection (`keep`, `drop`, `order`), per-mode defaults, hook lines | `estout_models.cpp` |
+| estout model values (rows from the fit's e(b) stripe when it recorded one), row selection (`keep`, `drop`, `order`), per-mode defaults, hook lines; the r() estout and `estimates table` store (`r(coefs)`, `r(stats)`, `r(coef)`, `r(m#_*)`) | `estout_models.cpp` |
 | estout number formats, padding, stars, and the row-by-row renderer (`eoRender`) | `estout_format.cpp` |
 | `estimates table` (Stata's own comparison table) | `estimates_table.cpp` |
 | `outreg2` (ledger grid, `append`, text, TeX and Excel XML output) | `table_outreg.cpp`, `outreg2_internal.h` |

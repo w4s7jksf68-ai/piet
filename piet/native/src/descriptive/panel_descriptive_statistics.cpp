@@ -3,6 +3,7 @@
 // panel descriptive statistics.
 #include "datamgmt/data_combine_internal.h"
 #include "piet/handlers/descriptive.h"
+#include "piet/inrange_filter.h"
 namespace piet::handlers::data_combine_detail {
 
 
@@ -44,24 +45,15 @@ namespace piet::handlers {
 using namespace data_combine_detail;
 
 
-ojson runInspect(const std::vector<std::string>& varlist, SessionState& session) {
-  if (!session.currentHbin().has_value()) return eval::noDataLoaded();
-  Datastore* ds = session.datastore();
-  if (ds == nullptr) return eval::noDataLoaded();
-  if (varlist.size() != 1)
-    return engineErrorBlock("inspect: one variable at a time in this build (`inspect varname`)",
-                            "syntax_error");
-  const std::string& name = varlist[0];
-  if (!ds->has(name))
-    return engineErrorBlock("variable " + name + " not found", "unknown_variable");
-  if (ds->dtype(name) != "f64")
-    return engineErrorBlock(
-        "inspect: " + name + " is a string variable; inspect reports the numeric composition of "
-        "a numeric variable.",
-        "bad_input");
-
+namespace {
+// One variable's table and r() set (the observations `ds` holds).
+ojson inspectOneVariable(const std::string& name, Datastore* ds, SessionState& session) {
   const int64_t n = ds->nRows();
-  const double* x = ds->col(name).f64();
+  // inspect counts a string variable as all missing: nothing to classify, N_unique 0.
+  const bool isStr = ds->dtype(name) != "f64";
+  const std::vector<double> noValues(isStr ? static_cast<size_t>(n) : 0,
+                                     std::numeric_limits<double>::quiet_NaN());
+  const double* x = isStr ? noValues.data() : ds->col(name).f64();
   int64_t neg = 0, zero = 0, pos = 0, ints = 0, nonints = 0, miss = 0;
   int64_t negint = 0, posint = 0;
   std::set<double> uniq;
@@ -183,122 +175,237 @@ ojson runInspect(const std::vector<std::string>& varlist, SessionState& session)
   out["inspect"] = rcls;
   return out;
 }
+}  // namespace
+
+ojson runInspect(const std::vector<std::string>& varlist, const std::optional<std::string>& ifExpr,
+                 const std::optional<std::string>& inRange, SessionState& session) {
+  if (!session.currentHbin().has_value()) return eval::noDataLoaded();
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return eval::noDataLoaded();
+  for (const auto& name : varlist)
+    if (!ds->has(name)) return engineErrorBlock("variable " + name + " not found", "unknown_variable");
+  const std::vector<std::string> names = varlist.empty() ? ds->names() : varlist;
+  // `if` / `in`: the tables describe the selected observations.
+  std::unique_ptr<Datastore> selected;
+  Datastore* data = ds;
+  const bool hasIf = ifExpr.has_value() && !ifExpr->empty();
+  if (hasIf || (inRange.has_value() && !inRange->empty())) {
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilter(session, session.currentHbin().value_or(ds->path()),
+                              hasIf ? ifExpr : std::nullopt, inRange);
+    } catch (const CobraError& ce) {
+      return engineErrorBlock(cobraErrorMessage(ce), ce.code);
+    }
+    if (!fr.ok) return inRangeRejectError(fr, inRange.value_or(""), "inspect");
+    if (fr.dataPath != ds->path()) session.noteProjectionScratch(fr.dataPath);
+    selected = std::make_unique<Datastore>(fr.dataPath);
+    data = selected.get();
+  }
+  ojson last;
+  std::string text;
+  for (size_t i = 0; i < names.size(); ++i) {
+    ojson one = inspectOneVariable(names[i], data, session);
+    if (!one.is_object() || one.value("type", std::string()) == "error") return one;
+    if (i) text += "\n\n";
+    text += one.value("text", std::string());
+    last = std::move(one);
+  }
+  if (names.empty()) return eval::noDataLoaded();
+  last["text"] = text;  // r() is the last variable's
+  return last;
+}
 
 
-ojson runXtsum(const std::vector<std::string>& varlist, SessionState& session) {
+// Stata's abbrev(name, 8) as xtsum prints a variable's name: a name past 8 characters keeps its
+// first characters, `~`, and its tail, the tail being the whole run of trailing digits when the
+// name ends in digits (`fatal1517` -> `fat~1517`, `ttl_exp68` -> `ttl_e~68`) and its last
+// character otherwise (`mileage_per_gallon` -> `mileage~n`).
+static std::string xtsumAbbrev(const std::string& name, size_t width) {
+  const size_t chars = cecon::ident::codePointCount(name);
+  if (chars <= width) return name;
+  size_t tailBytes = 0;
+  while (tailBytes < name.size() && std::isdigit(static_cast<unsigned char>(name[name.size() - 1 - tailBytes])))
+    ++tailBytes;
+  if (tailBytes == 0) {
+    size_t last = name.size() - 1;
+    while (last > 0 && (static_cast<unsigned char>(name[last]) & 0xC0) == 0x80) --last;
+    tailBytes = name.size() - last;
+  }
+  const std::string tail = name.substr(name.size() - tailBytes);
+  const size_t tailChars = cecon::ident::codePointCount(tail);
+  const size_t headChars = tailChars + 1 < width ? width - 1 - tailChars : 1;
+  return cecon::ident::truncateCodePoints(name, headChars) + "~" + tail;
+}
+
+// xtsum.ado's Variable table, one variable at a time, and the r() it leaves for the last one.
+// `idOverride` is i(); with none the xtset panel variable. `if` and `in` choose the rows. A
+// string variable is not refused: it is summarised as all missing (N = 0, n = 0), the way the
+// ado does it.
+ojson runXtsum(const std::vector<std::string>& varlistIn, SessionState& session,
+               const std::optional<std::string>& ifExpr, const std::optional<std::string>& inRange,
+               const std::string& idOverride) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   Datastore* ds = session.datastore();
   if (ds == nullptr) return eval::noDataLoaded();
   // BUG-657: xtsum.ado calls `_xt, i()`: "must specify panelvar; use xtset" r(459)
   // (was unsupported_option = r(198)).
-  if (!session.panelvar.has_value() || session.panelvar->empty())
-    return ojson(eval::errorBlock("engine_error", "must specify panelvar; use xtset", std::nullopt,
-                                  std::nullopt, std::nullopt, "r(459)"));
-  const std::string& idvar = *session.panelvar;
+  std::string idvar = idOverride;
+  if (idvar.empty()) {
+    if (!session.panelvar.has_value() || session.panelvar->empty())
+      return ojson(eval::errorBlock("engine_error", "must specify panelvar; use xtset", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(459)"));
+    idvar = *session.panelvar;
+  }
   if (!ds->has(idvar))
-    return engineErrorBlock("variable " + idvar + " not found", "unknown_variable");
+    return ojson(eval::errorBlock("engine_error", "variable " + idvar + " not found", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(111)"));
   if (ds->dtype(idvar) != "f64")
     return engineErrorBlock("xtsum: panel variable " + idvar + " must be numeric", "bad_input");
-  if (varlist.empty())
-    return engineErrorBlock("xtsum: variable list required", "syntax_error");
-  for (const auto& v : varlist) {
-    if (!ds->has(v)) return engineErrorBlock("variable " + v + " not found", "unknown_variable");
-    if (ds->dtype(v) != "f64")
-      return engineErrorBlock("xtsum: " + v + " is a string variable", "bad_input");
+  std::vector<std::string> varlist = varlistIn;
+  if (varlist.empty()) varlist = ds->names();  // syntax [varlist]: every variable
+  for (const auto& v : varlist)
+    if (!ds->has(v))
+      return ojson(eval::errorBlock("engine_error", "variable " + v + " not found", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(111)"));
+
+  std::unique_ptr<Datastore> filtered;
+  if ((ifExpr.has_value() && !ifExpr->empty()) || (inRange.has_value() && !inRange->empty())) {
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilter(session, ds->path(), ifExpr, inRange);
+    } catch (const CobraError& ce) {
+      return engineErrorBlock(cobraErrorMessage(ce), ce.code);
+    }
+    if (!fr.ok) return inRangeRejectError(fr, inRange.value_or(""), "xtsum");
+    filtered = std::make_unique<Datastore>(fr.dataPath);
+    ds = filtered.get();
   }
 
   const int64_t n = ds->nRows();
   const double* id = ds->col(idvar).f64();
+  // The ado sorts by the panel and time variables; the last row of each panel is where it
+  // reads T_i from. Rows are put in that order (data order within ties).
+  std::vector<int64_t> order(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) order[static_cast<size_t>(i)] = i;
+  const double* tv = nullptr;
+  if (session.timevar.has_value() && ds->has(*session.timevar) && ds->dtype(*session.timevar) == "f64")
+    tv = ds->col(*session.timevar).f64();
+  std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+    const double ia = id[a], ib = id[b];
+    if (ia != ib) return ia < ib;
+    return tv != nullptr && tv[a] < tv[b];
+  });
 
-  // BUG-377: Stata's real layout, captured live on nlswork
-  // (internal capture conventions.log, section Q4):
-  //
-  //   Variable         |      Mean   Std. dev.       Min        Max |    Observations
-  //   -----------------+--------------------------------------------+----------------
-  //   ln_wage  overall |  1.674907   .4780935          0   5.263916 |     N =   28534
-  //            between |              .424569          0   3.912023 |     n =    4711
-  //            within  |               .29266  -.4077221    4.78367 | T-bar = 6.05689
-  //
-  // The `|` rules and the N=/n=/T-bar= labels in the Observations column are the
-  // shape; the previous rendering used a plain Obs column and no rules.
   std::vector<std::string> lines;
-  {
-    char buf[200];
-    std::snprintf(buf, sizeof(buf), "%-16s | %9s %10s %10s %10s | %15s", "Variable", "Mean",
-                  "Std. dev.", "Min", "Max", "Observations");
-    lines.push_back(buf);
-    lines.push_back("-----------------+--------------------------------------------+----------------");
-  }
+  lines.push_back("Variable         |      Mean   Std. dev.       Min        Max |    Observations");
+  lines.push_back("-----------------+--------------------------------------------+----------------");
   ojson stats = ojson::object();
+  const double NA = std::numeric_limits<double>::quiet_NaN();
+  const auto colPad = [](std::string s, size_t col) {  // _col(col): pad to start at 1-based col
+    const size_t have = cecon::ident::codePointCount(s);
+    if (have < col - 1) s += std::string(col - 1 - have, ' ');
+    return s;
+  };
+  const auto g9 = [](double v) {
+    const std::string t = stataG(v);
+    const size_t w = cecon::ident::codePointCount(t);
+    return w >= 9 ? t : std::string(9 - w, ' ') + t;
+  };
+  const auto g8 = [](double v) {
+    const std::string t = std::isnan(v) ? std::string(".") : piet::fmt::general(v, 8, 0);
+    const size_t w = cecon::ident::codePointCount(t);
+    return w >= 8 ? t : std::string(8 - w, ' ') + t;
+  };
+  const auto f8 = [](int64_t v) {
+    const std::string t = std::to_string(v);
+    return t.size() >= 8 ? t : std::string(8 - t.size(), ' ') + t;
+  };
 
-  for (const auto& name : varlist) {
-    const double* x = ds->col(name).f64();
-    // Unit means, in first-appearance order; a unit with no non-missing value of
-    // THIS variable contributes nothing (Stata's n counts units that have one).
-    std::map<double, std::pair<double, int64_t>> acc;  // id -> (sum, count)
-    std::vector<double> all;
-    for (int64_t i = 0; i < n; ++i) {
-      if (std::isnan(x[i]) || std::isnan(id[i])) continue;
-      all.push_back(x[i]);
-      auto& a = acc[id[i]];
-      a.first += x[i];
-      a.second += 1;
+  for (size_t vi = 0; vi < varlist.size(); ++vi) {
+    const std::string& name = varlist[vi];
+    const bool isString = ds->dtype(name) == "factor";
+    int64_t N = 0, units = 0;
+    double gmean = NA, osd = NA, omin = NA, omax = NA, bsd = NA, bmin = NA, bmax = NA;
+    double wsd = NA, wmin = NA, wmax = NA, tbar = NA;
+    bool balanced = true;
+    if (!isString) {
+      const double* x = ds->col(name).f64();
+      // Per panel, in sorted order: sum, count over rows with x present, and whether the last
+      // row of the panel has x present (the ado reads T_i there).
+      struct Unit { double sum = 0.0; int64_t cnt = 0; bool lastOk = false; };
+      std::map<double, Unit> acc;
+      std::vector<double> all;
+      for (int64_t k = 0; k < n; ++k) {
+        const int64_t i = order[static_cast<size_t>(k)];
+        if (std::isnan(id[i])) continue;
+        Unit& u = acc[id[i]];
+        const bool ok = !std::isnan(x[i]);
+        u.lastOk = ok;  // overwritten until the panel's last row
+        if (!ok) continue;
+        all.push_back(x[i]);
+        u.sum += x[i];
+        u.cnt += 1;
+      }
+      N = static_cast<int64_t>(all.size());
+      double sum = 0.0;
+      for (double q : all) sum += q;
+      if (N > 0) {
+        gmean = sum / static_cast<double>(N);
+        omin = *std::min_element(all.begin(), all.end());
+        omax = *std::max_element(all.begin(), all.end());
+      }
+      osd = N > 1 ? sampleSdDV(all) : NA;
+      std::vector<double> means;
+      int64_t tMin = std::numeric_limits<int64_t>::max(), tMax = -1;
+      for (const auto& kv : acc) {
+        if (kv.second.cnt > 0) means.push_back(kv.second.sum / static_cast<double>(kv.second.cnt));
+        if (kv.second.lastOk) {
+          tMin = std::min(tMin, kv.second.cnt);
+          tMax = std::max(tMax, kv.second.cnt);
+        }
+      }
+      balanced = tMax < 0 || tMin == tMax;
+      units = static_cast<int64_t>(means.size());
+      if (!means.empty()) {
+        bmin = *std::min_element(means.begin(), means.end());
+        bmax = *std::max_element(means.begin(), means.end());
+        bsd = units > 1 ? sampleSdDV(means) : NA;
+      }
+      std::vector<double> within;
+      within.reserve(all.size());
+      for (int64_t i = 0; i < n; ++i) {
+        if (std::isnan(x[i]) || std::isnan(id[i])) continue;
+        const Unit& u = acc[id[i]];
+        within.push_back(x[i] - u.sum / static_cast<double>(u.cnt));
+      }
+      if (!within.empty()) {
+        wmin = *std::min_element(within.begin(), within.end()) + gmean;
+        wmax = *std::max_element(within.begin(), within.end()) + gmean;
+        wsd = within.size() > 1 ? sampleSdDV(within) : NA;
+      }
+      if (units > 0) tbar = static_cast<double>(N) / static_cast<double>(units);
     }
-    const int64_t N = static_cast<int64_t>(all.size());
-    const int64_t units = static_cast<int64_t>(acc.size());
-    const double NA = std::numeric_limits<double>::quiet_NaN();
-    double gmean = NA, omin = NA, omax = NA;
-    if (N > 0) {
-      double sum = 0;
-      omin = all[0];
-      omax = all[0];
-      for (double q : all) { sum += q; omin = std::min(omin, q); omax = std::max(omax, q); }
-      gmean = sum / static_cast<double>(N);
-    }
-    std::vector<double> means;
-    means.reserve(acc.size());
-    for (const auto& kv : acc) means.push_back(kv.second.first / static_cast<double>(kv.second.second));
-    double bmin = NA, bmax = NA;
-    if (!means.empty()) {
-      bmin = *std::min_element(means.begin(), means.end());
-      bmax = *std::max_element(means.begin(), means.end());
-    }
-    // Within: x_it - x̄_i + x̄. Stata reports the min/max of THAT quantity, which
-    // is why they can look odd next to the raw range — they are deviations
-    // re-centred on the grand mean, not observations.
-    std::vector<double> within;
-    within.reserve(all.size());
-    for (int64_t i = 0; i < n; ++i) {
-      if (std::isnan(x[i]) || std::isnan(id[i])) continue;
-      const auto& a = acc[id[i]];
-      within.push_back(x[i] - a.first / static_cast<double>(a.second) + gmean);
-    }
-    double wmin = NA, wmax = NA;
-    if (!within.empty()) {
-      wmin = *std::min_element(within.begin(), within.end());
-      wmax = *std::max_element(within.begin(), within.end());
-    }
-    const double osd = sampleSdDV(all), bsd = sampleSdDV(means), wsd = sampleSdDV(within);
-    const double tbar = units > 0 ? static_cast<double>(N) / static_cast<double>(units) : NA;
 
-    auto num = [](double v) { return stataG(v); };
-    char buf[240];
-    // Stata puts the variable name and the "overall" tag in one 16-wide stub.
-    std::string stub = name + "  overall";
-    // Widths count CHARACTERS (StataBE, scratch-r150/uni-v/p4.do), not bytes.
-    stub = cecon::ident::truncateCodePoints(stub, 16);
-    stub += std::string(16 - cecon::ident::codePointCount(stub), ' ');
-    std::snprintf(buf, sizeof(buf), "%s | %9s %10s %10s %10s |   N = %9lld", stub.c_str(),
-                  num(gmean).c_str(), num(osd).c_str(), num(omin).c_str(), num(omax).c_str(),
-                  static_cast<long long>(N));
-    lines.push_back(buf);
-    std::snprintf(buf, sizeof(buf), "%-16s | %9s %10s %10s %10s |   n = %9lld", "         between",
-                  "", num(bsd).c_str(), num(bmin).c_str(), num(bmax).c_str(),
-                  static_cast<long long>(units));
-    lines.push_back(buf);
-    std::snprintf(buf, sizeof(buf), "%-16s | %9s %10s %10s %10s | T-bar = %7s", "         within ",
-                  "", num(wsd).c_str(), num(wmin).c_str(), num(wmax).c_str(), num(tbar).c_str());
-    lines.push_back(buf);
+    // Each line is laid out by column, as the ado's _col() does: the table body to col 63, the
+    // Observations column from col 69.
+    {
+      std::string left = colPad(xtsumAbbrev(name, 8), 10) + "overall | " + g9(gmean) + "  " + g9(osd) + "  " +
+                         g9(omin) + "  " + g9(omax) + " |";
+      lines.push_back(colPad(left, 69) + "N =" + f8(N));
+    }
+    {
+      std::string left = colPad("", 10) + "between |" + std::string(0, ' ');
+      left = colPad(left, 31) + g9(bsd) + "  " + g9(bmin) + "  " + g9(bmax) + " |";
+      lines.push_back(colPad(left, 69) + "n =" + f8(units));
+    }
+    {
+      std::string left = colPad("", 10) + "within  |";
+      left = colPad(left, 31) + g9(wsd) + "  " + g9(wmin) + "  " + g9(wmax) + " | " +
+             (balanced ? "    T" : "T-bar") + " =" + g8(tbar);
+      lines.push_back(left);
+    }
+    if (vi + 1 < varlist.size()) lines.push_back(colPad("", 18) + "|" + std::string(44, ' ') + "|");
 
     ojson e;
     e["N"] = N;
@@ -325,27 +432,48 @@ ojson runXtsum(const std::vector<std::string>& varlist, SessionState& session) {
   // The numbers ride along beside the rendered text so a consumer (and the
   // selftest lock) can assert on values rather than on formatting.
   out["xtsum"] = stats;
+  out["xtsum_last"] = varlist.back();
   return out;
 }
 
 
-ojson runXttab(const std::vector<std::string>& varlist, SessionState& session) {
+ojson runXttab(const std::vector<std::string>& varlist, SessionState& session,
+               const std::optional<std::string>& ifExpr, const std::optional<std::string>& inRange,
+               const std::string& idOverride) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   Datastore* ds = session.datastore();
   if (ds == nullptr) return eval::noDataLoaded();
   // BUG-657: xttab.ado calls `_xt, i()`: "must specify panelvar; use xtset" r(459)
   // (was unsupported_option = r(198)).
-  if (!session.panelvar.has_value() || session.panelvar->empty())
-    return ojson(eval::errorBlock("engine_error", "must specify panelvar; use xtset", std::nullopt,
-                                  std::nullopt, std::nullopt, "r(459)"));
+  std::string idvar = idOverride;
+  if (idvar.empty()) {
+    if (!session.panelvar.has_value() || session.panelvar->empty())
+      return ojson(eval::errorBlock("engine_error", "must specify panelvar; use xtset", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(459)"));
+    idvar = *session.panelvar;
+  }
   if (varlist.size() != 1)
-    return engineErrorBlock("xttab: one variable at a time (`xttab varname`)", "syntax_error");
+    return ojson(eval::errorBlock("syntax_error", "too many variables specified", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(103)"));  // vs-stata bank: `xttab a b`
   const std::string& name = varlist[0];
-  const std::string& idvar = *session.panelvar;
   if (!ds->has(name)) return engineErrorBlock("variable " + name + " not found", "unknown_variable");
   if (!ds->has(idvar)) return engineErrorBlock("variable " + idvar + " not found", "unknown_variable");
   if (ds->dtype(name) != "f64")
-    return engineErrorBlock("xttab: " + name + " is a string variable", "bad_input");
+    return ojson(eval::errorBlock("engine_error", name + " must be numeric", std::nullopt, std::nullopt,
+                                  std::nullopt, "r(109)"));  // vs-stata bank: `xttab jail`
+
+  std::unique_ptr<Datastore> filtered;
+  if ((ifExpr.has_value() && !ifExpr->empty()) || (inRange.has_value() && !inRange->empty())) {
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilter(session, ds->path(), ifExpr, inRange);
+    } catch (const CobraError& ce) {
+      return engineErrorBlock(cobraErrorMessage(ce), ce.code);
+    }
+    if (!fr.ok) return inRangeRejectError(fr, inRange.value_or(""), "xttab");
+    filtered = std::make_unique<Datastore>(fr.dataPath);
+    ds = filtered.get();
+  }
 
   const int64_t n = ds->nRows();
   const double* x = ds->col(name).f64();
@@ -366,9 +494,12 @@ ojson runXttab(const std::vector<std::string>& varlist, SessionState& session) {
     ++unitRows[id[i]];
     allUnits.insert(id[i]);
   }
+  if (N == 0)
+    return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
+                                  std::nullopt, "r(2000)"));
   const int64_t nUnits = static_cast<int64_t>(allUnits.size());
 
-  // BUG-377: Stata's real layout, captured live on nlswork (section Q4):
+  // xttab.ado's table (StataBE 19.5, bank cells `xttab dry`, `xttab jl`):
   //
   //                     Overall             Between            Within
   //        race |    Freq.  Percent      Freq.  Percent        Percent
@@ -378,20 +509,33 @@ ojson runXttab(const std::vector<std::string>& varlist, SessionState& session) {
   //       Total |   28534    100.00      4711    100.00         100.00
   //                                 (n = 4711)
   //
-  // Note the BETWEEN column is headed "Freq." like the overall one — it is a
-  // count of UNITS, and the previous rendering called it "Units", which reads as
-  // a different quantity.
-  std::vector<std::string> lines;
+  // The BETWEEN column counts UNITS. A value-labelled variable shows its label cut to 8
+  // characters (`decode, maxlen(8)`), right-aligned in 9; otherwise the value as %9.0g.
+  const auto padL = [](const std::string& t, size_t w) {
+    const size_t have = cecon::ident::codePointCount(t);
+    return have >= w ? t : std::string(w - have, ' ') + t;
+  };
+  const auto fix = [](double v, int d) {
+    char b[64];
+    std::snprintf(b, sizeof(b), "%.*f", d, v);
+    return std::string(b);
+  };
+  const std::map<int, std::string>* labels = nullptr;
   {
-    char buf[200];
-    std::snprintf(buf, sizeof(buf), "%*s%-19s%-19s%s", 12, "", "Overall", "Between", "Within");
-    lines.push_back(buf);
-    std::snprintf(buf, sizeof(buf), "%10s | %8s %8s  %9s %8s %14s", name.c_str(), "Freq.",
-                  "Percent", "Freq.", "Percent", "Percent");
-    lines.push_back(buf);
-    lines.push_back("-----------+-----------------------------------------------------");
+    const auto lit = session.valueLabels.find(name);
+    if (lit != session.valueLabels.end()) labels = &lit->second;
   }
+  std::vector<std::string> lines;
+  lines.push_back("");
+  lines.push_back(std::string(18, ' ') + "Overall" + std::string(13, ' ') + "Between" +
+                  std::string(12, ' ') + "Within");
+  lines.push_back(padL(xtsumAbbrev(name, 9), 9) + " |    Freq.  Percent" +
+                  std::string(6, ' ') + "Freq.  Percent" + std::string(8, ' ') + "Percent");
+  lines.push_back(std::string(10, '-') + "+" + std::string(53, '-'));
   ojson rows = ojson::array();
+  ojson results = ojson::array();
+  double sumUnits = 0.0;
+  std::vector<double> unitsPerValue, withinPerValue;
   for (const auto& kv : overall) {
     const double val = kv.first;
     const int64_t freq = kv.second;
@@ -406,16 +550,17 @@ ojson runXttab(const std::vector<std::string>& varlist, SessionState& session) {
         acc += static_cast<double>(uk.second) / static_cast<double>(unitRows[uk.first]);
       withinPct = 100.0 * acc / static_cast<double>(units);
     }
-    const double ovPct = N > 0 ? 100.0 * static_cast<double>(freq) / static_cast<double>(N) : 0.0;
-    const double btPct =
-        nUnits > 0 ? 100.0 * static_cast<double>(units) / static_cast<double>(nUnits) : 0.0;
-    char buf[220];
-    char valbuf[32];
-    std::snprintf(valbuf, sizeof(valbuf), "%g", val);
-    std::snprintf(buf, sizeof(buf), "%10s | %8lld %8.2f  %9lld %8.2f %14.2f", valbuf,
-                  static_cast<long long>(freq), ovPct, static_cast<long long>(units), btPct,
-                  withinPct);
-    lines.push_back(buf);
+    const double ovPct = 100.0 * static_cast<double>(freq) / static_cast<double>(N);
+    const double btPct = 100.0 * static_cast<double>(units) / static_cast<double>(nUnits);
+    std::string shown;
+    if (labels != nullptr && val == std::floor(val) && labels->count(static_cast<int>(val)) != 0) {
+      shown = padL(cecon::ident::truncateCodePoints(labels->at(static_cast<int>(val)), 8), 9);
+    } else {
+      shown = padL(stataG(val), 9);
+    }
+    lines.push_back(shown + " |" + padL(std::to_string(freq), 8) + padL(fix(ovPct, 2), 10) +
+                    padL(std::to_string(units), 10) + padL(fix(btPct, 2), 10) + " " +
+                    padL(fix(withinPct, 2), 14));
     ojson r;
     r["value"] = val;
     r["freq"] = freq;
@@ -424,15 +569,28 @@ ojson runXttab(const std::vector<std::string>& varlist, SessionState& session) {
     r["units_percent"] = btPct;
     r["within_percent"] = withinPct;
     rows.push_back(r);
+    results.push_back(ojson::array({val, static_cast<double>(freq), ovPct, static_cast<double>(units), btPct,
+                                    withinPct}));
+    sumUnits += static_cast<double>(units);
+    unitsPerValue.push_back(static_cast<double>(units));
+    withinPerValue.push_back(withinPct);
   }
+  // The Total row: units are counted once per value they take, so the Between percent can pass
+  // 100; the Within total is the average of the Within percents weighted by those unit counts.
+  double overp = 0.0;
+  for (size_t i = 0; i < unitsPerValue.size(); ++i)
+    overp += (unitsPerValue[i] / sumUnits) * 100.0 * (withinPerValue[i] / 100.0);
+  const double totalBetweenPct = 100.0 * sumUnits / static_cast<double>(nUnits);
+  results.push_back(ojson::array({std::numeric_limits<double>::quiet_NaN(), static_cast<double>(N), 100.0,
+                                  sumUnits, totalBetweenPct, overp}));
+  lines.push_back(std::string(10, '-') + "+" + std::string(53, '-'));
+  lines.push_back("    Total |" + padL(std::to_string(N), 8) + padL("100.00", 10) +
+                  padL(std::to_string(static_cast<long long>(sumUnits)), 10) +
+                  padL(fix(totalBetweenPct, 2), 10) + " " + padL(fix(overp, 2), 14));
   {
-    char buf[220];
-    lines.push_back("-----------+-----------------------------------------------------");
-    std::snprintf(buf, sizeof(buf), "%10s | %8lld %8.2f  %9lld %8.2f", "Total",
-                  static_cast<long long>(N), 100.0, static_cast<long long>(nUnits), 100.0);
-    lines.push_back(buf);
-    std::snprintf(buf, sizeof(buf), "%*s(n = %lld)", 30, "", static_cast<long long>(nUnits));
-    lines.push_back(buf);
+    const std::string base = "(n = " + std::to_string(nUnits);
+    const size_t col = 40 > base.size() ? 40 - base.size() : 1;
+    lines.push_back(std::string(col - 1, ' ') + base + ")");
   }
   std::string text;
   for (size_t i = 0; i < lines.size(); ++i) { if (i) text += "\n"; text += lines[i]; }
@@ -442,6 +600,7 @@ ojson runXttab(const std::vector<std::string>& varlist, SessionState& session) {
   out["xttab"] = rows;
   out["n_obs"] = N;
   out["n_units"] = nUnits;
+  out["xttab_results"] = results;
   return out;
 }
 }

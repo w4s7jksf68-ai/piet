@@ -38,6 +38,8 @@ nlohmann::ordered_json runDistinct(const eval::ParsedCommand& parsed, SessionSta
 nlohmann::ordered_json runMissings(const eval::ParsedCommand& parsed, SessionState& session);
 // `mdesc [varlist]` -- the missing-value table; publishes r(miss)/r(total)/r(percent).
 nlohmann::ordered_json runMdesc(const eval::ParsedCommand& parsed, SessionState& session);
+// `misstable summarize [varlist] [if] [in] [, all showzeros]` (utility/misstable.cpp).
+nlohmann::ordered_json runMisstable(const eval::ParsedCommand& parsed, SessionState& session);
 // `labmask numvar, values(var) [lblname()]` -- synthesise a value label from a
 // second variable's text and attach it.
 nlohmann::ordered_json runLabmask(const eval::ParsedCommand& parsed, SessionState& session);

@@ -459,9 +459,10 @@ void testW2aqHistogram() {
   // A key `creturn list` does not print is still a key: StataBE 19.5 expands
   // `c(matsize)' to 400 and `c(framesmax)' to 100, so they are never "": c(matsize)
   // is served (400, BUG-1330), c(framesmax) refused by name.
-  // BUG-1330: c(linesize) is a real name this build does not serve (refused by
-  // name), and PIET's own c(sysdir_sample) keeps answering (the sysdir_* arm had
-  // made it unreachable).
+  // c(linesize) is served since 2026-11-11 (environment/stata_settings.cpp): 80,
+  // StataBE 19.5's value (vs-stata truth bank `display c(linesize)`); until then
+  // this arm pinned it as a real name this build refused. PIET's own
+  // c(sysdir_sample) keeps answering (the sysdir_* arm had made it unreachable).
   {
     piet::SessionState session(workdir);
     session.eval.cwd = workdir;
@@ -482,17 +483,18 @@ void testW2aqHistogram() {
                 v.errors[0].find("c(docx_paramode)") != std::string::npos &&
                 hasLine(w.displays, "CW|400|") && w.errors.empty() &&
                 f.displays.empty() && f.errors.size() == 1 &&
-                f.errors[0].find("c(framesmax)") != std::string::npos && g.displays.empty() &&
-                g.errors.size() == 1 && g.errors[0].find("c(linesize)") != std::string::npos &&
-                sd.errors.empty() && sampleDir,
+                f.errors[0].find("c(framesmax)") != std::string::npos &&
+                hasLine(g.displays, "CG|80|") && g.errors.empty() && sd.errors.empty() &&
+                sampleDir,
             "W2AQ (17) `c(k)' and `c(N)' expand to 11 and 60 (log:2501 hk_thg_024_g c(k) 16 on 14 "
             "fixture variables, here 9; _N 60; main: unsupported macro), a name that is no c() "
             "key expands to \"\", a Stata key PIET does not serve (c(docx_paramode), "
-            "c(linesize), the hidden c(framesmax)) is refused by name, the hidden c(matsize) "
-            "is Stata's 400 (BUG-1330 serves it), and "
+            "the hidden c(framesmax)) is refused by name, c(linesize) is Stata's 80, the "
+            "hidden c(matsize) is Stata's 400 (BUG-1330 serves it), and "
             "c(sysdir_sample) is the sample directory -- got " +
                 lineStarting(r.displays, "CK|") + " " + lineStarting(u.displays, "CU|") + " " +
-                lineStarting(w.displays, "CW|") + " " + lineStarting(f.displays, "CF|") + " " + cs);
+                lineStarting(w.displays, "CW|") + " " + lineStarting(f.displays, "CF|") + " " +
+                lineStarting(g.displays, "CG|") + " " + cs);
   }
 
   // (18) numeric `r(name)' / `e(name)' are macro text by Stata's %18.0g rule

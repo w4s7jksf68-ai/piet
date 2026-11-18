@@ -216,7 +216,10 @@ std::vector<ojson> runCompressMeta(const eval::ParsedCommand& parsed, SessionSta
     return r;
   };
   if (!session.hasData()) {
-    echo("  (0 bytes saved)");
+    // StataBE 19.5 with nothing in memory: r(3) "no dataset in use" (vs-stata
+    // bank 9ac72852c9dbebc7, `compress` after `clear all`).
+    out.push_back(ojson(eval::errorBlock("engine_error", "no dataset in use", std::nullopt,
+                                         std::nullopt, std::nullopt, "r(3)")));
     return out;
   }
   std::vector<std::string> vars;
@@ -229,6 +232,14 @@ std::vector<ojson> runCompressMeta(const eval::ParsedCommand& parsed, SessionSta
       return out;
     }
     vars = vr.tokens;
+    // A typed name that is no variable is r(111) (vs-stata bank `compress
+    // zznotavar`); expandVarlist passes literals through unchecked.
+    if (!spec.empty()) {
+      if (auto bad = loops::checkKnownVarlist(vars, session)) {
+        out.push_back(*bad);
+        return out;
+      }
+    }
   }
   Datastore* ds = session.datastore();
   if (ds == nullptr) {
@@ -342,6 +353,7 @@ std::vector<ojson> runCompressMeta(const eval::ParsedCommand& parsed, SessionSta
       session.implicitFloatVars.erase(c.name);
       saved += c.saved;
       echo("  variable " + c.name + " was " + c.from + " now " + c.to);
+      session.datasetChanged = true;  // a storage type changed (vs-stata bank: compress -> 1)
     }
   }
   echo("  (" + commas(saved) + " bytes saved)");
@@ -781,8 +793,12 @@ std::optional<ojson> resolveByKeyNames(SessionState& session, std::vector<std::s
     }
     names = ex.tokens;
   }
+  // `set varabbrev off`: a name is only its own variable, and one that is
+  // none is left for the command's refusal (vs-stata bank a84fdb6575065f7a).
+  const bool abbrevOff = varAbbreviationOff(session);
   for (auto& t : names) {
     if (std::find(all.begin(), all.end(), t) != all.end()) continue;
+    if (abbrevOff) continue;
     std::vector<std::string> hits;
     for (const auto& v : all)
       if (v.size() > t.size() && v.compare(0, t.size(), t) == 0) hits.push_back(v);

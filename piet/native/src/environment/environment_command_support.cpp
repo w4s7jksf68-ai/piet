@@ -79,8 +79,11 @@ std::string sessionCwd(const SessionState& session) {
 // varlist path, which is tried first by every caller, handles it if it ever is.
 std::string argAfterCommand(const std::string& raw) {
   std::string s = trim(raw);
-  const size_t sp = s.find_first_of(" \t");
+  // The command word ends at a blank or at the comma that opens the options:
+  // `dir, wide` has no argument (it was read as the directory `wide`).
+  const size_t sp = s.find_first_of(" \t,");
   if (sp == std::string::npos) return "";
+  if (s[sp] == ',') return "";
   s = trim(s.substr(sp + 1));
   const size_t comma = s.find(',');
   if (comma != std::string::npos) s = trim(s.substr(0, comma));

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
+#include "piet/eval/result_order.h"  // orderRResults (tabulate lists r() as Stata does)
 #include "results_support.h"
 #include "summary_support.h"
 #include "text_support.h"
@@ -7,6 +8,8 @@
 #include "options.h"
 #include "handler_declarations.h"
 #include "piet/handlers/descriptive.h"
+#include "data/missing.h"  // cecon::missing_kind (tabstat, missing)
+#include <set>
 namespace piet::dispatch_detail {
 bool route_tabulation(std::string& cmd,
     std::string& cmdTyped,
@@ -21,6 +24,74 @@ bool route_tabulation(std::string& cmd,
       blocks.push_back(ojson(eval::noDataLoaded()));
       return true;
     }
+    // tab1 and tab2 run the one-way / two-way tabulate for each variable (pair) inside
+    // `capture` (tab1.ado, tab2.ado): a refusal the inner tabulate raises is printed
+    // under the first table's heading, the loop stops, r() is empty, and the command
+    // itself ends rc 0 (bank: `tab1 rep78, zznotanoption`, `tab2 rep78 foreign, n`).
+    // Only the refusals of the inner tabulate come this way; a missing varlist or an
+    // unknown variable is tab1's own syntax and stays an error.
+    const bool tabLoop = cmd == "tab1" || cmd == "tab2";
+    auto tabRefuse = [&](ojson err) {
+      if (!tabLoop || parsed.varlist.empty() || err.value("type", std::string()) != "error") {
+        blocks.push_back(std::move(err));
+        return true;
+      }
+      std::string msg = err.value("message", std::string());
+      // What tab1 / tab2 swallow is Stata's own refusal of one table. PIET's "not implemented" answer is
+      // not Stata's: swallowing it would end rc 0 with no table and no r(), so it stays the error.
+      if (msg.find("does not yet implement") != std::string::npos ||
+          msg.find("not supported in this version of PIET") != std::string::npos ||
+          msg.find("not implemented") != std::string::npos) {
+        blocks.push_back(std::move(err));
+        return true;
+      }
+      msg.erase(std::remove(msg.begin(), msg.end(), '`'), msg.end());
+      std::string heading = "-> tabulation of " + parsed.varlist[0];
+      if (cmd == "tab2" && parsed.varlist.size() >= 2) heading += " by " + parsed.varlist[1];
+      heading += parsed.ifExpr.has_value() && !parsed.ifExpr->empty() ? " if " + *parsed.ifExpr + " " : "  ";
+      ojson head, refusal;
+      head["type"] = "display";
+      head["text"] = heading;
+      refusal["type"] = "display";
+      refusal["text"] = msg;
+      blocks.push_back(std::move(head));
+      blocks.push_back(std::move(refusal));
+      eval::replaceRClass(session.eval);
+      eval::declareRPosted(session.eval, "tabulate", {});
+      return true;
+    };
+    // One- and two-letter spellings Stata reads as the first option of tabulate's syntax line that
+    // they prefix, and that no vocabulary row can carry because the same letters also open an
+    // option of the other kind (bank: `tabulate rep78, s(price)` and `su(price)` are
+    // summarize(); bare `e` is exact; bare `s` / `su` are "option s incorrectly specified";
+    // `nol` is nolabel on tab1 and tab2 as it is on tabulate). A bare `l` is read and does
+    // nothing at all: the table, r() and the statistics lines are those of the line without it
+    // (bank 11e74e34, d9c31dcc), so it is dropped here rather than guessed to be lrchi2.
+    for (auto& kv : parsed.opts) {
+      std::string& key = kv.first;
+      if ((key == "s" || key == "su") && !kv.second.isBool) key = "summarize";
+      else if (key == "e" && kv.second.isBool) key = "exact";
+      else if (key == "nol" && kv.second.isBool) key = "nolabel";
+    }
+    parsed.opts.erase(std::remove_if(parsed.opts.begin(), parsed.opts.end(),
+                                     [](const auto& kv) { return kv.first == "l" && kv.second.isBool; }),
+                      parsed.opts.end());
+    for (const auto& kv : parsed.opts) {
+      if ((kv.first == "s" || kv.first == "su") && kv.second.isBool)
+        return tabRefuse(ojson(eval::errorBlock("syntax_error", "option " + kv.first + " incorrectly specified",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                std::string("r(198)"))));
+    }
+    double tabExactWork = 1.0;
+    bool tabFirstOnly = false;
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "exact" && !v.isBool) {
+        try { tabExactWork = std::max(1.0, std::stod(strutil::trim(v.strValue))); } catch (...) {}
+      }
+      if (k == "firstonly") tabFirstOnly = true;
+    }
+    if (tabFirstOnly && cmd != "tab2")
+      return tabRefuse(ojson(eval::engineError("option `firstonly` not allowed", "unsupported_option")));
     bool chi2 = false;
     std::optional<std::string> sumvar;
     for (const auto& [k, v] : parsed.opts) {
@@ -52,6 +123,13 @@ bool route_tabulation(std::string& cmd,
       if (k == "all") chi2 = true;
       tabStatWords.push_back(k == "v" ? std::string("V") : k);
     }
+    // expected, cchi2, clrchi2 and plot change what the table shows (extra cell lines, a bar
+    // column) and no renderer draws them: they are in kVocabTabulate's `unimplemented` set and
+    // refused by name before this point.
+    bool tabSubpop = false;
+    std::string tabSubpopVar;
+    for (const auto& [k, v] : parsed.opts)
+      if (k == "subpop" && !v.isBool) { tabSubpop = true; tabSubpopVar = strutil::trim(v.strValue); }
     // BS-097: chi2/sum/summarize/missing/generate/sort are the tabulate/tab1/
     // tab2 options this arm actually READS (with BUG-1514's statistics above).
     // `cell`/`col`/
@@ -95,9 +173,50 @@ bool route_tabulation(std::string& cmd,
       if (k == "matrow") tabMatRow = strutil::trim(v.strValue);
       if (k == "matcol") tabMatCol = strutil::trim(v.strValue);
     }
+    // tab2's syntax is varlist(min=2) (tab2.ado), read before any option: one
+    // variable is r(102) "too few variables specified" whatever else is typed
+    // (bank: `tab2 rep78`, `tab2 rep78, plot|subvarname|sum|sort`, `tab2 x if ...`).
+    if (cmd == "tab2" && parsed.varlist.size() == 1) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "too few variables specified",
+                                              std::nullopt, std::nullopt, std::nullopt,
+                                              std::string("r(102)"))));
+      return true;
+    }
     if (auto err = eval::rejectUnknownOptions(parsed.opts, kTabulateKnownOpts,
                                               kVocabTabulate.unimplemented)) {
-      blocks.push_back(ojson(*err));
+      return tabRefuse(ojson(*err));
+    }
+    // `sort` orders a one-way table's rows; a two-way tabulate refuses it (bank:
+    // `tabulate rep78 foreign, sort` r(198) "option sort not allowed").
+    if ((cmd == "tabulate" || cmd == "tab" || cmd == "ta") && parsed.varlist.size() == 2) {
+      for (const auto& kv : parsed.opts) {
+        if (kv.first == "sort") {
+          blocks.push_back(ojson(eval::errorBlock("syntax_error", "option sort not allowed",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  std::string("r(198)"))));
+          return true;
+        }
+      }
+    }
+    // tab1 runs one tabulate per variable and leaves its loop at the first one that
+    // refuses (tab1.ado captures each): `tab1 rep78 foreign, matcol(c)` prints
+    // "option matcol() not allowed" under the first variable's header and ends rc 0
+    // with no matrix c (bank: the `matrix list c` after it is r(111)). The one-way
+    // tabulate has no matcol().
+    if (cmd == "tab1" && !tabMatCol.empty() && !parsed.varlist.empty()) {
+      {
+        // tab1 leaves its loop at the first refusal: the heading and message of the
+        // FIRST variable only (bank: `tab1 rep78 foreign, matcol(c)`).
+        ojson head, refusal;
+        head["type"] = "display";
+        head["text"] = "-> tabulation of " + parsed.varlist[0] + "  ";
+        refusal["type"] = "display";
+        refusal["text"] = "option matcol() not allowed";
+        blocks.push_back(std::move(head));
+        blocks.push_back(std::move(refusal));
+      }
+      eval::replaceRClass(session.eval);
+      eval::declareRPosted(session.eval, "tabulate", {});
       return true;
     }
     if (parsed.varlist.empty()) {
@@ -125,18 +244,13 @@ bool route_tabulation(std::string& cmd,
         for (std::string w; iss >> w;)
           if (w == "V") upperV = true;
       }
-      if (!upperV) {
-        blocks.push_back(ojson(eval::engineError("option `v` not allowed", "unsupported_option")));
-        return true;
-      }
+      if (!upperV) return tabRefuse(ojson(eval::engineError("option `v` not allowed", "unsupported_option")));
     }
     // BUG-1514: `nolog` silences exact's enumeration log and is refused without it.
     if (!(tabStats & handlers::kTabExact))
       for (const auto& [k, v] : parsed.opts)
-        if (k == "nolog") {
-          blocks.push_back(ojson(eval::engineError("option `nolog` not allowed", "unsupported_option")));
-          return true;
-        }
+        if (k == "nolog")
+          return tabRefuse(ojson(eval::engineError("option `nolog` not allowed", "unsupported_option")));
     // BUG-1514: the statistics are two-way options. One-way, Stata answers r(198)
     // "option lrchi2 not allowed" (likewise gamma, V, all, and chi2 itself, which
     // this arm accepted and ignored; StataBE 19.5 `tabulate c, chi2`). tab1 prints
@@ -164,6 +278,34 @@ bool route_tabulation(std::string& cmd,
       blocks.push_back(ojson(eval::engineError("option `" + word + "` not allowed", "unsupported_option")));
       return true;
     }
+    {
+      std::string oneWayRefused;
+      if (tabTwoWay && tabSubpop) oneWayRefused = "subpop";
+      else if (sumvar.has_value() && tabSubpop)
+        return tabRefuse(ojson(eval::unsupportedOption(
+            "subpop", "tabulate: subpop() is served for plain one-way tables, not with summarize()")));
+      else if (!sumvar.has_value()) {
+        for (const auto& kv : parsed.opts)
+          if (kv.first == "nomeans" || kv.first == "nostandard" || kv.first == "noobs" ||
+              kv.first == "means" || kv.first == "standard" || kv.first == "freq" || kv.first == "obs") {
+            oneWayRefused = kv.first;
+            break;
+          }
+      }
+      if (!oneWayRefused.empty())
+        return tabRefuse(ojson(eval::engineError("option `" + oneWayRefused + "` not allowed",
+                                                 "unsupported_option")));
+    }
+    // summarize()'s column options choose which of Mean, Std. dev., Freq. and Obs a table shows. The
+    // one-way table draws them (the block carries `columns`); the two-way summarize table has no
+    // renderer for them, so they are refused by name rather than accepted and ignored.
+    if (sumvar.has_value() && tabTwoWay) {
+      for (const auto& kv : parsed.opts)
+        if (kv.first == "nomeans" || kv.first == "nostandard" || kv.first == "noobs" || kv.first == "means" ||
+            kv.first == "standard" || kv.first == "freq" || kv.first == "obs")
+          return tabRefuse(ojson(eval::unsupportedOption(
+              kv.first, "tabulate: option " + kv.first + " of summarize() is not implemented for a two-way table in this version of PIET")));
+    }
     // BUG-1514: the statistics count frequencies. Under [aw=] StataBE 19.5 answers
     // r(406) "lrchi2 not allowed with aweights" (chi2, V, gamma, taub and all alike),
     // under [iw=] r(198) "option lrchi2 not allowed" (chi2 ... all alike).
@@ -183,17 +325,13 @@ bool route_tabulation(std::string& cmd,
     }
     // matcol() is a two-way option and the matrix options belong to tabulate
     // itself: one-way matcol() is Stata's "option matcol() not allowed", r(198).
-    // tab1/tab2 build several tables, and this build does not say which one a
-    // matrix would hold, so the options are refused there by name.
+    // tab1/tab2 hand the option to every tabulate they run, so each table overwrites
+    // the matrix and the LAST table's is what stays (bank: `tab1 rep78 foreign,
+    // matcell(m)` leaves m = the foreign counts, `tab2 rep78 foreign, matcol(c)`).
     if (!tabMatCol.empty() && tabPlainCmd && parsed.varlist.size() == 1) {
       blocks.push_back(ojson(eval::errorBlock("syntax_error", "option matcol() not allowed",
                                               std::nullopt, std::nullopt, std::nullopt,
                                               std::string("r(198)"))));
-      return true;
-    }
-    if (!tabPlainCmd && (!tabMatCell.empty() || !tabMatRow.empty() || !tabMatCol.empty())) {
-      blocks.push_back(ojson(eval::unsupportedOption(
-          "matcell", cmd + ": matcell()/matrow()/matcol() are served for `tabulate` only")));
       return true;
     }
     Datastore* ds = session.datastore();
@@ -246,7 +384,7 @@ bool route_tabulation(std::string& cmd,
       ds = tabIfDs.get();
     }
     // `parsed.weightVar` survives the tokenizer's guard here as fw/aw/iw on
-    // tabulate/tab1 and fw on tab2 (kStataLegalWeights answers r(101) for the
+    // tabulate/tab1 and fw on tab2 (kStataQualifiers answers r(101) for the
     // rest); runTabulate reads the type to choose integer fweight cells or
     // the real-valued aweight/iweight cells. The `if`-prefilter above (when
     // present) already carries the weight column through unchanged since it
@@ -271,13 +409,19 @@ bool route_tabulation(std::string& cmd,
     }
     ojson tabBlock =
         handlers::runTabulate(*ds, parsed.varlist, chi2, cmd, sumvar, parsed.weightVar,
-                              tabMissing, tabSort, parsed.weightType, tabStats);
+                              tabMissing, tabSort, parsed.weightType, tabStats, tabExactWork,
+                              tabFirstOnly, tabSubpopVar);
     // B4-W3b: the RAW level keys, snapshotted here — the value-label
     // substitution a few lines down rewrites tabBlock["table"]["rows"] in
     // place, and a dummy built from a LABEL ("Domestic") instead of its code
     // (0) would compare against a string the column does not hold.
     std::vector<std::string> tabRawRows;
     std::optional<ojson> tabRawTable;  // the table before value labels, for the matrices
+    // tab1/tab2: the matrices are the last table's (the loop overwrites them).
+    if (tabBlock.is_object() && !tabBlock.contains("table") && tabBlock.contains("tables") &&
+        tabBlock["tables"].is_array() && !tabBlock["tables"].empty() &&
+        tabBlock["tables"].back().is_object() && tabBlock["tables"].back().contains("table"))
+      tabRawTable = tabBlock["tables"].back()["table"];
     if (tabBlock.is_object() && tabBlock.contains("table") && tabBlock["table"].is_object()) {
       tabRawTable = tabBlock["table"];
       if (tabBlock["table"].contains("rows") && tabBlock["table"]["rows"].is_array())
@@ -393,6 +537,44 @@ bool route_tabulation(std::string& cmd,
         tabBlock["tables"].is_array() && !tabBlock["tables"].empty())
       postTabR(tabBlock["tables"].back());
     if (!sumvar.has_value()) postTabR(tabBlock);
+    // summarize(): which of Mean, Std. dev., Freq. and Obs the table shows. By default the first
+    // three, and Obs too under a weight; naming any of means / standard / freq shows only
+    // those named, naming obs ADDS the Obs column to whatever the rest leaves (bank
+    // b1a71de16eadd437: `summarize(price) obs` prints Mean, Std. dev., Freq. and Obs, while
+    // f613ef85b28c4d6e: `... means` prints Mean alone), and a no-form takes its column
+    // away (bank: `summarize(price) nomeans`, `... noobs`). The block
+    // carries the list; it is added only when an option or a weight changes the default.
+    if (sumvar.has_value() && tabBlock.is_object() && tabBlock.value("type", std::string()) != "error") {
+      bool means = true, standard = true, freq = true, obs = parsed.weightVar.has_value();
+      bool typed = false, anyPositive = false;
+      for (const auto& kv : parsed.opts) {
+        const std::string& k = kv.first;
+        if (k == "means" || k == "standard" || k == "freq") anyPositive = true;
+        if (k == "means" || k == "standard" || k == "freq" || k == "obs" || k == "nomeans" ||
+            k == "nostandard" || k == "nofreq" || k == "noobs")
+          typed = true;
+      }
+      if (anyPositive) means = standard = freq = false;
+      for (const auto& kv : parsed.opts) {
+        const std::string& k = kv.first;
+        if (k == "means") means = true;
+        else if (k == "standard") standard = true;
+        else if (k == "freq") freq = true;
+        else if (k == "obs") obs = true;
+        else if (k == "nomeans") means = false;
+        else if (k == "nostandard") standard = false;
+        else if (k == "nofreq") freq = false;
+        else if (k == "noobs") obs = false;
+      }
+      if (typed || parsed.weightVar.has_value()) {
+        ojson cols = ojson::array();
+        if (means) cols.push_back("means");
+        if (standard) cols.push_back("standard");
+        if (freq) cols.push_back("freq");
+        if (obs) cols.push_back("obs");
+        tabBlock["columns"] = cols;
+      }
+    }
     // BUG-1012: tabulate, summarize() leaves r() EMPTY in Stata (every read of
     // r(N) r(r) r(mean) ... is `.` after it: sx_tab_sum, sx_tab_sum_two). Before,
     // the previous command's r() stayed live and was read back as tabulate's.
@@ -506,11 +688,60 @@ bool route_tabulation(std::string& cmd,
     // uses one of them. So the expression is cond(missing(v), ., v==level) and
     // never a bare comparison.
     if (!tabGenStub.empty()) {
-      ojson genErr = runTabulateGenerate(tabGenStub, parsed.varlist, tabRawRows, session,
-                                         parsed.ifExpr, parsed.inRange, tabMissing);
-      if (!genErr.is_null()) {
-        blocks.push_back(genErr);
-        return true;
+      if (tabTwoWay) {
+        // generate() is a one-way option: the two-way tabulate answers r(198)
+        // "option gen() not allowed", naming the option as typed (bank: `tab2 rep78
+        // foreign, gen(z)` prints it under the first pair's heading and ends rc 0).
+        std::string typed = "generate";
+        const long long comma = eval::findUnquotedComma(parsed.raw);
+        if (comma >= 0) {
+          std::istringstream iss(parsed.raw.substr(static_cast<size_t>(comma) + 1));
+          for (std::string w; iss >> w;) {
+            const size_t paren = w.find('(');
+            const std::string word = lower(paren == std::string::npos ? w : w.substr(0, paren));
+            if (!word.empty() && std::string("generate").compare(0, word.size(), word) == 0)
+              typed = word;
+          }
+        }
+        return tabRefuse(ojson(eval::errorBlock("syntax_error", "option " + typed + "() not allowed",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                std::string("r(198)"))));
+      }
+      if (cmd == "tab1") {
+        // tab1 runs `tabulate v, generate(stub)` per variable: the first makes
+        // stub1..stubK, a later one finds stub1 taken and prints the refusal after its
+        // own table (bank: `tab1 rep78 foreign, gen(zz)` shows both tables, then
+        // "variable zz1 already defined", r() = the second table's, rc 0).
+        ojson* tabs = tabBlock.is_object() && tabBlock.contains("tables") && tabBlock["tables"].is_array()
+                          ? &tabBlock["tables"] : nullptr;
+        for (size_t ti = 0; tabs != nullptr && ti < parsed.varlist.size() && ti < tabs->size(); ++ti) {
+          std::vector<std::string> levels;
+          const ojson& t = (*tabs)[ti];
+          if (t.contains("table") && t["table"].contains("rows") && t["table"]["rows"].is_array())
+            for (const auto& r : t["table"]["rows"])
+              if (r.is_string()) levels.push_back(r.get<std::string>());
+          ojson genErr = runTabulateGenerate(tabGenStub, {parsed.varlist[ti]}, levels, session,
+                                             parsed.ifExpr, parsed.inRange, tabMissing);
+          if (genErr.is_null()) continue;
+          ojson kept = ojson::array();
+          for (size_t k = 0; k <= ti && k < tabs->size(); ++k) kept.push_back((*tabs)[k]);
+          *tabs = std::move(kept);
+          postTabR(tabs->back());
+          blocks.push_back(tabBlock);
+          ojson refusal;
+          refusal["type"] = "display";
+          refusal["text"] = genErr.value("message", std::string("generate() failed"));
+          blocks.push_back(std::move(refusal));
+          eval::declareRPosted(session.eval, "tabulate", {"N", "r"});
+          return true;
+        }
+      } else {
+        ojson genErr = runTabulateGenerate(tabGenStub, parsed.varlist, tabRawRows, session,
+                                           parsed.ifExpr, parsed.inRange, tabMissing);
+        if (!genErr.is_null()) {
+          blocks.push_back(genErr);
+          return true;
+        }
       }
     }
     // The names Stata posts (RULING.md D.3.4): one-way N r
@@ -519,6 +750,25 @@ bool route_tabulation(std::string& cmd,
     // ase_gam, taub ase_taub, p_exact p1_exact with lrchi2, V, gamma, taub, exact,
     // for the statistics the (last) table carries: none on a table with one row or
     // one column. With sum() the set is not declared.
+    // A table tab1/tab2 refused ("too many values") ended the loop: the tables before
+    // it stay, the refusal prints under its own heading, and r() is empty.
+    if (!sumvar.has_value() && tabBlock.is_object() && tabBlock.contains("refused") &&
+        tabBlock["refused"].is_object()) {
+      const ojson refused = tabBlock["refused"];
+      tabBlock.erase("refused");
+      if (tabBlock.contains("tables") && tabBlock["tables"].is_array() && !tabBlock["tables"].empty())
+        blocks.push_back(ojson(tabBlock));
+      ojson head, refusal;
+      head["type"] = "display";
+      head["text"] = refused.value("header", std::string());
+      refusal["type"] = "display";
+      refusal["text"] = refused.value("message", std::string());
+      blocks.push_back(std::move(head));
+      blocks.push_back(std::move(refusal));
+      eval::replaceRClass(session.eval);
+      eval::declareRPosted(session.eval, "tabulate", {});
+      return true;
+    }
     if (!sumvar.has_value() && tabBlock.is_object() &&
         tabBlock.value("type", std::string()) != "error") {
       const bool twoWay = cmd == "tab2" || (cmd != "tab1" && parsed.varlist.size() == 2);
@@ -536,7 +786,37 @@ bool route_tabulation(std::string& cmd,
         if (last.contains("taub")) stataNames.insert(stataNames.end(), {"taub", "ase_taub"});
         if (last.contains("exact")) stataNames.insert(stataNames.end(), {"p_exact", "p1_exact"});
       }
+      // Stata lists them `N r c chi2 p ... CramersV gamma ase_gam taub ase_taub`
+      // (vs-stata truth bank, `: r(scalars)` after tabulate).
+      eval::orderRResults(session.eval,
+                          {"N", "r", "c", "chi2", "p", "chi2_lr", "p_lr", "CramersV", "gamma",
+                           "ase_gam", "taub", "ase_taub", "p_exact", "p1_exact"});
       eval::declareRPosted(session.eval, "tabulate", std::move(stataNames));
+    }
+    // `exact` on a table too large to enumerate: Stata prints the table and the statistics it
+    // already has, then ends r(910) with r() posted (bank: `ta industry race, exact`, N r c
+    // stay set). tab2 swallows the refusal like any other the inner tabulate raises.
+    {
+      ojson* lastTab = tabBlock.is_object() && tabBlock.contains("tables") && tabBlock["tables"].is_array() &&
+                               !tabBlock["tables"].empty()
+                           ? &tabBlock["tables"].back() : &tabBlock;
+      if (lastTab->is_object() && lastTab->contains("exact_refused")) {
+        const int64_t ws = (*lastTab)["exact_refused"].get<int64_t>();
+        lastTab->erase("exact_refused");
+        const std::string msg = "exceeded memory limits using exact(" + std::to_string(ws) +
+                                "); try again with larger #; see help tabulate for details";
+        blocks.push_back(ojson(tabBlock));
+        if (tabLoop) {
+          ojson refusal;
+          refusal["type"] = "display";
+          refusal["text"] = msg;
+          blocks.push_back(std::move(refusal));
+        } else {
+          blocks.push_back(ojson(eval::errorBlock("engine_error", msg, std::nullopt, std::nullopt,
+                                                  std::nullopt, std::string("r(910)"))));
+        }
+        return true;
+      }
     }
     blocks.push_back(ojson(tabBlock));
     return true;
@@ -548,20 +828,78 @@ bool route_tabulation(std::string& cmd,
       blocks.push_back(ojson(eval::noDataLoaded()));
       return true;
     }
+    // Stata reads the options before it looks at the dimensions: `table, zzabbrprobe` is r(198)
+    // "option zzabbrprobe not allowed" (bank).
     if (parsed.varlist.empty()) {
-      blocks.push_back(ojson(eval::engineError("table: requires at least one row variable")));
+      if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabTable.known, kVocabTable.unimplemented)) {
+        blocks.push_back(ojson(*err));
+        return true;
+      }
+    }
+    // Stata 17 spells the dimensions `table (rowspec) (colspec)`; the tokenizer hands them over
+    // with the parentheses attached (`(foreign`, `rep78)`, `()`). The groups are read back from the
+    // tokens: a dimension is one variable (nested dimensions, a `var` / `command` / `result`
+    // dimension in the row position and the like are tables this build does not draw), the
+    // pre-17 spelling `table rowvar [colvar]` has no parentheses. `(result)` in the column
+    // position is the statistics' own dimension, which is where this table puts them.
+    std::vector<std::vector<std::string>> dimGroups;
+    {
+      std::string joined;
+      for (const auto& t : parsed.varlist) joined += (joined.empty() ? "" : " ") + t;
+      if (joined.find('(') != std::string::npos) {
+        size_t i = 0;
+        while (i < joined.size()) {
+          if (std::isspace(static_cast<unsigned char>(joined[i]))) { ++i; continue; }
+          if (joined[i] != '(') {
+            blocks.push_back(ojson(eval::engineError("table: dimension list `" + joined + "` is not understood")));
+            return true;
+          }
+          const size_t close = joined.find(')', i);
+          if (close == std::string::npos) {
+            blocks.push_back(ojson(eval::engineError("table: unbalanced parentheses in the dimension list")));
+            return true;
+          }
+          std::vector<std::string> group;
+          std::istringstream gs(joined.substr(i + 1, close - i - 1));
+          for (std::string w; gs >> w;) group.push_back(w);
+          dimGroups.push_back(std::move(group));
+          i = close + 1;
+        }
+      } else {
+        for (const auto& t : parsed.varlist) dimGroups.push_back({t});
+      }
+    }
+    // A third dimension is a page variable: one table per level of it (a third `(result)`
+    // dimension puts each statistic on a page of its own).
+    std::string pageVarName;
+    bool pageByStatistic = false;
+    if (dimGroups.size() == 3 && dimGroups[2].size() == 1) {
+      if (dimGroups[2][0] == "result") pageByStatistic = true;
+      else if (dimGroups[2][0] != "var" && dimGroups[2][0] != "command") pageVarName = dimGroups[2][0];
+      if (pageByStatistic || !pageVarName.empty()) dimGroups.pop_back();
+    }
+    if (dimGroups.size() > 2 ||
+        (dimGroups.size() == 2 && dimGroups[1].size() == 1 && dimGroups[1][0] == "result" && dimGroups[0].size() > 1)) {
+      blocks.push_back(ojson(eval::unsupportedOption(
+          "table", "table: tables with more than two dimensions are not drawn by this build")));
       return true;
     }
-    // Stata 17 spells the dimensions `table (rowspec) (colspec)`. The tokenizer
-    // hands them over with the parentheses attached, so a bare lookup reported
-    // "variable not found: '(region)'". Strip one enclosing pair per token; a
-    // token without them is the pre-17 spelling and passes through untouched.
-    auto stripDimParens = [](const std::string& t) {
-      return (t.size() >= 2 && t.front() == '(' && t.back() == ')') ? t.substr(1, t.size() - 2) : t;
-    };
-    std::string rowvar = stripDimParens(parsed.varlist[0]);
+    for (size_t gi = 0; gi < dimGroups.size(); ++gi) {
+      const auto& g = dimGroups[gi];
+      const bool special = std::any_of(g.begin(), g.end(), [](const std::string& w) {
+        return w == "result" || w == "var" || w == "command";
+      });
+      if (g.size() > 1 || (special && !(gi == 1 && g.size() == 1 && g[0] == "result"))) {
+        blocks.push_back(ojson(eval::unsupportedOption(
+            "table", "table: nested dimensions and the var / command / result dimensions are not "
+                     "drawn by this build")));
+        return true;
+      }
+    }
+    std::string rowvar = !dimGroups.empty() && !dimGroups[0].empty() ? dimGroups[0][0] : std::string();
     std::optional<std::string> colvar;
-    if (parsed.varlist.size() >= 2) colvar = stripDimParens(parsed.varlist[1]);
+    if (dimGroups.size() >= 2 && !dimGroups[1].empty() && dimGroups[1][0] != "result") colvar = dimGroups[1][0];
+    // A column dimension without a row dimension (`table () (rep78)`): the one row is the Total.
     // `statistic()` REPEATS in Stata 17 (`statistic(mean y) statistic(count y)`).
     // The old loop overwrote its single slot each pass, so a two-statistic
     // request silently answered with the last one only — the caller asked two
@@ -570,9 +908,8 @@ bool route_tabulation(std::string& cmd,
     std::vector<StatSpec> statSpecs;
     // BUG-1015: the pre-17 `contents(stat var ...)` (c()) form, legal only under
     // `version 16:` or lower (table_16.sthlp; w2as sx_table_c_v16*). Its
-    // statistics map onto the same cells statistic() computes; the ones this
-    // table kernel does not compute (median, p#, iqr, rawsum) are refused by
-    // name rather than shown empty, and a word that is no statistic is r(198)
+    // statistics map onto the same cells statistic() computes (median, p#, iqr and rawsum
+    // included), and a word that is no statistic is r(198)
     // (sx_table_ref_stat). The form is output-only: it posts no r().
     const bool tableV16 = session.callerVersion > 0.0 && session.callerVersion < 17.0;
     bool tableContents = false;
@@ -602,12 +939,6 @@ bool route_tabulation(std::string& cmd,
                                                   std::string("r(198)"))));
           return true;
         }
-        if (!kServed.count(st)) {
-          blocks.push_back(ojson(eval::unsupportedOption(
-              "contents(" + st + ")",
-              "table, contents(): this build computes freq mean sd sum count n max min")));
-          return true;
-        }
         if (st == "freq") {
           statSpecs.push_back({"freq", std::nullopt});
           ++i;
@@ -632,6 +963,36 @@ bool route_tabulation(std::string& cmd,
         if (!parts.empty()) {
           StatSpec sp;
           sp.stat = lower(parts[0]);
+          // statistic(percent, across(v) | total): `total` is the default denominator (the whole
+          // table); across(v) divides by the same cell with v collapsed (bank: `table rep78
+          // foreign, statistic(percent, across(foreign))` gives 100.00 along each row). The
+          // across variable rides on the statistic's name as `percent@v`.
+          {
+            const size_t comma = v.strValue.find(',');
+            if (comma != std::string::npos) {
+              std::string head = strutil::trim(v.strValue.substr(0, comma));
+              std::string tail = strutil::trim(v.strValue.substr(comma + 1));
+              std::istringstream hs(head);
+              parts.clear();
+              for (std::string w; hs >> w;) parts.push_back(w);
+              sp.stat = lower(parts.empty() ? std::string() : parts[0]);
+              if (tail.compare(0, 7, "across(") == 0 && !tail.empty() && tail.back() == ')') {
+                const std::string av = strutil::trim(tail.substr(7, tail.size() - 8));
+                if (av.empty() || av.find(' ') != std::string::npos ||
+                    (sp.stat != "percent" && sp.stat != "proportion")) {
+                  blocks.push_back(ojson(eval::unsupportedOption(
+                      "statistic", "table: across() is served for statistic(percent) and statistic(proportion) "
+                                   "with one variable")));
+                  return true;
+                }
+                sp.stat += "@" + av;
+              } else if (tail != "total") {
+                blocks.push_back(ojson(eval::unsupportedOption(
+                    "statistic", "table: statistic(..., " + tail + ") is not implemented in this version of PIET")));
+                return true;
+              }
+            }
+          }
           if (parts.size() >= 2) sp.var = parts[1];
           statSpecs.push_back(std::move(sp));
         }
@@ -643,7 +1004,7 @@ bool route_tabulation(std::string& cmd,
     // registration block (see top of file); this binding keeps every existing
     // use — including the reject net below — reading the same set.
     const std::unordered_set<std::string>& kTableKnownOpts = kVocabTable.known;
-    if (auto err = eval::rejectUnknownOptions(parsed.opts, kTableKnownOpts)) {
+    if (auto err = eval::rejectUnknownOptions(parsed.opts, kTableKnownOpts, kVocabTable.unimplemented)) {
       blocks.push_back(ojson(*err));
       return true;
     }
@@ -653,23 +1014,84 @@ bool route_tabulation(std::string& cmd,
         blocks.push_back(ojson(eval::engineError("variable " + *sp.var + " not found")));
         return true;
       }
-    // BUG-042: same if-prefilter as tabulate above (runTable is likewise
-    // pure Datastore computation with no cobra --keepif to forward to).
+    // The options that shape the result. `missing` makes the dimension variables' missing values
+    // categories (and keeps those rows in r(N)); `nototals` and `totals(v)` choose the margins
+    // (totals(v) names the dimension a margin is drawn for: under the column variable the Total
+    // row, under the row variable the Total column; bank: `table foreign rep78, ... tot(foreign)`
+    // draws the Total column); `listwise` keeps only the rows where every statistic's variable
+    // is present; `zerocounts` reports 0 in an empty cell of a count or frequency.
+    handlers::TableLayout lay;
+    bool optNoTotals = false, optListwise = false, legacyRow = false, legacyColumn = false;
+    std::vector<std::string> totalsVars;
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "missing") lay.includeMissing = true;
+      else if (k == "nototals") optNoTotals = true;
+      else if (k == "totals" && !v.isBool) {
+        std::istringstream ts(v.strValue);
+        for (std::string w; ts >> w;) totalsVars.push_back(w);
+      } else if (k == "listwise") optListwise = true;
+      else if (k == "row") legacyRow = true;
+      else if (k == "col" || k == "column") legacyColumn = true;
+      else if (k == "zerocounts") lay.zeroCounts = true;
+    }
+    if ((legacyRow || legacyColumn) && !tableV16) {
+      blocks.push_back(ojson(eval::engineError(std::string("option `") + (legacyRow ? "row" : "col") +
+                                               "` not allowed", "unsupported_option")));
+      return true;
+    }
+    if (tableContents) {
+      // The pre-17 form draws margins only when asked: `row` the Total row, `column` the Total column.
+      lay.showRowTotal = legacyRow;
+      lay.showColTotal = legacyColumn;
+    } else {
+      lay.showRowTotal = !optNoTotals;
+      lay.showColTotal = !optNoTotals;
+      if (!totalsVars.empty() && !optNoTotals) {
+        const auto has = [&](const std::string& v) {
+          return std::find(totalsVars.begin(), totalsVars.end(), v) != totalsVars.end();
+        };
+        lay.showRowTotal = colvar.has_value() ? has(*colvar) : false;
+        lay.showColTotal = !rowvar.empty() && has(rowvar);
+      }
+    }
+    if (parsed.weightVar.has_value() && parsed.weightType.has_value()) {
+      lay.weightVar = *parsed.weightVar;
+      const std::string wt = lower(*parsed.weightType);
+      lay.weightType = (wt == "fw" || wt == "fweight") ? "fw" : (wt == "aw" || wt == "aweight") ? "aw"
+                       : (wt == "pw" || wt == "pweight") ? "pw" : "iw";
+    }
+    // rows outside `if` / `in` / listwise are not in the table (Stata's `marksample`): one
+    // prefilter through the shared if-and-in chain, which also carries time-series operators.
+    std::optional<std::string> tableIf = parsed.ifExpr;
+    if (optListwise) {
+      std::string present;
+      for (const auto& sp : statSpecs)
+        if (sp.var.has_value()) present += (present.empty() ? "" : ",") + *sp.var;
+      if (!present.empty()) {
+        const std::string cond = "!missing(" + present + ")";
+        tableIf = tableIf.has_value() && !tableIf->empty() ? "(" + *tableIf + ") & " + cond : cond;
+      }
+    }
     std::unique_ptr<Datastore> tableIfDs;
-    if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) {
-      std::string tableIfPath = dispatcherNextPath(session.workdir(), "tableif");
-      // BUG-369 follow-up: `table x if L.y>0` — see the codebook arm above.
-      std::vector<std::string> ifArgs = translate::injectTsContextForExpr(
-          {"eval", "--data", ds->path(), "--keepif", *parsed.ifExpr, "--out", tableIfPath},
-          *parsed.ifExpr, session);
+    if ((tableIf.has_value() && !tableIf->empty()) || (parsed.inRange.has_value() && !parsed.inRange->empty())) {
+      handlers::InRangeFilterResult fr;
       try {
-        runCobraJson(ifArgs);
+        fr = handlers::applyIfAndInFilter(session, ds->path(), tableIf, parsed.inRange);
       } catch (const CobraError& ce) {
         blocks.push_back(ojson(eval::engineError(cobraErrorMessage(ce), ce.code)));
         return true;
       }
-      tableIfDs = std::make_unique<Datastore>(tableIfPath);
+      if (!fr.ok) {
+        blocks.push_back(ojson(handlers::inRangeRejectError(fr, *parsed.inRange, cmdTyped)));
+        return true;
+      }
+      tableIfDs = std::make_unique<Datastore>(fr.dataPath);
       ds = tableIfDs.get();
+      if (ds->nRows() == 0) {  // bank: `table foreign if price>999999` r(2000)
+        blocks.push_back(ojson(eval::errorBlock("engine_error", "no observations", std::nullopt,
+                                                std::nullopt, std::nullopt, std::string("r(2000)"))));
+        return true;
+      }
     }
     // BUG-160 CLOSURE: ONE table, not one runTable() call (and one block) per
     // statistic. The single- and two-or-more-statistic requests share the
@@ -685,16 +1107,62 @@ bool route_tabulation(std::string& cmd,
     std::vector<std::pair<std::string, std::optional<std::string>>> multiSpecs;
     multiSpecs.reserve(statSpecs.size());
     for (const auto& sp : statSpecs) multiSpecs.emplace_back(sp.stat, sp.var);
+    // Pages: one table per level of the third variable, or one per statistic for a third
+    // (result) dimension. r(N) is the rows in the table, the same on every page.
+    if (!pageVarName.empty() || (pageByStatistic && multiSpecs.size() > 1)) {
+      std::vector<ojson> pages;
+      if (!pageVarName.empty()) {
+        if (!ds->has(pageVarName)) {
+          blocks.push_back(ojson(eval::engineError("variable " + pageVarName + " not found")));
+          return true;
+        }
+        lay.pageVar = pageVarName;
+        ojson probe = ojson(handlers::runTableMulti(*ds, rowvar, colvar, multiSpecs, &session, &lay));
+        if (probe.value("type", std::string()) == "error") {
+          blocks.push_back(std::move(probe));
+          return true;
+        }
+        const ojson levels = probe.contains("page_levels") ? probe["page_levels"] : ojson::array();
+        for (const auto& lv : levels) {
+          lay.pageLevel = lv["value"].get<double>();
+          ojson page = (multiSpecs.size() == 1)
+                           ? ojson(handlers::runTable(*ds, rowvar, colvar, multiSpecs[0].first,
+                                                      multiSpecs[0].second, &session, &lay))
+                           : ojson(handlers::runTableMulti(*ds, rowvar, colvar, multiSpecs, &session, &lay));
+          page.erase("page_levels");
+          page["page"] = ojson{{"var", pageVarName}, {"label", lv["label"]}};
+          pages.push_back(std::move(page));
+        }
+        if (pages.empty()) pages.push_back(std::move(probe));
+      } else {
+        for (const auto& sp : multiSpecs) {
+          ojson page = ojson(handlers::runTable(*ds, rowvar, colvar, sp.first, sp.second, &session, &lay));
+          page["page"] = ojson{{"var", "result"}, {"label", sp.first}};
+          pages.push_back(std::move(page));
+        }
+      }
+      if (pages.front().value("type", std::string()) == "error") {
+        blocks.push_back(std::move(pages.front()));
+        return true;
+      }
+      if (pages.front().contains("n_obs") && pages.front()["n_obs"].is_number()) {
+        eval::replaceRClass(session.eval);
+        session.eval.rValues.set("N", pages.front()["n_obs"].get<double>());
+        eval::declareRPosted(session.eval, "table", {"N"});
+      }
+      for (auto& pg : pages) blocks.push_back(std::move(pg));
+      return true;
+    }
     ojson tableBlk = (multiSpecs.size() == 1)
                          ? ojson(handlers::runTable(*ds, rowvar, colvar, multiSpecs[0].first,
-                                                    multiSpecs[0].second, &session))
+                                                    multiSpecs[0].second, &session, &lay))
                          : ojson(handlers::runTableMulti(*ds, rowvar, colvar, multiSpecs,
-                                                         &session));
+                                                         &session, &lay));
     // BUG-373: table is r-class in Stata and published nothing. r(N) is the
     // tabulated sample's own count, which the block already carries.
     // BUG-1015: and r(N) is ALL it posts (table.sthlp Stored results): r() is
     // replaced and declared, so r(mean) after it reads `.` (sx_table_one).
-    if (!tableContents && tableBlk.value("type", std::string()) != "error" &&
+    if (tableBlk.value("type", std::string()) != "error" &&
         tableBlk.contains("n_obs") && tableBlk["n_obs"].is_number()) {
       eval::replaceRClass(session.eval);
       session.eval.rValues.set("N", tableBlk["n_obs"].get<double>());
@@ -729,9 +1197,54 @@ bool route_tabulation(std::string& cmd,
       if (k == "by" && !v.isBool) byVal = strutil::trim(v.strValue);
       // `stat`/`s` are abbreviations of statistics() (ado: Statistics(str));
       // `stats()` is its own synonym option (ado: STATS(str)).
+      // `s` and `c` take an argument: bare, tabstat.ado's syntax reads them as the
+      // abbreviations of Statistics(str) / Columns(str) and refuses (bank:
+      // `tabstat price mpg, by(foreign) s`, `tabstat price mpg rep78, c`).
       if ((k == "stat" || k == "statistics" || k == "s") && !v.isBool) statisticsVal = v.strValue;
       if (k == "stats" && !v.isBool) statsVal = v.strValue;
       if ((k == "columns" || k == "c") && !v.isBool) columnsVal = strutil::trim(v.strValue);
+    }
+    // A bare `s` or `c` is read as typed (the registry resolves a one-letter word
+    // to some option): tabstat.ado's Statistics(str) and Columns(str) need an
+    // argument, so Stata answers r(198) "option s incorrectly specified" (bank:
+    // `tabstat price mpg, by(foreign) s`, `tabstat price mpg rep78, c`).
+    {
+      const long long comma = eval::findUnquotedComma(parsed.raw);
+      if (comma >= 0) {
+        // Only a word standing alone at the top level counts: one followed at once by
+        // "(" is an option WITH its argument (`s(mean sd)`, `c( s )` -- Stata strips the
+        // blanks around a string option's argument), and what is inside the
+        // parentheses is that argument.
+        const std::string optText = parsed.raw.substr(static_cast<size_t>(comma) + 1);
+        std::string topLevel;
+        int depth = 0;
+        for (size_t i = 0; i < optText.size(); ++i) {
+          const char ch = optText[i];
+          if (ch == '(') {
+            // The word before it names an option that has an argument; blanks may
+            // stand between the two (bank b2a03c7e: `tabstat x1, stat (mean) save`).
+            if (depth == 0) {
+              while (!topLevel.empty() && topLevel.back() == ' ') topLevel.pop_back();
+              while (!topLevel.empty() && topLevel.back() != ' ') topLevel.pop_back();
+            }
+            ++depth;
+          } else if (ch == ')') {
+            if (depth > 0) --depth;
+            if (depth == 0) topLevel += ' ';
+          } else if (depth == 0) {
+            topLevel += std::isspace(static_cast<unsigned char>(ch)) ? ' ' : ch;
+          }
+        }
+        std::istringstream iss(topLevel);
+        for (std::string w; iss >> w;) {
+          if (w == "s" || w == "c") {
+            blocks = failed(ojson(eval::errorBlock("syntax_error", "option " + w + " incorrectly specified",
+                                                   std::nullopt, std::nullopt, std::nullopt,
+                                                   std::string("r(198)"))));
+            return true;
+          }
+        }
+      }
     }
     const std::unordered_set<std::string>& kTabstatKnownOpts = kVocabTabstat.known;
     bool tsNoTotal = false, tsSave = false;
@@ -777,14 +1290,104 @@ bool route_tabulation(std::string& cmd,
       const std::string wt = lower(*parsed.weightType);
       weightFlag = (wt == "aw" || wt == "aweight") ? "--aweight" : "--fweight";
     }
-    ojson tsBlock =
-        weightFlag.empty()
-            ? ojson(handlers::runTabstat(parsed.varlist, byVal, statCsv, session, parsed.ifExpr,
-                                         /*wantGroups=*/true, tsNoTotal))
-            : ojson(handlers::runTabstatWeighted(parsed.varlist, byVal, statCsv, session,
-                                                 parsed.ifExpr, /*wantGroups=*/true, tsNoTotal,
-                                                 weightFlag, *parsed.weightVar));
+    // casewise (same): only the rows where every variable of the list is present.
+    std::optional<std::string> tsIf = parsed.ifExpr;
+    bool tsMissing = false;
+    {
+      bool casewise = false;
+      for (const auto& [k, v] : parsed.opts) {
+        if ((k == "casewise" || k == "same") && (!v.isBool || v.boolValue)) casewise = true;
+        if (k == "missing" && (!v.isBool || v.boolValue)) tsMissing = true;
+      }
+      if (casewise) {
+        std::string present = "!missing(";
+        for (size_t i = 0; i < parsed.varlist.size(); ++i)
+          present += (i == 0 ? "" : ",") + parsed.varlist[i];
+        present += ")";
+        tsIf = parsed.ifExpr.has_value() && !parsed.ifExpr->empty()
+                   ? "(" + *parsed.ifExpr + ") & " + present
+                   : present;
+      }
+    }
+    const auto callTabstat = [&](const std::optional<std::string>& by, const std::optional<std::string>& cond,
+                                 bool groups, bool noTotal) {
+      return weightFlag.empty()
+                 ? ojson(handlers::runTabstat(parsed.varlist, by, statCsv, session, cond, groups, noTotal,
+                                              parsed.inRange))
+                 : ojson(handlers::runTabstatWeighted(parsed.varlist, by, statCsv, session, cond, groups,
+                                                      noTotal, weightFlag, *parsed.weightVar,
+                                                      parsed.inRange));
+    };
+    ojson tsBlock = callTabstat(byVal, tsIf, /*groups=*/true, tsNoTotal);
     if (tsBlock.value("type", std::string()) == "error") { blocks = failed(tsBlock); return true; }
+    // missing: the by variable's missing values are groups of their own. A numeric missing
+    // sorts after every number (`.` before `.a` ... `.z`), a string's "" before every text;
+    // the Total row then covers every selected row, the missing ones included (bank:
+    // `tabstat price mpg weight, by(rep78) missing` shows the `.` group and Total over 74).
+    if (tsMissing && byVal.has_value() && !byVal->empty() && tsBlock.contains("groups")) {
+      Datastore* msds = session.datastore();
+      std::set<int> kinds;
+      bool strBy = false, strMissing = false;
+      if (msds != nullptr && msds->has(*byVal)) {
+        strBy = msds->dtype(*byVal) == "factor";
+        std::unique_ptr<Datastore> filtered;
+        Datastore* src = msds;
+        if ((tsIf.has_value() && !tsIf->empty()) || (parsed.inRange.has_value() && !parsed.inRange->empty())) {
+          handlers::InRangeFilterResult fr;
+          try {
+            fr = handlers::applyIfAndInFilter(session, msds->path(), tsIf, parsed.inRange);
+          } catch (const CobraError& ce) {
+            blocks = failed(ojson(eval::engineError(cobraErrorMessage(ce), ce.code)));
+            return true;
+          }
+          if (fr.ok) {
+            filtered = std::make_unique<Datastore>(fr.dataPath);
+            src = filtered.get();
+          }
+        }
+        const cecon::Column& bc = src->col(*byVal);
+        const int64_t nrows = src->nRows();
+        if (strBy) {
+          const int32_t* codes = bc.codes();
+          for (int64_t i = 0; i < nrows; ++i)
+            if (codes[i] < 0 || bc.levels[static_cast<size_t>(codes[i])].empty()) strMissing = true;
+        } else {
+          const double* d = bc.f64();
+          for (int64_t i = 0; i < nrows; ++i)
+            if (std::isnan(d[i])) {
+              const int kind = cecon::missing_kind(d[i]);
+              kinds.insert(kind < 0 ? 0 : kind);
+            }
+        }
+      }
+      auto andIf = [&](const std::string& cond) {
+        return tsIf.has_value() && !tsIf->empty() ? "(" + *tsIf + ") & " + cond : cond;
+      };
+      ojson extra = ojson::array();
+      if (strMissing) {
+        ojson all = callTabstat(std::nullopt, andIf(*byVal + "==\"\""), false, false);
+        if (all.value("type", std::string()) == "error") { blocks = failed(all); return true; }
+        extra.push_back(ojson{{"stats", all["total"]}, {"value", ""}});
+      }
+      for (int kind : kinds) {
+        const std::string lit = kind == 0 ? std::string(".") : std::string(".") + static_cast<char>('a' + kind - 1);
+        ojson all = callTabstat(std::nullopt, andIf(*byVal + "==" + lit), false, false);
+        if (all.value("type", std::string()) == "error") { blocks = failed(all); return true; }
+        extra.push_back(ojson{{"stats", all["total"]}, {"value", lit}});
+      }
+      if (!extra.empty()) {
+        ojson merged = ojson::array();
+        if (strMissing) merged.push_back(extra[0]);
+        for (const auto& g : tsBlock["groups"]) merged.push_back(g);
+        for (size_t i = strMissing ? 1 : 0; i < extra.size(); ++i) merged.push_back(extra[i]);
+        tsBlock["groups"] = merged;
+        if (!tsNoTotal) {
+          ojson all = callTabstat(std::nullopt, tsIf, false, false);
+          if (all.value("type", std::string()) == "error") { blocks = failed(all); return true; }
+          tsBlock["total"] = all["total"];
+        }
+      }
+    }
     // The text table for a `log using` transcript (as measured on StataBE).
     {
       std::optional<ojson> tsRefusal;
@@ -871,12 +1474,28 @@ bool route_tabulation(std::string& cmd,
   // 3-letter spelling specifically.
   if (cmd == "corr" || cmd == "cor" || cmd == "pwcorr" || cmd == "correlate") {
     bool pairwise = false, sig = false, obs = false, covar = false;
+    handlers::CorrExtra extra;
+    bool bonferroni = false, sidak = false;
+    std::optional<std::string> starText, printText;
+    std::vector<std::string> correlateOnly, pwcorrOnly;
     for (const auto& [k, v] : parsed.opts) {
       if (k == "pairwise" && v.isBool && v.boolValue) pairwise = true;
       if (k == "sig" && v.isBool && v.boolValue) sig = true;
       if (k == "obs" && v.isBool && v.boolValue) obs = true;
       // BUG-1014: correlate's covariance (abbreviation cov, correlate.sthlp).
       if (k == "covariance" && (!v.isBool || v.boolValue)) covar = true;
+      // correlate's means / noformat / wrap; pwcorr's bonferroni, sidak, listwise
+      // (casewise), star(#), print(#) (correlate.sthlp, pwcorr.ado's syntax line).
+      if (k == "means" || k == "noformat" || k == "wrap") correlateOnly.push_back(k);
+      if (k == "means") extra.means = true;
+      if (k == "bonferroni" || k == "sidak" || k == "listwise" || k == "casewise" ||
+          k == "star" || k == "print")
+        pwcorrOnly.push_back(k);
+      if (k == "bonferroni") bonferroni = true;
+      if (k == "sidak") sidak = true;
+      if (k == "listwise" || k == "casewise") extra.listwise = true;
+      if (k == "star") starText = v.isBool ? std::string() : v.strValue;
+      if (k == "print") printText = v.isBool ? std::string() : v.strValue;
     }
     // BS-097: pairwise/sig/obs are the only corr/pwcorr/correlate options
     // this arm reads (real Stata also has means/covariance/kendall/star()/
@@ -890,6 +1509,36 @@ bool route_tabulation(std::string& cmd,
       return true;
     }
     if (cmd == "pwcorr") pairwise = true;
+    {
+      const auto refuse198 = [&](const std::string& msg) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt,
+                                                std::nullopt, std::string("r(198)"))));
+        return true;
+      };
+      if (cmd == "pwcorr" && !correlateOnly.empty())
+        return refuse198("option " + correlateOnly.front() + " not allowed");
+      if (cmd != "pwcorr" && !pwcorrOnly.empty())
+        return refuse198("option " + pwcorrOnly.front() + " not allowed");
+      // pwcorr.ado: bonferroni and sidak together are r(198); star(#) and print(#)
+      // are levels, # >= 1 read as a percentage, and a level still >= 1 "out of range".
+      if (bonferroni && sidak) return refuse198("options bonferroni and sidak may not be combined");
+      extra.adjust = bonferroni ? 1 : sidak ? 2 : 0;
+      for (const auto& [text, target, name] :
+           {std::tuple<std::optional<std::string>*, double*, const char*>{&starText, &extra.star, "star"},
+            std::tuple<std::optional<std::string>*, double*, const char*>{&printText, &extra.print, "print"}}) {
+        if (!text->has_value()) continue;
+        const std::string t = strutil::trim(**text);
+        char* end = nullptr;
+        double lv = std::strtod(t.c_str(), &end);
+        if (t.empty() || end == nullptr || *end != '\0' || std::isnan(lv))
+          return refuse198("option " + std::string(name) + "() incorrectly specified");
+        if (lv >= 1) {
+          lv /= 100.0;
+          if (lv >= 1) return refuse198(std::string(name) + "() out of range");
+        }
+        *target = lv;
+      }
+    }
 
     // BS-028 (BETA Phase C batch C1): `obs` was previously mismapped
     // straight into `sig` — `correlate, obs` silently became `correlate,
@@ -935,7 +1584,7 @@ bool route_tabulation(std::string& cmd,
     ojson corrBlock = ojson(handlers::runCorrStata(
         parsed.varlist, pairwise, sig, covar, corrWeightFlag,
         parsed.weightVar.has_value() ? *parsed.weightVar : std::string(), session, parsed.ifExpr,
-        parsed.inRange));
+        parsed.inRange, extra));
     // BS-028 composing 1-liner (BETA campaign C2): record `obs` on the
     // block itself so a future frontend change can decide whether to
     // render the per-pair N matrix (`nobs`, already flowing per the NOTE

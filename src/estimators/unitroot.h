@@ -44,6 +44,31 @@ inline void fuller_cv(int kase, double N, double& c1, double& c5, double& c10) {
     c1 = interp(0); c5 = interp(1); c10 = interp(2);
 }
 
+// pperron's Z(rho) critical values: Fuller's (1976) table for the normalized
+// bias T(rho-1), interpolated linearly in N on the same grid fuller_cv uses
+// (pperron.ado GetCrit). kase 1 noconstant, 2 constant, 4 trend.
+inline void pperron_zrho_cv(int kase, double N, double& c1, double& c5, double& c10) {
+    static const double P1[3][6] = {{-11.9, -12.9, -13.3, -13.6, -13.7, -13.8},
+                                    {-7.3, -7.7, -7.9, -8.0, -8.0, -8.1},
+                                    {-5.3, -5.5, -5.6, -5.7, -5.7, -5.7}};
+    static const double P2[3][6] = {{-17.2, -18.9, -19.8, -20.3, -20.5, -20.7},
+                                    {-12.5, -13.3, -13.7, -14.0, -14.0, -14.1},
+                                    {-10.2, -10.7, -11.0, -11.2, -11.2, -11.3}};
+    static const double P4[3][6] = {{-22.5, -25.7, -27.4, -28.4, -28.9, -29.5},
+                                    {-17.9, -19.8, -20.7, -21.3, -21.5, -21.8},
+                                    {-15.6, -16.8, -17.5, -18.0, -18.1, -18.3}};
+    const double(*zp)[6] = (kase == 1) ? P1 : (kase == 4) ? P4 : P2;
+    auto interp = [&](int r) -> double {
+        if (N <= 25) return zp[r][0];
+        if (N <= 50) return zp[r][0] + (N - 25) / 25 * (zp[r][1] - zp[r][0]);
+        if (N <= 100) return zp[r][1] + (N - 50) / 50 * (zp[r][2] - zp[r][1]);
+        if (N <= 250) return zp[r][2] + (N - 100) / 150 * (zp[r][3] - zp[r][2]);
+        if (N <= 500) return zp[r][3] + (N - 250) / 250 * (zp[r][4] - zp[r][3]);
+        return zp[r][5];
+    };
+    c1 = interp(0); c5 = interp(1); c10 = interp(2);
+}
+
 // MacKinnon (1994) approximate p-value. type: 'c' (constant) or 't' (trend).
 inline double mackinnon_p(char type, double tau) {
     double g0, g1, g2, g3 = 0, mn = -1e300, mx = 1e300;
@@ -97,8 +122,14 @@ struct DfullerResult {
 };
 
 // kase: 1 noconstant, 2 constant (default), 3 drift, 4 trend. lags = # of ΔY lags.
+// in_sample (optional, aligned with y): a row with in_sample[i] == 0 is never a
+// regression row but still supplies its lagged and differenced values -- Stata's
+// `if` selects rows after the L./D. operators are evaluated, so `dfuller y if t >= c`
+// keeps the first selected row, whose L.y is the excluded row before it (bank
+// 17341262 `dfuller gnp96 if date>=tq(1980q1)`: N 90, not 89).
 inline DfullerResult dfuller_fit(const std::vector<double>& y, const std::vector<double>& time,
-                                 int64_t n, int lags, int kase, double delta = 1.0) {
+                                 int64_t n, int lags, int kase, double delta = 1.0,
+                                 const std::vector<char>* in_sample = nullptr) {
     DfullerResult r;
     r.lags = lags; r.kase = kase;
     if (lags < 0) lags = 0;
@@ -125,6 +156,7 @@ inline DfullerResult dfuller_fit(const std::vector<double>& y, const std::vector
     int64_t navail = std::min<int64_t>(n, std::min<int64_t>(static_cast<int64_t>(Dy.size()), static_cast<int64_t>(Ly.size())));
     for (int j = 0; j < lags; ++j) navail = std::min<int64_t>(navail, static_cast<int64_t>(DL[static_cast<size_t>(j)].size()));
     for (int64_t i = 0; i < navail; ++i) {
+        if (in_sample != nullptr && !(*in_sample)[static_cast<size_t>(i)]) continue;
         if (std::isnan(Dy[i]) || std::isnan(Ly[i])) continue;
         bool ok = true;
         for (int j = 0; j < lags; ++j) if (std::isnan(DL[j][i])) { ok = false; break; }
@@ -166,6 +198,7 @@ inline DfullerResult dfuller_fit(const std::vector<double>& y, const std::vector
 
 struct PperronResult {
     double Zrho = 0, Ztau = 0, p = 1, cv1 = 0, cv5 = 0, cv10 = 0;
+    double zrho_cv1 = 0, zrho_cv5 = 0, zrho_cv10 = 0;  // Z(rho)'s critical values
     int64_t n = 0;
     int lags = 0, kase = 2;
     bool ok = false;
@@ -177,8 +210,10 @@ struct PperronResult {
 
 // kase: 1 noconstant, 2 constant (default), 4 trend. lags = Newey-West bandwidth q
 // (default int(4*(T/100)^(2/9))).
+// in_sample: as dfuller_fit's (bank d879f03e `pperron gnp96 if ...`: N 90).
 inline PperronResult pperron_fit(const std::vector<double>& y, const std::vector<double>& time,
-                                 int64_t n, int lags, int kase, double delta = 1.0) {
+                                 int64_t n, int lags, int kase, double delta = 1.0,
+                                 const std::vector<char>* in_sample = nullptr) {
     PperronResult r;
     r.kase = kase;
     TsOpSpec sL; sL.ok = true; sL.lag_net = 1;
@@ -191,7 +226,10 @@ inline PperronResult pperron_fit(const std::vector<double>& y, const std::vector
     int k = 1 + (wantC ? 1 : 0) + (wantT ? 1 : 0);  // L.y + const + trend
     std::vector<int64_t> rows;
     int64_t navail = std::min<int64_t>(n, std::min<int64_t>(static_cast<int64_t>(Ly.size()), static_cast<int64_t>(y.size())));
-    for (int64_t i = 0; i < navail; ++i) if (!std::isnan(Ly[i]) && !std::isnan(y[i])) rows.push_back(i);
+    for (int64_t i = 0; i < navail; ++i)
+        if ((in_sample == nullptr || (*in_sample)[static_cast<size_t>(i)]) && !std::isnan(Ly[i]) &&
+            !std::isnan(y[i]))
+            rows.push_back(i);
     int64_t T = static_cast<int64_t>(rows.size());
     if (T <= k + 2) return r;
     std::vector<double> X(static_cast<size_t>(T) * k), dep(T);
@@ -220,9 +258,19 @@ inline PperronResult pperron_fit(const std::vector<double>& y, const std::vector
     double Td = static_cast<double>(T);
     double gam0 = 0; for (int64_t i = 0; i < T; ++i) gam0 += u[i] * u[i]; gam0 /= Td;
     double lam = gam0;
+    // The residual autocovariances pair TIME lags (pperron.ado: sum(u*L`i'.u)): u at
+    // t and at t - j*delta, both in the regression sample. Pairing the j-th previous
+    // ROW instead counts pairs across a gap in the calendar (sp500's weekends:
+    // Z(rho) -3.883 for Stata's -3.346). Positions on the delta grid, in time order.
+    std::map<int64_t, double> uAt;
+    for (int64_t i = 0; i < T; ++i)
+        uAt[static_cast<int64_t>(std::llround((time[static_cast<size_t>(rows[i])] - tmin) / delta))] = u[i];
     for (int j = 1; j <= q; ++j) {
         double g = 0;
-        for (int64_t i = j; i < T; ++i) g += u[i] * u[i - j];
+        for (const auto& [pos, ui] : uAt) {
+            const auto prev = uAt.find(pos - j);
+            if (prev != uAt.end()) g += ui * prev->second;
+        }
         g /= Td;
         lam += 2.0 * (1.0 - static_cast<double>(j) / (q + 1)) * g;
     }
@@ -233,6 +281,7 @@ inline PperronResult pperron_fit(const std::vector<double>& y, const std::vector
     r.Ztau = Zt0 * std::sqrt(gam0 / lam) - 0.5 * (lam - gam0) * Tss / std::sqrt(lam);
     r.n = T; r.lags = q;
     uroot::fuller_cv(kase, Td, r.cv1, r.cv5, r.cv10);
+    uroot::pperron_zrho_cv(kase, Td, r.zrho_cv1, r.zrho_cv5, r.zrho_cv10);
     if (kase == 2 || kase == 4) r.p = uroot::mackinnon_p(kase == 4 ? 't' : 'c', r.Ztau);
     r.ok = true;
     return r;

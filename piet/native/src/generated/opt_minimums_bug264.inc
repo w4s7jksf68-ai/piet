@@ -78,7 +78,7 @@ static const std::map<std::string, std::vector<OptMinimum>> kOptMinimumsGenerate
     {"frget", {{"from", 1}}},
     {"frlink", {{"frame", 1}}},
     {"hausman", {{"alleqs", 1}, {"constant", 1}, {"equations", 2}, {"skipeqs", 2}, {"tconsistent", 4}, {"tefficient", 4}}},
-    {"heckman", {{"level", 1}, {"offset", 3}, {"select", 1}, {"twostep", 3}}},
+    {"heckman", {{"level", 1}, {"offset", 3}, {"select", 3}, {"twostep", 3}}},  // SELect: vs-stata bank e6c7cbb7 / fff6b18f `s()` and `se()` are r(198) "option select() required"; b52c2512 `sel()` fits
     {"ivreghdfe", {{"absorb", 1}, {"cluster", 2}, {"keepsingletons", 7}, {"level", 1}, {"noconstant", 3}, {"robust", 1}}},
     {"ivregress", {{"absorb", 1}, {"cluster", 1}, {"level", 1}, {"noconstant", 3}, {"robust", 1}}},
     {"levelsof", {{"clean", 1}, {"local", 1}, {"missing", 4}, {"separate", 1}}},

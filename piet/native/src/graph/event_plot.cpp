@@ -41,14 +41,15 @@
 namespace {
 
 // event_plot. `alpha()` becomes coefplot's `level()`; `stub_lag`/`stub_lead`
-// select and order the coefficients; `together` and the four cosmetic options
-// are read to build the note. `shift`/`trimlag`/`trimlead` change WHICH
-// coefficients are plotted and `savecoef`/`perturb` change what is stored --
-// all five are numbers-or-content, not cosmetics, so they are refused by name.
+// select and order the coefficients; `together` and the cosmetic options
+// are read to build the note. `shift` moves the event time of every coefficient and
+// `trimlag` / `trimlead` leave out the lags / leads beyond that horizon; `savecoef` writes the
+// coefficients into the dataset, which is content, not cosmetics, and is refused by name.
 const piet::eval::OptVocab& kVocabEventPlot = piet::eval::registerOptVocab(
     {"event_plot"}, {{"stub_lag", "stub_lead", "together", "plottype", "ciplottype", "graph_opt",
-                      "noautolegend", "alpha", "name"},
-                     {"shift", "trimlag", "trimlead", "savecoef", "perturb"}});
+                      "noautolegend", "alpha", "name", "shift", "trimlag", "trimlead", "default_look",
+                      "lag_opt", "lead_opt", "lag_ci_opt", "lead_ci_opt", "legend_opt", "perturb"},
+                     {"savecoef"}});
 
 }  // namespace
 
@@ -109,6 +110,76 @@ ojson runEventPlot(const eval::ParsedCommand& parsed, SessionState& session) {
                                             kVocabEventPlot.unimplemented))
     return ojson(*err);
 
+  // A model name that is not a stored estimation result is r(111) before the stubs
+  // are read (bank: `event_plot nosuchmodel`).
+  for (const std::string& nm : parsed.varlist) {
+    if (nm == "." || nm == "||" || nm.find_first_of("*?(") != std::string::npos) continue;
+    const bool stored = std::any_of(session.estimates.begin(), session.estimates.end(),
+                                    [&](const auto& kv) { return kv.first == nm; });
+    if (!stored) {
+      return ojson(eval::errorBlock("engine_error", "estimation result " + nm + " not found",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(111)"));
+    }
+  }
+  // `plot` is not an abbreviation of plottype() and `plottype()` takes a twoway
+  // plot type (bank: `plot(connected)` r(198) "option plot() incorrectly specified",
+  // `plottype(zzz)` r(198) "zzz is not a twoway plot type"); inside graph_opt() the
+  // twoway options are read with their own minimums: `n(`, `na(`, `nam(` are not name().
+  {
+    const long long comma = eval::findUnquotedComma(parsed.raw);
+    if (comma >= 0) {
+      std::string tail = parsed.raw.substr(static_cast<size_t>(comma) + 1);
+      int depth = 0;
+      std::string word;
+      for (size_t i = 0; i <= tail.size(); ++i) {
+        const char ch = i < tail.size() ? tail[i] : ' ';
+        if (depth == 0 && (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')) {
+          word.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        } else {
+          if (depth == 0 && word == "plot" && ch == '(') {
+            return gxSyntax("option plot() incorrectly specified");
+          }
+          word.clear();
+        }
+        if (ch == '(') ++depth;
+        if (ch == ')' && depth > 0) --depth;
+      }
+    }
+    if (auto go = optStr(parsed.opts, "graph_opt")) {
+      std::string w;
+      int depth = 0;
+      for (size_t i = 0; i <= go->size(); ++i) {
+        const char ch = i < go->size() ? (*go)[i] : ' ';
+        if (depth == 0 && (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')) {
+          w.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        } else {
+          if (depth == 0 && ch == '(' && (w == "n" || w == "na" || w == "nam")) {
+            return gxSyntax("option " + w + "() not allowed");
+          }
+          w.clear();
+        }
+        if (ch == '(') ++depth;
+        if (ch == ')' && depth > 0) --depth;
+      }
+    }
+    if (auto pt = optStr(parsed.opts, "plottype")) {
+      static const char* kTypes[] = {"scatter", "line", "connected", "scatteri", "area", "bar",
+                                     "spike", "dropline", "dot", "rarea", "rbar", "rspike", "rcap",
+                                     "rcapsym", "rscatter", "rline", "rconnected", "pcspike",
+                                     "pccapsym", "pcarrow", "pcbarrow", "pcscatter", "tsline",
+                                     "tsrline", "lowess", "lpoly", "lfit", "qfit", "function",
+                                     "histogram", "kdensity"};
+      const std::string t = trimOf(*pt);
+      bool known = false;
+      for (const char* k : kTypes) {
+        const std::string full(k);
+        if (t == full || (t.size() >= 2 && t.size() < full.size() && full.compare(0, t.size(), t) == 0))
+          known = true;
+      }
+      if (!known) return gxSyntax(t + " is not a twoway plot type");
+    }
+  }
+
   const std::optional<std::string> stubLag = optStr(parsed.opts, "stub_lag");
   const std::optional<std::string> stubLead = optStr(parsed.opts, "stub_lead");
   if ((!stubLag.has_value() || stubLag->empty()) && (!stubLead.has_value() || stubLead->empty())) {
@@ -116,6 +187,23 @@ ojson runEventPlot(const eval::ParsedCommand& parsed, SessionState& session) {
                     ": at least one of stub_lag() and stub_lead() is required — they name the "
                     "coefficients to plot, e.g. `stub_lag(x#) stub_lead(F#x)`.");
   }
+
+  // shift(#): event time moves by # periods; trimlag(#) / trimlead(#): lags / leads beyond # are left out
+  // (each an integer; bank: `event_plot, ... together shift(-1)`, `trimlead(1) trimlag(1)` rc 0)
+  auto intOpt = [&](const char* key, long long* out) -> std::optional<ojson> {
+    const auto text = optStr(parsed.opts, key);
+    if (!text.has_value()) return std::nullopt;
+    long long v = 0;
+    if (!parseStrictInt(trimOf(*text), &v)) return gxSyntax(kCmd + ": option " + key + "() incorrectly specified");
+    *out = v;
+    return std::nullopt;
+  };
+  long long shiftBy = 0, trimLag = -1, trimLead = -1;
+  if (auto bad = intOpt("shift", &shiftBy)) return *bad;
+  if (auto bad = intOpt("trimlag", &trimLag)) return *bad;
+  if (auto bad = intOpt("trimlead", &trimLead)) return *bad;
+  const bool hasTrimLag = optStr(parsed.opts, "trimlag").has_value();
+  const bool hasTrimLead = optStr(parsed.opts, "trimlead").has_value();
 
   // `alpha(a)` is a significance level; coefplot speaks confidence levels.
   std::vector<std::pair<std::string, eval::OptValue>> fwd = parsed.opts;
@@ -135,7 +223,15 @@ ojson runEventPlot(const eval::ParsedCommand& parsed, SessionState& session) {
   }
 
   ojson block = ojson(runCoefplot(parsed.varlist, fwd, session));
-  if (isErrorBlock(block)) return renameDelegateError(block, kCmd, "coefplot");
+  if (isErrorBlock(block)) {
+    // bank: `event_plot, stub_lag(L#) stub_lead(F#)` with nothing estimated is
+    // r(301) "last estimates not found".
+    if (block.value("message", std::string()).find("no stored estimates") != std::string::npos) {
+      return ojson(eval::errorBlock("engine_error", "last estimates not found", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(301)"));
+    }
+    return renameDelegateError(block, kCmd, "coefplot");
+  }
   if (!block.is_object() || !block.contains("models") || !block["models"].is_array())
     return gxError(kCmd + ": internal — `coefplot` returned no models.", "internal");
 
@@ -158,7 +254,9 @@ ojson runEventPlot(const eval::ParsedCommand& parsed, SessionState& session) {
         hit = true;
       }
       if (!hit) continue;
-      picked.emplace_back(rel, c);
+      if (hasTrimLag && rel > trimLag) continue;
+      if (hasTrimLead && -rel > trimLead) continue;
+      picked.emplace_back(rel + shiftBy, c);
     }
     // Stable: two coefficients at the same relative time (a lag 0 and a lead 0,
     // say) keep the coeftable's own order rather than a sort's internals.
@@ -182,7 +280,11 @@ ojson runEventPlot(const eval::ParsedCommand& parsed, SessionState& session) {
   }
 
   if (kept == 0) {
-    return gxError(kCmd + ": no coefficients match stub_lag()/stub_lead()");
+    // bank: `event_plot, stub_lag(Z#)` r(498)
+    return ojson(eval::errorBlock(
+        "engine_error",
+        "No estimates found. Make sure you have specified stub_lag and stub_lead correctly.", std::nullopt,
+        std::nullopt, std::nullopt, "r(498)"));
   }
 
   // The x range coefplot computed covered coefficients this command dropped;
@@ -206,7 +308,8 @@ ojson runEventPlot(const eval::ParsedCommand& parsed, SessionState& session) {
   // block JSON and not the figure; making it visible is a frontend change and
   // is reported rather than done.
   const std::vector<std::string> cosmetic =
-      presentOpts(parsed.opts, {"plottype", "ciplottype", "graph_opt", "noautolegend"});
+      presentOpts(parsed.opts, {"plottype", "ciplottype", "graph_opt", "noautolegend", "default_look",
+                                "lag_opt", "lead_opt", "lag_ci_opt", "lead_ci_opt", "legend_opt", "perturb"});
   if (!cosmetic.empty()) {
     appendBlockNote(block, "(" + kCmd + ": " + joinWith(cosmetic, ", ") +
                                " accepted and not applied — this build draws the coefficient plot "

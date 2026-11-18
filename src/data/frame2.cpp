@@ -1166,12 +1166,20 @@ std::vector<std::vector<double>> key_cols(const Frame& fr, const std::vector<std
 // bit pattern so it hashes/compares consistently as a map/set key.
 struct RowKey {
     std::vector<double> v;
+    // A missing key component equals another of the SAME kind only: `.` and
+    // `.a` are different values to Stata's duplicates, merge and reshape (vs-stata
+    // bank 2026-11-10: `duplicates report x` over 1 . .a .z 2 .b -1 . 0 counts 8
+    // unique values).
     bool operator==(const RowKey& o) const {
         if (v.size() != o.v.size()) return false;
         for (size_t i = 0; i < v.size(); ++i) {
             bool na = std::isnan(v[i]), nb = std::isnan(o.v[i]);
             if (na != nb) return false;
-            if (!na && v[i] != o.v[i]) return false;
+            if (na) {
+                if (missing_kind(v[i]) != missing_kind(o.v[i])) return false;
+            } else if (v[i] != o.v[i]) {
+                return false;
+            }
         }
         return true;
     }
@@ -1181,7 +1189,8 @@ struct RowKeyHash {
         size_t h = 1469598103934665603ull;
         for (double x : k.v) {
             uint64_t bits;
-            if (std::isnan(x)) bits = 0x7ff8000000000000ull;  // canonical NaN bit pattern
+            if (std::isnan(x))  // one canonical pattern per missing kind
+                bits = 0x7ff8000000000000ull + static_cast<uint64_t>(missing_kind(x));
             else std::memcpy(&bits, &x, 8);
             h ^= bits;
             h *= 1099511628211ull;
@@ -1880,22 +1889,17 @@ Frame Frame::fillin(const std::vector<std::string>& varlist, int64_t* n_added_ou
     if (has("_fillin"))
         throw EngineError("bad_input", "fillin: variable _fillin already exists");
 
-    // The observed value set of each fillin variable, in FIRST-SEEN order, then
-    // sorted ascending so the generated grid is deterministic and matches the
-    // sorted order Stata leaves behind.
+    // The observed value set of each fillin variable, sorted ascending in Stata's order (every
+    // real number, then `.`, `.a` .. `.z`: each extended missing is a value of its own).
     std::vector<std::vector<double>> K = key_cols(*this, varlist);
     const size_t nv = varlist.size();
     std::vector<std::vector<double>> levels(nv);
     for (size_t k = 0; k < nv; ++k) {
         std::vector<double> vals(K[k].begin(), K[k].end());
-        std::sort(vals.begin(), vals.end(), [](double a, double b) {
-            if (std::isnan(a)) return false;   // missing sorts last
-            if (std::isnan(b)) return true;
-            return a < b;
-        });
-        vals.erase(std::unique(vals.begin(), vals.end(), [](double a, double b) {
-                       return (std::isnan(a) && std::isnan(b)) || a == b;
-                   }),
+        std::sort(vals.begin(), vals.end(),
+                  [](double a, double b) { return cecon::stata_cmp(a, b) < 0; });
+        vals.erase(std::unique(vals.begin(), vals.end(),
+                               [](double a, double b) { return cecon::stata_cmp(a, b) == 0; }),
                    vals.end());
         levels[k] = std::move(vals);
     }
@@ -1919,7 +1923,6 @@ Frame Frame::fillin(const std::vector<std::string>& varlist, int64_t* n_added_ou
             RowKey key;
             key.v.resize(nv);
             for (size_t k = 0; k < nv; ++k) key.v[k] = levels[k][at[k]];
-            for (auto& x : key.v) if (std::isnan(x)) x = std::numeric_limits<double>::quiet_NaN();
             if (!present.count(key)) newTuples.push_back(key.v);
             for (size_t k = nv; k-- > 0;) {         // odometer increment
                 if (++at[k] < levels[k].size()) break;
@@ -1969,7 +1972,8 @@ Frame Frame::fillin(const std::vector<std::string>& varlist, int64_t* n_added_ou
         out.append_f64_column("_fillin", std::move(flag));
     }
     out.finalize_after_bulk_load();
-    return out;
+    // fillin.ado ends with `sort varlist`: the filled rows are not left at the end.
+    return out.gsort(varlist, std::vector<bool>(varlist.size(), true));
 }
 
 Frame Frame::cross(const Frame& usingf) const {

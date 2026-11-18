@@ -106,6 +106,23 @@ bool bsampleIsStataFastPath(const eval::ParsedCommand& parsed) {
 }
 
 ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
+  // strata() names variables that must exist whether or not this build draws within strata
+  // (vs-stata bank: `bsample, strata(nosuchvar)` is r(111) "(error in option strata())").
+  if (session.hasData())
+    if (const auto strataText = optStr(parsed.opts, "strata")) {
+      Datastore* sds = nullptr;
+      try {
+        sds = session.datastore();
+      } catch (const std::exception&) {
+      }
+      if (sds != nullptr)
+        for (std::istringstream words(*strataText); words;) {
+          std::string nm;
+          if (!(words >> nm)) break;
+          if (!sds->has(nm))
+            return rsErrorRc("variable " + nm + " not found\n(error in option strata())", 111);
+        }
+    }
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabBsample.known,
                                             kVocabBsample.unimplemented))
     return ojson(*err);
@@ -131,18 +148,73 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
   if (ds->has(kRowIdx))
     return rsError("bsample: the scratch column " + std::string(kRowIdx) +
                    " already exists in this dataset; rename it and retry.");
+  // idcluster(): an existing variable of that name is replaced (bsample.ado:
+  // `capture confirm new variable` / `confirm variable` / `drop`); vs-stata bank
+  // `bsample, cluster(rep78) idcluster(mpg)` rc 0, k 12.
+  bool dropOldId = false;
   if (idclusterOpt.has_value()) {
-    ojson guard = newVarGuard(session, "bsample", *idclusterOpt);
-    if (!guard.is_null()) return guard;
+    if (ds->has(*idclusterOpt)) {
+      dropOldId = true;
+    } else {
+      ojson guard = newVarGuard(session, "bsample", *idclusterOpt);
+      if (!guard.is_null()) return guard;
+    }
   }
 
-  // The GROUPS being drawn: either every row on its own, or the rows of each
-  // distinct cluster value. A factor cluster groups on the code (and every
-  // missing cluster value is ONE group, as Stata treats it).
-  std::vector<std::vector<int64_t>> groups;  // 1-based row indices
+  // bsample.ado (StataBE 19.5). Without cluster() and without `#` the fast path
+  // (no r() is touched); otherwise `count if touse` runs first, so r(N) is the
+  // number of observations drawn from.
+  //  - `#`: SRSWR -- the fast path's draw, then one more uniform per resampled row
+  //    in that order, the rows sorted by it and the first # kept. # must be a
+  //    whole number in 1.._N (r(198) / r(498)).
+  //  - cluster(var): the data sorted by the cluster (stable; every missing value
+  //    of one kind is one cluster, sorted last), the clusters numbered 1..G
+  //    (G = 1 is r(460)), and ClustSRSWR's draw (bsdraw::clustSrswr, shared with
+  //    the bootstrap prefix). idcluster(): NewClustID -- the data ordered by
+  //    (cluster, copy, row) and each (cluster, copy) numbered 1, 2, ...
+  //    `#` below G with cluster() draws again (NewClustID's random order): not
+  //    implemented, refused by name.
+  std::vector<int64_t> idx;        // 1-based input rows, in the result's row order
+  std::vector<char> isCopy;        // rows `expand` created: outside e(sample)
+  std::vector<int64_t> idcluster;  // idcluster(): the new cluster number of each row
+  long long nsamp = -1;
+  if (!parsed.varlist.empty()) {
+    double want = 0;
+    if (!parseStrictDouble(parsed.varlist[0], &want))
+      return rsErrorRc("expression: " + parsed.varlist[0] + ": is not an integer", 198);
+    if (std::fabs(want - std::trunc(want)) >= 1e-7)
+      return rsErrorRc("expression: " + parsed.varlist[0] + ": is not an integer", 198);
+    if (want <= 0) return rsErrorRc("resample size must be greater than zero", 498);
+    nsamp = static_cast<long long>(std::llround(want));
+  }
+  const bool fast = bsampleIsStataFastPath(parsed);
   if (!clusterOpt.has_value()) {
-    groups.reserve(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; ++i) groups.push_back({i + 1});
+    if (nsamp > n)
+      return rsErrorRc("resample size must not be greater than number of observations", 498);
+    int64_t nKept = 0;
+    std::vector<int64_t> rows = bsdraw::srswrFast(session.seed.stream(), n, &nKept);
+    std::vector<char> copy(rows.size(), 0);
+    for (size_t i = static_cast<size_t>(nKept); i < rows.size(); ++i) copy[i] = 1;
+    if (nsamp >= 0 && nsamp != n) {
+      std::vector<double> w(rows.size());
+      for (auto& x : w) x = session.seed.stream().runiform();
+      std::vector<size_t> ord(rows.size());
+      std::iota(ord.begin(), ord.end(), size_t{0});
+      std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return w[a] < w[b]; });
+      ord.resize(static_cast<size_t>(nsamp));
+      std::vector<int64_t> r2;
+      std::vector<char> c2;
+      for (size_t k : ord) {
+        r2.push_back(rows[k]);
+        c2.push_back(copy[k]);
+      }
+      rows.swap(r2);
+      copy.swap(c2);
+    }
+    for (size_t i = 0; i < rows.size(); ++i) {
+      idx.push_back(rows[i] + 1);
+      isCopy.push_back(copy[i]);
+    }
   } else {
     const std::vector<std::string> cvars = splitWs(*clusterOpt);
     if (cvars.size() != 1)
@@ -150,60 +222,82 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
                          ") names " + std::to_string(cvars.size()) + ".",
                      "unimplemented");
     const std::string& cv = cvars[0];
-    if (!ds->has(cv)) return rsError("variable " + cv + " not found");
-    std::map<std::string, size_t> seen;
+    if (!ds->has(cv)) return rsErrorRc("variable " + cv + " not found", 111);
     const cecon::Column& c = ds->col(cv);
-    for (int64_t i = 0; i < n; ++i) {
-      std::string key;
-      if (c.dtype == cecon::DType::Factor) {
-        const int32_t code = c.codes()[i];
-        key = code < 0 ? std::string(".") : ("c" + std::to_string(code));
-      } else {
-        const double v = c.f64()[i];
-        key = std::isnan(v) ? std::string(".") : eval::pythonFloatRepr(v);
+    const bool isStr = c.dtype == cecon::DType::Factor;
+    auto strOf = [&](int64_t i) -> std::string {
+      const int32_t code = c.codes()[i];
+      return (code >= 0 && static_cast<size_t>(code) < c.levels.size())
+                 ? c.levels[static_cast<size_t>(code)]
+                 : std::string();
+    };
+    auto cmp = [&](int64_t a, int64_t b) -> int {
+      if (isStr) {
+        const std::string sa = strOf(a), sb = strOf(b);
+        return sa < sb ? -1 : (sb < sa ? 1 : 0);
       }
-      auto it = seen.find(key);
-      if (it == seen.end()) {
-        it = seen.emplace(key, groups.size()).first;
-        groups.emplace_back();
+      return cecon::stata_cmp(c.f64()[a], c.f64()[b]);
+    };
+    std::vector<int64_t> sorted(static_cast<size_t>(n));
+    std::iota(sorted.begin(), sorted.end(), int64_t{0});
+    std::stable_sort(sorted.begin(), sorted.end(),
+                     [&](int64_t a, int64_t b) { return cmp(a, b) < 0; });
+    std::vector<int64_t> clid(static_cast<size_t>(n), 0);
+    int64_t G = 0;
+    for (size_t q = 0; q < sorted.size(); ++q) {
+      if (q == 0 || cmp(sorted[q], sorted[q - 1]) != 0) ++G;
+      clid[q] = G;
+    }
+    if (G == 1) return rsErrorRc("singleton cluster detected", 460);
+    if (nsamp > G) return rsErrorRc("resample size must not be greater than number of clusters", 498);
+    if (nsamp >= 0 && nsamp != G)
+      return ojson(eval::unsupportedOption(
+          "bsample #, cluster()",
+          "a resample of fewer clusters than the data holds orders the drawn clusters with a "
+          "further draw (bsample.ado's NewClustID) that this build does not reproduce."));
+    const std::vector<int64_t> pos = bsdraw::clustSrswr(session.seed.stream(), clid, G);
+    std::vector<int64_t> mult(static_cast<size_t>(G) + 1, 0);
+    {
+      std::vector<int64_t> seen(static_cast<size_t>(n), 0);
+      for (int64_t p : pos) ++seen[static_cast<size_t>(p)];
+      for (int64_t q = 0; q < n; ++q)
+        mult[static_cast<size_t>(clid[static_cast<size_t>(q)])] = std::max(
+            mult[static_cast<size_t>(clid[static_cast<size_t>(q)])], seen[static_cast<size_t>(q)]);
+    }
+    if (!idclusterOpt.has_value()) {
+      std::vector<int64_t> firstSeen(static_cast<size_t>(n), 0);
+      for (int64_t p : pos) {
+        idx.push_back(sorted[static_cast<size_t>(p)] + 1);
+        isCopy.push_back(firstSeen[static_cast<size_t>(p)]++ > 0 ? 1 : 0);
       }
-      groups[it->second].push_back(i + 1);
+    } else {
+      int64_t id = 0;
+      size_t q0 = 0;
+      while (q0 < sorted.size()) {
+        size_t q1 = q0;
+        while (q1 < sorted.size() && clid[q1] == clid[q0]) ++q1;
+        const int64_t m = mult[static_cast<size_t>(clid[q0])];
+        for (int64_t k = 0; k < m; ++k) {
+          ++id;
+          for (size_t q = q0; q < q1; ++q) {
+            idx.push_back(sorted[q] + 1);
+            isCopy.push_back(k > 0 ? 1 : 0);
+            idcluster.push_back(id);
+          }
+        }
+        q0 = q1;
+      }
     }
   }
-
-  const int64_t nGroups = static_cast<int64_t>(groups.size());
-  int64_t draws = nGroups;  // default size = _N, or G when clustering
-  if (!parsed.varlist.empty()) {
-    long long want = 0;
-    if (!parseStrictInt(parsed.varlist[0], &want) || want < 0)
-      return rsSyntax("bsample: `" + parsed.varlist[0] + "' is not a non-negative whole number");
-    draws = want;
-    if (!clusterOpt.has_value() && draws > n)
-      return rsError("bsample: cannot draw " + std::to_string(draws) +
-                     " observation(s) without replacement from " + std::to_string(n) +
-                     " — bsample draws WITH replacement, so # may not exceed _N in Stata either.");
-    if (clusterOpt.has_value() && draws > nGroups)
-      return rsError("bsample: cannot draw " + std::to_string(draws) + " cluster(s) from " +
-                     std::to_string(nGroups));
+  if (!fast) {
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", static_cast<double>(n));
+    eval::declareRPosted(session.eval, "bsample", {"N"});
   }
 
-  std::vector<int64_t> idx;
-  std::vector<int64_t> idcluster;
-  int64_t nKept = -1;  // the fast path's originals: rows [0, nKept) of the result
-  if (bsampleIsStataFastPath(parsed)) {
-    // Stata's own draw on the session stream (core/rng_mt64.h), so `set seed s` +
-    // bsample gives Stata's rows; shared with the bootstrap prefix (bsample_draws.h).
-    for (int64_t row : bsdraw::srswrFast(session.seed.stream(), n, &nKept)) idx.push_back(row + 1);
-  } else {
-    const uint64_t seed = drawSeed(session, std::nullopt);
-    for (int64_t d = 0; d < draws; ++d) {
-      const uint32_t u = rowKey32(seed, d);
-      const int64_t g = static_cast<int64_t>(u % static_cast<uint32_t>(nGroups));
-      for (int64_t row : groups[static_cast<size_t>(g)]) {
-        idx.push_back(row);
-        idcluster.push_back(d + 1);
-      }
-    }
+  if (dropOldId) {
+    ojson dropped = runDrop({*idclusterOpt}, session);
+    if (dropped.is_object() && dropped.value("type", std::string()) == "error") return dropped;
   }
 
   // Three steps, exactly the shape the bootstrap replicate in
@@ -254,14 +348,15 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
     return *err;
   session.load(out);
   if (auto bad = assertRowCount(session, "bsample", static_cast<int64_t>(idx.size()))) return *bad;
-  if (nKept >= 0) {
+  {
     // e(sample) T2 (StataBE w2_esample_copies X2 `10|61|m0=20|m0_diff=10`): the
     // marker travels with each kept original row through the sort and keep, and
     // the rows `expand` creates are outside the sample (expand's rule,
     // runExpandIf). The merge carried the mask onto the copies; clear them.
     if (std::optional<std::vector<double>> cells = esampleHeadMask(session)) {
       bool any = false;
-      for (size_t i = static_cast<size_t>(nKept); i < cells->size(); ++i) {
+      for (size_t i = 0; i < cells->size() && i < isCopy.size(); ++i) {
+        if (!isCopy[i]) continue;
         any = any || (*cells)[i] != 0.0;
         (*cells)[i] = 0.0;
       }
@@ -270,6 +365,14 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
                        "not be cleared on the expanded copies; e(sample) is not reliable until "
                        "the next estimation.");
     }
+  }
+  if (idclusterOpt.has_value()) {
+    // NewClustID: `gen byte` 0/1, then the running sum -- byte while the ids fit.
+    int64_t top = 0;
+    for (int64_t v : idcluster) top = std::max(top, v);
+    session.varMeta[*idclusterOpt].stataType =
+        top <= 100 ? std::string("byte") : (top <= 32740 ? std::string("int") : std::string("long"));
+    session.implicitFloatVars.erase(*idclusterOpt);
   }
   return mutationResult(session, "bsample", idclusterOpt.has_value()
                                                 ? std::vector<std::string>{*idclusterOpt}

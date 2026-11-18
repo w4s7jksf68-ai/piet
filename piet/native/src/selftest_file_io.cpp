@@ -77,9 +77,20 @@ void testTempfileSaveUseRoundtripBug085() {
   // this tree, exactly as the `runSaveData` BUG A note records.
   (void)runCmd(session, "set obs 3");
   (void)runCmd(session, "gen z = _n");
-  auto jForeign = runCmd(session, "save \"myfile.csv\", replace");
-  check(!firstBlockOfType(jForeign, "error").is_null(),
-        "BUG-085 over-fix guard: a foreign extension (`.csv`) is STILL rejected");
+  // The rule has moved with the bank (vs-stata cell 978a80b21c1fc51e): StataBE
+  // saves a .dta under ANY extension and says so, "file myfile.csv saved as .dta
+  // format". What this guard keeps is that no other format is written under the
+  // name: the bytes are a Stata .dta, never CSV text.
+  auto jForeign = runCmd(session, "save \"" + workdir + "/myfile.csv\", replace");
+  check(firstBlockOfType(jForeign, "error").is_null(),
+        "BUG-085 over-fix guard: a foreign extension (`.csv`) is saved as .dta format, as Stata does");
+  {
+    std::ifstream probeCsv(cecon::to_native_path(workdir + "/myfile.csv"), std::ios::binary);
+    std::string headCsv(16, '\0');
+    probeCsv.read(headCsv.data(), static_cast<std::streamsize>(headCsv.size()));
+    check(headCsv.compare(0, 11, "<stata_dta>") == 0,
+          "BUG-085 over-fix guard: `myfile.csv` holds Stata .dta bytes, not CSV text");
+  }
 
   fs::remove_all(workdir, ec);
 }
@@ -152,9 +163,11 @@ void testBug343FileFamily() {
           "BUG-343: r(eof) is 1 once the reads run past the end — the value a read loop tests");
   }
   {  // BUG-1526: `binary` mode reads the file's bytes (BUG-343 refused it by name).
+    // `read` is spelled out: file open requires read and/or write (StataBE 19.5,
+    // vs-stata bank ce8d6ca22764ce30 `file open h1 using f.txt` r(198)).
     piet::SessionState session(workdir);
     session.eval.cwd = workdir;
-    auto r = piet::doexec::executeDoSource("file open bh using \"" + out + "\", binary\n"
+    auto r = piet::doexec::executeDoSource("file open bh using \"" + out + "\", read binary\n"
                                            "file read bh %5s w %1bu nl\n"
                                            "display \"`w'|\" nl\n"
                                            "file close bh\n",
@@ -406,7 +419,8 @@ void testAerEnvBundle() {
         {"sysdir set PLUS " + sdDir,
          "(sysdir set PLUS " + sdDir + ": recorded for findfile)"},
         {"pause on", "(pause on: PIET is non-interactive -- no effect)"},
-        {"gr_edit .plotregion1.style.editstyle margin(medium) editcopy",
+        // gr_edit edits the graph in memory: with none it is r(111) (vs-stata bank), so one is drawn first
+        {"twoway function y = x^2, range(0 1) nodraw\ngr_edit .plotregion1.style.editstyle margin(medium) editcopy",
          "(gr_edit: graph-editor recording, appearance only -- ignored)"},
     };
     for (const auto& [src, note] : kNotes) {
@@ -460,6 +474,75 @@ void testAerEnvBundle() {
               "`), and nodescend does not (r(601)); got `" +
               session.eval.locals.get("fn", "<unset>") + "` rc2 " +
               session.eval.locals.get("rc2", "<unset>"));
+  }
+  {  // Review of the s3b_io lane: spellings Stata accepts must not be refused.
+    // `adopath - CODEWORD` and `adopath - .` remove the entry the default list holds under that
+    // spelling; `ado, find(...)` and `ado, from(...)` are Stata's own options; the valid import
+    // and export subcommands PIET does not read keep a named refusal (not "unknown
+    // subcommand" r(198)); a line ends at CR LF ("win") or at a lone CR ("mac"); and a text
+    // import leaves no file name behind, so `save, replace` cannot overwrite its source.
+    const std::string crFile = at("crlf_status.txt");
+    const std::string csvFile = at("text_source.csv");
+    writeFile(crFile, std::string("one\r\ntwo\rthree"));
+    writeFile(csvFile, "a,b\n1,2\n");
+    piet::SessionState session(workdir);
+    session.eval.cwd = workdir;
+    (void)piet::doexec::executeDoSource(
+        "capture adopath - PLUS\nlocal rcPlus = _rc\n"
+        "capture adopath - .\nlocal rcDot = _rc\n"
+        "capture adopath - PLUS\nlocal rcAgain = _rc\n"
+        "capture ado, find(\"x\")\nlocal rcFind = _rc\n"
+        "capture ado, zzabbrprobe\nlocal rcBad = _rc\n"
+        "capture import parquet using x\nlocal rcParquet = _rc\n"
+        "capture import zzsub using x\nlocal rcUnknown = _rc\n"
+        "file open crh using \"" + crFile + "\", read text\n"
+        "file read crh crline\nlocal st1 `r(status)'\n"
+        "file read crh crline\nlocal st2 `r(status)'\n"
+        "file read crh crline\nlocal st3 `r(status)'\n"
+        "file close crh\n"
+        "import delimited using \"" + csvFile + "\", clear\n"
+        "local fn `\"`c(filename)'\"'\n"
+        "capture save, replace\nlocal rcSave = _rc\n",
+        session, piet::dispatch);
+    auto L = [&](const char* n) { return session.eval.locals.get(n, "<unset>"); };
+    check(L("rcPlus") == "0" && L("rcDot") == "0" && L("rcAgain") == "111",
+          "ENV/adopath: `- PLUS` and `- .` remove the entries the default list holds under those "
+          "spellings, a second `- PLUS` is r(111) -- got " + L("rcPlus") + "/" + L("rcDot") + "/" +
+              L("rcAgain"));
+    check(L("rcFind") == "0" && L("rcBad") == "198",
+          "ENV/ado: `ado, find()` is Stata's option, any other is r(198) -- got " + L("rcFind") +
+              "/" + L("rcBad"));
+    check(L("rcParquet") != "198" && L("rcUnknown") == "198",
+          "IO/import: `parquet` is a Stata subcommand (named refusal), `zzsub` is r(198) unknown "
+          "subcommand -- got " + L("rcParquet") + "/" + L("rcUnknown"));
+    check(L("st1") == "win" && L("st2") == "mac" && L("st3") == "none",
+          "IO/file read: r(status) is win for CR LF, mac for a lone CR, none for an unterminated "
+          "last line -- got " + L("st1") + "/" + L("st2") + "/" + L("st3"));
+    std::ifstream sf(csvFile, std::ios::binary);
+    std::string sbytes((std::istreambuf_iterator<char>(sf)), std::istreambuf_iterator<char>());
+    check(L("rcSave") == "198" && sbytes == "a,b\n1,2\n",
+          "IO/save: after import delimited c(filename) is empty, `save, replace` is r(198) and the "
+          "text source is untouched -- got rc " + L("rcSave"));
+  }
+  {  // A label of an extended missing value survives save and use (the writer and the reader
+    // spell the codes 2147483621 ... 2147483647 the same way): `.a` stays `.a`.
+    const std::string dtaFile = at("extmiss_label.dta");
+    piet::SessionState session(workdir);
+    session.eval.cwd = workdir;
+    (void)piet::doexec::executeDoSource(
+        "clear\nset obs 2\ngen x = _n\nreplace x = .a in 2\n"
+        "label define lxm 1 \"one\" .a \"miss a\"\nlabel values x lxm\n"
+        "save \"" + dtaFile + "\", replace\nuse \"" + dtaFile + "\", clear\n",
+        session, piet::dispatch);
+    auto r = piet::doexec::executeDoSource("label list lxm\n", session, piet::dispatch);
+    bool kept = false, plain = false;
+    for (const auto& line : displays(r.blocks)) {
+      if (line.find(".a  miss a") != std::string::npos) kept = true;
+      if (line.find("2147483622") != std::string::npos) plain = true;
+    }
+    check(kept && !plain,
+          "IO/dta: the label of `.a` reads back as `.a` after save and use, not as the integer "
+          "2147483622");
   }
   {
     piet::SessionState session(workdir);
@@ -1222,9 +1305,11 @@ void testAerIoText() {
           "AER-IOTEXT (vii/no-set): an assignment with no open workbook is an ERROR. A handler "
           "that invented a default filename writes a workbook nobody asked for, in a directory "
           "nobody chose, and reports success");
-    check(has(errText(e), "putexcel set"),
-          "AER-IOTEXT (vii/no-set): ...and the message names `putexcel set`, so the fix is in the "
-          "message rather than in the manual. Got `" + errText(e) + "`");
+    // StataBE 19.5 (truth bank cell 49b409063b4b2264: `putexcel clear` then `putexcel
+    // A1 = ("x")`): r(198) "no Excel file specified".
+    check(has(errText(e), "no Excel file specified"),
+          "AER-IOTEXT (vii/no-set): ...and the message is Stata's own, \"no Excel file specified\" "
+          "(bank cell 49b409063b4b2264). Got `" + errText(e) + "`");
 
     piet::SessionState s2(workdir);
     seed(s2);
@@ -1925,7 +2010,9 @@ void testBS006LogUsingRealFileWrite() {
       const std::string expectA =
           "\n.  log using \"" + A + "\", replace text\n"
           "\n.  display \"plain\"\nplain\n"
-          "\n.  display \"brace {c -(} x\"\nbrace {c -(} x\n"
+          // A text log shows what display draws: `{c -(}` is `{` (StataBE 19.5,
+          // vs-stata bank 5bda82a0107a4135 `{c -(}literal{c )-}` -> {literal}).
+          "\n.  display \"brace {c -(} x\"\nbrace { x\n"
           "\n.  count\n336\n"
           "\n.  capture noisily confirm variable nosuchvar\n"
           "variable nosuchvar not found\n(engine_error)\n"

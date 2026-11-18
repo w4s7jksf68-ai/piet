@@ -176,9 +176,11 @@ void testAerGraphX() {
       "set obs 6\n"
       "gen gx = _n\n"
       "gen gy = 2*_n\n"
-      "twoway scatter gy gx, name(g1) title(\"T1\")\n"
-      "twoway line gy gx, name(g2) title(\"T2\")\n"
-      "twoway connected gy gx, name(g3) title(\"T3\")\n";
+      // two plots per graph: grc1leg2 keeps one graph's LEGEND, which a graph of one plot has none of (its
+      // default legend is off) and StataBE answers r(111) for (vs-stata bank)
+      "twoway (scatter gy gx) (lfit gy gx), name(g1) title(\"T1\")\n"
+      "twoway (line gy gx) (lfit gy gx), name(g2) title(\"T2\")\n"
+      "twoway (connected gy gx) (lfit gy gx), name(g3) title(\"T3\")\n";
 
   // Counts the panels whose legend is still ON, and reports which one it is.
   auto keptLegend = [&](const nlohmann::ordered_json& blk, std::string& whichTitle) {
@@ -626,6 +628,8 @@ void testAerGraphX() {
     for (const char* form : kForms) {
       piet::SessionState s(workdir);
       seed(s);
+      // `grstyle set ...` needs a started session (`grstyle init`): r(499) without one (vs-stata bank)
+      if (std::string(form).rfind("grstyle set", 0) == 0) (void)piet::dispatch("grstyle init", s);
       auto blocks = piet::dispatch(form, s);
       const nlohmann::ordered_json e = firstError(blocks);
       check(e.is_null(),
@@ -715,7 +719,9 @@ void testAerGraphX() {
     check(!e.is_null(),
           "AER-GRAPHX (xiii): a stub matching NO coefficient is refused, not quietly widened to "
           "'plot them all' -- which would render the controls as an event study.");
-    check(has(errText(e), "no coefficients match"),
+    // The sentence is event_plot's own (vs-stata bank 69506245b3ca350d: "No estimates
+    // found. Make sure you have specified stub_lag and stub_lead correctly.").
+    check(has(errText(e), "No estimates found") && has(errText(e), "stub_lag"),
           "AER-GRAPHX (xiii): ...and the sentence says the stubs matched nothing, which is the "
           "half of the line the user has to fix. Got `" + errText(e) + "`");
     auto r2 = exec("event_plot ev2\n", s);
@@ -1885,17 +1891,21 @@ void testBetaEGraphicsBatch() {
     }
   }
 
-  // --- BS-052: `by()` real faceting is honestly rejected everywhere it's
-  // read (scatter/histogram/kdensity/twoway), not silently dropped.
+  // --- BS-052: `by()` on a twoway plot draws one panel per group; kdensity takes none (r(191)).
   {
     std::string wd = base + "/bs052_by_facet_reject";
     fs::create_directories(wd, ec);
     piet::SessionState session(wd);
     runCmd(session, "sysuse fatalities, clear");
 
+    // vs-stata bank (StataBE 19.5: `scatter price mpg, by(foreign)` rc 0, cell ff01eb072c6a2a9a): by() on a
+    // twoway plot is served as one panel per group, laid out as a graph combine.
     auto jScatterBy = runCmd(session, "scatter income beertax, by(state)");
-    check(firstBlockOfType(jScatterBy, "error").value("code", std::string()) == "unsupported_option",
-          "BS-052: `scatter ..., by(state)` is an honest unsupported_option reject");
+    auto gScatterBy = firstBlockOfType(jScatterBy, "graph");
+    check(firstBlockOfType(jScatterBy, "error").is_null() && !gScatterBy.is_null() &&
+              gScatterBy.value("kind", std::string()) == "graph_combine" &&
+              gScatterBy.value("panels", nlohmann::json::array()).size() > 1,
+          "BS-052: `scatter ..., by(state)` draws one panel per state");
     // gfx-histogram-kdensity-family: histogram's by() is served (one panel per
     // group, common start and width: w2aq_histogram_family hk_h_bystr, hk_h_byfw).
     auto jHistBy = runCmd(session, "histogram income, by(state)");
@@ -1904,12 +1914,131 @@ void testBetaEGraphicsBatch() {
               gHistBy.value("panels", nlohmann::json::array()).size() > 1,
           "BS-052: `histogram ..., by(state)` draws one panel per state");
     auto jKdensBy = runCmd(session, "kdensity income, by(state)");
-    check(firstBlockOfType(jKdensBy, "error").value("code", std::string()) == "unsupported_option",
-          "BS-052: `kdensity ..., by(state)` is an honest unsupported_option reject");
+    // StataBE 19.5 (vs-stata bank cell for `kdensity price, by(foreign)`): r(191)
+    // "option by() not allowed" -- kdensity takes no by() at all.
+    check(firstBlockOfType(jKdensBy, "error").value("reason", std::string()) == "r(191)",
+          "BS-052: `kdensity ..., by(state)` is r(191) option by() not allowed (bank)");
     auto jTwowayBy = runCmd(session, "twoway (scatter income beertax), by(state)");
-    check(firstBlockOfType(jTwowayBy, "error").value("code", std::string()) == "unsupported_option",
-          "BS-052: parenthesised `twoway (scatter ...), by(state)` (global option) is an honest "
-          "unsupported_option reject");
+    auto gTwowayBy = firstBlockOfType(jTwowayBy, "graph");
+    check(firstBlockOfType(jTwowayBy, "error").is_null() && !gTwowayBy.is_null() &&
+              gTwowayBy.value("panels", nlohmann::json::array()).size() > 1,
+          "BS-052: parenthesised `twoway (scatter ...), by(state)` draws one panel per state "
+          "(bank: `twoway scatter price mpg, by(foreign)` rc 0, cell a8e03bbc8ca8d9bc)");
+    // Each panel draws the statement on its OWN group's rows, as the single-plot form does: the layered forms
+    // (parenthesised, `||`, a global `if`, a plot's own `if`) carry the group's condition too.
+    {
+      runCmd(session, "generate byte bgrp = beertax > 0.5");
+      auto panelNs = [&](const std::string& cmd, bool layered) {
+        std::vector<long long> ns;
+        auto g = firstBlockOfType(runCmd(session, cmd), "graph");
+        for (const auto& pn : g.value("panels", nlohmann::json::array())) {
+          long long n = -1;
+          if (layered) {
+            if (pn.contains("layers") && pn["layers"].is_array() && !pn["layers"].empty())
+              n = pn["layers"][0].value("n", -1LL);
+          } else {
+            n = pn.value("n", -1LL);
+          }
+          ns.push_back(n);
+        }
+        return ns;
+      };
+      const auto single = panelNs("scatter income beertax, by(bgrp)", false);
+      check(single.size() == 2 && single[0] > 0 && single[1] > 0 && single[0] != single[1],
+            "by(): the single-plot form draws each group's own rows");
+      check(panelNs("twoway (scatter income beertax) (lfit income beertax), by(bgrp)", true) == single,
+            "by(): `(plot) (plot), by()` draws each panel on its group's rows, not on all of them");
+      check(panelNs("twoway scatter income beertax || lfit income beertax, by(bgrp)", true) == single,
+            "by(): `plot || plot, by()` draws each panel on its group's rows");
+      check(panelNs("twoway (scatter income beertax if income > 0), by(bgrp)", true).size() == 2,
+            "by(): a plot's own `if` inside the parentheses is read, not refused");
+      // a float group value is selected by its stored value (15 printed digits do not round-trip 0.1 as a float)
+      runCmd(session, "generate float bgf = cond(beertax > 0.5, 0.1, 0.3)");
+      const auto fl = panelNs("scatter income beertax, by(bgf)", false);
+      check(fl.size() == 2 && fl[0] > 0 && fl[1] > 0, "by(): a float by variable's groups are not empty");
+      // by(, missing) adds a panel this build does not draw: a named refusal, not a note
+      check(!firstBlockOfType(runCmd(session, "scatter income beertax, by(state, missing)"), "error").is_null(),
+            "by(..., missing) is refused by name");
+      // the documented abbreviations of the by() suboptions reach the same refusal / the same layout
+      // (help by_option: miss(ing), r(ows), c(ols)); an abbreviation is not a second, silent reading
+      check(!firstBlockOfType(runCmd(session, "scatter income beertax, by(state, miss)"), "error").is_null(),
+            "by(..., miss) is refused by name like by(..., missing)");
+      auto gRows = firstBlockOfType(runCmd(session, "scatter income beertax, by(bgrp, r(1))"), "graph");
+      check(gRows.is_object() && gRows.value("grid", nlohmann::json::object()).value("rows", 0) == 1,
+            "by(..., r(1)) lays the panels out in one row");
+      // a by-graph is one graph in memory: the panels it is drawn from are not registered as `Graph`
+      runCmd(session, "graph drop _all");
+      runCmd(session, "scatter income beertax, by(bgrp) name(gbp)");
+      auto jDir = runCmd(session, "graph dir");
+      const std::string dirText = firstBlockOfType(jDir, "display").value("text", std::string());
+      check(dirText.find("gbp") != std::string::npos && dirText.find("Graph") == std::string::npos,
+            "by(..., name()) leaves one graph in memory, not a `Graph` per panel");
+      check(firstBlockOfType(runCmd(session, "scatter income beertax, name(Graph)"), "error").is_null(),
+            "a graph named Graph is not refused after a named by-graph");
+    }
+    // grc1leg2 counts the legend's keys: two series in ONE plot are two keys, a single series is too few
+    // (bank cell 92828c316bca2814: one series with legend(on) is r(111) "has too few keys")
+    {
+      runCmd(session, "scatter income beertax year, name(k1, replace)");
+      runCmd(session, "scatter income beertax, name(k2, replace) legend(on)");
+      check(firstBlockOfType(runCmd(session, "grc1leg2 k1 k2"), "error").is_null(),
+            "grc1leg2: a graph of one plot with two series has two legend keys");
+      auto tooFew = firstBlockOfType(runCmd(session, "grc1leg2 k2 k1"), "error");
+      check(tooFew.is_object() && tooFew.value("reason", std::string()) == "r(111)" &&
+                tooFew.value("message", std::string()).find("-k2-") != std::string::npos,
+            "grc1leg2: a one-series legend is r(111) too few keys, naming the graph");
+    }
+    // graph bar yvaroptions(label(...)) holds label OPTIONS: a text in it is refused, labsize() is not
+    // (bank cell 7dc92d2f2c57f2d0)
+    check(firstBlockOfType(runCmd(session, "graph bar income beertax, yvaroptions(label(labsize(small)))"), "error")
+              .is_null(),
+          "graph bar: yvaroptions(label(labsize())) is a valid spelling");
+    check(!firstBlockOfType(runCmd(session, "graph bar income, over(state) yvaroptions(label(\"Avg\"))"), "error")
+               .is_null(),
+          "graph bar: a label text inside yvaroptions(label()) is refused");
+    // serset: only `create` takes if / in
+    {
+      runCmd(session, "scatter income beertax");
+      check(!firstBlockOfType(runCmd(session, "serset use in 1/5, clear"), "error").is_null(),
+            "serset use takes no `in` range");
+    }
+    // grstyle set plain: nogrid is `nog`, minor is `m`; grid with nogrid is r(198)
+    {
+      runCmd(session, "grstyle init");
+      check(firstBlockOfType(runCmd(session, "grstyle set plain, nog"), "error").is_null() &&
+                firstBlockOfType(runCmd(session, "grstyle set plain, m"), "error").is_null(),
+            "grstyle set plain: nog and m are valid abbreviations");
+      auto gn = firstBlockOfType(runCmd(session, "grstyle set plain, grid nogrid"), "error");
+      check(gn.is_object() && gn.value("reason", std::string()) == "r(198)",
+            "grstyle set plain: grid and nogrid together is r(198)");
+      runCmd(session, "grstyle clear");
+      // every grstyle form that is no subcommand needs `grstyle init` first: bare or with options it is
+      // r(499) (bank: `grstyle zznotasub`, `grstyle , zzabbrprobe`; the bank's bare `grstyle` cell
+      // 2706ff569788a789 ran in a Stata session that a stopped cell had left initialised)
+      auto bareG = firstBlockOfType(runCmd(session, "grstyle"), "error");
+      check(bareG.is_object() && bareG.value("reason", std::string()) == "r(499)",
+            "bare grstyle without grstyle init is r(499)");
+    }
+    // the fit plots read r() as range() and the band plots l() as level() (class syntax of lfit / lfitci)
+    {
+      auto layerPts = [&](const std::string& cmd) {
+        auto g = firstBlockOfType(runCmd(session, cmd), "graph");
+        return g.value("layers", nlohmann::json::array());
+      };
+      const auto lr = layerPts("twoway lfit income beertax, r(0.2 0.6)");
+      check(lr.is_array() && !lr.empty() && std::fabs(lr[0]["points"].front()[0].get<double>() - 0.2) < 1e-6 &&
+                std::fabs(lr[0]["points"].back()[0].get<double>() - 0.6) < 1e-6,
+            "twoway lfit ..., r(a b) is range(a b)");
+      const auto lq = layerPts("twoway (scatter income beertax) (qfit income beertax, r(0.2 0.6))");
+      check(lq.is_array() && lq.size() == 2 && std::fabs(lq[1]["points"].front()[0].get<double>() - 0.2) < 1e-6,
+            "(qfit ..., r(a b)) is range(a b)");
+      const auto lc = layerPts("twoway lfitci income beertax, l(80)");
+      check(lc.is_array() && !lc.empty() && lc[0].value("level", 0.0) == 80.0,
+            "twoway lfitci ..., l(80) is level(80)");
+      const auto lq2 = layerPts("twoway (scatter income beertax) (qfitci income beertax, l(80))");
+      check(lq2.is_array() && lq2.size() == 2 && lq2[1].value("level", 0.0) == 80.0,
+            "(qfitci ..., l(80)) is level(80)");
+    }
   }
 
   // --- BS-053: `||` double-pipe layer separator -- an alternate spelling
@@ -2231,17 +2360,18 @@ void testBUG129And130GraphHonesty() {
   // BUG-129: a lone unsupported layer no longer renders an empty plot that
   // "succeeds" — it is a reject.
   {
-    // serset-twoway RNG: rcap/rspike are drawn now (w2al tf_rcap_*), so the
-    // lone-unsupported-layer legs name pcspike, a Stata type PIET still lacks.
-    auto j = runCmd(session, "twoway (pcspike hi x lo x)");
+    // serset-twoway RNG: rcap/rspike are drawn now (w2al tf_rcap_*), and so are pcspike / pcarrow (vs-stata
+    // bank cells 24b42aeff46d6834, fe90577ff32b345f), so the lone-unsupported-layer legs name fpfit, a Stata
+    // type PIET still lacks.
+    auto j = runCmd(session, "twoway (fpfit hi x)");
     check(!firstBlockOfType(j, "error").is_null() && firstBlockOfType(j, "graph").is_null(),
-          "BUG-129: a lone `(pcspike ...)` is a reject, not an empty successful plot");
+          "BUG-129: a lone `(fpfit ...)` is a reject, not an empty successful plot");
   }
 
   // BUG-129: the reject carries a nonzero Stata rc through `capture`
   // (unsupported_command -> r(199)).
   {
-    piet::dispatch("capture twoway (pcspike hi x lo x)", session);
+    piet::dispatch("capture twoway (fpfit hi x)", session);
     check(session.eval.locals.get("_rc", "") == "199",
           "BUG-129: an unsupported twoway layer inside `capture` sets _rc=199");
   }
@@ -2359,9 +2489,9 @@ void testBUG129And130GraphHonesty() {
   // net sits AFTER the supported-plot-type pre-scan, so a command-level gap is
   // still reported as one.
   {
-    auto err = blockOrEmpty(runCmd(session, "twoway (pcspike hi x lo x, lstyle(ci))"), "error");
+    auto err = blockOrEmpty(runCmd(session, "twoway (fpfit hi x, lstyle(ci))"), "error");
     check(err.value("code", std::string()) == "unsupported_command" &&
-              err.value("message", std::string()).find("pcspike") != std::string::npos,
+              err.value("message", std::string()).find("fpfit") != std::string::npos,
           "W4 ordering: an unsupported PLOT TYPE still answers `plot type is not supported`, "
           "not `option lstyle not allowed`");
   }
@@ -2575,8 +2705,12 @@ void testAerW2OptVocabTwoWay() {
       {&kFatal, "collapse (mean) fatal, by(state)", "collapse (mean) fatal, by(state) zzzfake",
        true, "collapse"},
       // --- registered, and MEASURED to have no net ---------------------------
+      // `file open` landed its net: its options are words of [P] file's syntax and
+      // anything else is r(198) "option X not allowed" (vs-stata bank
+      // 5f23c4c38a584add `file open h1 using f.txt, read zznotanoption`), so this
+      // pin flips from "measured to have no net" to "rejects", as instructed.
       {&kFatal, "file open w2h using \"" + txt + "\", write replace",
-       "file open w2h using \"" + txt + "\", write replace zzzfake", false, "file"},
+       "file open w2h using \"" + txt + "\", write replace zzzfake", true, "file"},
       {&kNone, "net query", "net query, zzzfake", false, "net"},
       {&kNone, "ssc install nothingatall", "ssc install nothingatall, zzzfake", false, "ssc"},
       // EM1 (2026-10-21): `set more` has its own arm now and its option net with it

@@ -490,14 +490,36 @@ ojson runFileCmd(const std::string& rawLine, SessionState& session) {
     const std::string path = piet::resolveUserPath(session, typed);
     if (path.empty()) return err("file open: a filename is required", "syntax_error");
 
-    bool wantRead = opts.find("read") != std::string::npos;
-    bool wantWrite = opts.find("write") != std::string::npos;
-    const bool wantAppend = opts.find("append") != std::string::npos;
-    const bool wantReplace = opts.find("replace") != std::string::npos;
+    // The options are words of [P] file open's syntax -- read, write, text,
+    // binary, replace, append, all -- and read or write is required: `file
+    // open h1 using f.txt` is r(198) "option -read- and/or -write- required"
+    // and `..., read zznotanoption` r(198) "option zznotanoption not allowed"
+    // (vs-stata bank ce8d6ca22764ce30, 5f23c4c38a584add).
+    bool wantRead = false, wantWrite = false, wantAppend = false, wantReplace = false;
     // BUG-1526: `binary` is the byte-stream mode (text is the default).
-    const bool wantBinary = opts.find("binary") != std::string::npos;
+    bool wantBinary = false;
+    {
+      // The syntax line's minimal spellings: r:ead, w:rite, t:ext, b:inary;
+      // replace, append and all are typed in full.
+      auto spells = [](const std::string& typed, const char* full, size_t shortest) {
+        const std::string f(full);
+        return typed.size() >= shortest && typed.size() <= f.size() &&
+               f.compare(0, typed.size(), typed) == 0;
+      };
+      std::istringstream ow(opts);
+      std::string w;
+      while (ow >> w) {
+        if (spells(w, "read", 1)) wantRead = true;
+        else if (spells(w, "write", 1)) wantWrite = true;
+        else if (w == "append") wantAppend = true;
+        else if (w == "replace") wantReplace = true;
+        else if (spells(w, "binary", 1)) wantBinary = true;
+        else if (!spells(w, "text", 1) && w != "all")
+          return errRc("option " + w + " not allowed", "198");
+      }
+    }
+    if (!wantRead && !wantWrite) return errRc("option -read- and/or -write- required", "198");
     if (wantAppend) wantWrite = true;
-    if (!wantRead && !wantWrite) wantRead = true;  // Stata's default is read
     // `read write`: both verbs on one handle, the file created if it is not
     // there and positioned at its top ([P] file); replace and append belong to
     // `write` alone.
@@ -597,6 +619,9 @@ ojson runFileCmd(const std::string& rawLine, SessionState& session) {
     if (words.size() != 2 || words[0] != "byteorder" ||
         (words[1] != "hilo" && words[1] != "lohi" && words[1] != "1" && words[1] != "2"))
       return errRc("invalid syntax", "198", "syntax_error");
+    // A text handle has no byte order to set (StataBE 19.5, bank 820bf5f373f5628b:
+    // r(109) "may not set byte order for text file").
+    if (!fh.binary) return errRc("may not set byte order for text file", "109");
     fh.hilo = words[1] == "hilo" || words[1] == "1";
     return ojson();
   }
@@ -717,19 +742,36 @@ ojson runFileCmd(const std::string& rawLine, SessionState& session) {
   std::string line;
   int c = 0;
   bool any = false;
+  // A line ends at LF (unix), at CR LF (win) or at a CR that no LF follows (mac).
+  const char* ending = "none";
   while ((c = std::fgetc(fh.fp)) != EOF) {
     any = true;
-    if (c == '\n') break;
-    if (c != '\r') line.push_back(static_cast<char>(c));
+    if (c == '\n') { ending = "unix"; break; }
+    if (c == '\r') {
+      const int next = std::fgetc(fh.fp);
+      if (next == '\n') {
+        ending = "win";
+      } else {
+        if (next != EOF) std::ungetc(next, fh.fp);
+        ending = "mac";
+      }
+      break;
+    }
+    line.push_back(static_cast<char>(c));
   }
   fh.eof = !any;
   session.eval.locals.set(localName, fh.eof ? std::string() : line);
   // r(eof) is what a Stata read loop tests. Setting it through the same r-store
   // every r-class command uses is the whole wiring — BUG-344's lesson was that a
   // value computed but never published is a value that does not exist.
-  piet::eval::OrderedFloatDict r;
-  r.set("eof", fh.eof ? 1.0 : 0.0);
-  session.eval.rValues = r;
+  // r(status) names what ended the line: unix (LF), win (CR LF), mac (CR), none
+  // (the file ended inside the line) or eof (nothing was left to read) -- bank
+  // cells ec78f918776af396, 12d75ce4dae8066f (unix, eof); win and mac are the
+  // spellings Stata documents for the other two endings.
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("eof", fh.eof ? 1.0 : 0.0);
+  session.eval.rStrings.set("status", fh.eof ? "eof" : ending);
+  eval::declareRPosted(session.eval, "file read", {"eof", "status"});
   return ojson();
 }
 

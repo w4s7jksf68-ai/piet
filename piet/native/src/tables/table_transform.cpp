@@ -132,6 +132,29 @@ bool parseTransformOpt(const std::string& raw, TransformSpec* out, std::string* 
 }
 
 
+// estout: `eform` is transform(exp(@) exp(@)), with eform(1 0 ...) taking the
+// per-model pattern; transform() overrides it and noeform cancels it. Returns the
+// transform() text to parse, empty when none applies.
+std::string table_detail::eformTransformRaw(const std::vector<std::pair<std::string, eval::OptValue>>& opts) {
+  bool eform = false, noeform = false, hasTransform = false;
+  std::string pattern;
+  for (const auto& [k, v] : opts) {
+    if (k == "transform") hasTransform = true;
+    if (k == "noeform") noeform = true;
+    if (k == "eform") {
+      eform = true;
+      if (!v.isBool) {
+        const std::string a = strutil::trim(dequote(v.strValue));
+        if (!a.empty() && a != "eform") pattern = a;
+      }
+    }
+  }
+  if (!eform || noeform || hasTransform) return std::string();
+  return pattern.empty() ? std::string("exp(@) exp(@)")
+                         : "exp(@) exp(@), pattern(" + pattern + ")";
+}
+
+
 TransformCell transformOneCell(const TransformSpec& spec, size_t modelIdx,
                                const std::string& coefName, double b,
                                const nlohmann::ordered_json& snap, SessionState& session) {

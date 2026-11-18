@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -277,7 +278,12 @@ std::string applyStataFmt(double v, const std::string& fmt) {
 // Numeric / logical functions
 
 PyValue fnInlist(const std::vector<PyValue>& args) {
-  requireArity(args, 1, SIZE_MAX, "inlist");
+  // [FN] inlist(z,a,b,...): 2 to 250 arguments for reals, 2 to 10 for strings.
+  // Fewer is r(198) (vs-stata bank cd41d4ac414b3827 `display inlist(1)`); more
+  // is r(130) "expression too long" (f9e4292202194e3f eleven strings,
+  // 016b14911b9f141a 251 reals; ten strings and 250 reals run).
+  requireArity(args, 2, SIZE_MAX, "inlist");
+  if (args.size() > (args[0].isStr() ? 10u : 250u)) throw PyExc("r(130): expression too long");
   const PyValue& val = args[0];
   std::vector<PyValue> rest(args.begin() + 1, args.end());
 
@@ -308,6 +314,20 @@ PyValue fnInlist(const std::vector<PyValue>& args) {
 // so an overflow to -inf is a number: inrange(-1e300*1e10, ., 5) is 1.
 PyValue fnInrange(const std::vector<PyValue>& args) {
   requireArity(args, 3, 3, "inrange");
+  // All strings: the same ordered rules, `""` standing for missing ([FN]
+  // inrange(): "If the arguments are strings, "." is interpreted as """), with
+  // Stata's byte-wise string order. StataBE 19.5: inrange("b","a","c") and
+  // inrange("abc","abc","abd") are 1.
+  if (args[0].isStr() && args[1].isStr() && args[2].isStr()) {
+    const std::string& z = args[0].strVal();
+    const std::string& a = args[1].strVal();
+    const std::string& b = args[2].strVal();
+    if (z.empty()) return PyValue::boolean(false);
+    if (a.empty() && b.empty()) return PyValue::boolean(true);
+    if (a.empty()) return PyValue::boolean(z <= b);
+    if (b.empty()) return PyValue::boolean(a <= z);
+    return PyValue::boolean(a <= z && z <= b);
+  }
   auto fval = pythonFloat(args[0]);
   if (!fval) return PyValue::boolean(false);
   auto isMissing = [](double d) { return std::isnan(d) || d >= kStataMissingSentinel; };
@@ -318,8 +338,82 @@ PyValue fnInrange(const std::vector<PyValue>& args) {
   return PyValue::boolean((isMissing(*lo) || *lo <= *fval) && (isMissing(*hi) || *fval <= *hi));
 }
 
+// clip(x,a,b) ([FN]): x when a < x < b, b when x >= b, a when x <= a; a
+// missing x is itself (.a stays .a), a missing a is minus infinity and a
+// missing b plus infinity, and a > b is `.`. StataBE 19.5 (vs-stata bank
+// inlist_cond cells): clip(.a,1,2) .a, clip(5,.,3) 3, clip(5,7,.) 7,
+// clip(5,10,1) ., clip(-0,0,1) +0; two arguments are r(198).
+PyValue fnClip(const std::vector<PyValue>& args) {
+  requireArity(args, 3, 3, "clip");
+  requireNumeric(args);
+  auto isMissing = [](double d) { return std::isnan(d) || d >= kStataMissingSentinel; };
+  auto x = pythonFloat(args[0]);
+  auto a = pythonFloat(args[1]);
+  auto b = pythonFloat(args[2]);
+  if (!x || !a || !b) return PyValue::floating(kStataMissingSentinel);
+  if (std::isnan(*x)) return PyValue::floating(kStataMissingSentinel);
+  if (isMissing(*x)) return PyValue::floating(*x);
+  const double lo = isMissing(*a) ? -std::numeric_limits<double>::infinity() : *a;
+  const double hi = isMissing(*b) ? std::numeric_limits<double>::infinity() : *b;
+  if (lo > hi) return PyValue::floating(kStataMissingSentinel);
+  if (*x <= lo) return PyValue::floating(lo);
+  if (*x >= hi) return PyValue::floating(hi);
+  return PyValue::floating(*x);
+}
+
+// [FN] Programming functions: the double-precision limits. maxdouble() is
+// the largest double below missing, mindouble() its negative, and
+// smallestdouble() the smallest full-precision positive double (StataBE 19.5,
+// vs-stata bank 6972b67b7dd551d9 8.99e+307, 69fce5354138da76 -8.99e+307,
+// 18947f926e8c9dd3 2.23e-308).
+PyValue fnMaxdouble(const std::vector<PyValue>& args) {
+  requireArity(args, 0, 0, "maxdouble");
+  return PyValue::floating(0x1.fffffffffffffp+1022);
+}
+PyValue fnMindouble(const std::vector<PyValue>& args) {
+  requireArity(args, 0, 0, "mindouble");
+  return PyValue::floating(-0x1.fffffffffffffp+1022);
+}
+PyValue fnSmallestdouble(const std::vector<PyValue>& args) {
+  requireArity(args, 0, 0, "smallestdouble");
+  return PyValue::floating(0x1p-1022);
+}
+
+// [FN] lnfactorial(n) = ln(n!) for n >= 0 (n truncated to an integer, as
+// Stata does), missing below 0 or for a missing n; comb(n,k) the number of
+// k-combinations of n, missing unless 0 <= k <= n are integers or when it
+// exceeds maxdouble() (StataBE 19.5, vs-stata bank c577868282a4cd33 comb(5,2)
+// 10, 7b607b77620d909a comb(10,3) 120, bf969d08a6c0121e comb(1030,515) `.`).
+PyValue fnLnfactorial(const std::vector<PyValue>& args) {
+  requireArity(args, 1, 1, "lnfactorial");
+  requireNumeric(args);
+  const auto v = pythonFloat(args[0]);
+  if (!v || std::isnan(*v) || *v >= kStataMissingSentinel || *v < 0)
+    return PyValue::floating(kStataMissingSentinel);
+  return PyValue::floating(std::lgamma(std::trunc(*v) + 1.0));
+}
+PyValue fnComb(const std::vector<PyValue>& args) {
+  requireArity(args, 2, 2, "comb");
+  requireNumeric(args);
+  const auto n = pythonFloat(args[0]);
+  const auto k = pythonFloat(args[1]);
+  const auto bad = [](const std::optional<double>& d) {
+    return !d || std::isnan(*d) || *d >= kStataMissingSentinel || *d != std::floor(*d);
+  };
+  if (bad(n) || bad(k) || *k < 0 || *n < 0 || *k > *n) return PyValue::floating(kStataMissingSentinel);
+  const double kk = std::min(*k, *n - *k);
+  double r = 1.0;
+  for (double i = 1; i <= kk; ++i) {
+    r = r * (*n - kk + i) / i;
+    if (!std::isfinite(r) || r > 0x1.fffffffffffffp+1022) return PyValue::floating(kStataMissingSentinel);
+  }
+  return PyValue::floating(std::round(r));
+}
+
 PyValue fnCond(const std::vector<PyValue>& args) {
-  requireArity(args, 3, SIZE_MAX, "cond");
+  // cond(x,a,b[,c]): a fifth argument is r(198) (vs-stata bank f10a0aae6d9dc9d5
+  // `display cond(1,2,3,4,5)`).
+  requireArity(args, 3, 4, "cond");
   const PyValue& test = args[0];
   const PyValue& yes = args[1];
   const PyValue& no = args[2];
@@ -2010,6 +2104,35 @@ PyValue fnUstrtrim(const std::vector<PyValue>& args) {
 // what Python's float() reads but Stata does not (inf, nan, 1e400) is `.`, and
 // so is a non-numeric string -- the value `.` itself, not a NaN, so
 // `real("abc") == .` is 1 (w2x_fn_string_math.log:782 f4).
+// Two number spellings Stata reads that Python's float() does not ([U] 12.2):
+// the hexadecimal %21x form, `[+|-]1.h[hh...]{X|x}{+|-}h[hh]` (at most 13 hex
+// digits after the point, power -3ff..+3ff) or `[+|-]0.0[0...]{X|x}-3ff`, and a
+// `d`/`D` exponent. StataBE 19.5: real("1.0X+3") is 8, real("1d3") is 1000
+// (truth bank cells a539be9fb08844f0, 137161c9f51243f5); real("0x1A") stays `.`.
+static std::optional<double> stataHexOrDExponent(const std::string& t) {
+  static const std::regex reHex(R"(^([+-]?)([01])\.([0-9a-fA-F]{1,13})[xX]([+-])([0-9a-fA-F]{1,3})$)");
+  static const std::regex reD(R"(^([+-]?(?:\d+\.?\d*|\.\d+))[dD]([+-]?\d+)$)");
+  std::smatch m;
+  if (std::regex_match(t, m, reHex)) {
+    const double sign = m.str(1) == "-" ? -1.0 : 1.0;
+    const long power = std::strtol(m.str(5).c_str(), nullptr, 16) * (m.str(4) == "-" ? -1 : 1);
+    if (power < -0x3ff || power > 0x3ff) return std::nullopt;
+    const std::string frac = m.str(3);
+    if (m.str(2) == "0") {
+      if (frac.find_first_not_of('0') != std::string::npos || power != -0x3ff) return std::nullopt;
+      return sign * 0.0;
+    }
+    double mant = 1.0, scale = 1.0;
+    for (char c : frac) {
+      scale /= 16.0;
+      mant += scale * static_cast<double>(std::stoi(std::string(1, c), nullptr, 16));
+    }
+    return sign * std::ldexp(mant, static_cast<int>(power));
+  }
+  if (std::regex_match(t, m, reD)) return pythonFloat(m.str(1) + "e" + m.str(2));
+  return std::nullopt;
+}
+
 PyValue fnReal(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "real");
   if (args[0].isStr()) {
@@ -2018,6 +2141,10 @@ PyValue fnReal(const std::vector<PyValue>& args) {
     if (t.size() == 2 && t[0] == '.' && t[1] >= 'a' && t[1] <= 'z')
       return PyValue::floating(stataMissingWithKind(t[1] - 'a' + 1));
     if (t.find('_') != std::string::npos) return PyValue::floating(kStataMissingSentinel);
+    if (auto x = stataHexOrDExponent(t)) {
+      if (!(std::fabs(*x) < kStataMissingSentinel)) return PyValue::floating(kStataMissingSentinel);
+      return PyValue::floating(*x);
+    }
   }
   auto f = pythonFloat(args[0]);
   if (f && args[0].isStr() && !(std::fabs(*f) < kStataMissingSentinel)) return PyValue::floating(kStataMissingSentinel);
@@ -2792,6 +2919,7 @@ void addStataFns(PyNamespace& ns) {
   ns.fns["inlist"] = fnInlist;
   ns.fns["inrange"] = fnInrange;
   ns.fns["cond"] = fnCond;
+  ns.fns["clip"] = fnClip;
   ns.fns["mod"] = fnMod;
   ns.fns["missing"] = fnMissing;
   ns.fns["lower"] = fnLower;
@@ -2941,6 +3069,15 @@ void addStataFns(PyNamespace& ns) {
   ns.fns["reldif"] = fnReldif;  // BUG-1046
   ns.fns["tobytes"] = fnTobytes;  // BUG-1373
   ns.fns["reverse"] = fnReverse;
+  // strreverse() is reverse()'s name since Stata 14 (vs-stata bank
+  // eb584b653c475152: both are cba); trunc() is int()'s ([FN], dd058573eb85449e).
+  ns.fns["strreverse"] = fnReverse;
+  ns.fns["trunc"] = fnInt;
+  ns.fns["maxdouble"] = fnMaxdouble;
+  ns.fns["mindouble"] = fnMindouble;
+  ns.fns["smallestdouble"] = fnSmallestdouble;
+  ns.fns["lnfactorial"] = fnLnfactorial;
+  ns.fns["comb"] = fnComb;
   ns.fns["strrpos"] = fnStrrpos;
   ns.fns["wordcount"] = fnWordcount;
   ns.fns["strtoname"] = fnStrtoname;

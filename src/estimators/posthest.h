@@ -52,6 +52,9 @@ void predict_xb(const double* X, int64_t n, int k,
 struct MarginsResult {
     std::vector<double> dydx;
     std::vector<double> se;
+    // d(AME_c)/d(beta), one length-k row per design column c (the delta method's
+    // Jacobian, which margins publishes as r(Jacobian)).
+    std::vector<std::vector<double>> J;
     bool ok = true;
 };
 
@@ -414,6 +417,7 @@ struct MarginsGridResult {
     std::vector<MarginsGridColumn> cols;
     std::vector<double> b;  // m
     std::vector<double> V;  // m*m row-major
+    std::vector<std::vector<double>> J;  // m rows of d(b)/d(beta) over in.names (r(Jacobian))
 };
 
 inline MarginsGridResult margins_grid(const MarginsGridInput& in) {
@@ -687,6 +691,7 @@ inline MarginsGridResult margins_grid(const MarginsGridInput& in) {
             R.V[a * m + b] = s;
             R.V[b * m + a] = s;
         }
+    R.J = std::move(G);
     return R;
 }
 

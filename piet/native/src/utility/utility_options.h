@@ -9,7 +9,6 @@ extern const piet::eval::OptVocab& kVocabDistinct;
 extern const piet::eval::OptVocab& kVocabMissings;
 extern const piet::eval::OptVocab& kVocabMdesc;
 extern const piet::eval::OptVocab& kVocabLabmask;
-extern const piet::eval::OptVocab& kVocabRenvarlab;
 extern const piet::eval::OptVocab& kVocabStrdist;
 extern const piet::eval::OptVocab& kVocabSplitvallabels;
 extern const piet::eval::OptVocab& kVocabMarksample;

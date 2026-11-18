@@ -637,15 +637,28 @@ void testBUG203PostestReadsEstimator() {
           "prediction never reached the dataset");
   }
 
-  // ---- the estimators with no ML refit still honest-reject ---------------
+  // ---- an estimator with no refit: lincom reads ITS OWN e(b)/e(V) -------
+  // (stage-3 lane s3b_post; Stata's lincom is a Wald combination of e(b)/e(V):
+  // vs-stata bank 8c8672d3 `qreg price mpg weight` then `lincom mpg + 100*weight`
+  // equals Stata's r()). Never an OLS combination: the estimate is qreg's own
+  // coefficient and its se the qreg fit's.
   {
-    (void)piet::dispatch("qreg fatal beertax", session);
+    auto fit = piet::dispatch("qreg fatal beertax", session);
+    double bq = std::nan(""), seq = std::nan("");
+    for (const auto& b : fit)
+      if (b.is_object() && b.value("type", std::string()) == "estimation" && b.contains("coeftable"))
+        for (const auto& row : b["coeftable"])
+          if (row.value("name", std::string()) == "beertax") {
+            bq = row.value("b", std::nan(""));
+            seq = row.value("se", std::nan(""));
+          }
     auto blocks = piet::dispatch("lincom beertax", session);
-    const std::string msg = errorText(blocks);
-    check(msg.find("not supported after") != std::string::npos &&
-              msg.find("qreg") != std::string::npos,
-          "BUG-203: `lincom` after an estimator with no ML refit (`qreg`) is an honest "
-          "refusal that NAMES the estimator, not a silently-served OLS combination");
+    const double* est = session.eval.rValues.find("estimate");
+    const double* se = session.eval.rValues.find("se");
+    check(errorText(blocks).empty() && est != nullptr && se != nullptr && std::isfinite(bq) &&
+              std::fabs(*est - bq) <= 1e-12 * (1 + std::fabs(bq)) && std::fabs(*se - seq) <= 1e-12 * (1 + seq),
+          "BUG-203: `lincom` after `qreg` is qreg's own coefficient and se (posted e(b)/e(V)), "
+          "not a silently-served OLS combination");
   }
 
   // ---- the OLS family is untouched --------------------------------------

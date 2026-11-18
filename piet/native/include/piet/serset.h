@@ -89,7 +89,14 @@ class Store {
   int current() const { return current_; }
   const Serset* get(int id) const;
   const Serset* currentSet() const { return get(current_); }
+  Serset* getMutable(int id) {
+    auto it = sets_.find(id);
+    return it == sets_.end() ? nullptr : &it->second;
+  }
   void drop(int id);
+  // `serset reset_id`: moves serset `from` to the free id `to` (false when `from` does not exist or `to`
+  // is taken); the current serset follows it.
+  bool resetId(int from, int to);
   void dropOwner(const std::string& owner);
   // graph-family AI-6: `graph rename` moves a graph's sersets with it.
   void renameOwner(const std::string& from, const std::string& to);
@@ -156,6 +163,17 @@ std::vector<Serset> buildPlotSersets(std::vector<PlotSpec> plots);
 void registerGraph(SessionState& session, nlohmann::ordered_json& block, const std::string& nameOpt,
                    std::vector<Serset> sets, const nlohmann::ordered_json* meta = nullptr);
 
+// While one of these lives, registerGraph() records nothing: a by() graph draws each of its panels by a
+// sub-run of the same graph command, and only the finished by-graph is a graph in memory (under the
+// name() the statement gave, or `Graph`); a panel must not become `Graph`, replace a graph of that name
+// or leave its serset behind.
+struct SuppressGraphRegistration {
+  SuppressGraphRegistration();
+  ~SuppressGraphRegistration();
+  SuppressGraphRegistration(const SuppressGraphRegistration&) = delete;
+  SuppressGraphRegistration& operator=(const SuppressGraphRegistration&) = delete;
+};
+
 // graph-family AI-4: a graph's describe record (graph describe's r()):
 // {family, command, scheme, ysize, xsize, date, time}. The size is the
 // scheme's graphsize, never the xsize()/ysize() options (w2ai gf_tw_titles_d
@@ -180,11 +198,21 @@ std::optional<nlohmann::ordered_json> nameCollision(SessionState& session, const
 // `graph drop` hook: drop the sersets of the named graphs, or all of them.
 void dropGraphSersets(SessionState& session, const std::vector<std::string>& names, bool all);
 
-// The `serset` command family: `serset`, `serset [set] #`, `serset use [, clear]`,
-// `serset clear`, `serset drop`, `serset dir`. `args` = the words after
-// `serset` (before the comma); `clearOpt` = `, clear` given.
+// One option of a `serset` line: `omitallmiss`, `sort(mpg)`, `detail`, `clear` ...
+struct SersetOption {
+  std::string name;   // as typed (abbreviations are resolved per subcommand)
+  std::string value;  // the text inside the parentheses
+  bool isBool = true;
+};
+
+// The `serset` command family: `serset`, `serset [set] #`, `serset create varlist [if] [in] [,
+// omitanymiss omitallmiss omitdupmiss omitnothing sort(varlist)]`, `serset summarize svn [, detail]`,
+// `serset sort [svn ...]`, `serset use [, clear]`, `serset reset_id #`, `serset clear`,
+// `serset drop`, `serset dir`. `args` = the words after `serset` (before the comma); `sample` =
+// the data in memory already restricted by the line's if / in (only `serset create` reads it;
+// nullptr when no data is loaded).
 nlohmann::ordered_json runSerset(SessionState& session, const std::vector<std::string>& args,
-                                 bool clearOpt);
+                                 const std::vector<SersetOption>& opts, Datastore* sample);
 
 // `graph dir [pattern] [, memory gph detail]` (graph dir): r(list) is the
 // in-memory graph names (byte-sorted, `: list sort`) and the *.gph files of the

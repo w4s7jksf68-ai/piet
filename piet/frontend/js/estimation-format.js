@@ -90,6 +90,9 @@ function formatTestBlock(block) {
     lines.push(`( ${padL(String(i + 1), 1)})  ${r}`);
   });
 
+  // test, notest: the constraints alone, nothing tested (StataBE 19.5, bank 37fd4049).
+  if (block.notest) return lines.join('\n');
+
   if (restrictions.length) lines.push('');
 
   // BUG-1057: a statistic the engine could not form (R V R' exactly 0 after an
@@ -99,6 +102,36 @@ function formatTestBlock(block) {
   const missing = (x) => x == null || !Number.isFinite(Number(x));
   const stat = (x) => (missing(x) ? '.' : Number(x).toFixed(2));
   const prob = (x) => (missing(x) ? '.' : fmtP(Number(x)));
+
+  // test, mtest(bonferroni|holm|sidak): Stata's table of each constraint
+  // tested alone (its adjusted p starred) above the joint test (StataBE 19.5,
+  // vs-stata bank 336b8488):
+  //   --------------------------------------
+  //          |    F(df,70)     df      p > F
+  //   -------+------------------------------
+  //      (1) |        0.09      1     1.0000*
+  //   -------+------------------------------
+  //      All |       34.77      2     0.0000
+  //   --------------------------------------
+  //   * Bonferroni-adjusted p-values
+  if (Array.isArray(block.mtest) && block.mtest.length) {
+    const p4 = (x) => (missing(x) ? '.' : Number(x).toFixed(4));
+    const rule = '-'.repeat(38);
+    const mid = '-------+------------------------------';
+    lines.push(rule);
+    lines.push('       |' + padL(`F(df,${Math.round(block.df2)})`, 12) + padL('df', 7) + padL('p > F', 11));
+    lines.push(mid);
+    block.mtest.forEach((row, i) => {
+      lines.push(padL(`(${i + 1})`, 6) + ' |' + padL(stat(row.F), 12) + padL(String(Math.round(row.df)), 7) +
+                 padL(p4(row.adjustp), 11) + '*');
+    });
+    lines.push(mid);
+    lines.push('   All |' + padL(stat(block.F), 12) + padL(String(block.df1), 7) + padL(p4(block.p_F), 11));
+    lines.push(rule);
+    const method = { bonferroni: 'Bonferroni', holm: 'Holm', sidak: 'Sidak' }[block.mtmethod] || block.mtmethod;
+    lines.push(`* ${method}-adjusted p-values`);
+    return lines.join('\n');
+  }
 
   // iid → F statistic; robust/cluster → Wald chi2 (matches buildStats footer).
   if (block.vcov_type !== 'iid') {
@@ -332,12 +365,15 @@ function formatOneTable(block) {
   ];
 
   // ── Format all cell values ──────────────────────────────────────────────────
-  const fB   = rows.map(r => r.b  === null ? '(omitted)' : (fmtG(r.b)  ?? ''));
-  const fSE  = rows.map(r => r.se === null ? ''           : (fmtG(r.se) ?? ''));
+  // proportion, percent: estimate, std. err. and limits in percent, %9.2f (bank cdcb1db2)
+  const pct = block.estimator === 'proportion' && block.percent === true;
+  const fPct = x => (x == null || !isFinite(x)) ? '' : (100 * x).toFixed(2);
+  const fB   = rows.map(r => r.b  === null ? '(omitted)' : pct ? fPct(r.b) : (fmtG(r.b)  ?? ''));
+  const fSE  = rows.map(r => r.se === null ? ''           : pct ? fPct(r.se) : (fmtG(r.se) ?? ''));
   const fT   = rows.map(r => r.t  === null ? ''           : fmtT(r.t));
   const fPv  = rows.map(r => r.p  === null ? ''           : fmtP(r.p));
-  const fCLo = rows.map(r => r.ci_lo === null ? '' : (fmtG(r.ci_lo) ?? ''));
-  const fCHi = rows.map(r => r.ci_hi === null ? '' : (fmtG(r.ci_hi) ?? ''));
+  const fCLo = rows.map(r => r.ci_lo === null ? '' : pct ? fPct(r.ci_lo) : (fmtG(r.ci_lo) ?? ''));
+  const fCHi = rows.map(r => r.ci_hi === null ? '' : pct ? fPct(r.ci_hi) : (fmtG(r.ci_hi) ?? ''));
 
   // ── Column widths = max(header, all formatted values) ──────────────────────
   const nameW = Math.max(
@@ -384,7 +420,10 @@ function formatOneTable(block) {
 
   // ── Column header row ──────────────────────────────────────────────────────
   // "[95% Conf. Interval]" spans both CI columns (cLoW + 3 sep + cHiW wide)
-  const ciLabel  = '[95% conf. interval]';
+  // mean / proportion record the level their intervals were built at (level(), a replay)
+  const ciLevel = (block.estimator === 'mean' || block.estimator === 'proportion') &&
+    typeof block.level === 'number' && block.level !== 95 ? block.level : 95;
+  const ciLabel  = `[${ciLevel}% conf. interval]`;
   const ciTotalW = cLoW + 3 + cHiW;
   const ciHeaderSection = padR(ciLabel, ciTotalW); // left-align within CI region
 
@@ -400,6 +439,7 @@ function formatOneTable(block) {
   // a mislabeled "Coefficient" column.
   const bLabel = block.estimator === 'margins' ? 'dy/dx'
     : block.estimator === 'logistic' ? 'Odds ratio'
+    : pct ? 'Percent'
     : 'Coefficient';
 
   const headerRow = [
@@ -418,6 +458,25 @@ function formatOneTable(block) {
     ? [padL('', nameW), ' │',
        padL('', bW + 1),
        padL('Delta-method', seW + 3)].join('')
+    : null;
+
+  // proportion names the interval's type above it (Logit by default, or citype()'s), and
+  // mean / proportion under vce(cluster) put "Robust" above the std. err. column
+  // (StataBE 19.5, vs-stata bank 0c939704 citype(wilson), 33bdd87d vce(cluster rep78)).
+  const ciTypeLabel = block.estimator === 'proportion' && block.citype
+    ? ({ logit: 'Logit', normal: 'Normal', wilson: 'Wilson', exact: 'Exact',
+         jeffreys: 'Jeffreys', agresti: 'Agresti-Coull' }[block.citype] || '')
+    : '';
+  const robustLabel = (block.estimator === 'mean' || block.estimator === 'proportion') &&
+    _vc.startsWith('cluster(') ? 'Robust' : '';
+  const ciTypeBanner = (ciTypeLabel || robustLabel)
+    ? [padL('', nameW), ' │',
+       padL('', bW + 1),
+       padL(robustLabel, seW + 3),
+       padL('', tW + 3),
+       padL('', pW + 3),
+       '     ',
+       padL(ciTypeLabel, ciTotalW)].join('').replace(/\s+$/, '')
     : null;
 
   // ── Data rows ──────────────────────────────────────────────────────────────
@@ -443,16 +502,22 @@ function formatOneTable(block) {
   });
 
   // ── Assemble ───────────────────────────────────────────────────────────────
+  // mean / proportion `noheader`: no title, no Number of obs line
   const lines = [
-    ...statLines,
-    '',
+    ...(block.noheader ? [] : [...statLines,
+      // mean / proportion stdize(): the number of standard strata (bank 56f2dacb)
+      ...(block.n_stdize != null ? [`N. of std strata = ${block.n_stdize}`] : []), '']),
     ruleN + '┬' + ruleD,
     ...(marginsBanner ? [marginsBanner] : []),   // WS1 #3: Delta-method banner (margins only)
+    ...(ciTypeBanner ? [ciTypeBanner] : []),     // proportion's CI type / mean, proportion's Robust
     headerRow,
     ruleN + '┼' + ruleD,
     ...dataRows,
     ruleN + '┴' + ruleD,
     ...footerLines,
+    // proportion citype(agresti): an upper limit past 1 is cut to 1, and said so
+    ...(block.estimator === 'proportion' && block.agresti_truncated
+      ? ['Note: The Agresti\u2013Coull CI was truncated at 1 at the upper endpoint.'] : []),
   ];
 
   return lines.join('\n');

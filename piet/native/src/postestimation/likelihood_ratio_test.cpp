@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,7 +41,7 @@ namespace {
 // rule cannot reach -- `d` also begins `dir` -- so it is a declared alias.
 const piet::eval::OptVocab& kVocabLrtest = piet::eval::registerOptVocab(
     {"lrtest"},
-    {{"df", "force", "asis"}, {"stats", "dir", "saving", "using", "model"}, {{"d", "df"}}});
+    {{"df", "force", "asis", "stats", "dir"}, {"saving", "using", "model"}, {{"d", "df"}}});
 
 }  // namespace
 
@@ -95,6 +96,10 @@ std::string shownNumber(double v) { return strutil::trim(fmtStataDefaultG(v)); }
 // the series stops once a term past the mode no longer moves the sum -- the
 // remaining terms are below 1e-17 of it -- and a df far above chi2 costs
 // O(z) terms, not O(df) (Stata answers df(1e300) at once: p = 1.0000).
+// Shared (not file-local): estout's stats(p) falls back to chi2tail(e(df_m),
+// e(chi2)) when a fit posts no e(p) (tables/estout_models.cpp eoStatValue).
+}  // namespace
+
 double chi2UpperTailIntegerDf(double df, double x) {
   if (!(df > 0) || !std::isfinite(df)) return std::numeric_limits<double>::quiet_NaN();
   if (!(x > 0)) return 1.0;
@@ -127,6 +132,8 @@ double chi2UpperTailIntegerDf(double df, double x) {
   return std::min(1.0, sum);
 }
 
+namespace {
+
 // Stata's abbrev(s, n) for a name: first n-2 characters, `~`, last character.
 std::string abbrevName(const std::string& s, size_t n) {
   if (s.size() <= n || n < 3) return s;
@@ -140,6 +147,10 @@ struct LrModel {
   double ll = std::numeric_limits<double>::quiet_NaN();
   double ll0 = std::numeric_limits<double>::quiet_NaN();
   std::string cmd, depvar;
+  // for the stats / dir tables (estimates stats / estimates dir)
+  double dfIc = std::numeric_limits<double>::quiet_NaN();
+  double nParams = std::numeric_limits<double>::quiet_NaN();  // colsof(e(b))
+  std::string title, cmdShown;
 };
 
 // e(NAME) as a number, through the macro layer's own e() resolver -- the one
@@ -222,7 +233,94 @@ std::optional<ojson> lrModelInfo(const std::string& name, const eval::EvalSessio
   m.ll0 = eScalarOf(ev, "ll_0");
   m.cmd = cmd;
   m.depvar = estr.get("depvar");
+  if (m.depvar.empty() && ev.lastModelResult.has_value() && ev.lastModelResult->is_object())
+    m.depvar = ev.lastModelResult->value("depvar", std::string());
+  m.dfIc = eScalarOf(ev, "df_ic");
+  m.cmdShown = estr.get("cmd2").empty() ? cmd : estr.get("cmd2");
+  m.title = estr.get("estimates_title").empty() ? estr.get("title") : estr.get("estimates_title");
+  {
+    const auto eb = ev.resolveEMatrixFor("b", eval::EvalSession::EReader::kNames);
+    if (eb.matrix.has_value()) m.nParams = static_cast<double>(eb.matrix->colnames.size());
+  }
   return std::nullopt;
+}
+
+// lrtest's stats and dir options: `estimates stats` and `estimates dir, width(78)`
+// of the restricted then the unrestricted model (bank 3cf171b0 `lrtest A B, st`,
+// fc5ce2d1 `lrtest A B, dir`, e5d062e1 after ologit). stats: N, ll(null),
+// ll(model), df (e(df_ic), else e(rank)), AIC = -2 ll + 2 df, BIC = -2 ll +
+// ln(N) df. dir: the command, the depvar (abbreviated to 12; "no depvar",
+// "mult. depvar"), colsof(e(b)) and the title in 30-column pieces.
+std::string lrNum(const std::string& fmt, double v) {
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%.17g", v);
+  return formatNumberAsDisplayed(fmt, std::isnan(v) ? std::string(".") : std::string(buf));
+}
+std::string lrPadL(const std::string& s, size_t w) { return s.size() >= w ? s : std::string(w - s.size(), ' ') + s; }
+std::string lrPadR(const std::string& s, size_t w) { return s.size() >= w ? s : s + std::string(w - s.size(), ' '); }
+
+std::optional<std::string> lrStatsTable(const LrModel* ms[2]) {
+  std::string t = "\nAkaike's information criterion and Bayesian information criterion\n\n";
+  t += std::string(77, '-') + "\n";
+  t += "       Model |          N   ll(null)  ll(model)      df        AIC        BIC\n";
+  t += "-------------+---------------------------------------------------------------\n";
+  for (int i = 0; i < 2; ++i) {
+    const LrModel& m = *ms[i];
+    const double df = std::isfinite(m.dfIc) ? m.dfIc : m.rank;
+    if (!std::isfinite(m.N) || !std::isfinite(df)) return std::nullopt;
+    const double aic = -2.0 * m.ll + 2.0 * df;
+    const double bic = -2.0 * m.ll + std::log(m.N) * df;
+    t += lrPadL(m.name == "." ? std::string(".") : abbrevName(m.name, 12), 12) + " |" +
+         lrPadL(lrNum("%10.0fc", m.N), 11) + lrPadL(lrNum("%9.0g", m.ll0), 11) + lrPadL(lrNum("%9.0g", m.ll), 11) +
+         lrPadL(lrNum("%6.0f", df), 8) + lrPadL(lrNum("%9.0g", aic), 11) + lrPadL(lrNum("%9.0g", bic), 11) + "\n";
+  }
+  t += std::string(77, '-') + "\n";
+  t += "Note: BIC uses N = number of observations. See [R] IC note.";
+  return t;
+}
+
+std::optional<std::string> lrDirTable(const LrModel* ms[2]) {
+  const size_t lpiece = 30;  // width(78) - 48
+  std::string t = "\n" + std::string(14 + 33 + lpiece, '-') + "\n";
+  t += "             |           Dependent  Number of        \n";
+  t += "        Name | Command    variable     param.  Title \n";
+  t += std::string(13, '-') + "+" + std::string(33 + lpiece, '-') + "\n";
+  for (int i = 0; i < 2; ++i) {
+    const LrModel& m = *ms[i];
+    if (!std::isfinite(m.nParams)) return std::nullopt;
+    size_t ndp = 0;
+    {
+      std::istringstream in(m.depvar);
+      std::string w;
+      while (in >> w) ++ndp;
+    }
+    const std::string depn = ndp == 0 ? "no depvar" : ndp == 1 ? abbrevName(strutil::trim(m.depvar), 12) : "mult. depvar";
+    // the title in pieces of at most lpiece characters, broken between words
+    std::vector<std::string> pieces;
+    {
+      std::istringstream in(m.title);
+      std::string w, cur;
+      while (in >> w) {
+        while (w.size() > lpiece) {
+          if (!cur.empty()) pieces.push_back(cur), cur.clear();
+          pieces.push_back(w.substr(0, lpiece));
+          w = w.substr(lpiece);
+        }
+        if (cur.empty()) cur = w;
+        else if (cur.size() + 1 + w.size() <= lpiece) cur += " " + w;
+        else pieces.push_back(cur), cur = w;
+      }
+      if (!cur.empty()) pieces.push_back(cur);
+    }
+    std::string line = lrPadL(m.name == "." ? std::string(".") : abbrevName(m.name, 12), 12) + " | " +
+                       lrPadR(m.cmdShown, 10) + lrPadL(depn, 9);
+    line = lrPadR(line, 41) + lrPadL(lrNum("%4.0f", m.nParams), 4);
+    if (!pieces.empty()) line = lrPadR(line, 47) + pieces[0];
+    t += line + "\n";
+    for (size_t j = 1; j < pieces.size(); ++j) t += std::string(13, ' ') + "|" + std::string(33, ' ') + pieces[j] + "\n";
+  }
+  t += std::string(14 + 33 + lpiece, '-');
+  return t;
 }
 
 // One specification token of `lrtest`: a name, or a parenthesised name.
@@ -403,6 +501,22 @@ nlohmann::ordered_json runLrtest(const eval::ParsedCommand& parsed, SessionState
                                         "chi2_tail_out_of_range"));
   }
   const double p = chi2UpperTailIntegerDf(df, chi2);
+  // stats / dir: drawn after the test, restricted model first; a table that
+  // cannot be built from these results is refused rather than left out.
+  std::string tables;
+  {
+    const LrModel* order[2] = {&r, &u};
+    if (hasOpt(parsed.opts, "stats")) {
+      const auto t = lrStatsTable(order);
+      if (!t) return ojson(eval::refusedCommand("lrtest, stats", "ic_inputs_missing"));
+      tables += "\n" + *t;
+    }
+    if (hasOpt(parsed.opts, "dir")) {
+      const auto t = lrDirTable(order);
+      if (!t) return ojson(eval::refusedCommand("lrtest, dir", "e_b_missing"));
+      tables += "\n" + *t;
+    }
+  }
   eval::replaceRClass(session.eval);
   session.eval.rValues.set("df", df);
   session.eval.rValues.set("chi2", chi2);
@@ -434,6 +548,7 @@ nlohmann::ordered_json runLrtest(const eval::ParsedCommand& parsed, SessionState
   out += "\nLikelihood-ratio test\nAssumption: " + rshow + " nested within " + ushow + "\n\n" +
          ralign(dilr, w1) + " = " + ralign(dichi2, w2) + "\n" + ralign(diprob, w1) + " = " +
          ralign(dip, w2);
+  out += tables;
   return displayBlock(out);
 }
 

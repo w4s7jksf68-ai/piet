@@ -80,6 +80,15 @@ bool parseNumber(const std::string& field, double* out);
 // "", "." and ".a".."z": a numeric missing.
 bool isMissingToken(const std::string& field);
 
+// Whether the first of `records` is a row of names rather than data, as Stata's
+// delimited readers decide it with no varnames()/names option (vs-stata bank,
+// StataBE 19.5, 2026-11-10): it is, when some column holds a non-numeric word
+// there and only numbers (or missing values) in every later record. A file whose
+// columns are all text cannot be told apart and keeps its first line as data:
+// `a,b` over `x,zzz` and `y,short` reads v1 v2 with 3 observations, a tab file
+// read with `comma` one string variable with 3; `a;b;c` over `1,5;x;...` too.
+bool firstRecordNamesColumns(const std::vector<std::vector<std::string>>& records);
+
 enum class Case { kPreserve, kLower, kUpper };
 
 struct NameResult {
@@ -116,7 +125,8 @@ std::string caseMapUtf8(const std::string& s, Case c);
 //     at least 1; strL past 2045)
 //   all integers -> byte [-127,100], int [-32767,32740],
 //     long [-2147483647,2147483620], else double
-//   otherwise float (double with asDouble, or when a magnitude passes 2^24);
+//   otherwise float (double with asDouble, or when a magnitude passes long's
+//     range -- measured: 1e8 float, 1e10 double);
 //   all missing -> byte
 // A numericcols() column holding text is float, the text read as missing
 // (log:3061 dx_imd_024_numericcols code float).

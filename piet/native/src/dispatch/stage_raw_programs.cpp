@@ -226,7 +226,8 @@ bool interceptProgramDefinition(SessionState& session,
       std::string progSub;
       progIss >> progSub;
       std::string progSubLower = lower(progSub);
-      if (progSubLower == "drop" || progSubLower == "dir") {
+      // `program list` prints the definitions (handleProgramManage's "list").
+      if (progSubLower == "drop" || progSubLower == "dir" || progSubLower == "list") {
         std::vector<std::string> progNames;
         std::string nm;
         while (progIss >> nm) progNames.push_back(nm);
@@ -237,7 +238,7 @@ bool interceptProgramDefinition(SessionState& session,
           // to be a benign no-op here (Python parity) that `capture` read as 0.
           { blocks = ojson::array({echo, mgmtBlock}); return true; }
         }
-        if (mgmtBlock.contains("text") && progSubLower == "dir") {
+        if (mgmtBlock.contains("text") && (progSubLower == "dir" || progSubLower == "list")) {
           { blocks = ojson::array({echo, mgmtBlock}); return true; }
         }
         { blocks = ojson::array({echo}); return true; }

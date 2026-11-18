@@ -1,3 +1,104 @@
+# PIET A.1.0 / CoBrA 1.1.0 — checked against 39,290 Stata 19.5 cells: 32,148 now match
+
+The app reports PIET `A.1.0`, the engine CoBrA `1.1.0`; the engine contract moves to 1.27.0 and the
+app contract to 2.11.0, both additive (nothing renamed or removed). Corresponding source: this
+repository at tag `A.1.0`.
+
+**What this release is.** On 2026-11-10 StataBE 19.5 ran 39,290 small do-files ("cells") covering
+319 commands with their options, abbreviations, error cases and stored results, and everything it
+printed and stored was kept. A.1.0 is the result of running PIET against every one of those cells and
+repairing what differed. A cell matches when the return code, every stored result in `r()`, `e()`
+and `s()` (within the tolerances of `tests/eval/TOLERANCE.md`) and, for display cells, the printed
+text all agree with Stata's.
+
+| cells | A.0.2 code | A.1.0 |
+|---|---|---|
+| match Stata | 18,526 | **32,148** |
+| Stata runs it, PIET answers "not implemented in this version" | 8,699 | 3,872 |
+| a stored number differs | 1,315 | 141 |
+| Stata refuses it, PIET runs it | 2,469 | 301 |
+| both refuse, with another return code | 1,785 | 240 |
+| a stored result is missing, or a stored name or text differs | 3,830 | 741 |
+| a command PIET does not have | 2,384 | 1,596 |
+
+Both columns come from the same harness; two rules added during the work (values Stata itself cannot
+reproduce, such as its internal data checksum and the addresses of graph objects, are not compared)
+account for 122 of the new matches. 327 cells are not counted as targets: their Stata record is an artifact of the recording session
+(state left by an earlier cell, a package that failed to install there) or a limit only Stata/BE has.
+Outside them 32,114 of 38,963 cells match (82.4%).
+
+**Estimation**
+
+- `ivreg2`, `xtivreg2` and `ivreghdfe` post their whole set of stored results (fit statistics, F,
+  Sargan/Hansen J, under- and weak-identification statistics, first-stage results). `reghdfe` posts
+  `e(ic)` with two or more absorbed factors; `prais`, `xtreg, be`, `sureg` and `reg3` post what Stata
+  posts.
+- New: the random-effects `xtpoisson` model (gamma effects, Stata's default) with `vce(robust)`;
+  `heckman` by full maximum likelihood (Stata's default) with `select(varlist)`, `predict`,
+  `mills()` and `nshazard()`; `tobit, vce(cluster)` and `predict` after `tobit`.
+- `ologit`, `oprobit` and `mlogit` take weights and `offset()`, and `predict` after them gives `xb`,
+  `stdp` and `pr`. `mean` and `proportion` post their full results and take `over()`,
+  `vce(cluster)`, standardization and `citype()`. `pca` and `sktest` take weights.
+- `logit`, `probit` and the other maximum-likelihood fits publish `e(gradient)`, `e(ilog)` and ml's
+  settings, and `tobit` follows Stata's ml iteration.
+- `test`, `lincom` and `nlcom` now answer after fits the engine cannot re-fit (qreg, glm, ivregress
+  GMM/LIML, xtreg re, sureg, the ml fits above), from the posted `e(b)` and `e(V)`.
+- `level()` is honoured when abbreviated, down to `l(90)`.
+
+**Tables and Settings**
+
+- New setting, **Table size limits**: the largest one-way and two-way tables `tabulate` draws and the
+  cells of `tabulate, summarize()`. Empty means Stata's limit, that of Stata/SE and MP (12,000 rows;
+  1,200 x 80; 375 cells); type a larger number to raise one. No table may exceed 1,000,000 cells
+  (200,000 with `summarize()`), which bounds memory.
+- Large tables are built in linear time: a one-way table of 100,000 rows took 19 s and now takes 0.2 s.
+- `table` and `tabstat` follow Stata in more forms (pages for a third dimension, `tabstat` options).
+
+**Data, language, files, graphs**
+
+- Many data-management commands now leave Stata's `r()` results (`egen`, `isid`, `ipolate`,
+  `duplicates`, `contract`, `gsort`, `collapse`, `append`, the gtools family and others); new `char`
+  command; `findname` selects as Stata does.
+- `#delimit ;`, `set varabbrev off`, more extended macro functions, SMCL in `display`, the detail codes
+  of `%t` display formats, more matrix functions, and a second `program define` of a standing
+  program is refused (r(110)).
+- `infile`, `infix` and `input` read lines as Stata does; `import delimited` reports the encoding Stata
+  reports and posts its `r()`; `zipfile` and `zipsave` compress as zlib does.
+- More options of `twoway`, `binscatter`, `coefplot` and `event_plot` are supported, and `by()` graphs
+  draw one panel per group; `esttab` writes HTML and Markdown; `estimates table` takes its whole
+  option set.
+- Thousands of refusals now carry Stata's own return code and message, including the option
+  abbreviations Stata accepts and refuses (measured from 13,520 cells).
+
+**Changes that can move results you already have**
+
+- `import delimited` stores a non-integer numeric column as `float`, as Stata does, unless you give
+  `asdouble`.
+- `heckman ..., twostep`: an observation that is selected but has a missing outcome now leaves the
+  estimation sample, as Stata's `heckman` marks it out. Estimates on such data change.
+- `table`: a Total margin is computed over the table's own rows (those with every dimension present).
+- `frames reset` clears the data in memory.
+- Where Stata/BE and Stata/SE-MP differ, PIET follows SE/MP: `set maxvar` is accepted and the
+  `tabulate` limits are SE/MP's (adjustable in Settings).
+- An option whose only effect is output the app cannot draw yet stays a named "not implemented"
+  refusal instead of being accepted and silently ignored.
+
+**Known gaps**: 3,872 cells are still answered "not implemented" and 1,596 use commands PIET does not
+have. The differences found and not yet fixed are registered as defects, for example the order in
+which `label list` lists value labels after `reshape wide`, and `tabulate a b, summarize(x)`, which
+is computed but not drawn. Stata's own example datasets (`sysuse auto` and others) are not bundled;
+PIET's own `fatalities` is.
+
+**Code adopted from other projects** (listed in `THIRD_PARTY_NOTICES.txt`): zlib's deflate algorithm
+(Zlib licence), so that `zipfile` / `zipsave` report the sizes Stata reports; ICU's charset-detection
+tables (Unicode License v3), for `import delimited`'s encoding guess.
+
+**Checks on this tree:** before publication, the full internal gate (application self-test, the ten
+wave answer books, 339 frozen outputs, 112 engine unit tests, 148 correctness gates, registry,
+transport and probe checks) passed. In GitHub Actions, as before: engine unit tests,
+`tests/public_smoke.py` and the real-window `--ui-smoke` journey on macOS and Windows, and the
+downloads built from the commit at this tag by `.github/workflows/release.yml`.
+
 # PIET A.0.2 / CoBrA 1.0.2 — first Windows build; do-files open in their own folder
 
 The app reports PIET `A.0.2`, the engine CoBrA `1.0.2`; contracts unchanged at

@@ -143,6 +143,12 @@ nlohmann::ordered_json runEstimatesTable(const std::vector<std::string>& modelNa
                                           const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                           SessionState& session);
 
+// `estimates stats [namelist] [, n(#)]` -- N, ll(null), ll(model), df, AIC and BIC of each model
+// (r(S): one row per model).
+nlohmann::ordered_json runEstimatesStats(const std::vector<std::string>& modelNames,
+                                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                         SessionState& session);
+
 // ---------------------------------------------------------------------------
 // esttab / estout `transform()` -- 18 corpus uses over four papers (12 on estout
 // in paper 016, 6 on esttab in 015/083/104), and measurably ONE option: every

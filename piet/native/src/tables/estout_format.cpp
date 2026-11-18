@@ -119,7 +119,7 @@ bool eoFormatNumber(double vIn, const std::string& fmtIn, std::string* out) {
 // The full vFormat: number, then (when `lz` is off) the leading zero dropped,
 // then par() around it.
 bool eoVFormat(double v, const std::string& fmt, bool lz, const std::vector<std::string>& par,
-               std::string* out) {
+               std::string* out, const std::string& dmarker, const std::string& msign) {
   std::string val;
   if (!eoFormatNumber(v, fmt, &val)) return false;
   if (!lz) {
@@ -127,6 +127,18 @@ bool eoVFormat(double v, const std::string& fmt, bool lz, const std::vector<std:
       const size_t at = val.find("0.");
       if (at != std::string::npos) val.replace(at, 2, ".");
     }
+  }
+  // vFormat: dmarker() replaces the decimal point (the first one, as
+  // subinstr without `all` does), msign() a leading minus sign of the value as
+  // it stood before the marker was swapped.
+  const bool negative = !val.empty() && val[0] == '-';
+  if (!dmarker.empty()) {
+    const size_t dot = val.find('.');
+    if (dot != std::string::npos) val.replace(dot, 1, dmarker);
+  }
+  if (!msign.empty() && negative) {
+    const size_t minus = val.find('-');
+    if (minus != std::string::npos) val.replace(minus, 1, msign);
   }
   if (!par.empty()) {
     val = par[0] + val + (par.size() > 1 ? par[1] : std::string());
@@ -169,10 +181,116 @@ std::string eoStarLegend(const EoSpec& sp) {
 
 
 // The whole write phase. `out` receives the file text (every line ends `\n`).
-bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) {
+bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut, EoRPost* post) {
   SessionState& session = *sp.session;
   std::vector<EoModel> models = sp.models;  // TableIsAMess may rename equations
   const size_t M = models.size();
+  // equations(): name the equations of each model by number (estout AdjustRowEq), so
+  // that models with different equation names meet in the same block.
+  if (!sp.equationsSpec.empty() && !sp.matrixMode) {
+    std::string spec = sp.equationsSpec;
+    for (char& c : spec) {
+      if (c == ':') c = ' ';
+    }
+    std::string spec0;
+    for (char c : spec) {
+      if (c != '#') spec0 += c;
+    }
+    // MatchNames: terms are separated by commas; a term is [name =] #-list.
+    struct Term {
+      std::string eqname;
+      std::vector<std::string> words;
+    };
+    std::vector<Term> terms;
+    {
+      size_t start = 0;
+      int iterm = 0;
+      for (;;) {
+        const size_t comma = spec0.find(',', start);
+        const std::string piece = spec0.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        ++iterm;
+        Term t;
+        const size_t eq = piece.find('=');
+        if (eq != std::string::npos) {
+          t.eqname = eoTrim(piece.substr(0, eq));
+          t.words = splitWs(piece.substr(eq + 1));
+        } else {
+          t.eqname = "#" + std::to_string(iterm);
+          t.words = splitWs(piece);
+        }
+        terms.push_back(std::move(t));
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
+    }
+    {
+      std::set<std::string> seenNames;
+      for (const auto& t : terms) {
+        if (!seenNames.insert(t.eqname).second) {
+          err->msg = "duplicate matched equation names";
+          err->rc = 198;
+          return false;
+        }
+      }
+    }
+    for (size_t ni = 0; ni < M; ++ni) {
+      EoModel& em = models[ni];
+      std::vector<std::string> beq;
+      for (const auto& k : em.coefRows) {
+        if (std::find(beq.begin(), beq.end(), k.first) == beq.end()) beq.push_back(k.first);
+      }
+      for (const auto& t : terms) {
+        if (std::find(beq.begin(), beq.end(), t.eqname) != beq.end()) {
+          err->msg = "option equations() invalid\nspecified equation name already occurs in model " +
+                     std::to_string(ni + 1);
+          err->rc = 198;
+          return false;
+        }
+      }
+      std::map<std::string, std::string> renameEq;
+      for (const auto& t : terms) {
+        const size_t nword = t.words.size();
+        if (nword != 1 && nword != M) {
+          err->msg = "option equations() invalid\na term should consist of either 1 or " +
+                     std::to_string(M) + " equation numbers";
+          err->rc = 198;
+          return false;
+        }
+        const std::string w = nword > 1 ? t.words[ni] : t.words[0];
+        if (w == ".") continue;
+        char* endp = nullptr;
+        const long num = std::strtol(w.c_str(), &endp, 10);
+        if (w.empty() || *endp != '\0') {
+          err->msg = "option equations() invalid\n" + w + " was found, while an integer equation number was expected";
+          err->rc = 198;
+          return false;
+        }
+        if (num < 1 || num > static_cast<long>(beq.size())) {
+          err->msg = "option equations() invalid\nequation number " + w + " for model " +
+                     std::to_string(ni + 1) + " out of range";
+          err->rc = 198;
+          return false;
+        }
+        renameEq[beq[static_cast<size_t>(num - 1)]] = t.eqname;
+      }
+      auto ren = [&](const EoKey& k) {
+        const auto it = renameEq.find(k.first);
+        return it == renameEq.end() ? k : EoKey{it->second, k.second};
+      };
+      for (auto& k : em.coefRows) k = ren(k);
+      std::map<EoKey, EoCoefVals> nv;
+      for (const auto& [k, v] : em.vals) nv[ren(k)] = v;
+      em.vals = nv;
+      for (auto& [st, ord] : em.extraOrder) {
+        for (auto& k : ord) k = ren(k);
+      }
+      for (auto& [st, mp] : em.extra) {
+        std::map<EoKey, double> nm;
+        for (const auto& [k, v] : mp) nm[ren(k)] = v;
+        mp = nm;
+      }
+    }
+  }
   // rename() (estout RenameCoefs), per model before the union: every
   // row named `from` (in `eq` when it is given) is called `to`.
   if (!sp.rename.empty()) {
@@ -225,19 +343,13 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
   for (const auto& el : cells.elems) {
     if (el.star || el.name == "_star" || el.name == "_sigsign") tablehasstars = true;
   }
-  // r(ccols): the coefficient statistics a model carries (estout plus
-  // the p column stars add).
-  int ccols = 0;
-  {
-    std::set<std::string> vals;
-    for (const auto& el : cells.elems) vals.insert(el.name);
-    if (tablehasstars) {
-      for (const auto& el : cells.elems) {
-        if (el.star) vals.insert(el.pvalue);
-      }
-    }
-    ccols = static_cast<int>(vals.size());
-  }
+  // r(ccols): the coefficient statistics a model carries (estout: one per
+  // cells() element, ci as two, plus the p column stars add); in matrix mode
+  // the matrix's columns (MatrixMode).
+  const std::vector<std::string> coefCols = eoCoefColumns(cells);
+  // margin adds one column (`_dummy`, the discrete-change marker) to each model's block.
+  const int ccols = sp.matrixMode ? static_cast<int>(sp.matrixColNames.size())
+                                  : static_cast<int>(coefCols.size()) + (sp.margin ? 1 : 0) + (sp.dropped ? 1 : 0);
   auto rowsOf = [&](const EoModel& m) {
     std::vector<EoKey> rows;
     if (anyCoefStat) rows = m.coefRows;
@@ -272,7 +384,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
   bool hasB = !B.empty();
 
   // ---- TableIsAMess (estout) ----------------------------------
-  if (!sp.equationsGiven && !sp.unstack && hasB) {
+  if (!sp.equationsGiven && sp.equationsSpec.empty() && !sp.unstack && hasB) {
     std::vector<std::string> ueq;
     for (const auto& k : B) {
       if (std::find(ueq.begin(), ueq.end(), k.first) == ueq.end()) ueq.push_back(k.first);
@@ -354,8 +466,23 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
     if (!eoExpandEqVarlist(dl, B, false, &ex, nullptr, err)) return false;
     eoDropOrKeep(false, ex, &B);
   }
+  // starkeep() / stardrop() are read like keep() / drop(): the same list grammar (wildcards, `eq:`),
+  // expanded against the coefficients that remain.
+  std::vector<EoSpecItem> starKeepEx, starDropEx;
+  const auto eoJoin = [](const std::vector<std::string>& t) {
+    std::string r;
+    for (const auto& x : t) r += (r.empty() ? "" : " ") + x;
+    return r;
+  };
+  if (sp.hasStarKeep && !B.empty()) {
+    if (!eoExpandEqVarlist(eoJoin(sp.starKeep), B, false, &starKeepEx, nullptr, err)) return false;
+  }
+  if (!sp.starDrop.empty() && !B.empty()) {
+    if (!eoExpandEqVarlist(eoJoin(sp.starDrop), B, false, &starDropEx, nullptr, err)) return false;
+  }
   hasB = !B.empty();
   if (ccolsOut != nullptr) *ccolsOut = hasB ? ccols : -1;
+  if (post != nullptr) eoCollectRPost(sp, models, mrows, B, coefCols, post);
 
   // ---- names and equations of the final set ------------------------------------------
   size_t R = B.size();
@@ -636,7 +763,12 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
     for (auto& r : vblock) ins(r, std::vector<std::pair<int, bool>>{});
   }
   const size_t nphys = starsrow.size();
-  const int ncols = static_cast<int>(nphys) + 1 + (sp.labcol2 ? 1 : 0);
+  int ncols = static_cast<int>(nphys) + 1 + (sp.labcol2 ? 1 : 0);
+  if (sp.stardetach) {
+    for (int sr : starsrow) {
+      if (sr != 0) ++ncols;  // the detached stars are a column of their own
+    }
+  }
 
   // ---- widths (estout) --------------------------------------------------------------
   const std::vector<int>& mwv = sp.modelwidth;
@@ -657,7 +789,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
   if (sp.labcol2) totcharwidth += delwidth + labcol2width;
   for (size_t c = 0; c < nphys; ++c) {
     totcharwidth += delwidth + mw(c);
-    if (starsrow[c] != 0) totcharwidth += starwidth;
+    if (starsrow[c] != 0) totcharwidth += starwidth + (sp.stardetach ? delwidth : 0);
   }
   std::string hline;
   {
@@ -691,7 +823,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
     if (type == 2) return s;
     s = eoReplaceAll(s, "@title", sp.title);
     s = eoReplaceAll(s, "@note", sp.note);
-    s = eoReplaceAll(s, "@discrete", std::string());
+    s = eoReplaceAll(s, "@discrete", sp.margin ? sp.discrete + sp.discrete2 : std::string());
     s = eoReplaceAll(s, "@starlegend", starlegend);
     return s;
   };
@@ -740,7 +872,10 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
     w(fmtL2(eoAbbrev(labcol2width, chunk, sp.abbrev)));
   };
   auto starPad = [&](size_t c) {
-    if (c < starsrow.size() && starsrow[c] == 1) w(std::string(static_cast<size_t>(starwidth), ' '));
+    if (c < starsrow.size() && starsrow[c] == 1) {
+      if (sp.stardetach) w(sp.delimiter);
+      w(std::string(static_cast<size_t>(starwidth), ' '));
+    }
   };
 
   // WriteCaption (estout). Group ids are 1-based; -1 is an extracols column.
@@ -782,7 +917,13 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
       } else {
         ++nspan;
         spanwidth += cw + delwidthSpan;
-        if (starsrow[c] == 1) spanwidth += starwidth;
+        if (starsrow[c] == 1) {
+          spanwidth += starwidth;
+          if (sp.stardetach) {
+            ++nspan;
+            spanwidth += delwidthSpan;
+          }
+        }
         const int nextr = (c + 1 < row.size()) ? row[c + 1] : -9;
         const int nextrtwo = (c + 1 < rowtwo.size()) ? rowtwo[c + 1] : -9;
         if (r != nextr || rtwo != nextrtwo || rowtwo.empty()) {
@@ -815,7 +956,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
       for (size_t c = 0; c < nphys; ++c) {
         w(sp.delimiter);
         w(eoPadL("", mw(c)));
-        if (starsrow[c] == 1) w(std::string(static_cast<size_t>(starwidth), ' '));
+        starPad(c);
       }
       return;
     }
@@ -828,7 +969,13 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
     for (size_t c = 0; c < nphys; ++c) {
       ++nspan;
       spanwidth += delwidthSpan + mw(c);
-      if (starsrow[c] == 1) spanwidth += starwidth;
+      if (starsrow[c] == 1) {
+        spanwidth += starwidth;
+        if (sp.stardetach) {
+          ++nspan;
+          spanwidth += delwidthSpan;
+        }
+      }
     }
     std::string value = eoAbbrev(spanwidth, value0, sp.abbrev);
     value = prefix + value + suffix;
@@ -866,6 +1013,11 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
   auto pValue = [&](const EoModel& m, const EoKey& key, const EoElem& el) {
     return eoElemValue(m, key, el.pvalue);
   };
+  // starkeep()/stardrop(): whether this coefficient may carry stars (the lists were expanded above).
+  auto starAllowed = [&](const EoKey& key) {
+    if (sp.hasStarKeep && !eoSpecHits(starKeepEx, key)) return false;
+    return !eoSpecHits(starDropEx, key);
+  };
 
   // ---- prehead -------------------------------------------------------------------------------------
   {
@@ -878,6 +1030,12 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
       w(insertAt(line, 0, std::to_string(ncols)));
       nl();
     }
+  }
+  const std::string smclRule = std::string(static_cast<size_t>(std::max(0, std::min(totcharwidth, 400))), '-');
+  bool hasHeader = false;
+  if (sp.smclRules) {
+    w(smclRule);
+    nl();
   }
 
   std::vector<int> modelIds, eqIds, colIds;
@@ -918,6 +1076,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
         m0 = m;
       }
     }
+    hasHeader = true;
     writeBegin(mgb, tb, fmtV(eoAbbrev(sp.varwidth, sp.mgroups.lhs, sp.abbrev)));
     writeL2(&l2title);
     const std::string rep = writeCaption(pat, pat, sp.mgroups.list, sp.mgroups.span,
@@ -926,6 +1085,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
   }
   // ---- head: model numbers ------------------------------------------------------------------------------
   if (sp.numbers) {
+    hasHeader = true;
     w(sp.begin);
     w(fmtV(""));
     writeL2(&l2title);
@@ -947,6 +1107,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
         if (!mb.empty()) tb.clear();
         if (!me.empty()) te.clear();
       }
+      hasHeader = true;
       writeBegin(mb, tb, fmtV(eoAbbrev(sp.varwidth, sp.mlabels.lhs, sp.abbrev)));
       writeL2(&l2title);
       const std::string rep = writeCaption(modelIds, modelIds, mlabels, sp.mlabels.span,
@@ -966,6 +1127,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
       if (!eqlabelsbegin.empty()) tb.clear();
       if (!eqlabelsend.empty()) te.clear();
     }
+    hasHeader = true;
     writeBegin(eqlabelsbegin, tb, fmtV(eoAbbrev(sp.varwidth, sp.eqlabels.lhs, sp.abbrev)));
     writeL2(&l2title);
     const std::string rep = writeCaption(eqIds, modelIds, eqlabels, sp.eqlabels.span,
@@ -981,6 +1143,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
       if (!cb.empty()) tb.clear();
       if (!ce.empty()) te.clear();
     }
+    hasHeader = true;
     writeBegin(cb, tb, fmtV(eoAbbrev(sp.varwidth, sp.collabels.lhs, sp.abbrev)));
     writeL2(&l2title);
     const std::string rep = writeCaption(colIds, {}, collabels, sp.collabels.span,
@@ -988,8 +1151,37 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
     writeEnd(te, ce, {rep});
   }
   // ---- posthead ------------------------------------------------------------------------------------------------
+  if (hasHeader && sp.smclMidRules) {
+    w(smclRule);
+    nl();
+  }
   for (const auto& line : sp.posthead) {
     w(insertAt(line, 0, std::to_string(ncols)));
+    nl();
+  }
+  // style(mmd): the alignment / divider row (estout MakeMMDdef). The variable column is `varwidth`
+  // dashes, a label column two less than its width between colons, each model column its width less
+  // two (more for the star symbols) between colons.
+  if (sp.mmd) {
+    int varw = sp.varwidth <= 0 ? 1 : sp.varwidth;
+    int stw = starwidth <= 0 ? 1 : starwidth;
+    if (sp.stardetach) stw = std::max(1, stw - 2);
+    std::string row = "| " + std::string(static_cast<size_t>(std::max(1, varw)), '-');
+    if (sp.labcol2) {
+      row += " | :" + std::string(static_cast<size_t>(std::max(1, labcol2width - 2)), '-') + ":";
+    }
+    for (size_t c = 0; c < starsrow.size(); ++c) {
+      int mwj = mw(c);
+      if (mwj <= 0) mwj = 1;
+      mwj = std::max(1, mwj - 2);
+      row += " | :" + std::string(static_cast<size_t>(mwj), '-');
+      if (starsrow[c] == 1) {
+        if (sp.stardetach) row += ": | :";
+        row += std::string(static_cast<size_t>(stw), '-');
+      }
+      row += ":";
+    }
+    w(row + " |");
     nl();
   }
 
@@ -1063,6 +1255,10 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
               if (sp.eqlabels.replace) {
                 if (!eqlabelsbegin0.empty()) tb.clear();
                 if (!eqlabelsend.empty()) te.clear();
+              }
+              if (e > 1 && sp.smclEqRules) {
+                w(smclRule);
+                nl();
               }
               writeBegin(eqlabelsbegin0, tb, "");
               writeEqrow(value, sp.eqlabels.span, sp.eqlabels.prefix, sp.eqlabels.suffix);
@@ -1178,6 +1374,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
 
       // the cells
       bool newrow = false;
+      std::vector<bool> droppedFirst(models.size(), true);
       for (size_t i : rv) {
         for (size_t c = 0; c < nphys; ++c) {
           if (newrow && c == 0) {
@@ -1207,6 +1404,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
           const int mi = modelsrow[c];
           const auto& elems = vblock[i][c];
           int cwEff = mw(c);
+          std::string starPart;
           std::string thevalue;
           EoKey key = sp.unstack ? EoKey{} : B[r];
           bool skipcoef = false;
@@ -1219,10 +1417,22 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
             const EoElem& el = cells.elems[static_cast<size_t>(elems[t].first)];
             const bool off = elems[t].second || mi < 0;
             std::string v;
+            bool isDropped = false;
+            if (sp.dropped && !off && !skipcoef) {
+              const EoModel& dm = models[static_cast<size_t>(mi)];
+              auto dv = dm.vals.find(key);
+              isDropped = dv != dm.vals.end() && dv->second.zeroVar && dv->second.b == 0.0;
+            }
             if (off) {
               v.clear();
             } else if (skipcoef) {
               v = el.vacant;
+            } else if (isDropped) {
+              // estout GetCoefs: the first cell of this model for the coefficient says it was dropped
+              if (droppedFirst[static_cast<size_t>(mi)]) {
+                v = sp.droppedText;
+                droppedFirst[static_cast<size_t>(mi)] = false;
+              }
             } else {
               const EoModel& em = models[static_cast<size_t>(mi)];
               const size_t fr = sp.unstack ? r : r;
@@ -1237,21 +1447,23 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
                                                     el.par.size() > 1 ? el.par[1] : ""};
                   const std::vector<std::string> pu{"", el.par.size() > 2 ? el.par[2] : ""};
                   if (!eoVFormat(lo.kind == EoV::kNum ? lo.v : kEoNaN, fmtFor(el, fr), sp.lz,
-                                 el.hasPar ? pl : std::vector<std::string>{}, &a) ||
+                                 el.hasPar ? pl : std::vector<std::string>{}, &a, sp.dmarker, sp.msign) ||
                       !eoVFormat(hi.kind == EoV::kNum ? hi.v : kEoNaN, fmtFor(el, fr), sp.lz,
-                                 el.hasPar ? pu : std::vector<std::string>{}, &b2)) {
+                                 el.hasPar ? pu : std::vector<std::string>{}, &b2, sp.dmarker, sp.msign)) {
                     err->msg = fmtFor(el, fr) + ": invalid format";
                     err->rc = 198;
                     return false;
                   }
-                  v = a + b2;
+                  // without par the two limits still sit side by side as `lo,hi`
+                  // (vs-stata bank 7d40598c: `estout m1 m2 m3, cells(ci)` prints -193.0998,94.0754)
+                  v = el.hasPar ? a + b2 : a + "," + b2;
                 }
               } else {
                 const EoV x = eoElemValue(em, key, el.name);
                 if (x.kind == EoV::kVacant) {
                   v = el.vacant;
                 } else if (el.name == "_star") {
-                  v = eoStars(starlevels, pValue(em, key, el));
+                  v = starAllowed(key) ? eoStars(starlevels, pValue(em, key, el)) : std::string();
                   if (el.hasPar && el.par.size() >= 1) {
                     v = el.par[0] + v + (el.par.size() > 1 ? el.par[1] : std::string());
                   }
@@ -1263,7 +1475,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
                   double num = x.kind == EoV::kNum ? x.v : kEoNaN;
                   if (el.abs && (el.name == "t" || el.name == "z") && !std::isnan(num)) num = std::fabs(num);
                   if (!eoVFormat(num, fmtFor(el, fr), sp.lz,
-                                 el.hasPar ? el.par : std::vector<std::string>{}, &v)) {
+                                 el.hasPar ? el.par : std::vector<std::string>{}, &v, sp.dmarker, sp.msign)) {
                     err->msg = fmtFor(el, fr) + ": invalid format";
                     err->rc = 198;
                     return false;
@@ -1273,18 +1485,28 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
             }
             thevalue += v;
             if (c < starsrow.size() && starsrow[c] == 1) {
-              cwEff = mw(c) + starwidth;
               std::string sv;
-              if (!off && el.star && !skipcoef) {
+              if (!off && el.star && !skipcoef && starAllowed(key)) {
                 sv = eoStars(starlevels, pValue(models[static_cast<size_t>(mi)], key, el));
               }
-              if (t + 1 == elems.size()) sv = eoPadR(sv, starwidth);
-              thevalue += sv;
+              if (sp.stardetach) {
+                // stardetach: the stars of the column's elements follow in a column of their own
+                starPart += sv;
+                if (t + 1 < elems.size()) starPart += sp.incelldelimiter;
+              } else {
+                cwEff = mw(c) + starwidth;
+                if (t + 1 == elems.size()) sv = eoPadR(sv, starwidth);
+                thevalue += sv;
+              }
             }
             if (t + 1 < elems.size()) thevalue += sp.incelldelimiter;
           }
           w(sp.delimiter);
           w(eoPadL(thevalue, cwEff));
+          if (sp.stardetach && c < starsrow.size() && starsrow[c] == 1) {
+            w(sp.delimiter);
+            w(eoPadR(starPart, starwidth));
+          }
         }
         newrow = true;
       }
@@ -1337,6 +1559,10 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
     w(insertAt(line, 0, std::to_string(ncols)));
     nl();
   }
+  if (((R > 0) || nind > 0) && sp.smclMidRules && !sp.stats.empty()) {
+    w(smclRule);
+    nl();
+  }
 
   // ---- statistics (estout) ----------------------------------------------------------------------
   {
@@ -1374,12 +1600,13 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
         std::string cell;
         bool has = false;
         if (stc == 1) {
-          const EoV v = eoStatValue(models[static_cast<size_t>(m)], st.key);
+          const EoV v = eoStatValue(models[static_cast<size_t>(m)], st.key, sp.session);
           if (v.kind == EoV::kText) {
             cell = v.text;
             has = true;
           } else if (v.kind == EoV::kNum || v.kind == EoV::kMissing) {
-            if (!eoVFormat(v.kind == EoV::kNum ? v.v : kEoNaN, st.fmt, sp.lz, {}, &cell)) {
+            if (!eoVFormat(v.kind == EoV::kNum ? v.v : kEoNaN, st.fmt, sp.lz, {}, &cell, sp.dmarker,
+                           sp.msign)) {
               err->msg = st.fmt + ": invalid format";
               err->rc = 198;
               return false;
@@ -1390,8 +1617,9 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
         w(sp.delimiter);
         w(eoPadL(cell, cw));
         if (starsrow[c] == 1) {
+          if (sp.stardetach) w(sp.delimiter);
           if (st.star && has) {
-            const EoV p = eoStatValue(models[static_cast<size_t>(m)], "p");
+            const EoV p = eoStatValue(models[static_cast<size_t>(m)], "p", sp.session);
             w(eoPadR(eoStars(starlevels, p), starwidth));
           } else {
             w(std::string(static_cast<size_t>(starwidth), ' '));
@@ -1410,6 +1638,10 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut ) 
   }
 
   // ---- postfoot and legend ---------------------------------------------------------------------------------------
+  if (sp.smclRules) {
+    w(smclRule);
+    nl();
+  }
   {
     std::vector<std::string> post = sp.postfoot;
     if (sp.prehead.empty() && sp.posthead.empty() && sp.prefoot.empty() && sp.postfoot.empty()) {

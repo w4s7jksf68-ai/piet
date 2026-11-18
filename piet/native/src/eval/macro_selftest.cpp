@@ -125,7 +125,8 @@ bool selftestLocalRefScanMatchesRegex(std::string* firstDisagreement) {
       "`x'", "`acc' + `i'", "local acc = `acc' + `i'", "`_u'", "`1'", "`12'", "`x",
       "``x''", "`'", "``'", "`x`y''", "a`b'c", "`9x'", "`x9'", "`x-y'", "`x y'",
       "no ticks here", "`", "``", "`\"a b\"'", "`=2+3'", "`r(mean)'", "`s(k)'",
-      "`x' `y'", "``", "`0'", "`x_1'", "`X'", "`_'",
+      "`x' `y'", "``", "`0'", "`x_1'", "`X'", "`_'", "`*'", "`*", "`**'", "a `*' b",
+      "`++i'", "`i++'", "`--i'", "`i--'", "`+i'", "`i+'", "`++'", "`1abc'", "`++1'",
       // Unicode names (lane M)
       "`م'", "`ملاحظات'", "`دخل_2020'", "`ق1'", "`1ق'", "`x م'", "``م''", "`م",
   };
@@ -360,9 +361,9 @@ bool selftestMacroDefScanMatchesRegex(std::string* firstDisagreement) {
       // whitespace shapes
       "local\tq\t5", "local\t \tq 5", "local   q   5   ", "local\nq 5", "global\vg 1",
       // non-matches
-      "localq 5", "local", "local ", "local  ", "local 1x 3", "local -x 3", "local `k' 5",
+      "localq 5", "local", "local ", "local  ", "local -x 3", "local `k' 5",
       // BUG-923: positional locals match `local`, never `global`
-      "local 1 alpha", "local 12 \"b c\"", "local 1=3", "local 12abc 1", "local 1_ 2", "global 1 a",
+      "local 1 alpha", "local 12 \"b c\"", "local 1=3", "local 1x 3", "local 12abc 1", "local 1_ 2", "global 1 a",
       "globalg 1", "global", "global 9z 1", "scalar a = 1", "display 1", "",
       // the newline boundary: `.` cannot cross one, so the tail decides
       "local q a\nb", "global g a\nb", "local q 5\n",

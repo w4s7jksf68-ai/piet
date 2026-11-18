@@ -34,11 +34,38 @@ export function formatCorrelate(block) {
   const stubW = Math.max(12, ...names.map(n => n.length));
   const ncol = names.length;
 
+  // pwcorr's star(#) and print(#) (levels as fractions; pwcorr.ado): a pair's
+  // coefficient is starred when its p-value is at or below star, and a pair whose
+  // p-value is above print is left blank, its sig and obs cells too. The p-values
+  // are the block's p (adjusted under bonferroni/sidak), present with star/print
+  // whether or not `sig` was asked for.
+  const pOf = (i, j) => {
+    const v = Array.isArray(block.p) && Array.isArray(block.p[i]) ? block.p[i][j] : null;
+    return v === null || v === undefined || Number.isNaN(Number(v)) ? Infinity : Number(v);
+  };
+  const printLvl = isPwcorr && typeof block.print === 'number' ? block.print : -1;
+  const starLvl = isPwcorr && typeof block.star === 'number' ? block.star : -1;
+  const shown = (i, j) => printLvl < 0 || i === j || pOf(i, j) <= printLvl;
+
   const lines = [];
   // correlate (listwise) prints "(obs=N)"; pwcorr does not.
   if (!isPwcorr) {
     const nObs = block.n_obs ?? block.nobs ?? '';
     lines.push(`(obs=${nObs})`);
+    lines.push('');
+  }
+  // correlate's `means`: a table of each variable's mean, standard deviation,
+  // minimum and maximum over the sample, before the matrix (Stata: a 12-wide stub,
+  // four 13-wide columns, then two blank lines). Numbers in the general format.
+  if (!isPwcorr && Array.isArray(block.means) && block.means.length) {
+    const W = 13;
+    const g = (x) => (x === null || x === undefined || Number.isNaN(Number(x))) ? '.' : (fmtG(Number(x)) ?? '.');
+    lines.push(padL('Variable', 12) + ' │' + ['Mean', 'Std. dev.', 'Min', 'Max'].map(h => padL(h, W)).join(''));
+    lines.push('─'.repeat(13) + '┼' + '─'.repeat(W * 4));
+    for (const m of block.means) {
+      lines.push(padL(String(m.name ?? ''), 12) + ' │' + [m.mean, m.sd, m.min, m.max].map(x => padL(g(x), W)).join(''));
+    }
+    lines.push('');
     lines.push('');
   }
 
@@ -49,16 +76,27 @@ export function formatCorrelate(block) {
 
   for (let i = 0; i < ncol; i++) {
     // Coefficient row: lower-triangular (cols 0..i).
-    const coefCells = [];
-    for (let j = 0; j <= i; j++) coefCells.push(padL(fmt4(r[i][j]), COL));
-    // Stata adds a trailing space after the last coef on pwcorr rows.
-    lines.push(padL(names[i], stubW) + ' │' + coefCells.join('') + (isPwcorr ? ' ' : ''));
+    if (isPwcorr) {
+      // pwcorr.ado prints each cell as " " %7.4f then "*" or " ": the mark sits
+      // right after the number (the last cell's mark is the row's trailing blank).
+      let row = ' ';
+      for (let j = 0; j <= i; j++) {
+        if (!shown(i, j)) { row += ' '.repeat(COL); continue; }
+        const star = i !== j && starLvl >= 0 && pOf(i, j) <= starLvl ? '*' : ' ';
+        row += padL(fmt4(r[i][j]), COL - 1) + star;
+      }
+      lines.push(padL(names[i], stubW) + ' │' + row);
+    } else {
+      const coefCells = [];
+      for (let j = 0; j <= i; j++) coefCells.push(padL(fmt4(r[i][j]), COL));
+      lines.push(padL(names[i], stubW) + ' │' + coefCells.join(''));
+    }
 
     if (showSig) {
       // Significance row: p-values for strictly-lower cells (cols 0..i-1);
       // the diagonal/self cell is blank.
       const sigCells = [];
-      for (let j = 0; j < i; j++) sigCells.push(padL(fmt4(block.p[i][j]), COL));
+      for (let j = 0; j < i; j++) sigCells.push(shown(i, j) ? padL(fmt4(block.p[i][j]), COL) : ' '.repeat(COL));
       lines.push(' '.repeat(stubW) + ' │' + sigCells.join(''));
     }
 
@@ -69,7 +107,7 @@ export function formatCorrelate(block) {
       // prints it; verified: the "income" row of a live `pwcorr ..., obs`
       // run shows a lone "336" under its single 1.0000 diagonal cell).
       const obsCells = [];
-      for (let j = 0; j <= i; j++) obsCells.push(padL(fmtNobs(block.nobs[i][j]), COL));
+      for (let j = 0; j <= i; j++) obsCells.push(shown(i, j) ? padL(fmtNobs(block.nobs[i][j]), COL) : ' '.repeat(COL));
       lines.push(' '.repeat(stubW) + ' │' + obsCells.join(''));
     }
 
@@ -268,20 +306,28 @@ function fmtG8(x) {
   return s.replace(/^(-?)0\./, '$1.');   // Stata: drop leading zero (.5 not 0.5)
 }
 
-/** Format a tabulate VAR, sum(SUMVAR) block (mode:"summarize"). */
+/** Format a tabulate VAR, sum(SUMVAR) block (mode:"summarize"). The block's `columns` (present when an
+ *  option or a weight changes the default) names which of means / standard / freq / obs are shown, in
+ *  Stata's order; without it Mean, Std. dev. and Freq. are drawn. A weight's Freq. is the sum of the
+ *  weights (not always whole); Obs is the row count (the same as Freq. when the block does not carry it). */
 function formatTabulateSummarize(block) {
   const { var: v, sumvar: s, rows, overall } = block;
   const lines = [];
 
-  const colHdrs = [v ?? 'Category', 'Mean', 'Std. dev.', 'Freq.'];
-  const fmtRows = (rows ?? []).map(r => [
-    String(r.level),
-    fmtG8(r.mean),
-    fmtG8(r.sd),
-    String(r.N),
-  ]);
+  const shown = Array.isArray(block.columns) ? block.columns : ['means', 'standard', 'freq'];
+  const num = x => (Number.isInteger(x) ? String(x) : fmtG8(x));
+  const COL = {
+    means:    { hdr: 'Mean',      cell: r => fmtG8(r.mean) },
+    standard: { hdr: 'Std. dev.', cell: r => fmtG8(r.sd) },
+    freq:     { hdr: 'Freq.',     cell: r => num(r.N) },
+    obs:      { hdr: 'Obs',       cell: r => String(r.obs ?? r.N) },
+  };
+  const picked = ['means', 'standard', 'freq', 'obs'].filter(k => shown.includes(k));
+
+  const colHdrs = [v ?? 'Category', ...picked.map(k => COL[k].hdr)];
+  const fmtRows = (rows ?? []).map(r => [String(r.level), ...picked.map(k => COL[k].cell(r))]);
   if (overall) {
-    fmtRows.push(['Total', fmtG8(overall.mean), fmtG8(overall.sd), String(overall.N)]);
+    fmtRows.push(['Total', ...picked.map(k => COL[k].cell(overall))]);
   }
 
   const widths = colHdrs.map((h, i) =>

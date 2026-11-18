@@ -1251,8 +1251,9 @@ bool mxNeedsGrammar(const std::string& e, SessionState& session) {
   auto isIdStart = [](char c) { return cecon::ident::isIdentStartByte(c); };
   auto isIdChar = [](char c) { return cecon::ident::isIdentByte(c); };
   auto isDigit = [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; };
-  static const char* const kMatrixFns[] = {"J",   "I",      "nullmat", "inv",
-                                           "invsym", "syminv", "vecdiag"};
+  static const char* const kMatrixFns[] = {"J",        "I",    "nullmat", "inv",  "invsym",
+                                           "syminv",   "vecdiag", "cholesky", "corr",
+                                           "diag",     "vec",  "vech",    "hadamard"};
   size_t i = 0;
   while (i < e.size()) {
     const char c = e[i];
@@ -1693,6 +1694,142 @@ std::optional<MxValue> evalMxPrimary(const std::string& e, SessionState& session
     m.colnames = src.colnames;
     return mxMatrix(std::move(m));
   }
+  // [FN] Matrix functions of one matrix, as StataBE 19.5 answers them
+  // (vs-stata bank matrix cells):
+  //   cholesky(M)  the lower-triangular L with L*L' = M (Cholesky-Banachiewicz,
+  //                row by row), M's names (d7d3a100cec8d246 (4,2\2,3) -> 2 0 \ 1
+  //                1.4142136); a pivot that is not positive is r(506) `matrix
+  //                not positive definite` (1594b8dd6de2a4ce (1,2\2,1)).
+  //   corr(M)      M_ij / sqrt(M_ii * M_jj), M's names (d2b0e2f31a8478cc
+  //                (4,2\2,3) -> .57735027; df1de1c49545a30b from matrix accum).
+  //   diag(v)      the square matrix with the vector v on its diagonal, named
+  //                by v's columns (a row vector) or rows (a column vector)
+  //                (2bca5bcf26d38dde, e8e34861722c3d7a).
+  //   vec(M)       M's columns stacked, rows named `col:row`, the column c1;
+  //   vech(M)      the same of the lower triangle (2dbae7a1cc3387cc,
+  //                6bb7671a8320d547).
+  // A square argument is required except by vec() and diag(), which needs a
+  // vector: anything else is r(503); a missing cell r(504).
+  for (const char* fnName : {"cholesky", "corr", "diag", "vec", "vech"}) {
+    if (!callArg(fnName, inner)) continue;
+    std::optional<MxValue> arg = matrixArg(inner);
+    if (!arg.has_value()) return std::nullopt;
+    const eval::EvalMatrix& src = arg->m;
+    const std::string fn = fnName;
+    const size_t nr = src.data.size(), nc = mxCols(src);
+    const auto names = [](const std::vector<std::string>& v, size_t n, char kind) {
+      std::vector<std::string> out = v;
+      if (out.size() != n) {
+        out.clear();
+        for (size_t k = 0; k < n; ++k) out.push_back(std::string(1, kind) + std::to_string(k + 1));
+      }
+      return out;
+    };
+    const std::vector<std::string> rn = names(src.rownames, nr, 'r');
+    const std::vector<std::string> cn = names(src.colnames, nc, 'c');
+    const auto sub = [](const std::string& n) {
+      const size_t colon = n.rfind(':');
+      return colon == std::string::npos ? n : n.substr(colon + 1);
+    };
+    eval::EvalMatrix m;
+    if (fn == "vec" || fn == "vech") {
+      if (fn == "vech" && nr != nc) {
+        err = "r(503): conformability error";
+        return std::nullopt;
+      }
+      for (size_t j = 0; j < nc; ++j)
+        for (size_t i = fn == "vech" ? j : 0; i < nr; ++i) {
+          m.data.push_back({src.data[i][j]});
+          m.rownames.push_back(sub(cn[j]) + ":" + sub(rn[i]));
+        }
+      m.colnames = {"c1"};
+      return mxMatrix(std::move(m));
+    }
+    if (fn == "diag") {
+      if (nr != 1 && nc != 1) {
+        err = "r(503): conformability error";
+        return std::nullopt;
+      }
+      const bool row = nr == 1;
+      const size_t n = row ? nc : nr;
+      m.data.assign(n, std::vector<double>(n, 0.0));
+      for (size_t k = 0; k < n; ++k) m.data[k][k] = row ? src.data[0][k] : src.data[k][0];
+      m.rownames = row ? cn : rn;
+      m.colnames = m.rownames;
+      return mxMatrix(std::move(m));
+    }
+    if (nr != nc || nr == 0) {
+      err = "r(503): conformability error";
+      return std::nullopt;
+    }
+    for (const auto& r : src.data)
+      for (double v : r)
+        if (mxMissing(v)) {
+          err = "r(504): matrix has missing values";
+          return std::nullopt;
+        }
+    m = src;
+    m.rownames = rn;
+    m.colnames = cn;
+    if (fn == "corr") {
+      for (size_t i = 0; i < nr; ++i)
+        for (size_t j = 0; j < nr; ++j)
+          m.data[i][j] = src.data[i][j] / std::sqrt(src.data[i][i] * src.data[j][j]);
+      return mxMatrix(std::move(m));
+    }
+    // cholesky
+    for (size_t i = 0; i < nr; ++i)
+      for (size_t j = 0; j < nr; ++j) m.data[i][j] = 0.0;
+    for (size_t i = 0; i < nr; ++i) {
+      for (size_t j = 0; j <= i; ++j) {
+        double s = src.data[i][j];
+        for (size_t k = 0; k < j; ++k) s -= m.data[i][k] * m.data[j][k];
+        if (i == j) {
+          if (!(s > 0.0)) {
+            err = "r(506): matrix not positive definite";
+            return std::nullopt;
+          }
+          m.data[i][i] = std::sqrt(s);
+        } else {
+          m.data[i][j] = s / m.data[j][j];
+        }
+      }
+    }
+    return mxMatrix(std::move(m));
+  }
+  // hadamard(A,B): the element-by-element product of two matrices of the same
+  // shape, A's names (vs-stata bank 034cb05c1722078a, d8b1d1b4af572bf5); other
+  // shapes r(503).
+  if (callArg("hadamard", inner)) {
+    std::vector<std::string> args;
+    std::vector<char> argOps;
+    if (!splitTopLevel(inner, args, argOps) || args.size() != 2) {
+      err = "r(198): invalid syntax";
+      return std::nullopt;
+    }
+    std::optional<MxValue> a = evalMx(trim(args[0]), session, err);
+    if (!a.has_value()) return std::nullopt;
+    std::optional<MxValue> b = evalMx(trim(args[1]), session, err);
+    if (!b.has_value()) return std::nullopt;
+    if (a->scalar || b->scalar) {
+      err = "r(109): type mismatch";
+      return std::nullopt;
+    }
+    const eval::EvalMatrix x = mxAsMatrix(*a);
+    const eval::EvalMatrix y = mxAsMatrix(*b);
+    if (x.data.size() != y.data.size() || mxCols(x) != mxCols(y)) {
+      err = "r(503): conformability error";
+      return std::nullopt;
+    }
+    eval::EvalMatrix m = x;
+    const double kNaN = std::numeric_limits<double>::quiet_NaN();
+    for (size_t i = 0; i < m.data.size(); ++i)
+      for (size_t j = 0; j < m.data[i].size(); ++j) {
+        const double l = x.data[i][j], r = y.data[i][j];
+        m.data[i][j] = mxMissing(l) || mxMissing(r) ? kNaN : l * r;
+      }
+    return mxMatrix(std::move(m));
+  }
   // A subscript of a stored matrix: `A[]` is A whole; two scalar subscripts
   // read one element, a scalar (mxElementAt; `matrix X = A[1,1]` is r1 x c1,
   // oracle w2q L02); a range or a row/column name in either is a submatrix
@@ -1961,13 +2098,15 @@ bool isSymmetricMatrix(const eval::EvalMatrix& m) {
 // - A factor level's `bn` marker is not printed (`2bn.g` lists as `2.` over
 //   `g`, width 3), matrixNameAsListed.
 std::string renderMatrixList(const std::string& name, const eval::EvalMatrix& m,
-                             const std::function<std::string(double)>& cellText) {
+                             const std::function<std::string(double)>& cellText,
+                             const MatrixListOptions& opts) {
   const size_t nrows = m.data.size();
   const size_t ncols = nrows > 0 ? m.data[0].size() : 0;
   // A 0x0 matrix (`matrix S = e(V)` after `ereturn post` of b alone) is
   // `symmetric S[0,0]` and nothing more.
   const bool empty = nrows == 0 && ncols == 0;
   const bool sym = empty || isSymmetricMatrix(m);
+  const bool half = sym && !opts.nohalf;  // only the lower triangle is shown
   const auto abbrev = [](const std::string& s, size_t n) {
     return s.size() <= n ? s : s.substr(0, n - 2) + "~" + s.back();
   };
@@ -1985,6 +2124,7 @@ std::string renderMatrixList(const std::string& name, const eval::EvalMatrix& m,
                 : label.substr(0, colon + 1) + abbrev(label.substr(colon + 1), 12);
     rowLabelWidth = std::max(rowLabelWidth, label.size());
   }
+  if (opts.nonames) rowLabelWidth = 0;
   // Each column's equation, operator and name parts (the first two without
   // their delimiter), cut to their widths.
   std::vector<std::string> ceq(ncols), cop(ncols), cname(ncols);
@@ -2012,12 +2152,17 @@ std::string renderMatrixList(const std::string& name, const eval::EvalMatrix& m,
     cname[j] = abbrev(full, 12);
     w = std::max(w, cname[j].size());
   }
+  // nonames: the cells alone set the column width (StataBE 19.5 `matrix list
+  // A, nonames` of (1,2,3\4,5,6\7,8,10) is `   1   2   3`, vs-stata bank
+  // fdf7ce84f7c57b75).
+  if (opts.nonames) w = 0;
 
   std::vector<std::vector<std::string>> cells(nrows, std::vector<std::string>(ncols));
   for (size_t i = 0; i < nrows; ++i) {
-    const size_t limit = sym ? std::min(i + 1, ncols) : ncols;  // lower triangle incl. diagonal
+    const size_t limit = half ? std::min(i + 1, ncols) : ncols;  // lower triangle incl. diagonal
     for (size_t j = 0; j < limit; ++j) {
       cells[i][j] = cellText ? cellText(m.data[i][j]) : formatMatrixCell(m.data[i][j]);
+      if (opts.nodotz && cells[i][j] == ".z") cells[i][j].clear();
       w = std::max(w, cells[i][j].size());
     }
   }
@@ -2026,10 +2171,20 @@ std::string renderMatrixList(const std::string& name, const eval::EvalMatrix& m,
     return s.size() >= width ? s : std::string(width - s.size(), ' ') + s;
   };
 
+  // StataBE 19.5 `matrix list` options (vs-stata bank matrix cells):
+  // noblank drops the blank line (b82b016604a43c97), noheader the A[r,c] line
+  // (9b8a6a517ec11fe8), title() follows it as `A[2,3]:  Hello`
+  // (af4d6133dd000c1a), nohalf shows a symmetric matrix whole under its
+  // `symmetric` header (278fb745c5a05e15), nodotz shows .z as a blank
+  // (1d07e85b37988461).
   std::ostringstream out;
-  out << "\n";
-  if (sym) out << "symmetric ";
-  out << name << "[" << nrows << "," << ncols << "]\n";
+  if (!opts.noblank) out << "\n";
+  if (!opts.noheader) {
+    if (sym) out << "symmetric ";
+    out << name << "[" << nrows << "," << ncols << "]";
+    if (!opts.title.empty()) out << ":  " << opts.title;
+    out << "\n";
+  }
   if (empty) return out.str();
 
   // An equation or operator line: each part right-aligned in its column, its
@@ -2040,15 +2195,17 @@ std::string renderMatrixList(const std::string& name, const eval::EvalMatrix& m,
       out << ' ' << rjust(part[j], w) << (part[j].empty() ? ' ' : delim(j));
     out << "\n";
   };
-  if (anyEq) partLine(ceq, [](size_t) { return ':'; });
-  if (anyOp) partLine(cop, [&opDelim](size_t j) { return opDelim[j]; });
-  out << std::string(rowLabelWidth, ' ');
-  for (size_t j = 0; j < ncols; ++j) out << "  " << rjust(cname[j], w);
-  out << "\n";
+  if (!opts.nonames) {
+    if (anyEq) partLine(ceq, [](size_t) { return ':'; });
+    if (anyOp) partLine(cop, [&opDelim](size_t j) { return opDelim[j]; });
+    out << std::string(rowLabelWidth, ' ');
+    for (size_t j = 0; j < ncols; ++j) out << "  " << rjust(cname[j], w);
+    out << "\n";
+  }
 
   for (size_t i = 0; i < nrows; ++i) {
-    const size_t limit = sym ? std::min(i + 1, ncols) : ncols;
-    out << rjust(rlabels[i], rowLabelWidth);
+    const size_t limit = half ? std::min(i + 1, ncols) : ncols;
+    if (!opts.nonames) out << rjust(rlabels[i], rowLabelWidth);
     for (size_t j = 0; j < limit; ++j) out << "  " << rjust(cells[i][j], w);
     out << "\n";
   }

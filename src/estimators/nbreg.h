@@ -35,6 +35,16 @@ struct NbregResult {
     double loglik = 0;
     int iters = 0;
     bool converged = false;
+    // The ml path's record (empty / false at the α→0 boundary): the full fit's log
+    // likelihood at iteration 0..iters (e(ilog)) and gradient over (β, lnα) at the
+    // posted iterate (e(gradient)); the constant-only fit's maximum (e(ll_0)), when
+    // there is a constant; the Poisson comparison fit's log likelihood (e(ll_c)).
+    bool boundary = false;
+    std::vector<double> ilog;
+    std::vector<double> gradient;
+    bool has_ll_0 = false;
+    double ll_0 = 0;
+    double ll_c = 0;
 };
 
 // Inputs (column-major X = n_obs * k, no internal intercept — caller passes a
@@ -47,6 +57,10 @@ NbregResult nbreg(const double* X, int64_t n_obs, int k,
                   const double* y, const double* offset = nullptr,
                   const double* cluster_var = nullptr,
                   int maxit = 100, double tol = 1e-10,
-                  const double* weights = nullptr, bool freq = false);
+                  const double* weights = nullptr, bool freq = false,
+                  int cons_col = -2);
+// cons_col: the constant's column of X, or -1 when the model has none (noconstant:
+// no constant-only fit, no e(ll_0), even when a regressor is identically 1); -2
+// (the default) takes the first all-ones column as the constant.
 
 }  // namespace cecon

@@ -35,6 +35,7 @@
 #include "piet/inrange_filter.h"
 #include "piet/mutation_result.h"
 #include "piet/session_state.h"
+#include "piet/handlers/observations.h"  // runDrop: unique.ado's `cap drop _Unique`
 
 #include "utility_support.h"
 #include "utility_options.h"
@@ -81,28 +82,44 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
             ", detail` prints a per-variable breakdown this build does not produce. Run `distinct "
             "varlist` for the per-variable table."));
   }
+  // `missing` is gunique's alone; unique.ado's syntax line has no such option.
+  if (!gtools && hasFlag(parsed.opts, "missing"))
+    return ojson(eval::errorBlock("syntax_error", "option missing not allowed", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(198)"));
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabUnique.known,
                                             kVocabUnique.unimplemented))
     return ojson(*err);
   if (!session.hasData()) return ojson(eval::noDataLoaded());
   if (parsed.varlist.empty())
     return utilSyntax(verb + ": syntax is `" + verb + " varlist [if] [in] [, by(varlist) gen(newvar)]`");
+  const bool withMissing = gtools && hasFlag(parsed.opts, "missing");
 
   std::vector<std::string> byVars;
   if (auto b = optStr(parsed.opts, "by")) byVars = splitWs(*b);
-  const std::optional<std::string> gen = optStrAny(parsed.opts, {"gen", "generate"});
-
+  // gen() is read only with by(): both ados ignore it otherwise. by() without
+  // gen() writes _Unique (unique.ado drops an existing one first; gunique.ado
+  // refuses an existing one, r(110)).
+  std::optional<std::string> gen = optStrAny(parsed.opts, {"gen", "generate"});
+  if (byVars.empty()) gen.reset();
+  bool dropOldUnique = false;
   if (!byVars.empty() && !gen.has_value()) {
-    // unique.ado's by() form exists ONLY to fill a variable; without gen()
-    // there is nothing to print that the no-by form does not already print.
-    // Refusing by NAME (rather than inventing a per-group display table) keeps
-    // the answer honest about what this build does.
-    return ojson(eval::refusedCommand(verb, "unique_by_without_gen"));
+    gen = std::string("_Unique");
+    Datastore* hd = session.datastore();
+    if (hd != nullptr && hd->has("_Unique")) {
+      if (gtools)
+        return ojson(eval::errorBlock("syntax_error",
+                                      "Variable _Unique already exists.\nUse the gen() option to "
+                                      "specify a new variable.",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(110)"));
+      dropOldUnique = true;
+    }
   }
-  if (gen.has_value() && byVars.empty())
-    return utilSyntax(verb + ": gen() requires by() -- `" + verb +
-                      " varlist, by(groupvars) gen(newvar)` writes the per-group count of "
-                      "distinct " + joinWith(parsed.varlist, " ") + " combinations.");
+  if (gtools) {
+    Datastore* hd = session.datastore();
+    if (hd != nullptr && hd->nRows() < 1)
+      return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
+                                    std::nullopt, "r(2000)"));
+  }
 
   // The gen() form WRITES a column, so it must be as long as the frame and
   // aligned to it. `applyIfAndInFilter` returns a filtered FRAME, not a mask,
@@ -141,55 +158,82 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
     for (const auto& v : views) key.push_back(cellKey(v, i));
     return key;
   };
+  // unique.ado counts a missing value as a value (marksample ..., novarlist);
+  // gunique drops a row with any missing value unless `missing`.
+  auto rowIn = [&](int64_t i) {
+    if (!gtools || withMissing) return true;
+    for (const auto& v : views)
+      if (cellMissing(v, i)) return false;
+    return true;
+  };
 
-  if (byVars.empty()) {
-    std::set<std::vector<uint64_t>> distinctKeys;
-    for (int64_t i = 0; i < n; ++i) distinctKeys.insert(rowKey(i));
-    const int64_t nUnique = static_cast<int64_t>(distinctKeys.size());
+  // The whole-sample counts both ados publish before any by() work.
+  std::map<std::vector<uint64_t>, int64_t> sizes;
+  int64_t nIn = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    if (!rowIn(i)) continue;
+    ++nIn;
+    ++sizes[rowKey(i)];
+  }
+  const int64_t nUnique = static_cast<int64_t>(sizes.size());
+  eval::replaceRClass(session.eval);
+  std::ostringstream oss;
+  if (gtools) {
+    int64_t minJ = 0, maxJ = 0;
+    if (!sizes.empty()) {
+      minJ = std::numeric_limits<int64_t>::max();
+      for (const auto& kv : sizes) {
+        minJ = std::min(minJ, kv.second);
+        maxJ = std::max(maxJ, kv.second);
+      }
+    }
+    session.eval.rValues.set("N", static_cast<double>(nIn));
+    session.eval.rValues.set("J", static_cast<double>(nUnique));
     session.eval.rValues.set("unique", static_cast<double>(nUnique));
-    session.eval.rValues.set("N", static_cast<double>(n));
-    // r(sum) is unique.ado's own third return: the total of the per-group
-    // counts, which without by() is just the one count.
+    session.eval.rValues.set("minJ", static_cast<double>(minJ));
+    session.eval.rValues.set("maxJ", static_cast<double>(maxJ));
+    eval::declareRPosted(session.eval, "gunique", {"N", "J", "unique", "minJ", "maxJ"});
+    if (nIn == 0) {
+      oss << "(no observations)\n";
+    } else {
+      oss << "N = " << nIn << "; " << nUnique << (minJ == maxJ ? " balanced" : " unbalanced")
+          << " groups of sizes " << minJ << " to " << maxJ << "\n";
+    }
+  } else {
+    // unique.ado: r(unique) and r(sum) are both the count of distinct values in
+    // the sample, r(N) the sample size; the by() form adds nothing to r().
+    session.eval.rValues.set("unique", static_cast<double>(nUnique));
     session.eval.rValues.set("sum", static_cast<double>(nUnique));
-    std::ostringstream oss;
+    session.eval.rValues.set("N", static_cast<double>(nIn));
+    eval::declareRPosted(session.eval, "unique", {"unique", "sum", "N"});
     oss << "Number of unique values of " << joinWith(parsed.varlist, " ") << " is  " << nUnique
         << "\n";
-    oss << "Number of records is  " << n << "\n";
-    return displayBlock(oss.str());
+    oss << "Number of records is  " << nIn << "\n";
   }
+  if (byVars.empty() || (gtools && nIn == 0)) return displayBlock(oss.str());
 
-  // by() + gen(): the per-group count, written on the group's FIRST observation
-  // and MISSING everywhere else.
-  //
-  // BUG-422: this used to fill every observation of the group, and the comment
-  // here said unique.ado does the same. The P5 wave pin — which this comment
-  // named as the thing that would settle it — was captured on StataBE 19.5 with
-  // unique 1.2.4 on 2026-09-06 and settled it the other way: `summarize` over
-  // the generated column reads N=5, sum=200 (five groups, one row each), not
-  // N=4800, sum=192000. unique.ado does `by `by': gen `gen' = `count' if _n==1`.
-  // Filling the whole group is the more USEFUL answer and it is not Stata's; a
-  // do-file that then does `collapse (mean) u, by(region)` gets the same number
-  // either way, and one that does `summarize u` does not.
+  // by(): the per-group count of distinct varlist values.
+  //  unique.ado: on the by-group's FIRST observation, missing elsewhere
+  //    (`by by: gen g = uniq[_N] if _n==1`; BUG-422, StataBE 19.5 pin).
+  //  gunique.ado: on EVERY observation of the group whose varlist is not
+  //    missing (`gegen g = tag(by id) ...` then `gegen g = sum(g) if !mi(id),
+  //    by(by) replace`).
   int64_t nGroups = 0;
   std::vector<int64_t> gid = groupIds(ds, byVars, &nGroups);
   std::vector<std::set<std::vector<uint64_t>>> perGroup(static_cast<size_t>(nGroups));
-  std::set<std::vector<uint64_t>> overall;
   for (int64_t i = 0; i < n; ++i) {
-    std::vector<uint64_t> k = rowKey(i);
-    overall.insert(k);
-    perGroup[static_cast<size_t>(gid[static_cast<size_t>(i)])].insert(std::move(k));
+    if (!rowIn(i)) continue;
+    perGroup[static_cast<size_t>(gid[static_cast<size_t>(i)])].insert(rowKey(i));
   }
-  const std::string newvar = *gen;
-  ojson guard = newVarGuard(session, verb, newvar);
-  if (!guard.is_null()) return guard;
-
   std::vector<std::string> cells;
   cells.reserve(static_cast<size_t>(n));
-  int64_t total = 0;
-  for (const auto& g : perGroup) total += static_cast<int64_t>(g.size());
   std::vector<bool> groupSeen(static_cast<size_t>(nGroups), false);
   for (int64_t i = 0; i < n; ++i) {
     const size_t g = static_cast<size_t>(gid[static_cast<size_t>(i)]);
+    if (gtools) {
+      cells.push_back(rowIn(i) ? numCell(static_cast<double>(perGroup[g].size())) : std::string());
+      continue;
+    }
     if (groupSeen[g]) {
       cells.emplace_back();  // Stata missing on every row but the group's first
       continue;
@@ -197,18 +241,23 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
     groupSeen[g] = true;
     cells.push_back(numCell(static_cast<double>(perGroup[g].size())));
   }
+  const std::string newvar = *gen;
+  if (dropOldUnique) {
+    ojson dropped = runDrop({newvar}, session);
+    if (dropped.is_object() && dropped.value("type", std::string()) == "error") return dropped;
+  } else {
+    ojson guard = newVarGuard(session, verb, newvar);
+    if (!guard.is_null()) return guard;
+  }
+
   std::string out;
   if (auto err = writeColumn(session, *session.currentHbin(), newvar, cells, "f64", true, &out))
     return *err;
   session.load(out);
-  // r(unique) stays the DATASET's distinct count in both forms -- it answers
-  // the same question the no-by form's line prints. r(sum) is what the by()
-  // form adds: the total of the per-group counts, which equals r(unique) only
-  // when no value is shared across groups.
-  session.eval.rValues.set("unique", static_cast<double>(overall.size()));
-  session.eval.rValues.set("N", static_cast<double>(n));
-  session.eval.rValues.set("sum", static_cast<double>(total));
-  return mutationResult(session, "gen", {newvar});
+  ojson blocks = ojson::array();
+  blocks.push_back(displayBlock(oss.str()));
+  blocks.push_back(mutationResult(session, "gen", {newvar}));
+  return blocks;
 }
 
 // ===========================================================================

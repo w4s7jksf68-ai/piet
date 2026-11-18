@@ -261,6 +261,7 @@ ojson runGraphDisplay(SessionState& session, const std::string& nameArg,
     if (k == "xsize" || k == "xsiz") meta["xsize"] = val;
     if (k == "ysize" || k == "ysiz") meta["ysize"] = val;
   }
+  meta["displayed"] = true;  // `graph display` opens the Graph window (graph export, name() needs one)
   session.currentGraph = name;
   session.lastGraph = session.namedGraphs[name];
   ojson block = session.namedGraphs[name];

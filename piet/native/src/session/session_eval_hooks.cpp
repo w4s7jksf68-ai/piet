@@ -47,8 +47,19 @@ std::optional<std::string> SessionState::macroCValue(const std::string& name) {
   return v->text;
 }
 
-// SessionState::eNameOrderFor (declared with ENameContract in session_state.h).
+// SessionState::eNameOrderFor (declared with ENameContract in session_state.h):
+// the members, and only while no later command has rewritten that kind's order.
 std::optional<std::vector<std::string>> SessionState::eNameOrderFor(const std::string& kind) const {
+  if (eNameContract.has_value()) {
+    const ENameContract& c = *eNameContract;
+    if ((kind == "scalars" && c.scalarsReordered) || (kind == "macros" && c.macrosReordered) ||
+        (kind == "matrices" && c.matricesReordered))
+      return std::nullopt;
+  }
+  return eNameMembersFor(kind);
+}
+
+std::optional<std::vector<std::string>> SessionState::eNameMembersFor(const std::string& kind) const {
   if (!eNameContract.has_value() || ePostedLive || !lastModel_.has_value() ||
       lastModel_->fitSerial != eNameContract->fitSerial ||
       eval.eStrings.get("cmd") != eNameContract->cmd)

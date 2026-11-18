@@ -155,6 +155,12 @@ nlohmann::ordered_json runDuplicates(const std::string& sub,
 // columns' mmap'd payloads, no scratch file written.
 nlohmann::ordered_json runIsid(const std::vector<std::string>& varlist, SessionState& session,
                                 bool missok = false, bool sort = false);
+// `contract varlist [fw] [if] [in] [, freq() cfreq() percent() cpercent() format() float zero nomiss]`
+// in its general form (the plain `contract varlist` is runContract).
+nlohmann::ordered_json runContractFull(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runIsidUsing(const std::vector<std::string>& varlist,
+                                    const std::string& usingFile, SessionState& session,
+                                    bool missok = false, bool sort = false);
 
 // P1 wave data verbs — thin forwarders onto the engine subcommands of the same
 // name (the joinby/tsfill shape: PIET validates and resolves the `using` file,

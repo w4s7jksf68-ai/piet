@@ -410,7 +410,9 @@ nlohmann::ordered_json runRitestLine(const std::string& restIn, SessionState& se
   std::string resampTyped = rest.substr(0, cut);
   rest = rest.substr(cut);
   if (!expandText(resampTyped, session, &resampTyped, &err)) return fail(err);
-  if (resampTyped.empty()) return fail(rcError("varlist required", 100));
+  // no variable before the options or the colon: ritest's `confirm variable` on the
+  // empty first token, r(102) (bank 2ee6a3c2 `ritest , zzabbrprobe`)
+  if (resampTyped.empty()) return fail(rcError("too few variables specified", 102));
   std::string resampvar;
   {
     std::vector<std::string> v;
@@ -998,6 +1000,15 @@ nlohmann::ordered_json runRitestLine(const std::string& restIn, SessionState& se
   // ---- ado the original estimation back, r() ------------------------------------
   session.load(origHbin);
   restoreE(session, original);
+  // The ado stores the original estimates while its `preserve` is in force, so their
+  // e(sample) marker lives on the preserved working copy; once the data come back the
+  // restored e() has no marker on them and e(sample) reads 0 (bank eec0b8a7: rc 0,
+  // e(cmd) regress, `count if e(sample)` 0; 52a60e4e after areg the same).
+  if (session.lastModel().has_value())
+    session.setLastModelEsample(LastModel::EsampleState::kNone, 0, std::string(),
+                                session.lastModel()->dataPath);
+  else if (session.ePostedLive)
+    session.ePostedEsampleSerial = 0;  // a posted e() (an eclass program's): the same
 
   {
     char buf[256];

@@ -29,7 +29,9 @@
 #include <utility>
 #include <vector>
 
+#include "datamgmt/dataset_shape_support.h"
 #include "piet/datastore.h"
+#include "piet/eval/session.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/mutation_result.h"
@@ -149,17 +151,22 @@ ojson runCarryforward(const eval::ParsedCommand& parsed, SessionState& session) 
 // tsspell
 // ===========================================================================
 //
-// Spells over a tsset series: `_spell` numbers them within panel, `_seq`
-// numbers the observations within a spell, `_end` flags each spell's last
-// observation. Two forms:
+// Spells over a tsset series, the way tsspell.ado builds them, walking each panel in
+// time order:
 //
-//   tsspell varname       a spell is a run of EQUAL values of varname
-//   tsspell, cond(expr)   a spell is a run of observations where expr is true
+//   cond-form (cond(), or pcond() as `(x) > 0 & (x) < .`):
+//     _seq   = running count of consecutive observations where cond (and the if/in
+//              sample) is true, restarting from 0 on a false one
+//     _spell = a counter that advances at each _seq == 1, and is 0 where _seq is 0
+//   fcond-form (fcond(), or `tsspell varname`, whose fcond is `v != L.v | _n == 1`):
+//     _spell = running count of the observations where fcond (and the sample) holds,
+//              0 outside the sample
+//     _seq   = the position inside its _spell, 0 where _spell is 0
+//   _end   = 1 on the last observation of a spell: _seq >= the next row's _seq, with
+//            _seq non-zero (the panel's last row: _seq > 0)
 //
-// In either form a TIME GAP ends the spell: the previous observation must be
-// exactly one `delta` earlier (tsset's own step, defaulting to 1), or the run
-// restarts. The cond() form leaves non-spell observations at 0/0/0, which is
-// tsspell.ado's own convention and is why `_spell` is 1-based.
+// A gap in TIME does NOT break a cond() spell: the ado only warns, and leaves the count of
+// the gaps in r(N). It does break a `tsspell varname` run, because L.v is missing across a gap.
 //
 // LIKE rangestat, THE ANSWERS GO BACK IN ORIGINAL ROW ORDER: the panel/time
 // ordering below is an index permutation and never a rewrite of the frame.
@@ -169,32 +176,45 @@ ojson runTsspell(const eval::ParsedCommand& parsed, SessionState& session) {
     return ojson(*err);
   if (!session.hasData()) return ojson(eval::noDataLoaded());
   if (!session.timevar.has_value() || session.timevar->empty())
-    return utilError(
-        "tsspell: run `tsset timevar` (or `xtset panelvar timevar`) first so PIET knows which "
-        "variable orders the spells.",
-        "unsupported_option");
+    // StataBE 19.5: r(111) "time variable not set, use tsset varname ..."
+    // (vs-stata bank, `tsspell, cond(change>0)` without tsset).
+    return utilErrorRc("time variable not set, use tsset varname ...", 111);
 
-  const std::optional<std::string> cond = optStr(parsed.opts, "cond");
+  std::optional<std::string> cond = optStr(parsed.opts, "cond");
+  const std::optional<std::string> fcond = optStr(parsed.opts, "fcond");
+  const std::optional<std::string> pcond = optStr(parsed.opts, "pcond");
   if (parsed.varlist.size() > 1)
-    return utilSyntax("tsspell: syntax is `tsspell [varname] [, cond(expression) spell(name) "
-                      "seq(name) end(name)]`");
-  if (parsed.varlist.empty() && !cond.has_value())
-    return utilSyntax("tsspell: give either a varname or cond(expression) -- without one there is "
-                      "nothing to define a spell.");
-  if (!parsed.varlist.empty() && cond.has_value())
-    return utilSyntax("tsspell: give either a varname or cond(expression), not both.");
+    return utilSyntax("tsspell: syntax is `tsspell [varname] [if] [in] [, cond(expression) "
+                      "fcond(expression) pcond(expression) spell(name) seq(name) end(name) "
+                      "replace]`");
+  const int nopts = (cond.has_value() ? 1 : 0) + (fcond.has_value() ? 1 : 0) +
+                    (pcond.has_value() ? 1 : 0);
+  if (nopts > 1) return utilErrorRc("must specify at most one of cond(), fcond(), pcond()", 198);
+  if (pcond.has_value()) cond = "((" + *pcond + ") > 0 & (" + *pcond + ") < .)";
+  if (!cond.has_value() && !fcond.has_value() && parsed.varlist.empty())
+    return utilErrorRc("insufficient information", 198);
 
-  {
-    ojson q = refuseQualifiers(
-        parsed, "`tsspell` writes columns as long as the dataset and walks the series in time order; a "
-        "restricted sample would silently redefine where a spell breaks. Restrict first "
-        "(`preserve` + `keep if ...`), then run tsspell.");
-    if (!q.is_null()) return q;
-  }
+  std::vector<char> inSample;
+  if (auto err = dataset_shape_detail::ifInMask(session, parsed, &inSample)) return *err;
 
   const std::string spellVar = optStr(parsed.opts, "spell").value_or(std::string("_spell"));
   const std::string seqVar = optStr(parsed.opts, "seq").value_or(std::string("_seq"));
   const std::string endVar = optStr(parsed.opts, "end").value_or(std::string("_end"));
+  const bool replaceVars = hasFlag(parsed.opts, "replace");
+  // `replace` drops a variable of that name that already exists (the ado's `capture
+  // confirm new variable` / `drop`), so the three are made anew at the end of the data.
+  if (replaceVars) {
+    std::vector<std::string> doomed;
+    Datastore* d0 = session.datastore();
+    for (const auto& nm : {spellVar, seqVar, endVar})
+      if (d0 != nullptr && d0->has(nm) && nm != *session.timevar &&
+          std::find(doomed.begin(), doomed.end(), nm) == doomed.end())
+        doomed.push_back(nm);
+    if (!doomed.empty()) {
+      ojson dropped = runDrop(doomed, session);
+      if (const ojson* e = firstError(dropped)) return *e;
+    }
+  }
   for (const auto& nm : {spellVar, seqVar, endVar}) {
     ojson guard = newVarGuard(session, "tsspell", nm);
     if (!guard.is_null()) return guard;
@@ -207,13 +227,16 @@ ojson runTsspell(const eval::ParsedCommand& parsed, SessionState& session) {
   if (byVars.empty() && session.panelvar.has_value() && !session.panelvar->empty())
     byVars.push_back(*session.panelvar);
 
-  // The cond() form needs a row-wise truth value of an arbitrary expression.
+  // The cond()/fcond() forms need a row-wise truth value of an arbitrary expression.
   // PIET has exactly one expression evaluator and it lives behind `generate`;
   // this materializes the indicator through it and drops it afterwards, so
   // there is no second evaluator to drift.
+  const bool condForm = cond.has_value();
+  const bool fcondExpr = !condForm && fcond.has_value();
   std::string indicator;
-  if (cond.has_value()) {
-    if (auto err = materializeIndicator(session, "tsspell", *cond, &indicator)) return *err;
+  if (condForm || fcondExpr) {
+    if (auto err = materializeIndicator(session, "tsspell", condForm ? *cond : *fcond, &indicator))
+      return *err;
   }
   // The indicator column is scaffolding, never data. It has to be gone BEFORE
   // `mutationResult` reads the frame, or the varlist this command reports would
@@ -232,7 +255,8 @@ ojson runTsspell(const eval::ParsedCommand& parsed, SessionState& session) {
   ojson result;
   {
     std::vector<std::string> readCols = {*session.timevar};
-    if (!parsed.varlist.empty()) readCols.push_back(parsed.varlist[0]);
+    const bool byValue = !condForm && !fcondExpr;
+    if (byValue) readCols.push_back(parsed.varlist[0]);
     if (!indicator.empty()) readCols.push_back(indicator);
     for (const auto& b : byVars) readCols.push_back(b);
 
@@ -258,13 +282,14 @@ ojson runTsspell(const eval::ParsedCommand& parsed, SessionState& session) {
         int64_t nGroups = 0;
         const std::vector<int64_t> gid = groupIds(ds, byVars, &nGroups);
 
-        const bool byValue = !parsed.varlist.empty();
         ColView valueView;
         const double* ind = nullptr;
         if (byValue)
           valueView = viewOf(ds, parsed.varlist[0]);
         else
           ind = ds.col(indicator).f64();
+        // A missing indicator is non-zero, hence true, in the ado's `cond & touse`.
+        auto indTrue = [&](int64_t r) { return std::isnan(ind[r]) || ind[r] != 0.0; };
 
         std::vector<std::vector<int64_t>> order(
             static_cast<size_t>(std::max<int64_t>(nGroups, 1)));
@@ -278,51 +303,69 @@ ojson runTsspell(const eval::ParsedCommand& parsed, SessionState& session) {
         std::vector<double> spell(static_cast<size_t>(n), 0.0);
         std::vector<double> seq(static_cast<size_t>(n), 0.0);
         std::vector<double> endf(static_cast<size_t>(n), 0.0);
+        int64_t gaps = 0;  // the ado's r(N): adjacent rows whose time step is not delta
 
         for (const auto& g : order) {
-          int64_t spellNo = 0;
-          int64_t seqNo = 0;
-          int64_t prevRow = -1;
-          bool inSpell = false;
-          for (size_t j = 0; j < g.size(); ++j) {
-            const int64_t r = g[j];
-            const bool active = byValue ? true : (!std::isnan(ind[r]) && ind[r] != 0.0);
-            if (!active) {
-              inSpell = false;
-              prevRow = r;
-              continue;
-            }
-            bool newSpell = !inSpell;
-            if (!newSpell && prevRow >= 0) {
-              // A gap in TIME breaks the run whatever the values do.
-              const double dt = tv[r] - tv[prevRow];
-              if (std::isnan(dt) || dt != delta) newSpell = true;
-            }
-            if (!newSpell && byValue && prevRow >= 0) {
-              if (cellKey(valueView, r) != cellKey(valueView, prevRow)) newSpell = true;
-            }
-            if (newSpell) {
-              ++spellNo;
-              seqNo = 1;
-            } else {
-              ++seqNo;
-            }
-            spell[static_cast<size_t>(r)] = static_cast<double>(spellNo);
-            seq[static_cast<size_t>(r)] = static_cast<double>(seqNo);
-            inSpell = true;
-            prevRow = r;
+          const size_t m = g.size();
+          for (size_t j = 1; j < m; ++j) {
+            const int64_t r = g[j], pr = g[j - 1];
+            const double dt = tv[r] - tv[pr];
+            if (!std::isnan(tv[r]) && dt != delta && (!byVars.empty() || inSample[static_cast<size_t>(r)]))
+              ++gaps;
           }
-          // `_end` marks the LAST observation of each spell, which is known
-          // only once the following observation (or the group's end) is seen.
-          for (size_t j = 0; j < g.size(); ++j) {
-            const int64_t r = g[j];
-            if (spell[static_cast<size_t>(r)] == 0.0) continue;
-            bool last = true;
-            if (j + 1 < g.size()) {
-              const int64_t nx = g[j + 1];
-              last = spell[static_cast<size_t>(nx)] != spell[static_cast<size_t>(r)];
+          if (condForm) {
+            double counter = 0.0;
+            for (size_t j = 0; j < m; ++j) {
+              const int64_t r = g[j];
+              const bool c = indTrue(r) && inSample[static_cast<size_t>(r)];
+              double sq = c ? 1.0 : 0.0;
+              if (c && j > 0) sq = seq[static_cast<size_t>(g[j - 1])] + 1.0;
+              seq[static_cast<size_t>(r)] = sq;
+              if (sq != 0.0) {
+                if (inSample[static_cast<size_t>(r)] && sq == 1.0) counter += 1.0;
+                spell[static_cast<size_t>(r)] = counter;
+              }
             }
-            endf[static_cast<size_t>(r)] = last ? 1.0 : 0.0;
+          } else {
+            double counter = 0.0;
+            for (size_t j = 0; j < m; ++j) {
+              const int64_t r = g[j];
+              bool begins;
+              if (fcondExpr) {
+                begins = indTrue(r);  // an explicit fcond() is used as given
+              } else {
+                begins = j == 0;
+                if (!begins) {
+                  const int64_t pr = g[j - 1];
+                  const double dt = tv[r] - tv[pr];
+                  // L.v is the value one step back in time: missing across a gap.
+                  if (std::isnan(dt) || dt != delta)
+                    begins = !cellMissing(valueView, r);
+                  else
+                    begins = cellKey(valueView, r) != cellKey(valueView, pr);
+                }
+              }
+              if (inSample[static_cast<size_t>(r)]) {
+                if (begins) counter += 1.0;
+                spell[static_cast<size_t>(r)] = counter;
+              }
+            }
+            std::map<double, double> within;
+            for (size_t j = 0; j < m; ++j) {
+              const int64_t r = g[j];
+              const double sp = spell[static_cast<size_t>(r)];
+              double& pos = within[sp];
+              pos += 1.0;
+              seq[static_cast<size_t>(r)] = sp > 0.0 ? pos : 0.0;
+            }
+          }
+          for (size_t j = 0; j < m; ++j) {
+            const int64_t r = g[j];
+            const double sq = seq[static_cast<size_t>(r)];
+            endf[static_cast<size_t>(r)] =
+                (j + 1 < m ? (sq >= seq[static_cast<size_t>(g[j + 1])] && sq != 0.0) : sq > 0.0)
+                    ? 1.0
+                    : 0.0;
           }
         }
 
@@ -350,6 +393,15 @@ ojson runTsspell(const eval::ParsedCommand& parsed, SessionState& session) {
           session.load(cur);
           dropIndicator();
           result = mutationResult(session, "gen", {spellVar, seqVar, endVar});
+          eval::replaceRClass(session.eval);
+          session.eval.rValues.set("N", static_cast<double>(gaps));
+          eval::declareRPosted(session.eval, "tsspell", {"N"});
+          if (gaps > 0) {
+            ojson warn;
+            warn["type"] = "display";
+            warn["text"] = "warning: data contain gaps; see help on tsspell\n";
+            result = ojson::array({warn, result});
+          }
         }
       }
     }

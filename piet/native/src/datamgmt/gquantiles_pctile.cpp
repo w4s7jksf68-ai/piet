@@ -24,6 +24,8 @@
 #include "piet/cobra_runner.h"
 #include "piet/column_fetch.h"
 #include "piet/datastore.h"
+#include "piet/inrange_filter.h"
+#include "piet/dispatcher.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/mutation_result.h"
@@ -173,6 +175,73 @@ constexpr size_t kMaxPercentileCount = 10000;
 // (3) gquantiles _pctile / pctile.
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// gtools picks between sorting and selecting from a cost estimate and returns the ratio of the
+// two as r(method_ratio): with n the rows read and `out` the quantiles asked for, sorting costs
+// log(n) + 1 operations plus a pass for each extra output (xtile: 2 log(n) + 3 against out + 2;
+// percentiles only: log(n) + 1 against out).
+double gtoolsMethodRatio(double rows, double out, bool forXtile) {
+  const double sortCost = forXtile ? 2.0 * std::log(rows) + 3.0 : std::log(rows) + 1.0;
+  const double selectCost = forXtile ? out + 2.0 : out;
+  return sortCost / selectCost;
+}
+
+void putRMatrixColumn(SessionState& session, const std::string& name,
+                      const std::vector<double>& values) {
+  eval::EvalMatrix m;
+  for (size_t i = 0; i < values.size(); ++i) {
+    m.data.push_back({values[i]});
+    m.rownames.push_back("r" + std::to_string(i + 1));
+  }
+  m.colnames.push_back("c1");
+  m.gen = eval::nextStoreGeneration();
+  for (auto it = session.eval.rMatrices.begin(); it != session.eval.rMatrices.end(); ++it) {
+    if (it->first == name) {
+      session.eval.rMatrices.erase(it);
+      break;
+    }
+  }
+  session.eval.rMatrices.emplace_back(name, std::move(m));
+}
+
+}  // namespace
+
+// gquantiles ..., xtile leaves r(N) (non-missing observations), r(nquantiles) and r(nqused).
+void gquantilesPublishXtile(const eval::ParsedCommand& parsed, SessionState& session,
+                            const std::string& expText) {
+  if (!session.hasData()) return;
+  long long nq = 0;
+  for (const auto& kv : parsed.opts) {
+    if (kv.first == "cutpoints" || kv.first == "altdef") {
+      if (kv.first == "cutpoints") return;
+    }
+    if (kv.first == "nquantiles" && !kv.second.isBool) parseIntStrict(strutil::trim(kv.second.strValue), &nq);
+  }
+  if (nq < 2) return;
+  const std::string savedLeaf = session.leafCmdExpanded;
+  std::string line = "quietly count if !missing(" + expText + ")";
+  if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) line += " & (" + *parsed.ifExpr + ")";
+  if (parsed.inRange.has_value() && !parsed.inRange->empty()) line += " in " + *parsed.inRange;
+  (void)piet::dispatch(line, session);
+  session.leafCmdExpanded = savedLeaf;
+  const double* nv = session.eval.rValues.find("N");
+  if (nv == nullptr) return;
+  const double n = *nv;
+  session.eval.rValues.clear();
+  double rows = static_cast<double>(session.datastore()->nRows());
+  if (parsed.inRange.has_value() && !parsed.inRange->empty()) {
+    const InRangeBounds bounds = parseInRangeBounds(*parsed.inRange, session.datastore()->nRows());
+    if (bounds.ok) rows = static_cast<double>(bounds.b - bounds.a + 1);
+  }
+  session.eval.rValues.set("N", n);
+  session.eval.rValues.set("nquantiles", static_cast<double>(nq));
+  session.eval.rValues.set("nqused", static_cast<double>(nq - 1));
+  session.eval.rValues.set("method_ratio",
+                           gtoolsMethodRatio(rows, static_cast<double>(nq), /*forXtile=*/true));
+  eval::declareRPosted(session.eval, "gquantiles", {"N", "nquantiles", "nqused", "method_ratio"});
+}
+
 ojson runGQuantilesPctile(const eval::ParsedCommand& parsed, SessionState& session) {
   const eval::OptVocab* vocab = eval::findOptVocab("gquantiles");
   if (vocab != nullptr) {
@@ -255,6 +324,7 @@ ojson runGQuantilesPctile(const eval::ParsedCommand& parsed, SessionState& sessi
         return gtErr("gquantiles: nquantiles() requires a whole number", "syntax_error");
       }
       haveNq = true;
+      if (nq == 0) nq = 2;  // nquantiles(0) is "not given": two groups, as for xtile
     }
   }
   if (havePctSpec && haveNq) {
@@ -358,14 +428,29 @@ ojson runGQuantilesPctile(const eval::ParsedCommand& parsed, SessionState& sessi
   // as "not full-length". io/columnar.h pairs f64() with n_values() for exactly
   // this reason; every other reader in the tree (winsor2's clampBoundaries) uses
   // the row count rather than deriving one from bytes.
+  double rowsRead = 0.0;
   const int64_t count = column.n_values();
   if (data == nullptr || count != ds->nRows()) {
     return gtErr("gquantiles: could not read " + source + " as a full-length numeric column");
   }
 
+  // `in a/b`: only those rows are read, and they are the rows gtools reports having read.
+  int64_t firstRow = 1, lastRow = count;
+  if (parsed.inRange.has_value() && !parsed.inRange->empty()) {
+    const InRangeBounds bounds = parseInRangeBounds(*parsed.inRange, count);
+    if (!bounds.ok) {
+      InRangeFilterResult refused;
+      refused.ok = false;
+      refused.refusal = bounds.refusal;
+      return inRangeRejectError(refused, *parsed.inRange, "gquantiles");
+    }
+    firstRow = bounds.a;
+    lastRow = bounds.b;
+  }
+  rowsRead = static_cast<double>(lastRow - firstRow + 1);
   std::vector<double> sorted;
   sorted.reserve(static_cast<size_t>(count));
-  for (int64_t i = 0; i < count; ++i) {
+  for (int64_t i = firstRow - 1; i < lastRow; ++i) {
     if (!std::isnan(data[i])) sorted.push_back(data[i]);
   }
   if (sorted.empty()) {
@@ -385,6 +470,33 @@ ojson runGQuantilesPctile(const eval::ParsedCommand& parsed, SessionState& sessi
   // r() on every r-class command, and pctile is one.
   clearPositionalRValues(session);
 
+  // What gtools posts besides the percentiles themselves.
+  {
+    session.eval.rValues.set("N", static_cast<double>(sorted.size()));
+    std::vector<std::string> posted = {"N", "method_ratio", "nqused"};
+    const double rows = rowsRead;
+    if (havePctSpec) {
+      session.eval.rStrings.set("quantiles", strutil::trim(pctSpec));
+      session.eval.rValues.set("nquantiles_used", static_cast<double>(values.size()));
+      session.eval.rValues.set("nqused", static_cast<double>(values.size()));
+      session.eval.rValues.set("method_ratio",
+                               gtoolsMethodRatio(rows, static_cast<double>(values.size() + 1), false));
+      putRMatrixColumn(session, "quantiles_used", values);
+      posted.insert(posted.end(), {"quantiles", "nquantiles_used", "quantiles_used"});
+    } else {
+      session.eval.rValues.set("nquantiles", static_cast<double>(nq));
+      session.eval.rValues.set("nqused", static_cast<double>(nq - 1));
+      session.eval.rValues.set("method_ratio", gtoolsMethodRatio(rows, static_cast<double>(nq), false));
+      posted.push_back("nquantiles");
+      if (!wantVariable) {
+        putRMatrixColumn(session, "quantiles_used", values);
+        posted.push_back("quantiles_used");
+      }
+    }
+    if (!wantVariable)
+      for (size_t i = 0; i < values.size(); ++i) posted.push_back("r" + std::to_string(i + 1));
+    eval::declareRPosted(session.eval, "gquantiles", posted);
+  }
   if (!wantVariable) {
     for (size_t i = 0; i < values.size(); ++i) {
       session.eval.rValues.set("r" + std::to_string(i + 1), values[i]);

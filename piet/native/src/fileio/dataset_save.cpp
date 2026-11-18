@@ -52,7 +52,7 @@ namespace piet { namespace handlers { namespace dv_detail {
 // the scan there would silently drop the labels this whole function exists to
 // carry.
 inline std::string writeDtaMetaSidecar(SessionState& session, const std::vector<VarInfo>& card,
-                                std::string& errOut) {
+                                std::string& errOut, bool noLabel = false, bool orphans = false) {
   nlohmann::ordered_json vars = nlohmann::ordered_json::array();
   std::set<std::string> referencedSets;
   for (const auto& info : card) {
@@ -107,6 +107,11 @@ inline std::string writeDtaMetaSidecar(SessionState& session, const std::vector<
   // Only the defined sets an emitted column actually points at (a name with no
   // table is written as an attachment alone, as StataBE does).
   nlohmann::ordered_json valueLabels = nlohmann::ordered_json::object();
+  // orphans: every defined table goes to the file; nolabel: none does (the
+  // attachments named in `variables` are kept either way, as [D] save says).
+  if (orphans)
+    for (const auto& [setName, defs] : session.labelDefs) referencedSets.insert(setName);
+  if (noLabel) referencedSets.clear();
   for (const auto& setName : referencedSets) {
     nlohmann::ordered_json codes = nlohmann::ordered_json::object();
     for (const auto& [code, text] : session.labelDefs.at(setName)) codes[code] = cecon::hbin_level_json_text(text);
@@ -188,7 +193,7 @@ using namespace data_mutation_detail;
 // Persists the current dataset by copying the session hbin to FILE
 // (in-memory dataset unchanged, Stata-faithful).
 ojson runSaveData(const std::string& filepathArg, bool replace, SessionState& session,
-                  int dtaRelease) {
+                  int dtaRelease, bool noLabel, bool orphans) {
   // C4-L2A (D1 card plane, brief §1 save row): this entry check needs only
   // "is a dataset loaded", which is hasData() — the old
   // `session.datastore() == nullptr` half was logically REDUNDANT (datastore()
@@ -224,13 +229,11 @@ ojson runSaveData(const std::string& filepathArg, bool replace, SessionState& se
     effectiveFp = rawFp + ".dta";
     rawExt = ".dta";
   }
-  const bool isDta = rawExt == ".dta" || rawExt == ".tmp" || dtaRelease > 0;
-  if (!isDta && rawExt != ".hbin") {
-    std::string suggested = rawFp.substr(0, rawFp.size() - rawExt.size()) + ".dta";
-    return engineErrorBlock(
-        "save: `" + rawExt + "` is not a save format this version of PIET can write. Use `save " +
-        suggested + (replace ? ", replace" : "") + "` for Stata format or an explicit `.hbin`.");
-  }
+  // Whatever the extension, StataBE writes a .dta; the answer then says so
+  // (`save a.zzz` -> "file a.zzz saved as .dta format", bank 978a80b21c1fc51e).
+  // Only the explicit native .hbin plane is another format.
+  const bool isDta = rawExt != ".hbin";
+  const bool foreignExt = isDta && rawExt != ".dta" && rawExt != ".tmp" && dtaRelease == 0;
 
   // Resolve against session.cwd, NOT session.workdir() (parity FIX, native-
   // paths stabilization item 2): `save x.hbin` now lands next to the user's
@@ -485,7 +488,7 @@ ojson runSaveData(const std::string& filepathArg, bool replace, SessionState& se
         }
       }
       std::string metaPath;
-      if (card != nullptr) metaPath = writeDtaMetaSidecar(session, *card, dtaErr);
+      if (card != nullptr) metaPath = writeDtaMetaSidecar(session, *card, dtaErr, noLabel, orphans);
 
       if (dtaErr.empty()) {
         // `--data`/`--out` in FLAG form, never the positional fallback: `tmp` is
@@ -731,7 +734,7 @@ ojson runSaveData(const std::string& filepathArg, bool replace, SessionState& se
   // none), not the bare name they typed — the honesty requirement behind
   // this whole fix is exactly that the reported name must match the real
   // bytes on disk.
-  out["text"] = "file " + effectiveFp + " saved";
+  out["text"] = "file " + effectiveFp + (foreignExt ? " saved as .dta format" : " saved");
   return out;
 }
 }

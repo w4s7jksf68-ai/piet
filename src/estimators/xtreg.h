@@ -24,6 +24,10 @@ struct XtregReResult {
     double sigma_u = 0;          // sqrt(σ_u²)
     double rho = 0;              // σ_u² / (σ_u² + σ_e²)
     double T_h = 0;              // harmonic mean of T_i
+    // residual dof of the within regression, N - n_groups - kv, where kv counts
+    // only the covariates with within-panel variation (time-invariant ones drop
+    // out of that regression). Stata refuses the fit r(2001) when it is <= 0.
+    double df_e_within = 0;
     bool ok = true;
 };
 

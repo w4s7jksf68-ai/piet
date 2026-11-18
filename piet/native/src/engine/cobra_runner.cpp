@@ -24,6 +24,7 @@
 #include <sstream>
 
 #include "piet/bundle_paths.h"
+#include "eval/macro_expressions_internal.h"  // isStataFunctionName
 #include "piet/eval/errors.h"  // invalidDateLiteral, unbalancedExpr, timeSpanRefusal (cobraErrorMessage)
 #include "piet/session_state.h"  // Stage 1b: the intercept routes to the active session's worker
 #include "io/win_compat.h"  // cecon::native_exists (BUG-050 wide _waccess)
@@ -547,6 +548,10 @@ std::string cobraErrorMessage(const CobraError& ce) {
     static const std::regex reUnknownFn(R"(unknown function (\w+))");
     std::smatch m;
     if (std::regex_search(msg, m, reUnknownFn)) {
+      // A name Stata has no such function under is Stata's own refusal, r(133) "unknown
+      // function NAME()"; a Stata function the engine lacks stays "not supported".
+      if (!eval::macro_detail::isStataFunctionName(m.str(1)))
+        return "unknown function " + m.str(1) + "()";
       return "function " + m.str(1) + "() is not supported";
     }
     // FU-852: the Parser's "expr: tq(2010q5) invalid in '<expression>'" is

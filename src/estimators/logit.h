@@ -22,6 +22,7 @@ struct LogitResult {
     double ll = 0.0;             // e(ll): the ml objective at beta (see binary_ml_fit)
     std::vector<double> ilog;    // log likelihood at iteration 0..ic
     int64_t n_cdf = 0, n_cds = 0;  // e(N_cdf) / e(N_cds) (BinaryMlResult)
+    std::vector<double> gradient;  // e(gradient): d ll / d beta at the final iterate (k)
 };
 
 // Fit binary logit y ~ X. X is column-major n*k (caller includes an intercept
@@ -78,6 +79,7 @@ struct MlPath {
     std::vector<double> b;              // the iterate where the fit ended
     std::vector<double> inv_curvature;  // inverse of A = -H at b, k*k
     std::vector<double> ilog;           // ll at iteration 0..ic
+    std::vector<double> gradient;       // d ll / d b at the last evaluated iterate (e(gradient))
     double ll = 0.0;
     int ic = 0;
     bool converged = false;
@@ -96,6 +98,7 @@ struct BinaryMlResult {
     std::vector<double> p;       // fitted probabilities at beta (n)
     std::vector<double> bread;   // inv(H) at beta, k*k (symmetric)
     std::vector<double> ilog;    // ll at iteration 0..ic
+    std::vector<double> gradient;  // d ll / d beta at the last evaluated iterate, k (e(gradient))
     int ic = 0;
     double ll = 0.0;
     bool converged = false;

@@ -242,6 +242,23 @@ DtaMetaResult applyDtaMeta(const std::string& metaPath, SessionState& session) {
     }
   }
 
+  // Sets read from a file are stamped in FILE order (the sidecar's own
+  // value_label_order; its value_labels object has its keys sorted), so that bare
+  // `label dir` / `label list` list the last one in the file first (the bank:
+  // auto2 file origin, repair -> listed repair, origin; cancer file type,
+  // diedlbl -> listed diedlbl, type).
+  if (meta.contains("value_labels") && meta["value_labels"].is_object()) {
+    std::vector<std::string> order;
+    if (meta.contains("value_label_order") && meta["value_label_order"].is_array())
+      for (const auto& n : meta["value_label_order"])
+        if (n.is_string() && meta["value_labels"].contains(n.get<std::string>()))
+          order.push_back(n.get<std::string>());
+    if (order.empty())
+      for (auto it = meta["value_labels"].begin(); it != meta["value_labels"].end(); ++it)
+        order.push_back(it.key());
+    for (const std::string& n : order) session.stampLabelSet(n);
+  }
+
   // data_label: dataset-level label (Stata `label data`) -> session.dataLabel.
   if (meta.contains("data_label") && meta["data_label"].is_string()) {
     session.dataLabel = meta["data_label"].get<std::string>();
@@ -438,7 +455,21 @@ ojson runUse(const std::string& filepathArg, SessionState& session) {
     const unsigned char b0 = static_cast<unsigned char>(hb[0]);
     const bool oldDta = got >= 3 && (b0 == 113 || b0 == 114 || b0 == 115) &&
                         (hb[1] == 1 || hb[1] == 2) && hb[2] == 1;
-    if (xmlDta || oldDta) e = ".dta";
+    if (xmlDta || oldDta) {
+      e = ".dta";
+    } else if (e != ".hbin") {
+      // Neither PIET's own bytes nor Stata's, under a name that is not a
+      // delimited file PIET reads: StataBE answers `file t.txt not Stata
+      // format` r(610) (vs-stata truth bank, `use t.txt, clear` on a text
+      // file). It was read as a .hbin: `bad magic (not a .hbin file)` at rc 1.
+      // The data in memory are left alone here; under `clear` the use route
+      // empties them, as Stata's `clear` already had (dispatch/route_io.cpp).
+      std::string shown = strutil::trim(filepathArg);
+      if (shown.size() >= 2 && shown.front() == '"' && shown.back() == '"')
+        shown = shown.substr(1, shown.size() - 2);
+      return ojson(eval::errorBlock("engine_error", "file " + shown + " not Stata format",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(610)"));
+    }
   }
   std::string fmt = (e == ".dta") ? "dta" : (e == ".hbin") ? "hbin"
                      : (e == ".csv" || e == ".tsv")        ? "csv"
@@ -573,6 +604,13 @@ ojson runUse(const std::string& filepathArg, SessionState& session) {
       } catch (const nlohmann::json::exception&) {
         if (message.empty()) message = "use: .dta import failed for " + filepath;
       }
+      // A file the reader finds inconsistent is Stata's ".dta file corrupt",
+      // r(688) (StataBE 19.5 on a strL reference past the observations).
+      if (message.find(".dta file corrupt") != std::string::npos)
+        return ojson(eval::errorBlock("engine_error",
+                                      ".dta file corrupt\n    The strL component of the file is "
+                                      "corrupt.",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(688)"));
       return engineErrorBlock(std::string("use: ") + message, code);
     }
     if (!fileExists(out)) {
@@ -599,15 +637,15 @@ ojson runUse(const std::string& filepathArg, SessionState& session) {
     CobraRunResult cr = runCobra(args);  // `convert` writes status to stderr, nothing on stdout
     if (!cr.ok) {
       // Stata's `use` reads no text file: any .csv is "file X not Stata
-      // format" r(610), and the data in memory are gone by then (StataBE
-      // `use f.csv, clear` leaves k 0 N 0). Reading one is PIET's own
+      // format" r(610); under `clear` the data in memory are gone by then
+      // (StataBE `use f.csv, clear` leaves k 0 N 0), which the use route does
+      // (dispatch/route_io.cpp), and without it they stay. Reading one is PIET's own
       // extension, so a file it cannot read faithfully -- BUG-414: a row wider
       // than the names line, whose extra field the converter used to drop at
       // rc 0 -- gets the same answer and the file as typed.
       std::string shown = strutil::trim(filepathArg);
       if (shown.size() >= 2 && shown.front() == '"' && shown.back() == '"')
         shown = shown.substr(1, shown.size() - 2);
-      if (session.hasData()) (void)runClear("", session);
       // Stata's words exactly; the converter's reason is not part of them.
       return ojson(eval::errorBlock("engine_error", "file " + shown + " not Stata format",
                                     std::nullopt, std::nullopt, std::nullopt, "r(610)"));
@@ -718,7 +756,9 @@ ojson runUse(const std::string& filepathArg, SessionState& session) {
   // loadPath, which may be a scratch hbin conversion target for .dta/.csv
   // sources) now that the load has actually succeeded (ds() above would have
   // thrown on a bad hbin, so reaching here is the true success checkpoint).
-  session.setCurrentFile(filepath);
+  // A delimited text file opened through `use` is named by c(filename) but is not the
+  // dataset's own file: a name-less `save, replace` must not write .dta bytes over it.
+  session.setCurrentFile(filepath, fmt != "csv");
   ojson out;
   out["type"] = "data_mutation";
   out["action"] = "open";

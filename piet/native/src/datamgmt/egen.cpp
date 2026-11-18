@@ -13,6 +13,7 @@
 // function (the original 8 stat fns mean/sum/total/count/min/max/median/sd
 // plus the cobra 0.13.0 extended set tag/group/seq/rank/pctile/std/iqr)
 // routes to `cobra eval --egen NEWVAR=fn(expr)[,opts][, by(g1,g2)]`.
+#include <functional>
 #include "piet/handlers/data_values.h"
 #include "piet/eval/exprfns.h"  // B3(c): exprHasRunningSum
 #include "piet/translate.h"
@@ -322,10 +323,10 @@ const std::map<std::string, EgenFnVocab>& egenFnVocab() {
       {"cut",
        {{{"at", 2, true}, {"group", 1, true}, {"icodes", 2, false}, {"label", 1, false}}, {}}},
       // concat: punct(), decode, maxlength(), format() (help egen; `max()` is
-      // r(198), `maxl()` runs); punct() and format() run in runEgenAdoFunction.
+      // r(198), `maxl()` runs); all four run in runEgenAdoFunction.
       {"concat",
-       {{{"punct", 1, true}, {"format", 1, true}},
-        {{"decode", 1, false}, {"maxlength", 4, true}}}},
+       {{{"punct", 1, true}, {"format", 1, true}, {"decode", 1, false}, {"maxlength", 4, true}},
+        {}}},
       // values(): anyvalue keeps its text, anycount/anymatch read an integer numlist
       // (help egen); all three run in runEgenAdoFunction.
       {"anyvalue", {{{"values", 1, true}}, {}}},
@@ -400,6 +401,16 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
   auto eqPos = expr.find('=');
   std::string newvar = eqPos == std::string::npos ? "" : trim(expr.substr(0, eqPos));
   std::string rhs = eqPos == std::string::npos ? expr : trim(expr.substr(eqPos + 1));
+  // egen's syntax is `newvar = fcn(arguments)`: without the `=` (`egen v`,
+  // `egen , zzabbrprobe`), and a statistic of nothing (`egen v = mean()`), it
+  // is r(198) "invalid syntax" (vs-stata bank 2026-11-10).
+  if (!gtools) {
+    if (eqPos == std::string::npos)
+      return egenRcError("invalid syntax", 198, "syntax_error");
+    static const std::regex reEmptyStat(
+        R"(^(mean|total|sum|max|min|sd|median|count|iqr|kurt|mad|mdev|pctile|rank|skew|std)\s*\(\s*\)\s*$)");
+    if (std::regex_match(rhs, reEmptyStat)) return egenRcError("invalid syntax", 198, "syntax_error");
+  }
   {
     static const std::regex reHead(R"(^(\w+)(\s*\(.*)$)");
     std::smatch hm;
@@ -417,6 +428,10 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
   // BUG-1120: `egen _cons = mean(x)` is "_cons invalid varname" r(198), and so are
   // the storage types and if/in/using/with (`egen long = mean(x)`); a str# is
   // "str5 invalid variable name" (StataBE 19.5).
+  // egen's `newvarname` is one name: `egen zzz v = mean(price)` is r(103) "too
+  // many variables specified" (vs-stata bank b6fd7bd481a8d691).
+  if (newvar.find_first_of(" \t") != std::string::npos)
+    return egenRcError("too many variables specified", 103);
   if (auto r = strutil::newVarNameRefusal(newvar)) return egenRcError(r->message, r->rc);
   // BUG-1000: egen's ado runs `confirm new variable` before anything else, so an
   // existing target is r(110) and is never overwritten (the engine's column store
@@ -481,8 +496,9 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
     // one, plus `missing` for group (BUG-233).
     std::unordered_set<std::string> known = {"by"};
     std::vector<std::pair<std::string, eval::OptValue>> netOpts = opts;
-    if (fnName == "group") {
-      // egen group() `Missing`: m, mi, ... are missing (BUG-1111). The key
+    if (fnName == "group" || fnName == "tag") {
+      // egen group() `Missing`: m, mi, ... are missing (BUG-1111); tag() reads it the
+      // same way (BUG-1817: `egen t = tag(a), missing` runs in StataBE 19.5). The key
       // arrives as typed (the dispatcher leaves egen's keys to this function).
       // gtools' gegen takes `missing` only in full (`gegen q = group(a), m` is
       // `option m not allowed` r(198) with gtools installed).
@@ -497,7 +513,13 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
       // `label` (egen group()): the groups' value label, built below from the
       // grouping variables' values (aer_w2 w2b_dataio egen_group_label `1
       // zero`, w2b_dataio.log:1076). It is PIET-side, never forwarded.
-      known.insert("label");
+      if (fnName == "group" && !gtools) known.insert("label");
+      // gtools' gegen group() declares `label` and answers that it is not implemented
+      // (vs-stata bank: `gegen v = group(a b), label` r(198); it never labels).
+      if (fnName == "group" && gtools)
+        for (const auto& kv : netOpts)
+          if (kv.first == "label")
+            return egenRcError("Option -label- is not implemented.", 198, "syntax_error");
     }
     // What egen group() and egen tag() also declare, and this build does not
     // compute, is refused after the by-list (BUG-1106: `egen g = tag(x), by(k)
@@ -505,14 +527,11 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
     static const std::vector<EgenOptSpec> kGroupUnimplemented = {
         {"lname", 2, true}, {"truncate", 1, true}, {"autotype", 8, false},
         {"qlabel", 6, false}, {"nsort", 5, true}, {"debug", 5, false}};
-    static const std::vector<EgenOptSpec> kTagUnimplemented = {{"missing", 1, false}};
     std::vector<std::pair<std::string, eval::OptValue>> netted;
     for (const auto& kv : netOpts) {
       const EgenOptSpec* un = nullptr;
       if (known.count(kv.first) == 0 && fnName == "group")
         un = matchEgenOpt(kv.first, kGroupUnimplemented);
-      else if (known.count(kv.first) == 0 && fnName == "tag")
-        un = matchEgenOpt(kv.first, kTagUnimplemented);
       if (un == nullptr) {
         netted.push_back(kv);
       } else if (!unimplementedOpt.has_value()) {
@@ -667,6 +686,15 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
       kv.second.strValue = out;
     }
   } else if (fnName == "seq") {
+    // seq() takes no argument (`syntax [if] [in] [, ...]`): `egen v =
+    // seq(price)` is r(101) "varlist not allowed" (vs-stata bank
+    // 4cfee42f79bc4474).
+    {
+      static const std::regex reSeqArg(R"(^\s*\w+\s*\(\s*([^)]*?)\s*\))");
+      std::smatch am;
+      if (std::regex_search(rhs, am, reSeqArg) && !am.str(1).empty())
+        return egenRcError("varlist not allowed", 101, "syntax_error");
+    }
     // from() and block() take a number that is a whole number within int's
     // range, and refuse anything else -- the first such option as typed --
     // before anything is computed (BUG-1114, StataBE 19.5:
@@ -1116,6 +1144,180 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
   }
   return mutationResult(session, "egen",
                         newvar.empty() ? std::vector<std::string>{} : std::vector<std::string>{newvar});
+}
+
+// What egen's own program leaves in r() and s() (vs-stata bank, StataBE 19.5). egen.ado counts
+// the missing values of the new variable when the function did not take the message duty
+// (r(N)); a function that did leaves what its own last r-class command left: summarize for
+// mean/min/max/total/sum/pc (meanonly) and sd/std (full), count for count(), _pctile for
+// median/pctile/iqr. An expression argument is held in a scratch variable first and the same
+// command runs on that. By() and the missing option take other paths (no summarize), so they
+// leave nothing here. Each leftover is produced by running that command quietly, as the ado does.
+void egenPublishResidue(SessionState& session, const std::string& newvar, const std::string& rhsIn,
+                        const std::string& by, const std::optional<std::string>& ifExpr,
+                        const std::optional<std::string>& inRange,
+                        const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                        const std::string& typeToken) {
+  static const std::regex reFnArgs(R"(^(\w+)\s*\((.*)\)\s*$)");
+  std::smatch fa;
+  const std::string rhs = trim(rhsIn);
+  if (!std::regex_match(rhs, fa, reFnArgs)) return;
+  std::string fn = fa.str(1);
+  const std::string arg = trim(fa.str(2));
+  if (auto alias = rowAliasOf(fn); !alias.empty()) fn = alias;
+  auto hasOptNamed = [&](const char* full) {
+    auto vit = egenFnVocab().find(fn);
+    for (const auto& [k, v] : opts) {
+      if (k == "by" || (v.isBool && !v.boolValue)) continue;
+      const EgenOptSpec* sp = nullptr;
+      if (vit != egenFnVocab().end()) {
+        sp = matchEgenOpt(lower(k), vit->second.known);
+        if (sp == nullptr) sp = matchEgenOpt(lower(k), vit->second.unimplemented);
+      }
+      if (sp != nullptr && std::string(sp->full) == full) return true;
+      if (sp == nullptr && lower(k) == full) return true;
+    }
+    return false;
+  };
+  auto optValue = [&](const char* full) -> std::optional<std::string> {
+    auto vit = egenFnVocab().find(fn);
+    for (const auto& [k, v] : opts) {
+      if (v.isBool) continue;
+      const EgenOptSpec* sp = nullptr;
+      if (vit != egenFnVocab().end()) sp = matchEgenOpt(lower(k), vit->second.known);
+      if ((sp != nullptr && std::string(sp->full) == full) || (sp == nullptr && lower(k) == full))
+        return trim(v.strValue);
+    }
+    return std::nullopt;
+  };
+  const std::string savedLeaf = session.leafCmdExpanded;
+  auto quiet = [&](const std::string& cmd) {
+    (void)piet::dispatch("quietly " + cmd, session);
+    session.leafCmdExpanded = savedLeaf;
+  };
+  std::string qual;  // the `if` / `in` text of the call
+  if (ifExpr.has_value() && !trim(*ifExpr).empty()) qual += " if " + *ifExpr;
+  if (inRange.has_value() && !trim(*inRange).empty()) qual += " in " + *inRange;
+  auto plainVar = [&]() -> bool {
+    Datastore* ds = session.datastore();
+    return ds != nullptr && strutil::isValidStataIdentifier(arg) && ds->has(arg) &&
+           ds->dtype(arg) == "f64";
+  };
+  // `count if <cond> [& (if)] [in]`
+  auto countIf = [&](const std::string& cond) {
+    std::string c = "count if " + cond;
+    if (ifExpr.has_value() && !trim(*ifExpr).empty()) c += " & (" + *ifExpr + ")";
+    if (inRange.has_value() && !trim(*inRange).empty()) c += " in " + *inRange;
+    quiet(c);
+  };
+  auto posted = [&](std::vector<std::string> names) {
+    eval::declareRPosted(session.eval, "egen", std::move(names));
+  };
+
+  static const std::set<std::string> kCountMissing = {
+      "any",   "anycount", "anymatch", "anyvalue", "concat", "cut",   "diff",   "ends",
+      "eqany", "neqany",   "fill",     "ma",       "rank",   "seq",   "tag",    "rowfirst",
+      "rowlast", "rowmax", "rowmean",  "rowmedian", "rowmin", "rowmiss", "rownonmiss",
+      "rowpctile", "rowsd", "rowtotal"};
+  if (fn == "group") {
+    // group() hands the message duty to egen.ado only for a type that may be too narrow.
+    static const std::set<std::string> kWide = {"", "float", "double"};
+    if (!arg.empty() && kWide.count(typeToken) == 0 && newvar.size() > 0) {
+      quiet("count if missing(" + newvar + ")");
+      posted({"N"});
+    }
+    return;
+  }
+  if (kCountMissing.count(fn) != 0) {
+    quiet("count if missing(" + newvar + ")");
+    posted({"N"});
+    return;
+  }
+  if (fn == "mode") {
+    const bool missingOpt = hasOptNamed("missing");
+    const bool minmode = hasOptNamed("minmode");
+    const bool maxmode = hasOptNamed("maxmode");
+    const std::optional<std::string> nm = optValue("nummode");
+    const bool nummode1 = nm.has_value() && trim(*nm) == "1";
+    const bool defaultBranch = !minmode && !maxmode && !nm.has_value();
+    auto setS = [&]() {
+      session.eval.rStrings.set("\x01s:k", "1");
+      session.eval.rStrings.set("\x01s:varlist", arg);
+    };
+    if (defaultBranch) {
+      // count if !uniq & touse: the observations of every group whose mode is not unique,
+      // which are the ones left missing.
+      countIf("missing(" + newvar + ")");
+      posted({"N"});
+    } else if (!missingOpt) {
+      if (by.empty()) {
+        quiet("count" + qual);  // CheckMissingVarlist's count of the sample
+        posted({"N"});
+      } else {
+        countIf("missing(" + newvar + ")");  // all-missing groups, none when nothing is missing
+        const double* n = session.eval.rValues.find("N");
+        if (n != nullptr && *n != 0) {
+          eval::replaceRClass(session.eval);  // an unmeasured count: leave nothing
+          posted({});
+        } else {
+          posted({"N"});
+        }
+      }
+    }
+    if (minmode || nummode1) setS();
+    return;
+  }
+  if (!by.empty()) return;
+  // The variable the results are summed over: the argument itself when it is a variable, else a
+  // scratch double holding the expression over the call's sample (the ado does the same through
+  // its expression-to-variable step), dropped again once the quiet command has run.
+  static const std::string kScratch = "__piet_eg_rx";
+  auto overSubject = [&](const std::function<void(const std::string&)>& run) -> bool {
+    if (plainVar()) {
+      run(arg);
+      return true;
+    }
+    if (arg.empty()) return false;
+    quiet("generate double " + kScratch + " = (" + arg + ")" + qual);
+    Datastore* ds = session.datastore();
+    if (ds == nullptr || !ds->has(kScratch)) return false;
+    run(kScratch);
+    // drop is r-class too (r(k_drop)); what the quiet command above left is what egen leaves.
+    const eval::OrderedFloatDict kept = session.eval.rValues;
+    quiet("drop " + kScratch);
+    eval::replaceRClass(session.eval);
+    for (const auto& kv : kept.items()) session.eval.rValues.set(kv.first, kv.second);
+    return true;
+  };
+  if (fn == "mean" || fn == "total" || fn == "sum" || fn == "pc" ||
+      ((fn == "min" || fn == "max") && !hasOptNamed("missing"))) {
+    if (overSubject([&](const std::string& v) { quiet("summarize " + v + qual + ", meanonly"); }))
+      posted({"N", "sum_w", "sum", "mean", "min", "max"});
+    return;
+  }
+  if (fn == "sd" || fn == "std") {
+    if (overSubject([&](const std::string& v) { quiet("summarize " + v + qual); }))
+      posted({"N", "sum_w", "mean", "Var", "sd", "min", "max", "sum"});
+    return;
+  }
+  if (fn == "count") {
+    Datastore* ds = session.datastore();
+    if (ds == nullptr || !strutil::isValidStataIdentifier(arg) || !ds->has(arg)) return;
+    countIf("!missing(" + arg + ")");
+    posted({"N"});
+    return;
+  }
+  if (fn == "median" || fn == "pctile" || fn == "iqr") {
+    std::string p = fn == "median" ? "50" : fn == "iqr" ? "25 75" : optValue("p").value_or("50");
+    // An expression is held in a scratch variable that is missing outside the sample, which
+    // _pctile leaves out, so the sample qualifier is only needed for a plain variable.
+    const bool plain = plainVar();
+    if (overSubject([&](const std::string& v) {
+          quiet("_pctile " + v + (plain ? qual : std::string()) + ", p(" + p + ")");
+        }))
+      posted(fn == "iqr" ? std::vector<std::string>{"r1", "r2"} : std::vector<std::string>{"r1"});
+    return;
+  }
 }
 
 }  // namespace piet::handlers

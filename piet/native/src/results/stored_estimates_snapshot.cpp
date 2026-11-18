@@ -77,6 +77,17 @@ ojson makeSnapshot(const ojson& estBlock) {
   if (estBlock.contains("outcomes") && estBlock["outcomes"].is_array()) {
     snap["outcomes"] = estBlock["outcomes"];
   }
+  // Stata's e(b) stripe as the fit recorded it (eval::ebStripeOf): the stored
+  // table keeps e(b)'s column names and base levels (estout's rows,
+  // tables/estout_models.cpp eoStripeTable).
+  if (estBlock.contains("eb_stripe") && estBlock["eb_stripe"].is_array()) {
+    snap["eb_stripe"] = estBlock["eb_stripe"];
+  }
+  // A posting without e(b) (estpost) stays one when stored: its coefficient
+  // table is the screen's, not an e(b) estout could read (eoModelFrom).
+  if (estBlock.contains("posts_e_b") && estBlock["posts_e_b"].is_boolean()) {
+    snap["posts_e_b"] = estBlock["posts_e_b"];
+  }
   return snap;
 }
 
@@ -98,7 +109,40 @@ ojson escalarsFrom(const ojson& estBlock) {
     if (stataName == "N_clust" && v.is_number() && v.get<double>() == 0.0) continue;
     if (v.is_number()) out[stataName] = v;
   }
+  // Stata names the model test of an ML fit e(df_m), e(p) and its pseudo-R2
+  // e(r2_p); the engine's ML blocks spell them df_chi2 (logit, probit) or
+  // chi2_df (poisson), p_chi2, r2_pseudo (StataBE `logit foreign mpg`: e(df_m)
+  // 1, e(p) chi2tail(1, e(chi2)); `poisson rep78 mpg`: e(df_m) 1).
+  auto alias = [&](const char* stataName, std::initializer_list<const char*> keys) {
+    if (out.contains(stataName)) return;
+    for (const char* k : keys) {
+      if (estBlock.contains(k) && estBlock[k].is_number()) {
+        out[stataName] = estBlock[k];
+        return;
+      }
+    }
+  };
+  alias("df_m", {"df_chi2", "chi2_df"});
+  alias("p", {"p_chi2"});
+  alias("r2_p", {"r2_pseudo"});
   return out;
+}
+
+ojson emacrosFrom(const SessionState& session) {
+  ojson out = ojson::object();
+  for (const auto& [k, v] : session.eval.eStrings.items()) {
+    if (eval::isReservedStoreKey(k) || v.empty()) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+void mergeLiveEScalars(ojson& esc, const SessionState& session) {
+  if (!esc.is_object()) esc = ojson::object();
+  for (const auto& [k, v] : session.eval.eScalars.items()) {
+    if (eval::isReservedStoreKey(k) || esc.contains(k) || std::isnan(v)) continue;
+    esc[k] = v;
+  }
 }
 
 ojson emptyAddedBag() {

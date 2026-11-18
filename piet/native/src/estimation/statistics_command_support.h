@@ -105,8 +105,11 @@ bool numericColumn(const Datastore& ds, const std::string& name, std::vector<dou
 bool engineHasSubcommand(const std::string& sub);
 ojson engineTooOld(const std::string& stataCmd, const std::string& sub);
 
+// `storeType` (byte|int|long|float|double, "" = double): the Stata storage type
+// the engine rounds each value to as it stores the column (setcol --store-type).
 bool estimWriteColumn(SessionState& session, const std::string& name,
-                      const std::vector<double>& vals, ojson* err);
+                      const std::vector<double>& vals, ojson* err,
+                      const std::string& storeType = std::string());
 std::vector<double> jsonDoubles(const nlohmann::json& j);
 bool smoothIsNumeric(SessionState& session, const std::string& name);
 

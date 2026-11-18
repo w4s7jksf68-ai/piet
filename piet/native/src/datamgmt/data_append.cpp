@@ -389,7 +389,10 @@ DupKeyResult findDupKey(Datastore& ds, const std::vector<std::string>& keylist) 
         keyOss << "f:" << facCols[ki][static_cast<size_t>(row)];
       } else {
         double v = f64Cols[ki][static_cast<size_t>(row)];
-        if (std::isnan(v)) keyOss << "n:nan";
+        // Each missing kind is its own key value (`.` and `.a` differ to
+        // Stata's merge; vs-stata bank 98a02cb986ac9bcb: id . .a .b on one
+        // side is unique), the same rule as the engine join's RowKey.
+        if (std::isnan(v)) keyOss << "n:nan" << cecon::missing_kind(v);
         // eval::pythonFloatRepr, not lossy default ostream<<double (~6 sig
         // digits) — distinct high-precision keys (e.g. 1005938 vs 1005942)
         // would otherwise collide into the same composite-key string.
@@ -1175,6 +1178,9 @@ ojson runAppendFiles(const std::vector<std::string>& files, SessionState& sessio
       }
       return result;
     }
+    // The appended file is a change to the (empty) dataset in memory, where a plain
+    // `use` leaves it unchanged (vs-stata bank: `clear` + `append using f` -> c(changed) 1).
+    session.datasetChanged = true;
     int64_t n1 = -1;
     if (result.is_object() && result.contains("n_rows_after") &&
         result["n_rows_after"].is_number_integer())

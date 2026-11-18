@@ -12,7 +12,7 @@
 // The ado, in order:
 //   * ado `syntax [varlist(fv numeric)] [if] [in] [fweight] [, Quantile(real .5)
 //     NOTest mss(string) WLSiter(integer 1) Cluster(string) Epsilon(real 1e-7)
-//     Silverman]`: aw/pw/iw are r(101) (the tokenizer's kStataLegalWeights row,
+//     Silverman]`: aw/pw/iw are r(101) (the registry's kStataQualifiers row,
 //     R01-R03); any other option is r(198) (R04 vce(robust), R05, R07 robust).
 //   * ado marksample + `markout touse cluster, s`: an unknown cluster
 //     variable is r(111) (R06); a missing (or empty-string) cluster drops the row.
@@ -1215,6 +1215,17 @@ QregOldVce qregOldVce(const QrData& d, const std::vector<double>& resid, double 
   return out;
 }
 
+// qreg's hidden e(tolerance): the simplex tolerance of its LP, 1e-10 (every qreg and
+// qreg2 fit in the vs-stata bank, 113 of 113). Hidden from `ereturn list`, as qreg
+// posts it. qreg's other hidden result, e(basis), is not posted: it lists the basis
+// observations in the order of Stata's simplex pivots (bank be828335 `qreg price mpg
+// weight, quantile(75)`: 41 57 56, which is not their order under qreg's WLS-start
+// sort, 57 56 41), and PIET's LP does not follow those pivots.
+void postQregTolerance(SessionState& session) {
+  e3::setEScalarOnFit(session, "tolerance", 1e-10);
+  session.eval.markEHidden("tolerance", session.eval.eScalars.generationOf("tolerance"));
+}
+
 }  // namespace
 
 // Returns an ARRAY of blocks; the dispatcher pushes each element (never the
@@ -1226,6 +1237,15 @@ ojson runQreg2(const eval::ParsedCommand& parsed, SessionState& session) {
     return blocks;
   };
   if (!session.hasData()) return fail(ojson(eval::noDataLoaded()));
+
+  // ---- ado replay: no varlist redisplays the last estimates (_prefix_display),
+  // which without an e(b) is r(111) before any option is read (bank e744ae60
+  // `qreg2 , zzabbrprobe` after loading data).
+  // e(b) is asked of the one e() resolver every matrix reader uses: a fit's e(b) is
+  // built from its result block on demand, not stored in eMatrices.
+  if (parsed.varlist.empty() &&
+      !session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kNames).matrix.has_value())
+    return fail(rcError("matrix e(b) not found", 111));
 
   // ---- ado syntax ------------------------------------------------------------
   static const std::vector<e3::OptSpec> kSpecs = {
@@ -1454,6 +1474,42 @@ ojson runQreg2(const eval::ParsedCommand& parsed, SessionState& session) {
     e3::setEStringOnFit(session, "predict", "qreg_p");
     e3::setEStringOnFit(session, "properties", "b V");
     e3::setEStringOnFit(session, "marginsnotok", "stdp stddp residuals");
+    postQregTolerance(session);
+    // qreg2 calls qreg under version 11, whose standard errors come from a regress of
+    // the fitted values on the regressors; that regress leaves its standardized
+    // coefficients in e(beta) (1 x regressors, row r1): b_j sd(x_j) / sd(xb), the sds
+    // on the fit's frequency weights. Factor-variable designs are not posted here.
+    if (!fvops && K >= 2) {
+      double sw = 0, mxb = 0;
+      for (size_t t = 0; t < n; ++t) {
+        sw += W[t];
+        mxb += W[t] * xb[t];
+      }
+      mxb /= sw;
+      double sxb = 0;
+      for (size_t t = 0; t < n; ++t) sxb += W[t] * (xb[t] - mxb) * (xb[t] - mxb);
+      eval::EvalMatrix mb;
+      mb.rownames = {"r1"};
+      std::vector<double> row;
+      for (size_t j = 0; j + 1 < K; ++j) {
+        const size_t a = static_cast<size_t>(estIdx[j]);
+        double mx = 0;
+        for (size_t t = 0; t < n; ++t) mx += W[t] * X[t * p + a];
+        mx /= sw;
+        double sx = 0;
+        for (size_t t = 0; t < n; ++t) sx += W[t] * (X[t * p + a] - mx) * (X[t * p + a] - mx);
+        row.push_back(sxb > 0 ? bEst[a] * std::sqrt(sx / sxb) : kNaN);
+        mb.colnames.push_back(names[j]);
+      }
+      mb.data.push_back(row);
+      bool replaced = false;
+      for (auto& kv : session.eval.eMatrices)
+        if (kv.first == "beta") {
+          kv.second = mb;
+          replaced = true;
+        }
+      if (!replaced) session.eval.eMatrices.emplace_back("beta", std::move(mb));
+    }
   };
 
   // ---- ado: residuals, zeros, the bandwidth ---------------------------------
@@ -2107,6 +2163,7 @@ ojson runQregNative(const eval::ParsedCommand& parsed, SessionState& session) {
   e3::setEScalarOnFit(session, "sum_adev", sumAdev);
   e3::setEScalarOnFit(session, "convcode", 0.0);
   e3::setEScalarOnFit(session, "r2_p", 1.0 - sumAdev / sumRdev);
+  postQregTolerance(session);
   e3::setEStringOnFit(session, "bwmethod", "hsheather");
   e3::setEStringOnFit(session, "denmethod", "fitted");
   e3::setEStringOnFit(session, "predict", "qreg_p");

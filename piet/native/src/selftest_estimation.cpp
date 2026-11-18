@@ -700,13 +700,13 @@ void testP3WeightsWave() {
     check(policyOf("regress") == WeightPolicy::AllWeights, "P3: regress row is AllWeights");
     check(policyOf("reghdfe") == WeightPolicy::AllWeights, "P3: reghdfe row is AllWeights");
     // summarize serves [iw=] since the residual sweep (help summarize; w2aj
-    // qf_sw_iw_tight), pweight still Stata's r(101) via kStataLegalWeights; mean
+    // qf_sw_iw_tight), pweight still Stata's r(101) via kStataQualifiers; mean
     // takes every type (help mean; the engine serves pw and aw, w2aj
     // qf_mn_aw_sp, and refuses fw/iw by name).
     check(policyOf("summarize") == WeightPolicy::AllWeights, "P3: summarize row is AllWeights");
     check(policyOf("mean") == WeightPolicy::AllWeights, "P3: mean row is AllWeights");
     // proportion takes fweights and iweights too since BUG-1541; its aweight is
-    // Stata's r(101) via kStataLegalWeights (StataBE 19.5, scratch-laneA2/agents/wml/x1.log).
+    // Stata's r(101) via kStataQualifiers (StataBE 19.5, scratch-laneA2/agents/wml/x1.log).
     check(policyOf("proportion") == WeightPolicy::AllWeights, "P3: proportion row is AllWeights (BUG-1541)");
     // Regression guard: the OLD FweightOnly allow-list members that did NOT
     // move this wave stay exactly where they were.
@@ -716,7 +716,7 @@ void testP3WeightsWave() {
     // Rows LATER waves moved, each to the set Stata documents: tabulate/tab1 serve
     // [aw=]/[iw=] since the qualifier wave (f8413c27; help tabulate_oneway,
     // w2aj_qualifiers.log:2041 qf_tb_aw_sp, :2065 qf_tb_iw_sp), with pweight refused
-    // as Stata's r(101) by the tokenizer's kStataLegalWeights row; corr/pwcorr serve
+    // as Stata's r(101) by the registry's kStataQualifiers row; corr/pwcorr serve
     // [aw=]/[fw=] since BUG-1014 (help correlate; w2aj_qualifiers.log:1869 qf_co_aw).
     check(policyOf("tabulate") == WeightPolicy::AllWeights, "P3: tabulate row is AllWeights (qualifier wave)");
     check(policyOf("tab1") == WeightPolicy::AllWeights, "P3: tab1 row is AllWeights (qualifier wave)");
@@ -838,20 +838,25 @@ void testP3WeightsWave() {
     }
     {
       // Bare `mean`/`proportion` (registry drift guard's own probe shape,
-      // testRegistryRoutes above) — must land on the handler's own
-      // "requires at least one variable" syntax_error, never fall through
-      // to unsupported_command.
+      // testRegistryRoutes above) — never falls through to
+      // unsupported_command. An estimation command typed with no varlist is a
+      // replay, and with no estimates in memory Stata answers r(301) "last
+      // estimates not found" (StataBE 19.5 truth bank 2026-11-10, `mean ,
+      // zzabbrprobe`), answered by dispatch's checkStataLead.
       piet::SessionState session(workdir);
       (void)piet::dispatch("sysuse fatalities, clear", session);
       auto blocks = piet::dispatch("mean", session);
-      bool sawSyntaxError = false;
+      bool sawReplayRefusal = false;
       for (const auto& b : blocks) {
         if (b.is_object() && b.value("type", std::string()) == "error" &&
-            b.value("code", std::string()) == "syntax_error") {
-          sawSyntaxError = true;
+            b.value("message", std::string()) == "last estimates not found" &&
+            piet::eval::coarseRc(b) == "301") {
+          sawReplayRefusal = true;
         }
       }
-      check(sawSyntaxError, "P3 weight: bare `mean` (no varlist) is an honest syntax_error, not a crash");
+      check(sawReplayRefusal,
+            "P3 weight: bare `mean` (no varlist, no estimates) is Stata's r(301) "
+            "`last estimates not found`, not a crash");
     }
 
     fs::remove_all(workdir, ec);
@@ -1675,7 +1680,8 @@ void testBUG274MediateWiringResiduals() {
       // The select-equation carriage: pre-fix the outcomes[] remap hard-nulled
       // ci_lo/ci_hi; the engine sends them when --level is forwarded.
       bool selCi = false;
-      if (e.contains("outcomes") && e["outcomes"].is_array() && e["outcomes"].size() == 2) {
+      // outcome, selection, then the /mills section (bank b6e7e050's table)
+      if (e.contains("outcomes") && e["outcomes"].is_array() && e["outcomes"].size() >= 2) {
         const auto& sel = e["outcomes"][1];
         if (sel.contains("coeftable") && !sel["coeftable"].empty()) {
           const auto& r0 = sel["coeftable"][0];
@@ -1693,13 +1699,13 @@ void testBUG274MediateWiringResiduals() {
       // engine actually sent.
       ojson eDef = firstEst(piet::dispatch(
           "heckman income beertax, select(jailb = spirits unemp) twostep", session));
-      if (!eDef.is_null() && eDef.contains("outcomes") && eDef["outcomes"].size() == 2) {
+      if (!eDef.is_null() && eDef.contains("outcomes") && eDef["outcomes"].size() >= 2) {
         const auto& r0 = eDef["outcomes"][1]["coeftable"][0];
         const bool defHasCi = r0["ci_lo"].is_number() && r0["ci_hi"].is_number();
         if (defHasCi) {
           double dLo = r0["ci_lo"].get<double>(), dHi = r0["ci_hi"].get<double>();
           double sLo = std::nan(""), sHi = std::nan("");
-          if (e.contains("outcomes") && e["outcomes"].size() == 2) {
+          if (e.contains("outcomes") && e["outcomes"].size() >= 2) {
             const auto& s0 = e["outcomes"][1]["coeftable"][0];
             if (s0["ci_lo"].is_number()) sLo = s0["ci_lo"].get<double>();
             if (s0["ci_hi"].is_number()) sHi = s0["ci_hi"].get<double>();

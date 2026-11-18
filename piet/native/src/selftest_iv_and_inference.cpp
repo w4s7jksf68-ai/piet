@@ -193,10 +193,11 @@ void testD1BS063IvRegress() {
     check(ncEst != nullptr && !ncHasCons,
           "D1/BS-063: `ivregress 2sls ..., noconstant` fits without a constant (oracle "
           "w2d_uncovered ivregress_nocons_ctl)");
+    // level() is served now (the table is rebuilt at the level): Stata runs it (vs-stata
+    // bank 6fbbd6d7 `ivregress 2sls price weight (mpg = length turn), l(90)`, rc 0).
     (void)piet::dispatch("capture ivregress 2sls income (beertax = spirits), level(90)", session);
-    check(session.eval.locals.get("_rc", "") == "198",
-          "D1/BS-063: `ivregress 2sls ..., level(90)` honestly rejects (never silently "
-          "forwarded to the engine)");
+    check(session.eval.locals.get("_rc", "") == "0",
+          "D1/BS-063: `ivregress 2sls ..., level(90)` runs, as Stata does (bank 6fbbd6d7)");
   }
 
   // `reghdfe y (endog=instr), absorb(F)`: reghdfe 6.x has no IV syntax and

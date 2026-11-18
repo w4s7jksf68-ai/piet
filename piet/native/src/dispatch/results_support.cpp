@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "results_support.h"
+#include <set>
+#include "piet/display_hardening.h"
+#include "prefix_support.h"
 #include "text_support.h"
 #include "options.h"
 #include "handler_declarations.h"
@@ -117,12 +120,22 @@ std::optional<ojson> readEststoStoreOpts(
     const std::vector<std::pair<std::string, eval::OptValue>>& opts, EststoStoreOpts* out) {
   // NOT kVocabEststoStore.known: that slot is the UNION with `estimates`' own
   // vocabulary (b/se/stats/replace), none of which `eststo` takes.
-  static const std::unordered_set<std::string> kRead = {"title", "prefix"};
+  static const std::unordered_set<std::string> kRead = {"title", "prefix", "addscalars", "missing",
+                                                        "svy"};
   if (auto err = eval::rejectUnknownOptions(opts, kRead, kVocabEststoStore.unimplemented)) {
     return ojson(*err);
   }
   for (const auto& [k, v] : opts) {
     if (k == "title" && !v.isBool) out->title = dequoteEstTitle(v.strValue);
+    // addscalars() takes a list; `missing` and `svy` are spelled in eststo's syntax line and do
+    // nothing there ("doesn't do anything": eststo.ado), so they are no-ops here too.
+    if (k == "addscalars") {
+      if (v.isBool) {
+        return ojson(eval::errorBlock("syntax_error", "option addscalars() incorrectly specified",
+                                      std::nullopt, std::nullopt, std::nullopt, std::string("r(198)")));
+      }
+      out->addscalars = v.strValue;
+    }
     if (k == "prefix") {
       // eststo.ado declares Prefix(name): one Stata name, nothing else. A bare
       // `prefix` or a non-name would otherwise mint a key no `esttab` can spell.
@@ -136,6 +149,82 @@ std::optional<ojson> readEststoStoreOpts(
       }
       out->autoPrefix = p;
     }
+  }
+  return std::nullopt;
+}
+
+
+std::optional<ojson> applyEststoAddscalars(const std::string& specIn, SessionState& session,
+                                           std::vector<ojson>* notes,
+                                           std::vector<std::pair<std::string, double>>* added) {
+  auto rcErr = [](const std::string& msg, int rc) {
+    return std::optional<ojson>(ojson(eval::errorBlock("engine_error", msg, std::nullopt, std::nullopt,
+                                                       std::nullopt, "r(" + std::to_string(rc) + ")")));
+  };
+  std::string spec = trimWs(specIn);
+  if (spec.size() >= 2 && spec.front() == '"' && spec.back() == '"') spec = spec.substr(1, spec.size() - 2);
+  auto [body, tail] = splitTopLevelComma(spec);
+  bool replace = false;
+  if (tail.has_value()) {
+    const std::string t = lower(trimWs(*tail));
+    if (t.empty() || std::string("replace").compare(0, t.size(), t) != 0) return rcErr("addscalars() invalid", 198);
+    replace = true;
+  }
+  // `name exp name exp`: a token is a run without blanks outside parentheses and quotes
+  std::vector<std::string> toks;
+  {
+    std::string cur;
+    int depth = 0;
+    bool inq = false;
+    for (char c : body) {
+      if (c == '"') inq = !inq;
+      if (!inq) {
+        if (c == '(') ++depth;
+        else if (c == ')') --depth;
+      }
+      if (!inq && depth == 0 && (c == ' ' || c == '\t')) {
+        if (!cur.empty()) {
+          toks.push_back(cur);
+          cur.clear();
+        }
+      } else {
+        cur += c;
+      }
+    }
+    if (!cur.empty()) toks.push_back(cur);
+  }
+  if (toks.empty() || toks.size() % 2 != 0) return rcErr("addscalars() invalid", 198);
+  // the e() names the results hold now: scalars, macros, matrices and the function e(sample)
+  std::set<std::string> have = {"sample"};
+  for (const auto& kv : session.eval.eScalars.items()) have.insert(kv.first);
+  for (const auto& kv : session.eval.eStrings.items()) have.insert(kv.first);
+  for (const auto& kv : session.eval.eMatrices) have.insert(kv.first);
+  if (session.lastEstBlock.has_value()) {
+    for (const auto& k : {"N", "r2", "r2_a", "F", "df_m", "df_r", "rmse", "mss", "rss", "ll", "ll_0", "rank"}) {
+      if (session.lastEstBlock->contains(k) || std::string(k) == "N") have.insert(k);
+    }
+  }
+  for (size_t i = 0; i < toks.size(); i += 2) {
+    const std::string& lhs = toks[i];
+    if (lhs == "b" || lhs == "V" || lhs == "sample") return rcErr(lhs + " not allowed in addscalars()", 198);
+    if (!replace && have.count(lhs) != 0) return rcErr("e(" + lhs + ") already defined", 110);
+    // `eret scalar NAME = EXP` is what eststo runs for each pair; a left-hand token that is not a name
+    // (the `+` of `z 2 + 3`) fails it, and so does the whole option.
+    if (!strutil::isValidStataIdentifier(lhs)) return rcErr("addscalars() invalid", 198);
+    std::string rhs = toks[i + 1];
+    const auto v = piet::evalScalarExpr(rhs, session);
+    if (!v.has_value()) return rcErr("addscalars() invalid", 198);
+    session.eval.setEScalar(lhs, *v);
+    added->emplace_back(lhs, *v);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.15g", *v);
+    std::string val(buf);
+    if (val.rfind("0.", 0) == 0) val.erase(0, 1);
+    else if (val.rfind("-0.", 0) == 0) val.erase(1, 1);
+    ojson note;
+    note["type"] = "display";
+    note["text"] = "(e(" + lhs + ") = " + val + " added)";
+    notes->push_back(std::move(note));
   }
   return std::nullopt;
 }

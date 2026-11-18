@@ -420,6 +420,7 @@ bool rot_poly_fit(const std::vector<double>& x, const std::vector<double>& y,
 // are all invariant to that scaling, and it keeps degree p+2 well conditioned).
 struct LocalFit {
     bool ok = false;
+    bool var_ok = false;    // the variance factors / sigma2 asked for were computed (a full-rank window)
     double b0 = 0;
     double var_factor = 0;  // e1'(X'WX)^-1 X'W^2X (X'WX)^-1 e1  (want_var)
     double sigma2 = 0;      // sum W r^2 / (tr W - tr((X'WX)^-1 X'W^2X))  (want_sigma2)
@@ -469,19 +470,42 @@ LocalFit local_fit(const std::vector<double>& x, const std::vector<double>& y,
     // r(ngrid) counts SUCCESSFUL local regressions, so a singular window is a
     // missing smooth value AND is not counted -- not an error.
     std::vector<double> Ac = A, bc = b;
-    if (!spd_solve(Ac, bc, m)) return f;
+    bool reduced = false;
+    if (!spd_solve(Ac, bc, m)) {
+        // A window with fewer distinct x than the degree needs (rank-deficient normal
+        // equations) is still fitted: the collinear highest powers drop out, i.e. the
+        // local polynomial of the highest degree the window supports (bank:
+        // `lpoly price weight, degree(2)` on auto stores r(ngrid) 50 although the grid
+        // point 4777 holds two distinct weights). The point estimate is the same whether or
+        // not a variance is asked for; the variance factors are defined only for a full-rank
+        // window, so a reduced fit leaves its standard error missing (var_ok stays false).
+        bool solved = false;
+        for (int mr = m - 1; mr >= 1 && !solved; --mr) {
+            std::vector<double> Ar(static_cast<std::size_t>(mr) * static_cast<std::size_t>(mr)),
+                br(static_cast<std::size_t>(mr));
+            for (int r = 0; r < mr; ++r) {
+                br[static_cast<std::size_t>(r)] = b[static_cast<std::size_t>(r)];
+                for (int c = 0; c < mr; ++c)
+                    Ar[static_cast<std::size_t>(r * mr + c)] = A[static_cast<std::size_t>(r * m + c)];
+            }
+            if (spd_solve(Ar, br, mr)) {
+                bc.assign(static_cast<std::size_t>(m), 0.0);
+                for (int r = 0; r < mr; ++r) bc[static_cast<std::size_t>(r)] = br[static_cast<std::size_t>(r)];
+                solved = true;
+            }
+        }
+        if (!solved) return f;
+        reduced = true;
+    }
     f.b0 = bc[0];
     f.ok = true;
-    if (!want_var && !want_sigma2) return f;
+    if ((!want_var && !want_sigma2) || reduced) return f;
     // Columns of A^-1, one solve each (m <= degree+3, tiny).
     std::vector<double> Ainv(mm);
     for (int c = 0; c < m; ++c) {
         std::vector<double> Aw = A, e(static_cast<std::size_t>(m), 0.0);
         e[static_cast<std::size_t>(c)] = 1.0;
-        if (!spd_solve(Aw, e, m)) {
-            f.ok = false;
-            return f;
-        }
+        if (!spd_solve(Aw, e, m)) return f;  // var_ok stays false; the point estimate stands
         for (int r = 0; r < m; ++r) Ainv[static_cast<std::size_t>(r * m + c)] = e[static_cast<std::size_t>(r)];
     }
     if (want_var) {
@@ -512,12 +536,10 @@ LocalFit local_fit(const std::vector<double>& x, const std::vector<double>& y,
             for (int c = 0; c < m; ++c)
                 trS += Ainv[static_cast<std::size_t>(r * m + c)] * B[static_cast<std::size_t>(c * m + r)];
         const double den = wsum - trS;
-        if (!(den > 0)) {
-            f.ok = false;
-            return f;
-        }
+        if (!(den > 0)) return f;  // var_ok stays false; the point estimate stands
         f.sigma2 = num / den;
     }
+    f.var_ok = true;
     return f;
 }
 
@@ -678,7 +700,7 @@ LpolyResult lpoly_fit(const std::vector<double>& x, const std::vector<double>& y
         if (o.want_se) {
             const LocalFit pf =
                 local_fit(x, y, w, o.kernel, x0, r.pwidth, o.degree + 2, false, true);
-            if (pf.ok && f.var_factor >= 0) r.se[g] = std::sqrt(f.var_factor * pf.sigma2);
+            if (f.var_ok && pf.ok && pf.var_ok && f.var_factor >= 0) r.se[g] = std::sqrt(f.var_factor * pf.sigma2);
         }
     }
     return r;

@@ -3,6 +3,10 @@
 // data collapse.
 #include "data_mutation_internal.h"
 #include "piet/handlers/observations.h"
+
+#include <array>
+#include <cstring>
+#include <map>
 namespace piet::handlers::data_mutation_detail {
 
 
@@ -44,12 +48,16 @@ std::optional<std::string> canonicalCollapseStat(const std::string& raw, const s
     if (st == "skew") st = "skewness";
     if (st == "kurt") st = "kurtosis";
     if (kGtools.count(st)) return st;
+    // select# / select-# (the #th smallest / largest non-missing value).
+    static const std::regex reSel(R"(^select-?[1-9][0-9]{0,8}$)");
+    if (std::regex_match(st, reSel)) return st;
     static const std::regex reQ(R"(^p([0-9][0-9]?(\.[0-9]+)?)$)");
     if (std::regex_match(st, reQ) && st != "p0") return st;
     return std::nullopt;
   }
   *rcOut = flavor == "fcollapse" ? "110" : "198";
   if (kCollapseWords.count(raw)) return raw;
+  if (flavor == "fcollapse" && raw == "nansum") return raw;  // sum, missing when all are missing
   if (flavor == "fcollapse") {
     static const std::regex reQ(R"(^p[0-9]+$)");
     return std::regex_match(raw, reQ) ? std::optional<std::string>(raw) : std::nullopt;
@@ -725,6 +733,16 @@ ojson runCollapse(const std::string& rawLine, const std::optional<std::string>& 
     }
     filterIf = (ifExpr.has_value() && !ifExpr->empty()) ? "(" + *ifExpr + ") & " + cwPred : cwPred;
   }
+  // collapse_17.ado: `mark touse if in [wgt]` -- an observation whose weight is
+  // missing or zero is out of the sample before anything is computed, and r(N)
+  // counts the observations left (vs-stata bank: [aw=w] with w 0 on the 52
+  // domestic cars -> r(N) 22; [fw=rep78] -> 69).
+  if (weightVar.has_value() && !weightVar->empty()) {
+    const std::string wPred = "!missing(" + *weightVar + ") & " + *weightVar + " != 0";
+    filterIf = (filterIf.has_value() && !filterIf->empty()) ? "(" + *filterIf + ") & " + wPred
+                                                             : wPred;
+  }
+  int64_t nUsed = -1;  // observations collapsed (r(N)); -1 = all of them
 
   // BS-090 (BETA Phase G): collapse's own cobra CLI has a --keepif of its
   // own (unlike tabstat/corr/ttest), but it runs through the SAME
@@ -757,7 +775,57 @@ ojson runCollapse(const std::string& rawLine, const std::optional<std::string>& 
     if (rowsLeft == 0)
       return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
                                     std::nullopt, std::string(fcAppend ? "r(3498)" : "r(2000)")));
+    nUsed = rowsLeft;
   }
+  // gcollapse (gtools) posts r(N), r(J) (groups), r(minJ), r(maxJ) (the smallest
+  // and largest group's observation count) over the observations it collapses.
+  std::optional<std::array<int64_t, 3>> gtoolsGroups;
+  if (flavor == "gcollapse") {
+    try {
+      Datastore used(dataPath);
+      const int64_t n = used.nRows();
+      std::map<std::vector<uint64_t>, int64_t> sizes;
+      std::vector<const cecon::Column*> cols;
+      for (const auto& b : byVars) cols.push_back(&used.col(b));
+      for (int64_t i = 0; i < n; ++i) {
+        std::vector<uint64_t> key;
+        for (const cecon::Column* c : cols) {
+          if (c->dtype == cecon::DType::Factor) {
+            key.push_back(static_cast<uint64_t>(static_cast<int64_t>(c->codes()[i])));
+          } else {
+            double v = c->f64()[i];
+            if (v == 0.0) v = 0.0;  // -0 and 0 are one group
+            uint64_t bits = 0;
+            std::memcpy(&bits, &v, sizeof bits);
+            key.push_back(bits);
+          }
+        }
+        ++sizes[key];
+      }
+      int64_t lo = 0, hi = 0;
+      for (const auto& kv : sizes) {
+        lo = lo == 0 ? kv.second : std::min(lo, kv.second);
+        hi = std::max(hi, kv.second);
+      }
+      // r(N) needs nothing here: unfiltered, it is every row, which is what
+      // collapse's -1 already means (the route posts the row count), so the
+      // block carries n_used under collapse's rule and only the J fields are gtools'.
+      gtoolsGroups = std::array<int64_t, 3>{static_cast<int64_t>(sizes.size()), lo, hi};
+    } catch (const std::exception&) {
+      gtoolsGroups.reset();
+    }
+  }
+  auto withCounts = [&](ojson block) {
+    if (block.is_object() && block.value("type", std::string()) != "error") {
+      if (nUsed >= 0) block["n_used"] = nUsed;
+      if (gtoolsGroups.has_value()) {
+        block["gtools_J"] = (*gtoolsGroups)[0];
+        block["gtools_minJ"] = (*gtoolsGroups)[1];
+        block["gtools_maxJ"] = (*gtoolsGroups)[2];
+      }
+    }
+    return block;
+  };
 
   std::vector<CollapseResultMeta> resultMeta = collapseResultMeta(
       clist.items, byVars, flavorRun, wkind, optWords.count("clabel") != 0, session);
@@ -915,7 +983,7 @@ ojson runCollapse(const std::string& rawLine, const std::optional<std::string>& 
       }
       session.load(restorePath);
     }
-    return mutationResult(session, "collapse");
+    return withCounts(mutationResult(session, "collapse"));
   }
 
   session.load(outPath);
@@ -1009,6 +1077,10 @@ ojson runCollapse(const std::string& rawLine, const std::optional<std::string>& 
         "collapse: the data were collapsed, but the estimation-sample marker could not be "
         "written onto the result; e(sample) is not reliable until the next estimation.");
   }
-  return mutationResult(session, "collapse");
+  ojson collapsed = withCounts(mutationResult(session, "collapse"));
+  // A collapse with no by() group leaves the single-row result unchanged (vs-stata bank:
+  // c(changed) 0 after `collapse x y`, 1 when by() is given).
+  if (byVars.empty() && flavor == "collapse") session.datasetChanged = false;
+  return collapsed;
 }
 }

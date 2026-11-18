@@ -66,6 +66,38 @@ namespace command_detail {
 // Unicode names: the one rule (strutil.h -> core/ident.h), 32 characters.
 bool isValidStataName(const std::string& s) { return strutil::isValidStataIdentifier(s); }
 
+// [P] confirm's form words at their documented shortest spellings:
+// e:xistence, f:ile, fo:rmat, name:s, n:umber, mat:rix, sca:lar, str:ing,
+// v:ariable. new, numeric, date, frame, integer and the storage types are
+// typed in full (`int` and `str10` are types, not abbreviations). A word that
+// spells no form is returned as typed.
+std::string confirmFormWord(const std::string& typed) {
+  const std::string w = strutil::lower(typed);
+  if (w == "numeric" || w == "new" || w == "date" || w == "frame" || w == "integer") return w;
+  struct Form {
+    const char* full;
+    size_t shortest;
+  };
+  static const Form kForms[] = {{"existence", 1}, {"file", 1},   {"format", 2},
+                                {"names", 4},     {"number", 1}, {"matrix", 3},
+                                {"scalar", 3},    {"string", 3}, {"variable", 1}};
+  for (const Form& f : kForms) {
+    const size_t n = std::strlen(f.full);
+    if (w.size() >= f.shortest && w.size() <= n && std::strncmp(f.full, w.c_str(), w.size()) == 0)
+      return f.full;
+  }
+  return typed;
+}
+
+// A form word that another form word follows: `new file`, `integer number`,
+// `numeric variable`, `string format`, `double variable`.
+bool confirmLeadWord(const std::string& w) {
+  static const std::regex reLead(
+      R"(^(new|integer|numeric|string|date|byte|int|long|float|double|strl|str[0-9]+|str#)$)",
+      std::regex::icase);
+  return std::regex_match(w, reLead);
+}
+
 }  // namespace
 
 // `confirm [new] file|variable|numeric|string|integer|number|scalar|
@@ -91,8 +123,53 @@ bool isValidStataName(const std::string& s) { return strutil::isValidStataIdenti
 //     leading "number " token off arg specifically in the integer branch
 //     (same pattern as the numeric/string branch's own "variable " strip
 //     immediately below).
-ojson runConfirm(const std::string& raw, const std::vector<std::string>& varlist,
+ojson runConfirm(const std::string& typedRaw, const std::vector<std::string>& typedVarlist,
                   SessionState& session) {
+  // The form words are read at their documented abbreviations (`confirm f`,
+  // `confirm fo %9.2f`, `confirm sca s1`, `confirm str var make`): spell them
+  // out once here so every arm below sees the full word. Only the leading form
+  // words are rewritten -- never the argument.
+  std::string raw = typedRaw;
+  std::vector<std::string> varlist = typedVarlist;
+  {
+    static const char* kWs = " \t";
+    size_t p = raw.find_first_not_of(kWs);
+    p = p == std::string::npos ? raw.size() : raw.find_first_of(kWs, p);  // past `confirm`
+    std::string rebuilt = raw.substr(0, p == std::string::npos ? raw.size() : p);
+    size_t nWords = 0;
+    while (p != std::string::npos && p < raw.size()) {
+      const size_t b = raw.find_first_not_of(kWs, p);
+      if (b == std::string::npos) break;
+      const size_t e = raw.find_first_of(kWs, b);
+      const std::string word = raw.substr(b, e == std::string::npos ? std::string::npos : e - b);
+      const std::string canon = command_detail::confirmFormWord(word);
+      rebuilt += raw.substr(p, b - p) + canon;
+      if (nWords < varlist.size() && lower(varlist[nWords]) == lower(word)) varlist[nWords] = canon;
+      ++nWords;
+      p = e;
+      if (!command_detail::confirmLeadWord(canon)) break;
+    }
+    if (p != std::string::npos && p < raw.size()) rebuilt += raw.substr(p);
+    raw = rebuilt;
+  }
+  // `confirm byte|int|long|float|double variable VARLIST`: the form checks the
+  // storage type besides existence. It is read as `confirm variable` (same name
+  // rules and r(111) refusals) and each variable found is then held to the type;
+  // a different one is r(7) "'x' found where double variable expected" (bank cell
+  // 86bbe2e2564777a9: price is an int).
+  std::string wantStorage;
+  {
+    static const std::regex reTyped(
+        R"(^(\s*confirm\s+)(byte|int|long|float|double)\s+(v(?:a(?:r(?:i(?:a(?:b(?:le?)?)?)?)?)?)?)(\s+.*)$)",
+        std::regex::icase);
+    std::smatch tm;
+    if (std::regex_match(raw, tm, reTyped)) {
+      wantStorage = lower(tm.str(2));
+      raw = tm.str(1) + "variable" + tm.str(4);
+      varlist.erase(varlist.begin());
+      if (!varlist.empty()) varlist[0] = "variable";
+    }
+  }
   // BUG-1103: `variable' abbreviates down to `v' -- `confirm var x', `confirm v x',
   // `confirm numeric var x' (StataBE 19.5). Spelled out only, `confirm var zz' fell
   // to the silent unknown-subtype branch below at rc 0, where Stata says r(111).
@@ -124,6 +201,18 @@ ojson runConfirm(const std::string& raw, const std::vector<std::string>& varlist
       // variables ab'; StataBE 19.5).
       static const std::regex reVarKw("^" + kVariableWord + R"((\s+|$))", std::regex::icase);
       std::smatch vk;
+      // `confirm numeric format %td` / `confirm string format %10s` ([P] confirm):
+      // the format form of the type word (vs-stata bank b603f406b732843b,
+      // 7d362d4b25b844b0 run). A string format ends in s; a numeric one does not.
+      static const std::regex reFmtKw(R"(^format\s+(\S+)\s*$)", std::regex::icase);
+      std::smatch fk;
+      if (std::regex_search(arg, fk, reFmtKw)) {
+        const std::string f = fk.str(1);
+        const bool strFmt = !f.empty() && (f.back() == 's' || f.back() == 'S');
+        if (f.size() < 2 || f[0] != '%' || strFmt != (sub == "string"))
+          return engineErrorBlockRc("'" + f + "' found where " + sub + " format expected", 7);
+        return ojson::array();
+      }
       if (!std::regex_search(arg, vk, reVarKw)) return engineErrorBlockRc("invalid syntax", 198);
       arg = arg.substr(static_cast<size_t>(vk.length(0)));
     }
@@ -365,6 +454,8 @@ ojson runConfirm(const std::string& raw, const std::vector<std::string>& varlist
       }
       if (prefixHits > 1) return engineErrorBlockRc(one + " ambiguous abbreviation", 111);
       if (hit == nullptr) return engineErrorBlockRc("variable " + one + " not found", 111);
+      if (!wantStorage.empty() && serset::storageType(session, *session.datastore(), hit->first) != wantStorage)
+        return engineErrorBlockRc("'" + one + "' found where " + wantStorage + " variable expected", 7);
       if (sub == "numeric" || sub == "string") {
         const std::string& dtype = hit->second;
         bool isStrDtype = dtype.rfind("str", 0) == 0 || dtype == "factor";
@@ -466,12 +557,44 @@ ojson runConfirm(const std::string& raw, const std::vector<std::string>& varlist
     // blank-arg corner case — see this batch's report). Any non-blank arg
     // always succeeds.
     if (trim(arg).empty()) {
-      return engineErrorBlock("confirm existence: '' found where something expected");
+      // r(6), "'' found where something expected" (bank cell 9bd45b2a7fa36487).
+      return eval::errorBlock("engine_error", "'' found where something expected", std::nullopt,
+                              std::nullopt, std::nullopt, "r(6)");
     }
     return ojson::array();
   }
 
-  // Unknown confirm sub-type -- silent noop (future-proof, mirrors shims.py).
+  // The forms [P] confirm documents that are not served above. `format`: a
+  // display format begins with %: `confirm format badfmt` is r(7) "'badfmt'
+  // found where format expected" (vs-stata bank 21bf2b87875f48c6). `frame`:
+  // PIET's frames are the default frame and those `frame put` made: `confirm
+  // frame zzzfr` is r(111) "frame zzzfr not found" (52b131ffef753507).
+  if (sub == "format") {
+    for (size_t i = 1; i < varlist.size(); ++i)
+      if (varlist[i].size() < 2 || varlist[i][0] != '%')
+        return engineErrorBlockRc("'" + varlist[i] + "' found where format expected", 7);
+    return ojson::array();
+  }
+  if (sub == "frame" || (sub == "new" && varlist.size() > 1 && lower(varlist[1]) == "frame")) {
+    const bool newFrame = sub == "new";
+    for (size_t i = newFrame ? 2 : 1; i < varlist.size(); ++i) {
+      const std::string& f = varlist[i];
+      const bool exists = f == "default" || session.frames.count(f) != 0;
+      if (newFrame && exists) return engineErrorBlockRc("frame " + f + " already defined", 110);
+      if (!newFrame && !exists) return engineErrorBlockRc("frame " + f + " not found", 111);
+    }
+    return ojson::array();
+  }
+  // Any other first word is no form of confirm: `confirm`, `confirm , zz` and
+  // `confirm zzzthing x` are r(198) "invalid syntax" (331e7debb0cb668f,
+  // 4745777cf8bb2ae1, 97ce335c7ba0970a). The storage-type forms (`confirm
+  // double variable x`) are not checked by this build and stay silent.
+  {
+    static const std::regex reKnown(
+        R"(^(new|file|numeric|string|date|format|names?|integer|number|matrix|scalar|existence|frame|byte|int|long|float|double|strl|str[0-9]+|str#|variable)$)",
+        std::regex::icase);
+    if (!std::regex_match(sub, reKnown)) return engineErrorBlockRc("invalid syntax", 198);
+  }
   return ojson::array();
 }
 

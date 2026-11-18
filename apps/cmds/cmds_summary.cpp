@@ -99,6 +99,13 @@ int cmd_corr(const std::vector<std::string>& a) {
             for (int j = 0; j < k; ++j) if (std::isnan(col[j][r])) { listwise[r] = 0; break; }
         }
     }
+    // pwcorr of two variables with no row where both are present: r(2000).
+    if (pairwise && k == 2) {
+        int64_t both = 0;
+        for (int64_t r = 0; r < N; ++r)
+            if (!std::isnan(col[0][r]) && !std::isnan(col[1][r])) ++both;
+        if (both == 0) throw EngineError("no_obs", "no observations", "r(2000)");
+    }
     json coefs = json::array();
     for (int i = 0; i < k; ++i) {
         for (int j = 0; j <= i; ++j) {
@@ -115,18 +122,27 @@ int cmd_corr(const std::vector<std::string>& a) {
             double p = NA;
             if (sig && i != j && !std::isnan(r)) {
                 if (r < 1.0) {
+                    // min(2*ttail(N-2, |rho|*sqrt(N-2)/sqrt(1-rho^2)), 1): Stata's min()
+                    // skips a missing argument, so a t it cannot form (N = 2, or rho
+                    // = -1 dividing by 0) leaves p = 1.
                     const double df = m.nobs - 2.0;
-                    const double t = std::fabs(r) * std::sqrt(df) / std::sqrt(1 - r * r);
-                    p = std::min(t_twosided_pvalue(t, df), 1.0);
+                    const double den = std::sqrt(1 - r * r);
+                    const double t = std::fabs(r) * std::sqrt(df) / den;
+                    const double pt = (df > 0 && den > 0 && std::isfinite(t)) ? t_twosided_pvalue(t, df) : NA;
+                    p = std::isnan(pt) ? 1.0 : std::min(pt, 1.0);
                 } else {
                     p = 0.0;
                 }
             }
+            // pwcorr's `corr vi vj` refuses a pair with fewer than two observations
+            // (r(2000) / r(2001)), and the ado leaves that cell of r(Nobs) at its
+            // initial 0 (vs-stata bank 1ecea861: one observation, r(Nobs) all 0).
+            const double pairN = (pairwise && m.rows < 2) ? 0.0 : m.nobs;
             for (const auto& [ii, jj] : {std::pair<int, int>{i, j}, std::pair<int, int>{j, i}}) {
                 const size_t at = static_cast<size_t>(ii) * k + jj;
                 R[at] = r;
                 C[at] = covar ? cv : r;
-                NB[at] = m.nobs;
+                NB[at] = pairN;
                 P[at] = p;
             }
             if (j < i) {  // one coef row per unique pair (tidy)
@@ -160,6 +176,38 @@ int cmd_corr(const std::vector<std::string>& a) {
         out["n_obs"] = count(listN);
         if (w != nullptr) out["sum_w"] = listSumw;
     }
+    // correlate's `means`: each variable's mean, standard deviation, minimum and
+    // maximum over the correlation's sample, weighted as the correlation is (aw: the
+    // weights rescaled to sum to N, sd sqrt(Sum v(x-m)^2/(N-1)); fw: sqrt(Sum
+    // w(x-m)^2/(W-1))).
+    if (has(a, "--means") && !pairwise) {
+        json ms = json::array();
+        for (int j = 0; j < k; ++j) {
+            ExactSum sw, sx;
+            int64_t rows = 0;
+            double mn = NA, mx = NA;
+            for (int64_t r = 0; r < N; ++r) if (listwise[r]) {
+                const double v = col[j][r];
+                sw.add(wAt(r)); sx.add(wAt(r) * v); ++rows;
+                if (std::isnan(mn) || v < mn) mn = v;
+                if (std::isnan(mx) || v > mx) mx = v;
+            }
+            const double W = sw.value();
+            const double m = rows > 0 ? sx.value() / W : NA;
+            double ss = 0;
+            for (int64_t r = 0; r < N; ++r) if (listwise[r]) {
+                const double d = col[j][r] - m;
+                const double a_r = w == nullptr ? 1.0 : analytic ? wAt(r) * static_cast<double>(rows) / W : wAt(r);
+                ss += a_r * d * d;
+            }
+            const double den = (w != nullptr && !analytic) ? W - 1.0 : static_cast<double>(rows) - 1.0;
+            const double sd = den > 0 ? std::sqrt(ss / den) : NA;
+            auto num = [](double v) { return std::isnan(v) ? json(nullptr) : json(v); };
+            ms.push_back({{"name", vars[static_cast<size_t>(j)]}, {"mean", num(m)}, {"sd", num(sd)},
+                          {"min", num(mn)}, {"max", num(mx)}});
+        }
+        out["means"] = ms;
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }
@@ -184,6 +232,37 @@ void two_groups(const double* x, const double* g, int64_t N, const char* cmd,
     for (auto& p : gx) (p.first == gv1 ? v1 : v2).push_back(p.second);
 }
 
+// by()'s group values. A numeric variable's own values; a string variable's
+// strings ranked in byte order (_ttest ByString makes the first group the smaller
+// string), "" missing (markout strok). `labels` gets the string of each rank.
+std::vector<double> by_values(const Dataset& ds, const char* cmd, const std::string& by, int64_t N,
+                              std::vector<std::string>& labels) {
+    labels.clear();
+    if (!ds.has(by) || ds.col(by).dtype == DType::F64) {
+        const double* g = require_num(ds, cmd, by);
+        return std::vector<double>(g, g + N);
+    }
+    const Column& c = ds.col(by);
+    const int32_t* codes = c.codes();
+    std::vector<std::string> used;
+    for (int64_t i = 0; i < N; ++i) {
+        const int32_t k = codes[i];
+        if (k < 0 || static_cast<size_t>(k) >= c.levels.size() || c.levels[static_cast<size_t>(k)].empty()) continue;
+        used.push_back(c.levels[static_cast<size_t>(k)]);
+    }
+    std::sort(used.begin(), used.end());
+    used.erase(std::unique(used.begin(), used.end()), used.end());
+    std::vector<double> out(static_cast<size_t>(N), std::numeric_limits<double>::quiet_NaN());
+    for (int64_t i = 0; i < N; ++i) {
+        const int32_t k = codes[i];
+        if (k < 0 || static_cast<size_t>(k) >= c.levels.size() || c.levels[static_cast<size_t>(k)].empty()) continue;
+        const auto it = std::lower_bound(used.begin(), used.end(), c.levels[static_cast<size_t>(k)]);
+        out[static_cast<size_t>(i)] = static_cast<double>(it - used.begin());
+    }
+    labels = used;
+    return out;
+}
+
 // Independent-samples t-test core (pooled-variance vs unequal/Satterthwaite vs
 // Welch), given each sample's precomputed mean/sd/n. This is the SAME formula
 // cmd_ttest's --by() two-sample path has always used; BS-089 (`ttest x y,
@@ -191,6 +270,27 @@ void two_groups(const double* x, const double* g, int64_t N, const char* cmd,
 // instead of duplicating the arithmetic (byte-identical operation order to the
 // prior inline version — no ULP drift for the existing --by() callers).
 struct TwoSampleDiff { double diff, se, df, t, tc; };
+
+// Stata's division: x/0 is missing, never +-inf (ttesti.ado's t = diff/se when
+// a sample's sd is 0, or missing because it has one observation).
+double stata_div(double a, double b) {
+    if (std::isnan(a) || std::isnan(b) || b == 0.0) return std::numeric_limits<double>::quiet_NaN();
+    return a / b;
+}
+
+// ttest's three p-values (ttesti.ado OneTest/TwoTest, ttest.ado Paired): the
+// two-sided p = tprob(df, t), the tail on t's side is p/2 and the other 1 - p/2.
+// Taking the small tail as p/2 (not 1 - cdf) keeps its digits when it is tiny;
+// a missing t (or df) leaves all three missing.
+void t_test_pvalues(double t, double df, double& p, double& p_l, double& p_u) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    p = p_l = p_u = nan;
+    if (std::isnan(t) || std::isnan(df) || df <= 0) return;
+    p = t_twosided_pvalue(t, df);
+    if (t < 0) { p_l = p / 2; p_u = 1.0 - p_l; }
+    else       { p_u = p / 2; p_l = 1.0 - p_u; }
+}
+
 TwoSampleDiff two_sample_diff(double m1, double s1, int64_t n1, double m2, double s2, int64_t n2,
                               bool unequal, bool welch, double alpha) {
     double diff = m1 - m2, se, df;
@@ -205,60 +305,129 @@ TwoSampleDiff two_sample_diff(double m1, double s1, int64_t n1, double m2, doubl
         se = std::sqrt(sp2 * (1.0 / n1 + 1.0 / n2));
         df = n1 + n2 - 2.0;
     }
-    double t = diff / se, tc = t_critical(alpha, df);
+    double t = stata_div(diff, se);
+    double tc = std::isnan(df) ? std::numeric_limits<double>::quiet_NaN() : t_critical(alpha, df);
     return {diff, se, df, t, tc};
 }
 
 }  // namespace
 
 // ── sdtest (variance comparison) ─────────────────────────────────────────────
+// sdtest's three forms, as sdtest.ado hands them to sdtesti: `= #` is the
+// one-sample chi-squared test, `= var` the variance-ratio test of two variables
+// (each over its own nonmissing rows of the sample), by() the variance-ratio test
+// of two groups. Each sample's (n, mean, sd) passes the _ttest check first: no
+// observations is r(2000); an sd that summarize cannot form (r(Var) overflows) is
+// r(416) unless the sample has one observation, whose sd is then missing and so is
+// every statistic built on it. p_u is the upper tail, p_l = 1 - p_u, and p twice
+// the smaller of the two. Stored results: N df chi2 sd p_u p_l p (one-sample), N
+// df_1 df_2 F sd_1 sd_2 p_u p_l p sd (two-sample, sd = the combined sample's,
+// pooled from the two (n, mean, sd)).
 int cmd_sdtest(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data");
     std::vector<std::string> vars = split_csv(opt(a, "--vars", opt(a, "--var")));
     std::string by = opt(a, "--by"), against = opt(a, "--against");
     double level = std::stod(opt(a, "--level", "95"));
-    if (data_missing(data) || vars.empty() || (by.empty() && against.empty())) {
-        std::fprintf(stderr, "usage: cobra sdtest --data f.hbin --var V (--by G | --against SD0) [--level 95]\n");
+    if (data_missing(data) || vars.empty() || (by.empty() && against.empty() && vars.size() < 2)) {
+        std::fprintf(stderr, "usage: cobra sdtest --data f.hbin (--var V (--by G | --against SD0) | --vars V1,V2) [--level 95]\n");
         return 2;
     }
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     const int64_t N = ds.n_rows();
     double alpha = 1.0 - level / 100.0;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    auto num = [](double v) { return std::isnan(v) ? json(nullptr) : json(v); };
+    // summarize's mean and sd: missing when the sum or the variance overflows; a
+    // one-observation sample has no sd.
+    auto summ = [&](const std::vector<double>& v, double& m, double& s) {
+        mean_sd(v, m, s);
+        if (!std::isfinite(m)) m = nan;
+        if (!std::isfinite(s) || v.size() == 1) s = nan;
+    };
+    auto check = [](const std::string& which, size_t n, double s) {
+        if (n == 0)
+            throw EngineError("no_obs", which.empty() ? "no observations" : which + " sample has no observations",
+                              "r(2000)");
+        if (std::isnan(s) && n != 1)
+            throw EngineError("bad_input",
+                              which.empty() ? "standard deviation is missing"
+                                            : "standard deviation of " + which + " sample is missing",
+                              "r(416)");
+    };
+    auto tails = [](double pu, json& r) {
+        const double pl = 1.0 - pu;  // missing when p_u is
+        r["p_u"] = std::isnan(pu) ? json(nullptr) : json(pu);
+        r["p_l"] = std::isnan(pl) ? json(nullptr) : json(pl);
+        const double p = pl < pu ? 2.0 * pl : 2.0 * pu;
+        r["p"] = std::isnan(p) ? json(nullptr) : json(p);
+        return std::make_pair(pl, p);
+    };
     if (!against.empty()) {  // one-sample chi2
         double sd0 = std::stod(against);
         std::vector<double> v = nonmissing(require_num(ds, "sdtest", vars[0]), N);
-        double mean, sd; mean_sd(v, mean, sd);
+        double mean, sd; summ(v, mean, sd);
+        check("", v.size(), sd);
+        if (sd0 < 0) throw EngineError("bad_input", "hypothesized standard deviation is negative", "r(411)");
         int64_t n = static_cast<int64_t>(v.size());
         double df = static_cast<double>(n - 1), se = sd / std::sqrt(static_cast<double>(n));
-        double chi2 = df * sd * sd / (sd0 * sd0);
-        double p_l = chi2_cdf(chi2, df), p_u = chi2_pvalue(chi2, df);
+        double chi2 = (std::isnan(sd) || sd0 == 0.0) ? nan : df * sd * sd / (sd0 * sd0);
+        double p_u = (std::isnan(chi2) || !(df > 0)) ? nan : chi2_pvalue(chi2, df);
         double tc = t_critical(alpha, df);
+        json r = {{"N", n}, {"df", df}, {"chi2", num(chi2)}, {"sd", num(sd)}};
+        auto [p_l, p] = tails(p_u, r);
         json out = {{"estimator", "sdtest"}, {"mode", "one_sample"}, {"var", vars[0]}, {"sd0", sd0},
-                    {"level", level}, {"n_obs", n}, {"mean", mean}, {"sd", sd}, {"se", se},
-                    {"ci_lo", mean - tc * se}, {"ci_hi", mean + tc * se}, {"df", df}, {"chi2", chi2},
-                    {"p", std::min(1.0, 2 * std::min(p_l, p_u))}, {"p_lower", p_l}, {"p_upper", p_u}};
+                    {"level", level}, {"n_obs", n}, {"mean", mean}, {"sd", num(sd)}, {"se", num(se)},
+                    {"ci_lo", num(mean - tc * se)}, {"ci_hi", num(mean + tc * se)}, {"df", df}, {"chi2", num(chi2)},
+                    {"p", num(p)}, {"p_lower", num(p_l)}, {"p_upper", num(p_u)}, {"r", r}};
         emit(out, opt(a, "--out"));
         return 0;
     }
-    std::vector<double> v1, v2; double gv1, gv2;
-    two_groups(require_num(ds, "sdtest", vars[0]), require_num(ds, "sdtest", by), N, "sdtest", v1, v2, gv1, gv2);
-    double m1, s1, m2, s2; mean_sd(v1, m1, s1); mean_sd(v2, m2, s2);
+    std::vector<double> v1, v2;
+    json g1, g2;  // the group's value, or the variable's name
+    if (!by.empty()) {
+        double gv1, gv2;
+        std::vector<std::string> labels;
+        const std::vector<double> gcol = by_values(ds, "sdtest", by, N, labels);
+        two_groups(require_num(ds, "sdtest", vars[0]), gcol.data(), N, "sdtest", v1, v2, gv1, gv2);
+        g1 = gv1; g2 = gv2;
+        if (!labels.empty()) {
+            g1 = labels[static_cast<size_t>(gv1)];
+            g2 = labels[static_cast<size_t>(gv2)];
+        }
+    } else {
+        v1 = nonmissing(require_num(ds, "sdtest", vars[0]), N);
+        v2 = nonmissing(require_num(ds, "sdtest", vars[1]), N);
+        g1 = vars[0]; g2 = vars[1];
+    }
+    double m1, s1, m2, s2; summ(v1, m1, s1); summ(v2, m2, s2);
+    check("first", v1.size(), s1);
+    check("second", v2.size(), s2);
     int64_t n1 = v1.size(), n2 = v2.size();
-    double df1 = n1 - 1.0, df2 = n2 - 1.0, F = (s1 * s1) / (s2 * s2);
-    double p_l = f_cdf(F, df1, df2), p_u = f_pvalue(F, df1, df2);
-    auto grp = [&](double m, double s, int64_t n, double gv) {
+    double df1 = n1 - 1.0, df2 = n2 - 1.0;
+    const double ratio = stata_div(s1, s2);
+    const double F = ratio * ratio;
+    const double p_u = (std::isnan(F) || !(df1 > 0) || !(df2 > 0)) ? nan : f_pvalue(F, df1, df2);
+    auto grp = [&](double m, double s, int64_t n, const json& gv) {
         double se = s / std::sqrt(static_cast<double>(n)), tc = t_critical(alpha, n - 1.0);
-        return json{{"value", gv}, {"n", n}, {"mean", m}, {"sd", s}, {"se", se},
-                    {"ci_lo", m - tc * se}, {"ci_hi", m + tc * se}};
+        return json{{"value", gv}, {"n", n}, {"mean", m}, {"sd", num(s)}, {"se", num(se)},
+                    {"ci_lo", num(m - tc * se)}, {"ci_hi", num(m + tc * se)}};
     };
-    std::vector<double> all = v1; all.insert(all.end(), v2.begin(), v2.end());
-    double cm, cs; mean_sd(all, cm, cs);
-    json out = {{"estimator", "sdtest"}, {"mode", "two_sample"}, {"var", vars[0]}, {"by", by},
-                {"level", level}, {"n_obs", n1 + n2}, {"F", F}, {"df1", df1}, {"df2", df2},
-                {"p", std::min(1.0, 2 * std::min(p_l, p_u))}, {"p_lower", p_l}, {"p_upper", p_u},
-                {"sd_1", s1}, {"sd_2", s2}, {"groups", json::array({grp(m1, s1, n1, gv1), grp(m2, s2, n2, gv2)})},
-                {"combined", {{"n", n1 + n2}, {"mean", cm}, {"sd", cs}}}};
+    const int64_t n = n1 + n2;
+    const double cm = (n1 * m1 + n2 * m2) / static_cast<double>(n);
+    const double cs = std::sqrt(((n1 - 1) * s1 * s1 + n1 * (cm - m1) * (cm - m1) + (n2 - 1) * s2 * s2 +
+                                 n2 * (cm - m2) * (cm - m2)) /
+                                static_cast<double>(n - 1));
+    json r = {{"N", n}, {"df_1", df1}, {"df_2", df2}, {"F", num(F)}, {"sd_1", num(s1)}, {"sd_2", num(s2)},
+              {"sd", num(cs)}};
+    auto [p_l, p] = tails(p_u, r);
+    json out = {{"estimator", "sdtest"}, {"mode", by.empty() ? "two_variable" : "two_sample"}, {"var", vars[0]},
+                {"level", level}, {"n_obs", n}, {"F", num(F)}, {"df1", df1}, {"df2", df2},
+                {"p", num(p)}, {"p_lower", num(p_l)}, {"p_upper", num(p_u)},
+                {"sd_1", num(s1)}, {"sd_2", num(s2)}, {"groups", json::array({grp(m1, s1, n1, g1), grp(m2, s2, n2, g2)})},
+                {"combined", {{"n", n}, {"mean", cm}, {"sd", num(cs)}}}, {"r", r}};
+    if (!by.empty()) out["by"] = by;
+    else out["var2"] = vars[1];
     emit(out, opt(a, "--out"));
     return 0;
 }
@@ -269,7 +438,10 @@ int cmd_ttest(const std::vector<std::string>& a) {
     std::vector<std::string> vars = split_csv(opt(a, "--vars", opt(a, "--var")));
     std::string by = opt(a, "--by"), against = opt(a, "--against");
     bool welch = has(a, "--welch");        // Stata `welch`: implies unequal variances
-    bool unequal = welch || has(a, "--unequal");
+    // both flags are read (not short-circuited): an unread --unequal next to
+    // --welch trips the unconsumed-flag net.
+    const bool unequalFlag = has(a, "--unequal");
+    bool unequal = welch || unequalFlag;
     // BS-059: swap which group/variable is "first" — mirror-image output (group/
     // var order, mean_1/mean_2, and CI bounds swap; diff and t flip sign; |t|, p,
     // and CI width are unchanged). Applies to the --by() two-sample path and the
@@ -296,40 +468,72 @@ int cmd_ttest(const std::vector<std::string>& a) {
     // ttest posts, by form, under Stata's names (ttest's documented
     // Stored results). Each group's CI uses that group's own df (n_g - 1), the
     // difference's CI the test's df.
+    // A missing number goes out as JSON null; PIET posts it as Stata's `.`.
+    auto num = [](double v) { return std::isnan(v) ? json(nullptr) : json(v); };
+    // ttesti.ado / ttest.ado Paired: a sample of one observation has no standard
+    // deviation (its summarize r(Var) is missing), so neither its se, its CI, nor
+    // any statistic built on it exists.
+    // An sd summarize cannot form (r(Var) overflows: values near 1e300) is missing too.
+    auto sdOf = [](size_t n, double s) {
+        return (n == 1 || !std::isfinite(s)) ? std::numeric_limits<double>::quiet_NaN() : s;
+    };
+    // ttesti's _ttest check, run on each sample before any statistic: no
+    // observations is r(2000), a missing mean (the sum overflows) or a missing sd
+    // of a sample with more than one observation r(416). The paired test does not
+    // go through ttesti: its statistics are left missing instead.
+    auto check = [](const std::string& which, size_t n, double m, double s) {
+        if (n == 0)
+            throw EngineError("no_obs", which.empty() ? "no observations" : which + " sample has no observations",
+                              "r(2000)");
+        if (!std::isfinite(m))
+            throw EngineError("bad_input", which.empty() ? "mean is missing" : "mean of " + which + " sample is missing",
+                              "r(416)");
+        if (std::isnan(s) && n != 1)
+            throw EngineError("bad_input",
+                              which.empty() ? "standard deviation is missing"
+                                            : "standard deviation of " + which + " sample is missing",
+                              "r(416)");
+    };
+    // _ttest table: se = sd/sqrt(n), CI = mean -+ invt(n-1, level) * se.
     auto groupR = [&](json& r, const std::string& sfx, int64_t n, double m, double sd) {
         const double se = sd / std::sqrt(static_cast<double>(n));
         const double tc = t_critical(alpha, n - 1.0);
         r["N" + sfx] = n; r["mu" + sfx] = m;
-        r["se" + sfx] = se; r["lb" + sfx] = m - tc * se; r["ub" + sfx] = m + tc * se;
+        r["se" + sfx] = num(se); r["lb" + sfx] = num(m - tc * se); r["ub" + sfx] = num(m + tc * se);
         return se;
     };
     auto testR = [&](json& r, double t, double df, double ci_lo, double ci_hi, double se) {
-        const double p = t_twosided_pvalue(t, df), p_l = t_cdf(t, df);
-        r["t"] = t; r["df_t"] = df; r["p"] = p; r["p_l"] = p_l; r["p_u"] = 1.0 - p_l;
-        r["se"] = se; r["level"] = level;
+        double p, p_l, p_u;
+        t_test_pvalues(t, df, p, p_l, p_u);
+        r["t"] = num(t); r["df_t"] = num(df); r["p"] = num(p); r["p_l"] = num(p_l); r["p_u"] = num(p_u);
+        r["se"] = num(se); r["level"] = level;
         (void)ci_lo; (void)ci_hi;
     };
-    // Two-sample (by() or unpaired): 28 names, the combined sample included.
-    auto twoSampleR = [&](const std::vector<double>& v1, const std::vector<double>& v2, double m1,
-                          double s1, double m2, double s2, const TwoSampleDiff& d) {
+    // Two-sample (by() or unpaired): 28 names, the combined sample included. The
+    // combined row is ttesti.ado TwoTest's: its mean and sd pooled from the two
+    // groups' (n, mean, sd), so a group with no sd leaves the combined sd missing.
+    auto twoSampleR = [&](int64_t n1, int64_t n2, double m1, double s1, double m2, double s2,
+                          const TwoSampleDiff& d) {
         json r = json::object();
-        const int64_t n1 = static_cast<int64_t>(v1.size()), n2 = static_cast<int64_t>(v2.size());
         groupR(r, "_1", n1, m1, s1);
         groupR(r, "_2", n2, m2, s2);
-        std::vector<double> all(v1);
-        all.insert(all.end(), v2.begin(), v2.end());
-        double mc, sc; mean_sd(all, mc, sc);
-        groupR(r, "_combined", n1 + n2, mc, sc);
-        r["sd_1"] = s1; r["sd_2"] = s2; r["sd"] = sc;
+        const int64_t n = n1 + n2;
+        const double mc = (n1 * m1 + n2 * m2) / static_cast<double>(n);
+        const double sc = std::sqrt(((n1 - 1) * s1 * s1 + n1 * (mc - m1) * (mc - m1) +
+                                     (n2 - 1) * s2 * s2 + n2 * (mc - m2) * (mc - m2)) /
+                                    static_cast<double>(n - 1));
+        groupR(r, "_combined", n, mc, sc);
+        r["sd_1"] = num(s1); r["sd_2"] = num(s2); r["sd"] = num(sc);
         r["mu_diff"] = d.diff;
-        r["lb_diff"] = d.diff - d.tc * d.se; r["ub_diff"] = d.diff + d.tc * d.se;
+        r["lb_diff"] = num(d.diff - d.tc * d.se); r["ub_diff"] = num(d.diff + d.tc * d.se);
         testR(r, d.t, d.df, 0, 0, d.se);
         return r;
     };
     auto finish = [&](json out, double b, double se, double t, double df, double ci_lo, double ci_hi,
                       const std::string& name) {
-        double p = t_twosided_pvalue(t, df), p_l = t_cdf(t, df);
-        out["t"] = t; out["df"] = df; out["p"] = p; out["p_lower"] = p_l; out["p_upper"] = 1.0 - p_l;
+        double p, p_l, p_u;
+        t_test_pvalues(t, df, p, p_l, p_u);
+        out["t"] = t; out["df"] = df; out["p"] = p; out["p_lower"] = p_l; out["p_upper"] = p_u;
         out["level"] = level; out["se"] = se; out["ci_lo"] = ci_lo; out["ci_hi"] = ci_hi;
         out["coefs"] = json::array({{{"name", name}, {"b", b}, {"se", se}, {"t", t}, {"p", p},
                                      {"ci_lo", ci_lo}, {"ci_hi", ci_hi}}});
@@ -340,7 +544,9 @@ int cmd_ttest(const std::vector<std::string>& a) {
         double mu = std::stod(against);
         std::vector<double> v = nonmissing(require_num(ds, "ttest", vars[0]), N);
         double m, s; mean_sd(v, m, s); int64_t n = v.size();
-        double df = n - 1.0, se = s / std::sqrt(static_cast<double>(n)), t = (m - mu) / se;
+        s = sdOf(v.size(), s);
+        check("", v.size(), m, s);
+        double df = n - 1.0, se = s / std::sqrt(static_cast<double>(n)), t = stata_div(m - mu, se);
         double tc = t_critical(alpha, df);
         json out = {{"estimator", "ttest"}, {"mode", "one_sample"}, {"var", vars[0]}, {"mu", mu},
                     {"n_obs", n}, {"mean", m}, {"sd", s}};
@@ -349,26 +555,31 @@ int cmd_ttest(const std::vector<std::string>& a) {
         json r = json::object();
         groupR(r, "_1", n, m, s);
         r.erase("se_1");
-        r["sd_1"] = s;
+        r["sd_1"] = num(s);
         testR(r, t, df, m - tc * se, m + tc * se, se);
         out["r"] = r;
         return finish(out, m, se, t, df, m - tc * se, m + tc * se, vars[0]);
     }
     if (!by.empty()) {  // two-sample
         std::vector<double> v1, v2; double gv1, gv2;
-        two_groups(require_num(ds, "ttest", vars[0]), require_num(ds, "ttest", by), N, "ttest", v1, v2, gv1, gv2);
+        std::vector<std::string> labels;
+        const std::vector<double> gcol = by_values(ds, "ttest", by, N, labels);
+        two_groups(require_num(ds, "ttest", vars[0]), gcol.data(), N, "ttest", v1, v2, gv1, gv2);
         // reverse: swap the two group-splits (and their group values) BEFORE any
         // downstream stat is computed, so group_1/mean_1/... genuinely become
         // group_2/mean_2/...'s former values (not just a post-hoc sign flip).
         if (reverse) { std::swap(v1, v2); std::swap(gv1, gv2); }
         double m1, s1, m2, s2; mean_sd(v1, m1, s1); mean_sd(v2, m2, s2);
+        s1 = sdOf(v1.size(), s1); s2 = sdOf(v2.size(), s2);
+        check("first", v1.size(), m1, s1);
+        check("second", v2.size(), m2, s2);
         int64_t n1 = static_cast<int64_t>(v1.size()), n2 = static_cast<int64_t>(v2.size());
         TwoSampleDiff r = two_sample_diff(m1, s1, n1, m2, s2, n2, unequal, welch, alpha);
         json out = {{"estimator", "ttest"},
                     {"mode", welch ? "two_sample_welch" : unequal ? "two_sample_unequal" : "two_sample"},
                     {"var", vars[0]}, {"by", by}, {"n_1", n1}, {"n_2", n2}, {"mean_1", m1}, {"mean_2", m2},
                     {"sd_1", s1}, {"sd_2", s2}, {"mean_diff", r.diff}};
-        out["r"] = twoSampleR(v1, v2, m1, s1, m2, s2, r);
+        out["r"] = twoSampleR(n1, n2, m1, s1, m2, s2, r);
         return finish(out, r.diff, r.se, r.t, r.df, r.diff - r.tc * r.se, r.diff + r.tc * r.se, "diff");
     }
     // two-variable form: name1/name2 = vars[0]/vars[1], swapped under --reverse.
@@ -379,20 +590,25 @@ int cmd_ttest(const std::vector<std::string>& a) {
     if (unpaired) {  // BS-089: independent samples — same math as --by() above
         std::vector<double> v1 = nonmissing(x, N), v2 = nonmissing(y, N);
         double m1, s1, m2, s2; mean_sd(v1, m1, s1); mean_sd(v2, m2, s2);
+        s1 = sdOf(v1.size(), s1); s2 = sdOf(v2.size(), s2);
+        check("first", v1.size(), m1, s1);
+        check("second", v2.size(), m2, s2);
         int64_t n1 = static_cast<int64_t>(v1.size()), n2 = static_cast<int64_t>(v2.size());
         TwoSampleDiff r = two_sample_diff(m1, s1, n1, m2, s2, n2, unequal, welch, alpha);
         json out = {{"estimator", "ttest"},
                     {"mode", welch ? "unpaired_welch" : unequal ? "unpaired_unequal" : "unpaired"},
                     {"var1", name1}, {"var2", name2}, {"n_1", n1}, {"n_2", n2}, {"mean_1", m1}, {"mean_2", m2},
                     {"sd_1", s1}, {"sd_2", s2}, {"mean_diff", r.diff}};
-        out["r"] = twoSampleR(v1, v2, m1, s1, m2, s2, r);
+        out["r"] = twoSampleR(n1, n2, m1, s1, m2, s2, r);
         return finish(out, r.diff, r.se, r.t, r.df, r.diff - r.tc * r.se, r.diff + r.tc * r.se, "diff");
     }
     // paired (default): name1 - name2, row-wise on jointly-nonmissing obs
     std::vector<double> d;
     for (int64_t i = 0; i < N; ++i) if (!std::isnan(x[i]) && !std::isnan(y[i])) d.push_back(x[i] - y[i]);
     double md, sdd; mean_sd(d, md, sdd); int64_t n = d.size();
-    double df = n - 1.0, se = sdd / std::sqrt(static_cast<double>(n)), t = md / se, tc = t_critical(alpha, df);
+    sdd = sdOf(d.size(), sdd);
+    double df = n - 1.0, se = sdd / std::sqrt(static_cast<double>(n)), t = stata_div(md, se),
+           tc = t_critical(alpha, df);
     json out = {{"estimator", "ttest"}, {"mode", "paired"}, {"var1", name1}, {"var2", name2},
                 {"n_obs", n}, {"mean_diff", md}, {"sd_diff", sdd}};
     if (n == 0) throw EngineError("no_obs", "no observations");
@@ -403,12 +619,13 @@ int cmd_ttest(const std::vector<std::string>& a) {
         for (int64_t i = 0; i < N; ++i)
             if (!std::isnan(x[i]) && !std::isnan(y[i])) { a1.push_back(x[i]); a2.push_back(y[i]); }
         double m1, s1, m2, s2; mean_sd(a1, m1, s1); mean_sd(a2, m2, s2);
+        s1 = sdOf(a1.size(), s1); s2 = sdOf(a2.size(), s2);
         json r = json::object();
         groupR(r, "_1", n, m1, s1);
         groupR(r, "_2", n, m2, s2);
-        r["sd_1"] = s1; r["sd_2"] = s2;
-        r["mu_diff"] = m1 - m2; r["sd_diff"] = sdd;
-        r["lb_diff"] = md - tc * se; r["ub_diff"] = md + tc * se;
+        r["sd_1"] = num(s1); r["sd_2"] = num(s2);
+        r["mu_diff"] = m1 - m2; r["sd_diff"] = num(sdd);
+        r["lb_diff"] = num(md - tc * se); r["ub_diff"] = num(md + tc * se);
         testR(r, t, df, md - tc * se, md + tc * se, se);
         out["r"] = r;
     }
@@ -541,6 +758,9 @@ int cmd_tabstat(const std::vector<std::string>& a) {
     };
     std::vector<char> sample(static_cast<size_t>(N), 1);
     json groups = json::array();
+    // `missing` (tabstat's option): a missing by-value is a category of its own, sorted last, and its
+    // rows stay in the total; without it those rows leave the sample.
+    const bool byMissing = has(a, "--missing");
     if (!by.empty()) {
         const Column& bc = ds.col(by);
         if (bc.dtype == DType::Factor) {
@@ -549,8 +769,17 @@ int cmd_tabstat(const std::vector<std::string>& a) {
             std::iota(perm.begin(), perm.end(), 0);
             std::stable_sort(perm.begin(), perm.end(),
                              [&](int x, int y) { return bc.levels[x] < bc.levels[y]; });
+            auto emptyText = [&](int64_t i) { return cc[i] < 0 || bc.levels[static_cast<size_t>(cc[i])].empty(); };
             for (int64_t i = 0; i < N; ++i)
-                if (cc[i] < 0 || bc.levels[static_cast<size_t>(cc[i])].empty()) sample[static_cast<size_t>(i)] = 0;
+                if (emptyText(i) && !byMissing) sample[static_cast<size_t>(i)] = 0;
+            // `missing` makes the empty string a category of its own; it sorts before every other text.
+            if (byMissing) {
+                std::vector<char> keep(static_cast<size_t>(N), 0);
+                bool any = false;
+                for (int64_t i = 0; i < N; ++i)
+                    if (emptyText(i)) { keep[static_cast<size_t>(i)] = 1; any = true; }
+                if (any) groups.push_back({{"value", std::string()}, {"stats", block(keep)}});
+            }
             for (int code : perm) {
                 if (bc.levels[static_cast<size_t>(code)].empty()) continue;
                 std::vector<char> keep(static_cast<size_t>(N), 0);
@@ -573,6 +802,15 @@ int cmd_tabstat(const std::vector<std::string>& a) {
                 std::vector<char> keep(static_cast<size_t>(N), 0);
                 for (int64_t i = 0; i < N; ++i) keep[static_cast<size_t>(i)] = g[i] == gval ? 1 : 0;
                 groups.push_back({{"value", gval}, {"stats", block(keep)}});
+            }
+            if (byMissing) {
+                std::vector<char> keep(static_cast<size_t>(N), 0);
+                bool any = false;
+                for (int64_t i = 0; i < N; ++i) {
+                    if (std::isnan(g[i])) { keep[static_cast<size_t>(i)] = 1; any = true; }
+                    sample[static_cast<size_t>(i)] = 1;
+                }
+                if (any) groups.push_back({{"value", nullptr}, {"stats", block(keep)}});
             }
         }
     }

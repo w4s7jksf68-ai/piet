@@ -37,10 +37,11 @@
 
 namespace {
 const piet::eval::OptVocab& kVocabEventstudyinteract = piet::eval::registerOptVocab(
-    {"eventstudyinteract"}, {{"absorb", "cohort", "control_cohort",
-                                                          "vce", "level", "cluster"},
-     {"covariates", "weights",
-                                                                  "residualize"}});
+    // eventstudyinteract.ado's syntax: absorb() cohort() control_cohort()
+    // COVARIATEs() vce(); level() and cluster() are r(198) "option ... not
+    // allowed" there (vs-stata bank 77917209, 3cd19507), and weights come in
+    // brackets.
+    {"eventstudyinteract"}, {{"absorb", "cohort", "control_cohort", "vce"}, {"covariates"}});
 }  // namespace
 
 namespace piet {
@@ -74,6 +75,23 @@ ojson runEventstudyinteract(const eval::ParsedCommand& parsed, SessionState& ses
     return ojson::array({ojson(*err)});
   }
 
+  // `avar ..., robust` runs on every call, so [iw] is always r(101) "iweights
+  // not allowed with robust, cluster, AC or HAC" (vs-stata bank fe1bfa28).
+  if (parsed.weightType.has_value()) {
+    const std::string wt = strutil::lower(*parsed.weightType);
+    if (wt == "iw" || wt == "iweight")
+      return ojson::array({ojson(eval::errorBlock(
+          "engine_error", "iweights not allowed with robust, cluster, AC or HAC", std::nullopt,
+          std::nullopt, std::nullopt, "r(101)"))});
+    if (wt == "fw" || wt == "fweight")
+      return ojson::array({ojson(eval::unsupportedOption(
+          "[" + *parsed.weightType + "=" + parsed.weightVar.value_or("") + "]",
+          "`eventstudyinteract` only supports analytic or probability weights "
+          "([aw=]/[aweight=]/[pw=]/[pweight=]) in this engine; [" + *parsed.weightType +
+              "=] is not supported here. Remove the weight specification or switch to a "
+              "supported weight type — a different weight type will change the estimation "
+              "result."))});
+  }
   auto absorb = optStr(parsed, "absorb");
   auto cohort = optStr(parsed, "cohort");
   auto controlCohort = optStr(parsed, "control_cohort");

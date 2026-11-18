@@ -321,6 +321,17 @@ int test_sdid_main() {
                R4.error.find("pre-treatment periods") != std::string::npos,
            "F: adoption with no pre-treatment periods is refused by name");
 
+        // A treatment that is not an indicator (vs-stata bank 03ecd58c: Stata r(450)).
+        std::vector<int> adopt6(12, 0);
+        for (int u = 0; u < 6; ++u) adopt6[u] = 5;
+        Panel P6 = factor_panel(12, 10, adopt6, 1.0);
+        for (int64_t k = 0; k < P6.n(); ++k)
+            if (P6.w[k] != 0.0) { P6.w[k] = 2.0; break; }
+        SdidResult R6 = run(P6, SdidConfig{});
+        ok(!R6.ok && R6.diagnostic == SdidDiagnostic::NonBinaryTreatment &&
+               R6.error == "Treatment variable takes values distinct from 0 and 1.",
+           "F: a treatment taking values other than 0 and 1 is refused by name");
+
         // Two rows for the same (unit, period) cell.
         std::vector<int> adopt5(12, 0);
         for (int u = 0; u < 6; ++u) adopt5[u] = 5;

@@ -260,7 +260,7 @@ const std::vector<OptDef>& optDefs() {
       {"eqrename", 5, OptKind::kModel, 2},      {"asequation", 4, OptKind::kModel, 0},
       {"eform", 5, OptKind::kModel, 0},         {"rescale", 7, OptKind::kModel, 2},
       {"transform", 5, OptKind::kModel, 2},     {"noci", 4, OptKind::kModel, 1},
-      {"levels", 1, OptKind::kModel, 2},        {"ciname", 2, OptKind::kModel, 2},
+      {"levels", 2, OptKind::kModel, 2},        {"ciname", 2, OptKind::kModel, 2},
       {"vname", 1, OptKind::kModel, 2},         {"sename", 2, OptKind::kModel, 2},
       {"dfname", 2, OptKind::kModel, 2},        {"citype", 6, OptKind::kModel, 2},
       {"aux", 3, OptKind::kModel, 2},

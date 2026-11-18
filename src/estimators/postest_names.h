@@ -179,7 +179,51 @@ inline std::string expand_coef_abbrev(const std::vector<std::string>& names, con
     return changed ? out : std::string();
 }
 
+// The equations of a multi-equation e(b) (`eq:name` columns), in order of first
+// appearance; empty for a single-equation design.
+inline std::vector<std::string> equations_of(const std::vector<std::string>& names) {
+    std::vector<std::string> eqs;
+    for (const auto& n : names) {
+        const size_t colon = n.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string e = n.substr(0, colon);
+        if (std::find(eqs.begin(), eqs.end(), e) == eqs.end()) eqs.push_back(e);
+    }
+    return eqs;
+}
+
+// An equation reference as test/lincom take it: a name, or `#n` the n-th equation.
+// Returns the equation's name, or "" when there is none.
+inline std::string resolve_equation(const std::vector<std::string>& names, const std::string& e) {
+    const std::vector<std::string> eqs = equations_of(names);
+    if (e.size() > 1 && e[0] == '#') {
+        char* end = nullptr;
+        const long k = std::strtol(e.c_str() + 1, &end, 10);
+        if (end != nullptr && *end == '\0' && k >= 1 && static_cast<size_t>(k) <= eqs.size())
+            return eqs[static_cast<size_t>(k - 1)];
+        return std::string();
+    }
+    return std::find(eqs.begin(), eqs.end(), e) != eqs.end() ? e : std::string();
+}
+
 // Resolve one coefficient reference against the fitted design names.
+// A factor-level name with every `#bn.` base-none marker spelled plainly `#.`:
+// Stata's `1.race` and `_b[c.wage@1.race]` name the columns `1bn.race` and
+// `c.wage@1bn.race` that mean / proportion post (vs-stata bank 873f8125, f73b4f13).
+inline std::string strip_bn_marks(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == 'b' && i + 2 < s.size() && s[i + 1] == 'n' && s[i + 2] == '.' && i > 0 &&
+            std::isdigit(static_cast<unsigned char>(s[i - 1]))) {
+            ++i;  // drop "bn", keep the "."
+            continue;
+        }
+        out += s[i];
+    }
+    return out;
+}
+
 inline CoefRef resolve_coef(const std::vector<std::string>& names, const std::string& token,
                             const FactorLevels* levels) {
     CoefRef r;
@@ -189,8 +233,29 @@ inline CoefRef resolve_coef(const std::vector<std::string>& names, const std::st
     // `[eq]name` (a joint `test [A1_mean]x1`, suest) is the column `eq:name`
     if (t.size() > 2 && t[0] == '[') {
         const size_t close = t.find(']');
-        if (close != std::string::npos && close + 1 < t.size())
+        if (close != std::string::npos && close + 1 < t.size()) {
             t = trim_ws(t.substr(1, close - 1)) + ":" + trim_ws(t.substr(close + 1));
+        }
+    }
+    // `#2:x` / `[#2]x`: the second equation (test.ado); kept as written when there is none
+    if (t.size() > 2 && t[0] == '#') {
+        const size_t colon = t.find(':');
+        if (colon != std::string::npos) {
+            const std::string en = resolve_equation(names, t.substr(0, colon));
+            if (!en.empty()) t = en + t.substr(colon);
+        }
+    }
+    // A name without an equation in a multi-equation e(b) is the first equation's
+    // (Stata: `test weight` after tobit/mlogit/heckman is [#1]weight). Only when the
+    // bare name is not itself a column (a free parameter such as `/athrho`).
+    if (t.find(':') == std::string::npos && name_index(names, t) < 0) {
+        const std::vector<std::string> eqs = equations_of(names);
+        if (!eqs.empty() && names.front().find(':') != std::string::npos) {
+            std::string bare = t;
+            if (bare == "cons" || bare == "(intercept)") bare = "_cons";
+            const int j = name_index(names, eqs.front() + ":" + bare);
+            if (j >= 0) { r.name = t; r.kind = CoefKind::Column; r.idx = j; return r; }
+        }
     }
     r.name = t;
     if (t == "_cons" || t == "cons" || t == "(intercept)") {
@@ -201,6 +266,16 @@ inline CoefRef resolve_coef(const std::vector<std::string>& names, const std::st
     }
     int j = name_index(names, t);
     if (j >= 0) { r.kind = CoefKind::Column; r.idx = j; return r; }
+    // A name with no equation in a multi-equation e(b) is the FIRST equation's
+    // coefficient, as in Stata's test/lincom (vs-stata bank c9247e4f
+    // `test lower = upper` after leebounds: [collgrad]lower - [collgrad]upper).
+    if (t.find(':') == std::string::npos && !names.empty()) {
+        const size_t c = names[0].find(':');
+        if (c != std::string::npos && c > 0) {
+            const int q = name_index(names, names[0].substr(0, c + 1) + t);
+            if (q >= 0) { r.kind = CoefKind::Column; r.idx = q; return r; }
+        }
+    }
     // An abbreviated variable (expand_coef_abbrev): resolve the full spelling.
     // The rewrite names only model variables, so the second pass never rewrites.
     if (const std::string full = expand_coef_abbrev(names, t); !full.empty())
@@ -212,6 +287,17 @@ inline CoefRef resolve_coef(const std::vector<std::string>& names, const std::st
         for (size_t q = 0; q < names.size(); ++q) {
             if (interaction_key(names[q]) != key) continue;
             if (hit >= 0) { hit = -2; break; }  // two columns: not this rule's to pick
+            hit = static_cast<int>(q);
+        }
+        if (hit >= 0) { r.kind = CoefKind::Column; r.idx = hit; return r; }
+    }
+    // A level spelled without the `bn` of a base-none column (`1.race` for `1bn.race`):
+    // the unique column that reads the same with every `bn` dropped.
+    if (const std::string plain = strip_bn_marks(t); plain == t) {
+        int hit = -1;
+        for (size_t q = 0; q < names.size(); ++q) {
+            if (names[q] == strip_bn_marks(names[q]) || strip_bn_marks(names[q]) != t) continue;
+            if (hit >= 0) { hit = -2; break; }
             hit = static_cast<int>(q);
         }
         if (hit >= 0) { r.kind = CoefKind::Column; r.idx = hit; return r; }

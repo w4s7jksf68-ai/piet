@@ -184,6 +184,8 @@ enum {
     F_invlogit, F_logit,
     // reldif(x,y) (BUG-1046: `generate r = reldif(x,2)` was rc 1).
     F_reldif,
+    // clip(x,a,b) (vs-stata bank inlist_cond clip_var).
+    F_clip,
     // group(k): needs _n/_N like a draw needs its row. See the ev() case.
     F_group
 };
@@ -258,6 +260,10 @@ const FnInfo FNS[] = {
     // [FN] reldif(x,y) = |x-y|/(|y|+1). StataBE 19.5 (2026-11-03): reldif(x,2) of
     // 1,2,3 is .33333333, 0, .33333333; reldif(.a,.a) 0, reldif(.,.a) `.`.
     {"reldif", F_reldif, 2, 2},
+    // [FN] clip(x,a,b): a if x <= a, b if x >= b, else x; a missing bound is no
+    // bound, a missing x stays as it is, a > b is `.` (StataBE 19.5, vs-stata
+    // bank inlist_cond: clip(-0,0,1) +0, clip(5,10,1) ., clip(.a,1,2) .a).
+    {"clip", F_clip, 3, 3},
 };
 
 // invlogit/logit, shared by the scalar ev() and the vectorised ev_fn_vec().
@@ -276,6 +282,15 @@ inline double stata_logit(double x) {
 // rule PIET's display-layer fnReldif keeps: two missings are 0 when they are the
 // same one (reldif(.a,.a), reldif(1e308,1e308)), any other missing operand is
 // `.`. A value past c(maxdouble), such as the literal 1e308, is a missing too.
+inline double stata_clip(double x, double a, double b) {
+    if (std::isnan(x)) return x;
+    const bool am = std::isnan(a), bm = std::isnan(b);
+    if (!am && !bm && a > b) return NAd;
+    if (!am && x <= a) return a;
+    if (!bm && x >= b) return b;
+    return x;
+}
+
 inline double stata_reldif(double x, double y) {
     constexpr double kMaxDouble = 0x1.fffffffffffffp+1022;
     const bool mx = std::isnan(x) || x > kMaxDouble, my = std::isnan(y) || y > kMaxDouble;
@@ -629,6 +644,7 @@ double ev(const Node* n, const EvalCtx& c) {
                 case F_invlogit: return stata_invlogit(a0());
                 case F_logit: return stata_logit(a0());
                 case F_reldif: return stata_reldif(a0(), ev(A[1].get(), c));
+                case F_clip: return stata_clip(a0(), arg(1), arg(2));
                 case F_group:
                     // An `in` range comes only without a by-list or sort key
                     // (Frame::bygen refuses the rest), so c.row is the observation.
@@ -825,6 +841,9 @@ void ev_fn_vec(const Node* n, int64_t N, std::vector<double>& out) {
             return;
         case F_reldif:
             for (int64_t i = 0; i < N; ++i) out[i] = stata_reldif(V[0][i], V[1][i]);
+            return;
+        case F_clip:
+            for (int64_t i = 0; i < N; ++i) out[i] = stata_clip(V[0][i], V[1][i], V[2][i]);
             return;
         case F_normalden:
             for (int64_t i = 0; i < N; ++i) {
@@ -1196,9 +1215,24 @@ struct Parser {
         static const char* const kOp[kCmpLevels] = {"==", ">=", "<=", "<", ">", "!="};
         const char* op = kOp[lvl];
         size_t n = std::strlen(op);
+        // A relational pair may hold blanks: `price < = 4000` is `<=`, `x ~ = 1`
+        // and `x ! = 1` are `!=` (StataBE 19.5, vs-stata bank 48c7ca6b2f6a4aa0).
+        // spacedEq: the `=` that ends such a pair after the char at p, or npos.
+        const auto spacedEq = [this]() -> size_t {
+            size_t k = p + 1;
+            while (k < s.size() && (s[k] == ' ' || s[k] == '\t')) ++k;
+            if (k < s.size() && s[k] == '=' && !(k + 1 < s.size() && s[k + 1] == '=')) return k;
+            return std::string::npos;
+        };
         if (lvl == kCmpLevels - 1 && s.compare(p, 2, "~=") == 0) { p += 2; return true; }  // gen_tilde_ne_gt
+        if (n == 2 && op[1] == '=' && op[0] != '=' && p < s.size() &&
+            (s[p] == op[0] || (op[0] == '!' && s[p] == '~'))) {
+            const size_t k = spacedEq();
+            if (k != std::string::npos) { p = k + 1; return true; }
+        }
         if (s.compare(p, n, op) != 0) return false;
         if (n == 1 && p + 1 < s.size() && s[p + 1] == '=') return false;
+        if (n == 1 && spacedEq() != std::string::npos) return false;
         p += n;
         return true;
     }
@@ -2811,19 +2845,29 @@ std::vector<std::vector<double>> cols_as_double(const Frame& fr, int64_t n,
     return out;
 }
 // Compare rows a,b on key columns: NaN sorts last, NaN==NaN.
+// Group keys in Stata's total order: numbers, then . < .a < ... < .z, each
+// missing kind its own group (vs-stata bank 2026-11-10, StataBE 19.5: `collapse
+// (count) n=id, by(x)` over 1 . .a .z 2 .b -1 . 0 is 8 groups, not 5).
+// Two non-missing values decide with plain double compares (a NaN makes every
+// one of them false), so the missing-kind order is paid only when a key is
+// missing: the sort comparator is the hot loop of a large by()/levelsof.
 bool key_less(const std::vector<std::vector<double>>& K, int64_t a, int64_t b) {
     for (const auto& col : K) {
-        double x = mi(col[a]), y = mi(col[b]);
+        const double x = col[a], y = col[b];
         if (x < y) return true;
-        if (x > y) return false;
+        if (y < x) return false;
+        if (x == y) continue;
+        const int c = scmp(x, y);  // at least one side is missing
+        if (c < 0) return true;
+        if (c > 0) return false;
     }
     return false;
 }
 bool key_eq(const std::vector<std::vector<double>>& K, int64_t a, int64_t b) {
     for (const auto& col : K) {
-        double x = col[a], y = col[b];
-        if (std::isnan(x) && std::isnan(y)) continue;
-        if (x != y) return false;
+        const double x = col[a], y = col[b];
+        if (x == y) continue;
+        if (scmp(x, y) != 0) return false;  // equal only as the same missing kind
     }
     return true;
 }
@@ -3031,9 +3075,12 @@ void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
 }
 
 // egen tag(varlist): 1 on the first obs (current data order) of each distinct key
-// combination, 0 elsewhere; missing-key rows get missing. Distinct from group():
-// tag scans in DATA order and marks the first occurrence of each unseen key.
-void Frame::egen_tag(const std::string& out, const std::vector<std::string>& by_cols) {
+// combination, 0 elsewhere. A row with a missing key value is 0, never missing (the ado's
+// note: `if tag` idioms need 0/1), unless `missing` makes missing a key value like any other
+// (vs-stata bank: BUG-1817/1818). Distinct from group(): tag scans in DATA order and marks
+// the first occurrence of each unseen key.
+void Frame::egen_tag(const std::string& out, const std::vector<std::string>& by_cols,
+                     bool missing_as_key) {
     if (by_cols.empty()) throw std::runtime_error("egen tag(): requires a varlist");
     std::vector<std::vector<double>> K = cols_as_double(*this, n_, by_cols);
     // Stable-sort row indices by key to detect the first row of each key group, but
@@ -3054,8 +3101,8 @@ void Frame::egen_tag(const std::string& out, const std::vector<std::string>& by_
         // Is this group's key missing in any component? → tag missing for all its rows.
         bool key_missing = false;
         for (const auto& col : K) if (std::isnan(col[order[g0]])) { key_missing = true; break; }
-        if (key_missing) {
-            for (int64_t q = g0; q < g1; ++q) out_col[order[q]] = NAd;
+        if (key_missing && !missing_as_key) {
+            // stays 0
         } else {
             // first row of the group in ORIGINAL order = the smallest original index
             int64_t first = order[g0];
@@ -3854,8 +3901,11 @@ void Frame::ipolate(const std::string& out, const std::string& yvar, const std::
         }
         for (int64_t q = g0; q < g1; ++q) {
             int64_t r = order[q];
-            if (!std::isnan(y[r])) { o[r] = y[r]; continue; }  // observed y copies through regardless of x
-            if (std::isnan(x[r])) continue;        // can't place a missing-y row without x
+            // ipolate.ado leaves a row whose x is missing out of the sample (touse 0): its result
+            // is missing, observed y or not (vs-stata bank: ipolate price rep78, gen(p2) with 5
+            // missing rep78 -> 5 missing p2).
+            if (std::isnan(x[r])) continue;
+            if (!std::isnan(y[r])) { o[r] = y[r]; continue; }  // observed y copies through
             if (anc.empty()) continue;
             double xr = x[r];
             // locate first anchor with x >= xr
@@ -4208,7 +4258,11 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
     // weights to sum to n first, so the divisor is n-1 on the ORIGINAL observation count.
     const double vscale = analytic ? static_cast<double>(nrows) / sumw : 1.0;
     const double vdenom = analytic ? static_cast<double>(nrows) - 1.0 : sumw - 1.0;
-    if (vdenom >= 1.0) {
+    // One observation has no variance, whatever its importance weight: StataBE
+    // posts r(Var) and r(sd) missing for `summarize x [iw=w]` on a single row with
+    // w = 2, where Sum w - 1 = 1 would otherwise give 0 (r(N) is the row count).
+    const bool single_iw = importance && nrows < 2;
+    if (vdenom >= 1.0 && !single_iw) {
         double ss = 0;
         for (int64_t i = 0; i < n_; ++i) {
             if (std::isnan(w[i]) || std::isnan(x[i]) || out(i)) continue;
@@ -4444,11 +4498,34 @@ Frame Frame::collapse(const std::vector<CollapseSpec>& specs,
         }
         return false;
     };
+    // gtools' further statistics (unweighted): variance, cv, range, nunique, nmissing,
+    // skewness, kurtosis, geomean, nansum, and select#/select-# (the #th smallest / largest).
+    static const std::unordered_set<std::string> kAggGtools = {
+        "variance", "cv", "range", "nunique", "nmissing", "skewness", "kurtosis", "geomean",
+        "nansum"};
+    auto select_of = [](const std::string& st, int64_t* k, bool* largest) -> bool {
+        std::string t = st;
+        if (t.compare(0, 3, "raw") == 0) t = t.substr(3);
+        if (t.compare(0, 6, "select") != 0) return false;
+        std::string num = t.substr(6);
+        *largest = !num.empty() && num[0] == '-';
+        if (*largest) num = num.substr(1);
+        if (num.empty() || num.size() > 9) return false;
+        for (char ch : num) if (ch < '0' || ch > '9') return false;
+        *k = std::stoll(num);
+        return *k >= 1;
+    };
     if (G > 0) {
         for (const auto& s : specs) {
             const std::string& st = s.statistic;
             double pp;
             if (kAggKnown.count(st) || pctile_of(st, &pp)) continue;
+            int64_t sk = 0; bool sl = false;
+            if (kAggGtools.count(st) || select_of(st, &sk, &sl)) {
+                if (!wvar.empty())
+                    throw std::runtime_error("collapse: statistic '" + st + "' is not available with weights");
+                continue;
+            }
             throw std::runtime_error("collapse: unknown stat '" + st + "'");
         }
     }
@@ -4551,7 +4628,36 @@ Frame Frame::collapse(const std::vector<CollapseSpec>& specs,
                 else if (st == "lastnm") { agg = cnt ? s.back() : vp[si][order[b - 1]]; }
                 else if (st == "iqr") { if (cnt) { std::sort(s.begin(), s.end()); agg = stata_pctile(s, 75.0) - stata_pctile(s, 25.0); } }
                 else if (pctile_of(st, &pp)) { if (cnt) { std::sort(s.begin(), s.end()); agg = stata_pctile(s, pp); } }
-                else throw std::runtime_error("collapse: unknown stat '" + st + "'");
+                else if (st == "variance" || st == "cv" || st == "skewness" || st == "kurtosis") {
+                    if (cnt >= 1) {
+                        double t = 0; for (double x : s) t += x;
+                        const double mn = t / cnt;
+                        double m2 = 0, m3 = 0, m4 = 0;
+                        for (double x : s) { const double d = x - mn; m2 += d * d; m3 += d * d * d; m4 += d * d * d * d; }
+                        if (st == "variance") { if (cnt >= 2) agg = m2 / (cnt - 1); }
+                        else if (st == "cv") { if (cnt >= 2) agg = std::sqrt(m2 / (cnt - 1)) / mn; }
+                        else {
+                            m2 /= cnt; m3 /= cnt; m4 /= cnt;
+                            if (m2 > 0) agg = st == "skewness" ? m3 / std::pow(m2, 1.5) : m4 / (m2 * m2);
+                        }
+                    }
+                }
+                else if (st == "range") { if (cnt) agg = *std::max_element(s.begin(), s.end()) - *std::min_element(s.begin(), s.end()); }
+                else if (st == "nunique") { std::sort(s.begin(), s.end()); agg = static_cast<double>(std::unique(s.begin(), s.end()) - s.begin()); }
+                else if (st == "nmissing") { agg = static_cast<double>((b - a) - cnt); }
+                else if (st == "nansum") { if (cnt) { double t = 0; for (double x : s) t += x; agg = t; } }
+                else if (st == "geomean") {
+                    bool ok = cnt > 0;
+                    for (double x : s) if (x < 0.0) { ok = false; break; }
+                    if (ok) { double t = 0; for (double x : s) t += std::log(x); agg = std::exp(t / cnt); }
+                }
+                else {
+                    int64_t sk = 0; bool sl = false;
+                    if (select_of(st, &sk, &sl)) {
+                        std::sort(s.begin(), s.end());
+                        if (sk <= cnt) agg = sl ? s[static_cast<size_t>(cnt - sk)] : s[static_cast<size_t>(sk - 1)];
+                    } else throw std::runtime_error("collapse: unknown stat '" + st + "'");
+                }
             } else {
                 // ---- weighted path, per group ----
                 // fw (byte-unchanged for the statistics it always served):

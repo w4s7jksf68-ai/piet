@@ -115,7 +115,7 @@ function check(ctx, cond, msg) {
 function loadFix(p) { return JSON.parse(readFileSync(FIX(p), 'utf8')); }
 
 // ── load the real modules ────────────────────────────────────────────────────
-const { formatEstimation, formatCorrelate, formatSummarize, formatDescribe,
+const { formatEstimation, formatCorrelate, formatSummarize, formatTabulate, formatDescribe,
         initConsole, appendBlock, getGraphs, getGraphGalleryElidedCount, getGraphDroppedCount, setGraphSpillMaxBytes,
         clearConsole, clearGraphGallery,
         setGraphSpill, getGraphEntries, getGraphById, getGraphsAsync, getGraphSpilledCount, flushGraphSpill,
@@ -502,6 +502,85 @@ suite('WS1: pwcorr,sig adds a significance (p-value) line under each coef row', 
   check(ctx, text.split('\n').length >= 11, `pwcorr emits sig + spacer rows (>=11 lines)`);
 });
 
+suite('vs-stata s3b_est_other: correlate, means draws the means table before the matrix', (ctx) => {
+  // the block runCorrStata produced for `correlate price mpg weight, means` (auto.dta)
+  const block = {"type": "estimation", "estimator": "corr", "method": "correlate", "pairwise": false, "sig": false, "n_obs": 74, "variables": ["price", "mpg", "weight"], "r": [[1.0, -0.46859668819518696, 0.5386114626004788], [-0.46859668819518696, 1.0, -0.807174858942442], [0.5386114626004788, -0.807174858942442, 1.0]], "means": [{"max": 15906.0, "mean": 6165.256756756757, "min": 3291.0, "name": "price", "sd": 2949.4958847689186}, {"max": 41.0, "mean": 21.2972972972973, "min": 12.0, "name": "mpg", "sd": 5.785503209735141}, {"max": 4840.0, "mean": 3019.4594594594596, "min": 1760.0, "name": "weight", "sd": 777.1935671373662}]};
+  const lines = formatCorrelate(block).split('\n');
+  check(ctx, lines[0] === '(obs=74)', `"(obs=74)" first`);
+  const hdr = lines.findIndex(l => /^\s+Variable │/.test(l));
+  check(ctx, hdr === 2, `means header on line 3 (got ${hdr})`);
+  check(ctx, /Mean\s+Std\. dev\.\s+Min\s+Max$/.test(lines[hdr] || ''), `means header columns Mean / Std. dev. / Min / Max`);
+  const price = lines.find(l => /^\s+price │\s+6165\.257/.test(l)) || '';
+  check(ctx, price.includes(fmtG(2949.4958847689186)) && /3291\s+15906$/.test(price), `price row: mean, sd, min, max (${price})`);
+  const mtx = lines.findIndex((l, i) => i > hdr && /│\s+price\s+mpg\s+weight$/.test(l));
+  check(ctx, mtx === hdr + 2 + 3 + 2, `matrix header after the 3 rows and two blank lines (got ${mtx})`);
+});
+
+suite('vs-stata s3b_est_other: pwcorr star() marks and print() blanks pairs by their p-value', (ctx) => {
+  // the block runCorrStata produced for `pwcorr price mpg headroom, sig star(5) print(10) bonferroni`
+  const block = {"type": "estimation", "estimator": "corr", "method": "pwcorr", "pairwise": true, "sig": true, "n_obs": 74, "variables": ["price", "mpg", "headroom"], "r": [[1.0, -0.46859668819518696, 0.11450556501655837], [-0.46859668819518696, 1.0, -0.413802988411443], [0.11450556501655837, -0.413802988411443, 1.0]], "p": [[null, 7.638393615429355e-05, 0.993980918595832], [7.638393615429355e-05, null, 0.0007426390183539469], [0.993980918595832, 0.0007426390183539469, null]], "nobs": [[74, 74, 74], [74, 74, 74], [74, 74, 74]], "star": 0.05, "print": 0.1};
+  const lines = formatCorrelate(block).split('\n');
+  const row = (n) => lines.find(l => new RegExp('^\\s*' + n + ' │').test(l)) || '';
+  // Stata: " " %7.4f then "*" (p <= star) or " "; a pair with p > print is 9 blanks
+  check(ctx, row('price') === '       price │   1.0000 ', `price row "   1.0000 " (${JSON.stringify(row('price'))})`);
+  check(ctx, row('mpg') === '         mpg │  -0.4686*  1.0000 ', `mpg row starred (${JSON.stringify(row('mpg'))})`);
+  check(ctx, row('headroom') === '    headroom │           -0.4138*  1.0000 ', `headroom: price pair (p .994 > print .10) blank (${JSON.stringify(row('headroom'))})`);
+  const hi = lines.indexOf(row('headroom'));
+  check(ctx, lines[hi + 1] === '             │            0.0007', `headroom sig row blanks the printed-out pair (${JSON.stringify(lines[hi + 1])})`);
+  // without star/print the row is the plain one: no marks
+  const plain = formatCorrelate({ ...block, star: undefined, print: undefined }).split('\n');
+  check(ctx, plain.some(l => l === '         mpg │  -0.4686   1.0000 '), `no star() -> no marks`);
+});
+
+suite('vs-stata s3b_est_other: mean & proportion tables: CI type, vce(cluster) Robust and clusters line, noheader, stdize strata, percent, level', (ctx) => {
+  // the blocks runMeanOrProportion produced for `proportion foreign, citype(wilson)`,
+  // `proportion foreign, vce(cluster rep78)` and `mean price mpg, vce(cluster rep78)` (auto.dta)
+  const wil = {"type": "estimation", "estimator": "proportion", "depvar": "", "n_obs": 74, "coeftable": [{"b": 0.7027027027027027, "ci_hi": 0.794727839402392, "ci_lo": 0.5906708986801543, "name": "foreign:0", "p": 4.589403793270392e-21, "se": 0.053133133948629147, "t": 13.225320068304248}, {"b": 0.2972972972972973, "ci_hi": 0.4093291013198458, "ci_lo": 0.2052721605976081, "name": "foreign:1", "p": 3.6329033012975666e-07, "se": 0.053133133948629147, "t": 5.595327721205643}], "df": 73.0, "level": 95.0, "citype": "wilson"};
+  const pcl = {"type": "estimation", "estimator": "proportion", "depvar": "", "n_obs": 69, "coeftable": [{"b": 0.6956521739130435, "ci_hi": 0.943884667477943, "ci_lo": 0.2369927911201245, "name": "foreign:0", "p": 0.01025585713497559, "se": 0.15220032881364037, "t": 4.570635157857151}, {"b": 0.30434782608695654, "ci_hi": 0.7630072088798755, "ci_lo": 0.05611533252205702, "name": "foreign:1", "p": 0.11616255534034538, "se": 0.15220032881364037, "t": 1.9996528815625036}], "n_clusters": 5, "df": 4.0, "level": 95.0, "citype": "logit", "vcov_type": "cluster(rep78)"};
+  const mcl = {"type": "estimation", "estimator": "mean", "depvar": "", "n_obs": 69, "coeftable": [{"b": 6146.04347826087, "ci_hi": 6578.9355161914755, "ci_lo": 5713.151440330264, "name": "price", "p": 2.474399158271119e-06, "se": 155.91593621649005, "t": 39.41895631327293}, {"b": 21.28985507246377, "ci_hi": 25.29151571688648, "ci_lo": 17.28819442804106, "name": "mpg", "p": 0.00012226746613250885, "se": 1.4412893080187994, "t": 14.771395967495845}], "n_clusters": 5, "df": 4.0, "level": 95.0, "vcov_type": "cluster(rep78)"};
+  const banner = (text) => { const ls = text.split('\n'); const h = ls.findIndex(l => l.includes('[95% conf. interval]')); return h > 0 ? ls[h - 1] : ''; };
+  const tw = formatEstimation(wil);
+  check(ctx, /│\s+Wilson$/.test(banner(tw)), `citype(wilson): "Wilson" above the interval (${JSON.stringify(banner(tw))})`);
+  check(ctx, tw.includes('Std. err.') && !tw.includes('Robust') && !tw.includes('clusters in'), `citype(wilson): no Robust, no clusters line`);
+  const tp = formatEstimation(pcl);
+  check(ctx, /│\s+Robust\s+Logit$/.test(banner(tp)), `proportion vce(cluster): "Robust" and the default "Logit" (${JSON.stringify(banner(tp))})`);
+  check(ctx, tp.includes('std. err.') && tp.includes('(Std. err. adjusted for 5 clusters in rep78)'), `proportion vce(cluster): std. err. and the clusters line`);
+  const tm = formatEstimation(mcl);
+  check(ctx, /│\s+Robust$/.test(banner(tm)), `mean vce(cluster): "Robust" and no CI type (${JSON.stringify(banner(tm))})`);
+  check(ctx, tm.includes('(Std. err. adjusted for 5 clusters in rep78)'), `mean vce(cluster): the clusters line`);
+  const plain = formatEstimation({ ...mcl, vcov_type: undefined, n_clusters: undefined });
+  check(ctx, !plain.includes('Robust') && banner(plain).includes('Coefficient') === false && !/│\s+\S/.test(banner(plain)), `mean without vce(): no banner line`);
+  // `mean price mpg, noheader` (bank d85e3236): the table opens on its rule, no title / Number of obs
+  const noh = formatEstimation({ ...mcl, vcov_type: undefined, n_clusters: undefined, noheader: true }).split('\n');
+  check(ctx, noh[0].startsWith('──') && !noh.some(l => l.includes('Number of obs')), `noheader: first line is the rule (${JSON.stringify(noh[0])})`);
+  // `mean price mpg if trunk>8, over(foreign) stdize(rep78) stdweight(sw)` (bank 56f2dacb's form):
+  // the header names the standard strata
+  const std = {"type": "estimation", "estimator": "mean", "depvar": "", "n_obs": 60, "coeftable": [{"b": 5989.193991193991, "ci_hi": 6731.581773506291, "ci_lo": 5246.8062088816905, "name": "c.price@0bn.foreign", "p": 2.581063396118819e-23, "se": 371.0092439201787, "t": 16.142977808074626}, {"b": 5653.420179063361, "ci_hi": 6584.093857743572, "ci_lo": 4722.746500383149, "name": "c.price@1.foreign", "p": 1.0458930749596192e-17, "se": 465.10536149732064, "t": 12.155138699892042}], "n_clusters": 0, "df": 59.0, "level": 95.0, "n_stdize": 5};
+  const stdLines = formatEstimation(std).split('\n');
+  check(ctx, stdLines.includes('N. of std strata = 5'), `stdize(): "N. of std strata = 5" in the header`);
+  check(ctx, !formatEstimation(mcl).includes('std strata'), `no stdize(): no strata line`);
+  // `proportion foreign, percent` (bank cdcb1db2): Percent column, %9.2f, the values x 100
+  const pc = {"type": "estimation", "estimator": "proportion", "depvar": "", "n_obs": 74, "coeftable": [{"b": 0.7027027027027027, "ci_hi": 0.7969090031596038, "ci_lo": 0.5874215101569684, "name": "foreign:0", "p": 4.589403793270392e-21, "se": 0.053133133948629147, "t": 13.225320068304248}], "df": 73.0, "level": 95.0, "citype": "logit", "percent": true};
+  const pcText = formatEstimation(pc);
+  check(ctx, pcText.includes('Percent') && /foreign:0 │\s+70\.27\s+5\.31\s.*\s58\.74\s+79\.69$/m.test(pcText), `percent: 70.27 5.31 .. 58.74 79.69`);
+  // `mean, level(80)` replays at 80%: the interval header follows the block's level
+  check(ctx, formatEstimation({ ...mcl, level: 80 }).includes('[80% conf. interval]'), `level 80 -> "[80% conf. interval]"`);
+  check(ctx, formatEstimation(mcl).includes('[95% conf. interval]'), `level 95 -> "[95% conf. interval]"`);
+});
+
+suite('vs-stata s3b_est_other: proportion citype(agresti) notes an upper limit cut at 1', (ctx) => {
+  // the blocks runMeanOrProportion produced for `generate y = _n > 1` then
+  // `proportion y in 1/10, citype(agresti)` and `..., citype(wilson)` (auto.dta)
+  const ag = {"type": "estimation", "estimator": "proportion", "depvar": "", "n_obs": 10, "coeftable": [{"b": 0.1, "ci_hi": 0.4259677373948323, "ci_lo": -0.003941497504520802, "name": "y:0", "p": 0.3193155759720361, "se": 0.09486832980505139, "t": 1.0540925533894598}, {"b": 0.9, "ci_hi": 1.0, "ci_lo": 0.5740322626051677, "name": "y:1", "p": 5.537727791862313e-06, "se": 0.09486832980505139, "t": 9.486832980505138}], "df": 9.0, "level": 95.0, "citype": "agresti", "agresti_truncated": true};
+  const wi = {"type": "estimation", "estimator": "proportion", "depvar": "", "n_obs": 10, "coeftable": [{"b": 0.1, "ci_hi": 0.4041500267952386, "ci_lo": 0.017876213095072896, "name": "y:0", "p": 0.3193155759720361, "se": 0.09486832980505139, "t": 1.0540925533894598}, {"b": 0.9, "ci_hi": 0.9821237869049271, "ci_lo": 0.5958499732047615, "name": "y:1", "p": 5.537727791862313e-06, "se": 0.09486832980505139, "t": 9.486832980505138}], "df": 9.0, "level": 95.0, "citype": "wilson"};
+  const note = 'Note: The Agresti\u2013Coull CI was truncated at 1 at the upper endpoint.';
+  const ta = formatEstimation(ag).split('\n');
+  check(ctx, ta[ta.length - 1] === note, `agresti cut at 1: the note is the table's last line (${JSON.stringify(ta[ta.length - 1])})`);
+  check(ctx, ta[ta.length - 2].includes('┴'), `agresti cut at 1: the note follows the closing rule`);
+  const tw = formatEstimation(wi);
+  check(ctx, !tw.includes('Agresti'), `wilson: no Agresti note`);
+});
+
 suite('WS1: summarize header uses Std. dev. and pipe+rule separator', (ctx) => {
   const block = { type: 'summarize', stats: {
     id: { N: 960, mean: 60.5, sd: 34.65787, min: 1, max: 120 },
@@ -512,6 +591,32 @@ suite('WS1: summarize header uses Std. dev. and pipe+rule separator', (ctx) => {
   check(ctx, !text.includes('Std. Dev.'), `summarize no longer shows "Std. Dev."`);
   check(ctx, /Variable\s*│/.test(text), `summarize header has a │ separator after Variable`);
   check(ctx, /─+┼─+/.test(text), `summarize has a ┼ rule line`);
+});
+
+// vs-stata bank (s3b_tables): tabulate ..., summarize() draws the columns the block names. The blocks
+// are the handler's own answers for `tabulate rep78 [aw=weight], summarize(price)` (Mean, Std. dev.,
+// Freq. = the sum of the weights, and Obs = the row count) and `tabulate rep78, summarize(price)
+// obs` (Obs is ADDED to Mean, Std. dev. and Freq.: bank cell b1a71de16eadd437, Stata prints all
+// four columns).
+suite('s3b_tables: tabulate summarize() draws its column set (weighted Obs, obs)', (ctx) => {
+  const aw = loadFix('dom/tabulate_summarize_aw_oneway.json');
+  const t1 = formatTabulate(aw);
+  const head1 = t1.split('\n')[0];
+  check(ctx, /Mean/.test(head1) && /Std\. dev\./.test(head1) && /Freq\./.test(head1) && /Obs/.test(head1),
+        `weighted summarize() header carries Mean, Std. dev., Freq. and Obs (got ${JSON.stringify(head1)})`);
+  check(ctx, /6200\s+2\b/.test(t1), `weighted row 1 shows Freq. 6200 (sum of weights) beside Obs 2`);
+  check(ctx, /209210\s+69\b/.test(t1), `weighted Total row shows Freq. 209210 beside Obs 69`);
+  const nm = loadFix('dom/tabulate_summarize_obs_oneway.json');
+  const t2 = formatTabulate(nm);
+  const head2 = t2.split('\n')[0];
+  check(ctx, /Mean/.test(head2) && /Std\. dev\./.test(head2) && /Freq\./.test(head2) && /Obs/.test(head2),
+        `summarize() with obs shows Mean, Std. dev., Freq. and Obs (got ${JSON.stringify(head2)})`);
+  check(ctx, /6146\.0\d*\s+2912\.\d+\s+69\s+69\b/.test(t2), `Total row shows the mean, Freq. 69 and Obs 69`);
+  const plain = { ...nm }; delete plain.columns;
+  const t3 = formatTabulate(plain);
+  const head3 = t3.split('\n')[0];
+  check(ctx, /Mean/.test(head3) && /Std\. dev\./.test(head3) && /Freq\./.test(head3) && !/Obs/.test(head3),
+        `a block with no columns list keeps the default Mean, Std. dev., Freq.`);
 });
 
 suite('WS1: describe uses Stata two-row Storage/Display/Value + Variable label header', (ctx) => {
@@ -2111,6 +2216,34 @@ suite('MVP F6: coeftable-less estimation payloads render a generic fallback card
     'generic rows retain every coefficient name');
 });
 
+suite('vs-stata: test, mtest() draws the per-constraint table from a real dispatcher block', (ctx) => {
+  // piet/fixtures/dom/test_mtest_bonferroni.json: `regress price mpg weight foreign`
+  // then `test (mpg) (weight), mtest(bonferroni)` through piet_native (vs-stata
+  // bank 336b8488; StataBE 19.5 prints (1) 0.09 1 1.0000*, (2) 30.17 1 0.0000*,
+  // All 34.77 2 0.0000).
+  const block = loadFix('dom/test_mtest_bonferroni.json');
+  check(ctx, Array.isArray(block.mtest) && block.mtest.length === 2, 'fixture carries two mtest rows');
+  const text = formatEstimation(block);
+  const lines = text.split('\n');
+  check(ctx, lines.includes('       |    F(df,70)     df      p > F'), `header line drawn (got ${JSON.stringify(lines)})`);
+  check(ctx, lines.includes('   (1) |        0.09      1     1.0000*'), 'constraint 1 with its Bonferroni p');
+  check(ctx, lines.includes('   (2) |       30.17      1     0.0000*'), 'constraint 2 with its Bonferroni p');
+  check(ctx, lines.includes('   All |       34.77      2     0.0000'), 'joint row');
+  check(ctx, lines.includes('* Bonferroni-adjusted p-values'), 'method footnote');
+  check(ctx, !text.includes('Prob > F'), 'the plain joint lines are replaced by the table');
+});
+
+suite('vs-stata: test, notest lists the constraints and draws no statistic (real dispatcher block)', (ctx) => {
+  // piet/fixtures/dom/test_notest.json: `regress price mpg weight foreign` then
+  // `test mpg, notest` through piet_native (vs-stata bank 37fd4049: StataBE 19.5
+  // prints only "( 1)  mpg = 0").
+  const block = loadFix('dom/test_notest.json');
+  check(ctx, block.notest === true, 'fixture is a notest block');
+  const text = formatEstimation(block);
+  check(ctx, text.includes('mpg = 0'), `the constraint is listed (got ${JSON.stringify(text)})`);
+  check(ctx, !text.includes('Prob') && !text.includes('F('), 'no statistic is drawn');
+});
+
 suite('BS-026: tabstat renders a vars×stats table from real dispatcher fixture (no empty shell)', (ctx) => {
   const block = loadFix('dom/tabstat_estimation.json');
   check(ctx, block.estimator === 'tabstat',
@@ -3123,6 +3256,136 @@ suite('T2 (P8.1): Cmd/Ctrl+, toggles #settings-overlay open/close; a no-op while
   check(ctx, t2Obs.afterFirstOpen === true, '⌘, opens Settings');
   check(ctx, t2Obs.afterSecondClose === false, 'a second ⌘, closes Settings again (toggle)');
   check(ctx, t2Obs.guardHeld === true, '⌘, does not change Settings\' open state while #request-overlay carries .open');
+});
+
+// ── Settings: tabulate's table-size limits ─────────────────────────────────────
+// An empty box is Stata's limit (its placeholder names it); a whole number from 1
+// to the ceiling replaces it. Apply sends every limit as a number, 0 for an empty
+// box, and refuses to save while a box holds anything else. The row under test is
+// the REAL one from index.html, so its ids, placeholders and structure are loaded.
+const tabLimitObs = await (async () => {
+  const obs = { setBodies: [] };
+  const realIndex = new JSDOM(readFileSync(resolve(__dirname, '../index.html'), 'utf8'));
+  const realBox = realIndex.window.document.getElementById('set-tab-oneway-rows');
+  const realRow = realBox ? realBox.closest('.settings-row') : null;
+  obs.realRowFound = !!realRow;
+  obs.realCaptionIsLabel = !!(realRow && realRow.querySelector(':scope > label'));
+  dom.window.pietNative = {
+    request: async (key, body) => {
+      switch (key) {
+        case 'varlist':      return { varlist: [], n_rows: 0, n_cols: 0 };
+        case 'history':      return { history: [] };
+        case 'version':      return { piet_version: '0.0.0-test', cobra_version: '0.0.0-test' };
+        case 'settings.get':
+          return {
+            scratch_path: '', default_working_dir: '', default_export_dir: '',
+            memory_budget_mb: 0, compute_cores: 0, provenance_hash: false,
+            tab_oneway_max_rows: 0, tab_twoway_max_rows: 0, tab_twoway_max_cols: 200,
+            tab_summarize_max_cells: 0,
+            table_limit_defaults: { tab_oneway_max_rows: 12001, tab_twoway_max_rows: 1201,
+              tab_twoway_max_cols: 81, tab_summarize_max_cells: 376 },
+            table_limit_ceilings: { tab_oneway_max_rows: 500000, tab_twoway_max_rows: 500000,
+              tab_twoway_max_cols: 500000, tab_summarize_max_cells: 90000 },
+            sys: { total_ram_mb: 8192, cpu_count: 4, recommended_budget_mb: 4096 },
+            settings_file: '(test)',
+          };
+        case 'settings.set':
+          obs.setBodies.push(body);
+          return { ok: true };
+        default: return {};
+      }
+    },
+  };
+  document.body.innerHTML = `
+    <div id="pane-console">
+      <div id="console-wrap"><div id="console-empty"></div><div id="console-body"></div></div>
+      <div id="cmd-bar"><input id="cmd-input" type="text"><button id="btn-run" type="button">Run</button></div>
+      <div id="settings-overlay" class="console-overlay">
+        <div class="doedit-bar"><span class="doedit-title">Settings</span>
+          <button id="settings-apply" type="button">Apply</button>
+          <button id="settings-close" type="button">x</button>
+        </div>
+        <div id="settings-body">
+          <p id="settings-sysinfo"></p>
+          <input id="set-scratch-path"><input id="set-workdir">
+          <input id="set-mem-budget" type="range" min="256" max="8192" value="2048"><output id="set-mem-value"></output>
+          <span id="set-mem-recommended"></span>
+          <select id="set-cores"></select>
+          <input id="set-provenance" type="checkbox">
+          ${realRow ? realRow.outerHTML : ''}
+          <select id="set-fontsize"></select>
+          <p id="settings-status"></p>
+        </div>
+      </div>
+      <div id="request-overlay" class="console-overlay"></div>
+    </div>
+    <div id="var-list-wrap"></div>
+    <ul id="hist-list"></ul>
+    <span id="status-file">(no data)</span><span id="status-dims"></span>
+    <span class="kernel-dot" id="kernel-dot"></span>`;
+  const { init } = await import(JS('app.js'));
+  await init();
+  const settle = () => new Promise(r => setTimeout(r, 10));
+  const box = (id) => document.getElementById(id);
+  const IDS = ['set-tab-oneway-rows', 'set-tab-twoway-rows', 'set-tab-twoway-cols', 'set-tab-summarize-cells'];
+  obs.htmlPlaceholders = IDS.map((id) => (box(id) ? box(id).placeholder : null));
+  document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: ',', metaKey: true, bubbles: true, cancelable: true }));
+  await settle();
+  obs.shown = IDS.map((id) => [box(id).value, box(id).placeholder, box(id).max]);
+  obs.ceilingText = ['set-tab-cell-ceiling', 'set-tab-summarize-ceiling'].map((id) => (box(id) ? box(id).textContent : null));
+
+  // Apply once with the given box texts; returns the limits sent, or null when nothing was saved.
+  const apply = async (texts, badInputId) => {
+    for (const id of IDS) box(id).value = texts[id] ?? '';
+    if (badInputId) Object.defineProperty(box(badInputId), 'validity', { value: { badInput: true }, configurable: true });
+    const before = obs.setBodies.length;
+    box('settings-status').textContent = '';
+    box('settings-apply').click();
+    await settle();
+    if (badInputId) delete box(badInputId).validity;
+    const sent = obs.setBodies.slice(before).find((b) => b && 'tab_oneway_max_rows' in b) || null;
+    return { sent, status: box('settings-status').textContent };
+  };
+  // Raise one limit and give one back to Stata.
+  obs.raised = await apply({ 'set-tab-oneway-rows': '50000' });
+  // Each of these must stop the save: a fraction, a negative number, a number past
+  // the ceiling, an exponent, and text the number box could not read (badInput).
+  obs.fraction = await apply({ 'set-tab-twoway-rows': '1.9' });
+  obs.negative = await apply({ 'set-tab-twoway-rows': '-3' });
+  obs.pastCeiling = await apply({ 'set-tab-twoway-cols': '500001' });
+  obs.exponent = await apply({ 'set-tab-oneway-rows': '1e5' });
+  obs.unreadable = await apply({}, 'set-tab-summarize-cells');
+  obs.pastSummarizeCeiling = await apply({ 'set-tab-summarize-cells': '90001' });
+  // The ceiling itself is a valid limit.
+  obs.atCeiling = await apply({ 'set-tab-twoway-cols': '500000', 'set-tab-summarize-cells': '400' });
+
+  document.body.innerHTML = '';
+  return obs;
+})();
+
+suite("Settings: tabulate's table-size limits show Stata's limit for an empty box and Apply sends whole numbers", (ctx) => {
+  check(ctx, tabLimitObs.realRowFound === true && tabLimitObs.realCaptionIsLabel === false,
+    `index.html carries the limits row, and its caption is not a second <label> for the first box (found=${tabLimitObs.realRowFound}, captionIsLabel=${tabLimitObs.realCaptionIsLabel})`);
+  check(ctx, JSON.stringify(tabLimitObs.htmlPlaceholders) === JSON.stringify(['12000', '1200', '80', '375']),
+    `index.html's own placeholders are Stata/SE and MP's limits (got ${JSON.stringify(tabLimitObs.htmlPlaceholders)})`);
+  check(ctx, JSON.stringify(tabLimitObs.shown) === JSON.stringify([['', '12001', '500000'], ['', '1201', '500000'], ['200', '81', '500000'], ['', '376', '90000']]),
+    `an unset limit is an empty box whose placeholder is the limit settings.get names; a set one shows its number; max is the ceiling (got ${JSON.stringify(tabLimitObs.shown)})`);
+  check(ctx, JSON.stringify(tabLimitObs.ceilingText) === JSON.stringify(['500,000', '90,000']),
+    `the hint names the ceilings settings.get reports (got ${JSON.stringify(tabLimitObs.ceilingText)})`);
+  const a = tabLimitObs.raised.sent;
+  check(ctx, !!a && a.tab_oneway_max_rows === 50000 && a.tab_twoway_max_rows === 0
+      && a.tab_twoway_max_cols === 0 && a.tab_summarize_max_cells === 0,
+    `Apply sends the raised limit as a number and 0 for an empty box (got ${JSON.stringify(a)})`);
+  for (const [name, o] of [['a fraction', tabLimitObs.fraction], ['a negative number', tabLimitObs.negative],
+    ['a number past the ceiling', tabLimitObs.pastCeiling], ['an exponent', tabLimitObs.exponent],
+    ['unreadable text (badInput)', tabLimitObs.unreadable],
+    ['a summarize() limit past its own ceiling', tabLimitObs.pastSummarizeCeiling]]) {
+    check(ctx, o.sent === null && /Not saved/.test(o.status) && /(500,000|90,000)/.test(o.status),
+      `${name} in a limit box stops the save and says so (sent=${JSON.stringify(o.sent)}, status=${JSON.stringify(o.status)})`);
+  }
+  const c = tabLimitObs.atCeiling.sent;
+  check(ctx, !!c && c.tab_twoway_max_cols === 500000 && c.tab_summarize_max_cells === 400 && /^Saved\./.test(tabLimitObs.atCeiling.status),
+    `the ceiling itself is a limit that can be saved (got ${JSON.stringify(c)}, status=${JSON.stringify(tabLimitObs.atCeiling.status)})`);
 });
 
 // ── A6 — ▶ Run selection button: existence + shared busy-guard ────────────────
@@ -5603,6 +5866,30 @@ suite('FIX:GRID-TFMT-DETAIL: %td detail-string token map renders Stata\'s exact 
   for (const tok of ['CCYY', 'NN', 'DD', 'dd', 'Mon', 'Month', 'YY', '_']) {
     check(ctx, fmtsJoined.includes(tok), `oracle exercises the ${tok} detail token at least once`);
   }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// display _continue (vs-stata bank 4d9f4bb6b438d82c): at the top level of a
+//   do-file the next command's echo takes the rest of the open line, so the
+//   next display starts its own line; in a loop body (no echo) the pieces join.
+//   The fixture is the block stream `piet_native --do` produced for
+//     display "abc" _continue / display "def" /
+//     forvalues i = 1/1 { display "x" _continue / display "y" }
+// ════════════════════════════════════════════════════════════════════════════
+
+suite('display _continue: an echo closes the open line; a loop body joins its pieces', (ctx) => {
+  document.body.innerHTML =
+    '<div id="console-wrap"><div id="console-body"></div></div><div id="console-empty"></div>';
+  initConsole(document.getElementById('console-body'), document.getElementById('console-empty'), null);
+  clearConsole();
+  const run = loadFix('dom/display_continue_blocks.json');
+  for (const b of run.blocks) appendBlock(b);
+  const shown = [...document.querySelectorAll('#console-body .block-display')].map((el) => el.textContent);
+  check(ctx, shown.includes('abc') && shown.includes('def'),
+    `abc and def are two lines, the echo between them closing the first (shown: ${JSON.stringify(shown)})`);
+  check(ctx, !shown.some((t) => t.includes('abcdef')), 'the echo is not skipped over: no abcdef line');
+  check(ctx, shown.includes('xy'), 'inside the loop the _continue pieces join: xy');
+  document.body.innerHTML = '';
 });
 
 // ════════════════════════════════════════════════════════════════════════════

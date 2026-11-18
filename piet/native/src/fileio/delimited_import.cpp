@@ -3,6 +3,7 @@
 // delimited import.
 #include "datamgmt/data_io_internal.h"
 #include "piet/handlers/session_commands.h"
+#include "fileio/charset_guess.h"
 #include "piet/user_paths.h"
 namespace piet::handlers::data_io_detail {
 
@@ -204,15 +205,51 @@ std::optional<ojson> readOneImportOption(const std::string& key, const std::stri
     } else {
       return importRefusal(typed + ": invalid row number in varnames() option");
     }
+  } else if (key == "decimalseparator" || key == "groupseparator") {
+    // One character (or none: `""`); the value may be quoted. It also turns on
+    // the locale-style number reading, with the system locale (en_US here)
+    // behind whatever the option leaves unsaid.
+    const std::string trimmed = trim(typed);
+    if (trimmed.empty() || cecon::ident::codePointCount(trimmed) != 1)
+      return importRefusal("option " + key + "() incorrectly specified");
+    (key == "decimalseparator" ? request->decimalSeparator : request->groupSeparator) = trimmed;
+    request->numberLocale = true;
+  } else if (key == "parselocale") {
+    // The decimal and grouping characters of the language part of a locale
+    // name (en_US, de-DE, fr ...). Languages outside this table are refused by
+    // name rather than guessed at.
+    std::string language = strutil::lower(trim(typed));
+    const size_t cut = language.find_first_of("_-");
+    if (cut != std::string::npos) language.resize(cut);
+    struct Marks { const char* decimal; const char* group; };
+    static const std::map<std::string, Marks> kLocales = {
+        {"en", {".", ","}},  {"ja", {".", ","}},  {"ko", {".", ","}},  {"zh", {".", ","}},
+        {"he", {".", ","}},  {"th", {".", ","}},  {"de", {",", "."}},  {"es", {",", "."}},
+        {"it", {",", "."}},  {"nl", {",", "."}},  {"pt", {",", "."}},  {"da", {",", "."}},
+        {"tr", {",", "."}},  {"id", {",", "."}},  {"el", {",", "."}},  {"hr", {",", "."}},
+        {"ro", {",", "."}},  {"sl", {",", "."}},  {"fr", {",", "\xE2\x80\xAF"}},
+        {"ru", {",", "\xC2\xA0"}}, {"pl", {",", "\xC2\xA0"}}, {"cs", {",", "\xC2\xA0"}},
+        {"sv", {",", "\xC2\xA0"}}, {"fi", {",", "\xC2\xA0"}}, {"nb", {",", "\xC2\xA0"}},
+        {"no", {",", "\xC2\xA0"}}, {"uk", {",", "\xC2\xA0"}}, {"sk", {",", "\xC2\xA0"}},
+        {"hu", {",", "\xC2\xA0"}}, {"bg", {",", "\xC2\xA0"}}};
+    const auto known = kLocales.find(language);
+    if (known == kLocales.end())
+      return importRefusal("parselocale(" + typed + "): this version of PIET does not know that locale");
+    request->parseLocale = known->first;
+    if (request->decimalSeparator.empty()) request->decimalSeparator = known->second.decimal;
+    if (request->groupSeparator.empty()) request->groupSeparator = known->second.group;
+    request->numberLocale = true;
   } else if (key == "encoding" || key == "charset") {
     const std::string folded = strutil::lower(typed);
     if (folded == "utf-8" || folded == "utf8") {
       request->encoding.clear();
+      request->encodingTyped = typed;
     } else {
       const iconv_t probe = iconv_open("UTF-8", typed.c_str());
       if (probe == reinterpret_cast<iconv_t>(-1)) return importRefusal("encoding not supported");
       iconv_close(probe);
       request->encoding = typed;
+      request->encodingTyped = typed;
     }
   }
   return std::nullopt;
@@ -222,6 +259,12 @@ std::optional<ojson> readOneImportOption(const std::string& key, const std::stri
 std::optional<ojson> readImportOptions(const ImportOptionList& opts, ImportRequest* request) {
   for (const auto& [key, value] : opts) {
     if (key == "clear" || key == "collapsedelimiters") continue;  // the latter: accepted, no effect
+    // The strL space-saving rule is not applied by this reader at all, so the
+    // option's effect (strings stay str# unless too long) is already the rule.
+    if (key == "favorstrfixed") {
+      if (!value.isBool) return importRefusal("option favorstrfixed incorrectly specified");
+      continue;
+    }
     if (key == "asdouble" || key == "asfloat") {
       if (!value.isBool) return importRefusal("option " + key + "() incorrectly specified");
       (key == "asdouble" ? request->asDouble : request->asFloat) = true;
@@ -233,6 +276,12 @@ std::optional<ojson> readImportOptions(const ImportOptionList& opts, ImportReque
                            " incorrectly specified");
     }
     if (auto refusal = readOneImportOption(key, value.strValue, request)) return refusal;
+  }
+  if (request->numberLocale) {
+    // What the options leave unsaid comes from the system locale (en_US).
+    if (request->decimalSeparator.empty()) request->decimalSeparator = ".";
+    if (request->groupSeparator.empty() && request->decimalSeparator != ",") request->groupSeparator = ",";
+    if (request->groupSeparator == request->decimalSeparator) request->groupSeparator.clear();
   }
   if (request->numericColumns.everyColumn && request->stringColumns.everyColumn)
     return importRefusal("numericcols(_all) cannot be combined with stringcols(_all)");
@@ -298,14 +347,31 @@ std::optional<std::string> decodeToUtf8(const std::string& bytes, const std::str
 
 // The file's text as UTF-8; an error block when it cannot be had.
 std::optional<ojson> loadImportText(const std::string& path, const std::string& shownName,
-                                    const std::string& encoding, std::string* text) {
+                                    const std::string& encoding, std::string* text,
+                                    std::string* guessedEncoding) {
   std::ifstream file(cecon::to_native_path(path), std::ios::binary);
   if (!file) return rcErrorBlock("file " + shownName + " could not be opened", 603);
   std::ostringstream slurped;
   slurped << file.rdbuf();
   *text = slurped.str();
+  if (guessedEncoding) {
+    // r(encoding) when none was typed: the name of the encoding the bytes were
+    // read as. A file with no byte above 0x7F is valid in every Latin set; the
+    // name Stata gives it comes from its trigram scorer (fileio/charset_guess.cpp).
+    *guessedEncoding = piet::fileio::guessTextEncoding(*text, holdsOnlyUtf8(*text));
+  }
   if (!encoding.empty() || !holdsOnlyUtf8(*text)) {
     const std::string source = encoding.empty() ? std::string("ISO-8859-1") : encoding;
+    // A UTF-16 / UTF-32 file that ends in a half unit (a lone newline byte after
+    // the last whole character) is read up to it, as Stata reads one (bank
+    // fdeb29fec3ac0510: 1 observation); the stray byte is dropped.
+    {
+      std::string low = source;
+      for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      low.erase(std::remove(low.begin(), low.end(), '-'), low.end());
+      if (low.rfind("utf16", 0) == 0 && text->size() % 2 != 0) text->pop_back();
+      else if (low.rfind("utf32", 0) == 0 && text->size() % 4 != 0) text->resize(text->size() & ~size_t(3));
+    }
     auto decoded = decodeToUtf8(*text, source);
     if (!decoded.has_value()) return importRefusal("file " + shownName + " is not valid " + source);
     *text = std::move(*decoded);
@@ -315,17 +381,53 @@ std::optional<ojson> loadImportText(const std::string& path, const std::string& 
 }
 
 
-// With no varnames(), the first record names the columns when, leaving its
-// missing tokens aside, it holds text and no number.
-bool recordReadsAsNames(const std::vector<std::string>& record) {
+// With no varnames(), the first record can name the columns only when, leaving
+// its missing tokens aside, it holds some text; whether it does is then judged
+// by the columns below it (delimited::firstRecordNamesColumns): a numeric field
+// among the words does not stop it ("x,2020" over "1,2" names x and v2, bank
+// cell c2c0453e27a3d13e).
+bool recordReadsAsNames(const std::vector<std::string>& record, bool noRecordBelow) {
   bool sawText = false;
   for (const std::string& field : record) {
     if (delimited::isMissingToken(field)) continue;
     double unused = 0.0;
-    if (delimited::parseNumber(field, &unused)) return false;
-    sawText = true;
+    if (!delimited::parseNumber(field, &unused)) sawText = true;
+    // with no record below to tell by, one number among the words is data
+    else if (noRecordBelow) return false;
   }
   return sawText;
+}
+
+
+// A cell read with the locale's separators: an optional sign, digits with the
+// group separator between any of them, at most one decimal separator. The answer
+// is the same number spelled with `.` and no grouping; nullopt = not a number
+// under these separators.
+std::optional<std::string> readLocaleNumber(const std::string& cell, const std::string& decimal,
+                                            const std::string& group) {
+  const std::string text = trim(cell);
+  if (text.empty()) return std::nullopt;
+  std::string out;
+  size_t at = 0;
+  if (text[0] == '+' || text[0] == '-') out.push_back(text[at++]);
+  bool sawDecimal = false, sawDigit = false;
+  while (at < text.size()) {
+    if (std::isdigit(static_cast<unsigned char>(text[at]))) {
+      out.push_back(text[at++]);
+      sawDigit = true;
+    } else if (!decimal.empty() && text.compare(at, decimal.size(), decimal) == 0) {
+      if (sawDecimal) return std::nullopt;
+      sawDecimal = true;
+      out.push_back('.');
+      at += decimal.size();
+    } else if (!group.empty() && !sawDecimal && sawDigit && text.compare(at, group.size(), group) == 0) {
+      at += group.size();
+    } else {
+      return std::nullopt;
+    }
+  }
+  if (!sawDigit) return std::nullopt;
+  return out;
 }
 
 
@@ -335,6 +437,22 @@ ojson answerEmptyImport(SessionState& session) {
   ojson answer;
   answer["type"] = "display";
   answer["text"] = "(0 vars, 0 obs)";
+  return answer;
+}
+
+// The same answer with the results `import delimited` posts: r(N) and r(k) are 0,
+// r(delimiters) and r(encoding) are what the import would have posted (bank cell
+// 1095875730abc4fc: `varnames(9)` over five lines).
+ojson answerEmptyImportPosting(SessionState& session, const std::string& delimiters,
+                               const std::string& encoding) {
+  ojson answer = answerEmptyImport(session);
+  if (answer.is_object() && answer.value("type", std::string()) == "error") return answer;
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("N", 0.0);
+  session.eval.rValues.set("k", 0.0);
+  session.eval.rStrings.set("delimiters", delimiters);
+  session.eval.rStrings.set("encoding", encoding);
+  eval::declareRPosted(session.eval, "import delimited", {"N", "k", "delimiters", "encoding"});
   return answer;
 }
 
@@ -383,7 +501,9 @@ ojson runImportDelimited(const std::vector<std::string>& varlist, const std::str
   if (!cecon::native_exists(path)) return rcErrorBlock("file " + shownName + " not found", 601);
 
   std::string text;
-  if (auto failure = loadImportText(path, shownName, request.encoding, &text)) return *failure;
+  std::string guessedEncoding;
+  if (auto failure = loadImportText(path, shownName, request.encoding, &text, &guessedEncoding))
+    return *failure;
   if (!request.delimiterNamed)
     request.reader.delims = std::string(1, delimited::detectDelimiter(text));
 
@@ -394,11 +514,32 @@ ojson runImportDelimited(const std::vector<std::string>& varlist, const std::str
   // Which record names the columns, and which records hold data (both 0-based
   // here). A record at or before the names record is never data.
   const auto recordCount = static_cast<long long>(records.size());
-  if (request.namesRecord > recordCount)
-    return importRefusal(request.namesRecordTyped + ": invalid row number in varnames() option");
+  // A names row past the last row of the file leaves nothing to read: an empty
+  // dataset, rc 0 (bank cell 1095875730abc4fc: `varnames(9)` over 5 lines is
+  // "(0 vars, 0 obs)"), not a refusal.
+  if (request.namesRecord > recordCount) {
+    std::string delimiterShown;
+    for (const char c : request.reader.delims)
+      delimiterShown += c == '\t' ? std::string("\\t") : std::string(1, c);
+    return answerEmptyImportPosting(
+        session, delimiterShown,
+        request.encodingTyped.empty() ? guessedEncoding : request.encodingTyped);
+  }
   long long namesAt = -1;
   if (request.namesRecord > 0) namesAt = request.namesRecord - 1;
-  else if (!request.noNamesRecord && recordReadsAsNames(records.front())) namesAt = 0;
+  else if (!request.noNamesRecord && recordReadsAsNames(records.front(), records.size() < 2)) {
+    // Whether the first record names the columns is judged on the cells as
+    // numbers: under parselocale() and friends `1,5` is the number 1.5.
+    std::decay_t<decltype(records)> asNumbers;
+    if (request.numberLocale) {
+      asNumbers = records;
+      for (auto& record : asNumbers)
+        for (auto& cell : record)
+          if (auto number = readLocaleNumber(cell, request.decimalSeparator, request.groupSeparator))
+            cell = *number;
+    }
+    if (delimited::firstRecordNamesColumns(request.numberLocale ? asNumbers : records)) namesAt = 0;
+  }
   const long long dataFrom = std::max(request.records.first - 1, namesAt + 1);
   const long long dataEnd =
       request.records.last > 0 ? std::min(request.records.last, recordCount) : recordCount;
@@ -436,16 +577,39 @@ ojson runImportDelimited(const std::vector<std::string>& varlist, const std::str
   table.names = std::move(named.names);
   table.labels = namesAt >= 0 ? std::move(named.labels) : std::vector<std::string>(windowSize);
 
-  // Storage types, each from its column's data cells.
+  // Storage types, each from its column's data cells. With parselocale() /
+  // decimalseparator() / groupseparator() a column whose every cell reads as a
+  // number under those separators is typed, and stored, from the cells
+  // respelled with `.` and no grouping; any other column is read as before.
   const bool typeAsDouble =
       request.asDouble || (!request.asFloat && session.defaultStorageType == "double");
   std::vector<const std::string*> columnCells;
+  std::vector<std::vector<std::string>> localized(windowSize);
   for (size_t slot = 0; slot < windowSize; ++slot) {
     columnCells.clear();
     for (long long r = dataFrom; r < dataEnd; ++r)
       columnCells.push_back(&cellOf(records[static_cast<size_t>(r)], slot));
     const bool numericForced = request.numericColumns.holds(fileColumnOf(slot));
     const bool stringForced = !numericForced && request.stringColumns.holds(fileColumnOf(slot));
+    if (request.numberLocale && !stringForced) {
+      std::vector<std::string> respelled;
+      bool allNumbers = true, anyNumber = false;
+      for (const std::string* cell : columnCells) {
+        if (trim(*cell).empty() || delimited::isMissingToken(*cell)) {
+          respelled.push_back(*cell);
+          continue;
+        }
+        auto number = readLocaleNumber(*cell, request.decimalSeparator, request.groupSeparator);
+        if (!number) { allNumbers = false; break; }
+        respelled.push_back(std::move(*number));
+        anyNumber = true;
+      }
+      if (allNumbers && anyNumber) {
+        localized[slot] = std::move(respelled);
+        columnCells.clear();
+        for (const std::string& cell : localized[slot]) columnCells.push_back(&cell);
+      }
+    }
     table.types.push_back(
         delimited::typeColumn(columnCells, stringForced, numericForced, typeAsDouble));
   }
@@ -454,12 +618,28 @@ ojson runImportDelimited(const std::vector<std::string>& varlist, const std::str
     std::vector<std::string> row;
     row.reserve(windowSize);
     for (size_t slot = 0; slot < windowSize; ++slot)
-      row.push_back(cellOf(records[static_cast<size_t>(r)], slot));
+      row.push_back(localized[slot].empty()
+                        ? cellOf(records[static_cast<size_t>(r)], slot)
+                        : localized[slot][static_cast<size_t>(r - dataFrom)]);
     table.rows.push_back(std::move(row));
   }
 
+  const double importedRows = static_cast<double>(table.rows.size());
+  const double importedColumns = static_cast<double>(table.names.size());
   if (auto failure = delimited::stageAndAdopt(session, table, "import delimited", path))
     return *failure;
+
+  // [D] import delimited stored results: r(N), r(k), r(delimiters) (a tab is
+  // written as backslash-t) and r(encoding) (as typed, else the encoding read).
+  std::string delimiterShown;
+  for (const char c : request.reader.delims) delimiterShown += c == '\t' ? std::string("\\t") : std::string(1, c);
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("N", importedRows);
+  session.eval.rValues.set("k", importedColumns);
+  session.eval.rStrings.set("delimiters", delimiterShown);
+  session.eval.rStrings.set("encoding",
+                            request.encodingTyped.empty() ? guessedEncoding : request.encodingTyped);
+  eval::declareRPosted(session.eval, "import delimited", {"N", "k", "delimiters", "encoding"});
   return openBlockFor(session, path);
 }
 }

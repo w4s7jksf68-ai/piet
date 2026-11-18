@@ -78,6 +78,7 @@ std::optional<double> wholeNumber(const std::string& text) {
 struct Request {
   std::string clusterVar;
   bool mlVariance = false;
+  bool svy = false;
 };
 
 // Reads vce(...) into `word` ("robust"/"cluster", empty when vce() is empty) and
@@ -142,7 +143,7 @@ std::optional<ojson> readOptionLine(const eval::ParsedCommand& parsed, Request& 
         break;
       }
       case kSvy:
-        if (notBuilt.empty()) notBuilt = "svy";
+        req.svy = true;  // judged after the fits are screened (Stata's order)
         break;
       case kMinus:
         if (notBuilt.empty()) notBuilt = "minus()";
@@ -236,6 +237,21 @@ double fitScalar(const eval::EvalSession& fitView, const char* name) {
 std::optional<ojson> screenFit(const std::string& name, const StoredModel& stored,
                                const StoredModel* first) {
   const auto word = [&stored](const char* key) { return stored.eStrings.get(key); };
+  // The estimators suest cannot combine, refused first (r(322), "<cmd> is not
+  // supported by suest"; bank dde7856a after ivregress 2sls).
+  static const std::set<std::string> kNotSupported = {
+      "cox",        "xtgee",      "ivreg",      "ivregress", "areg",       "xtreg",     "sem",
+      "xtmixed",    "mixed",      "xtmepoisson", "mepoisson", "xtmelogit", "melogit",   "meglm",
+      "gsem",       "gmm",        "ivpoisson",  "reg3",      "sureg",      "xtheckman", "xteregress",
+      "xteprobit",  "xteoprobit", "xteintreg",  "asclogit",  "asmixlogit", "asmprobit", "asroprobit",
+      "nlogit",     "rologit",    "cmclogit",   "cmmixlogit", "cmmprobit", "cmrologit", "cmroprobit",
+      "cmxtmixlogit"};
+  for (const char* key : {"cmd", "cmd2"})
+    if (kNotSupported.count(word(key))) return e3::rcError(word(key) + " is not supported by suest", 322);
+  if (word("cmd") == "regress" && word("model") == "iv")
+    return e3::rcError("regression models with instruments are not supported by suest", 322);
+  if (word("cmd") == "regress" && !word("absvar").empty())
+    return e3::rcError("regress with option absorb() is not supported by suest", 322);
   if (!word("clustvar").empty())
     return e3::rcError(name + " was estimated with cluster(" + word("clustvar") +
                            "). re-estimate without the cluster() option, and specify the "
@@ -245,13 +261,15 @@ std::optional<ojson> screenFit(const std::string& name, const StoredModel& store
     return e3::rcError("model " + name +
                            " was estimated with pweights, you should re-estimate using iweights",
                        322);
+  // Stata's test: e(vce) one of "", oim, ols, standard and e(vcetype) "" or OIM.
+  const std::string vce = word("vce"), vcetype = word("vcetype");
+  if ((vce != "" && vce != "oim" && vce != "ols" && vce != "standard") || (vcetype != "" && vcetype != "OIM"))
+    return e3::rcError(name + " was estimated with a nonstandard vce (" + (vce.empty() ? vcetype : vce) + ")",
+                       322);
   if (word("cmd") != "regress")
     return outOfScope("suest of a stored `" + word("cmd") +
                       "` fit is not implemented in this version of PIET (only regress is); "
                       "nothing was estimated");
-  const std::string vce = word("vce");
-  if (!vce.empty() && vce != "ols")
-    return e3::rcError(name + " was estimated with a nonstandard vce (" + vce + ")", 322);
   if (first != nullptr) {
     if (word("wtype") != first->eStrings.get("wtype"))
       return e3::rcError("inconsistent weighting types", 322);
@@ -441,6 +459,12 @@ std::vector<std::vector<double>> sandwich(const std::vector<FitEquations>& fits,
 }  // namespace
 
 nlohmann::ordered_json runSuest(const eval::ParsedCommand& parsed, SessionState& session) {
+
+  // A line with no names is a replay: of suest's own results, else r(301)
+  // (bank 349c1c7b `suest , zzabbrprobe` after no suest: "estimation results
+  // for suest not found", before the options are read).
+  if (parsed.varlist.empty() && session.eval.eStrings.get("cmd") != "suest")
+    return wrapBlock(e3::rcError("estimation results for suest not found", 301));
   Request req;
   if (auto bad = readOptionLine(parsed, req)) return wrapBlock(*bad);
 
@@ -448,8 +472,15 @@ nlohmann::ordered_json runSuest(const eval::ParsedCommand& parsed, SessionState&
   std::vector<std::string> names;
   {
     std::set<std::string> seen;
-    for (const std::string& word : parsed.varlist)
+    // `.` is the active results; when they are a stored fit (`estimates
+    // store B` the last thing done to them) they go by that name (bank
+    // a9c1d1bc `suest A .` after storing B: "Simultaneous results for A, B").
+    for (std::string word : parsed.varlist) {
+      if (word == "." && !session.activeEstimatesName.empty() && session.lastEstBlock.has_value() &&
+          session.eval.eStrings.get("_estimates_name") == session.activeEstimatesName)
+        word = session.activeEstimatesName;
       if (seen.insert(word).second) names.push_back(word);
+    }
   }
   if (names.empty())
     return wrapBlock(outOfScope(
@@ -482,6 +513,13 @@ nlohmann::ordered_json runSuest(const eval::ParsedCommand& parsed, SessionState&
     nextSlot += fits[m].slotCount();
   }
   const size_t dim = nextSlot;
+  // svy: after the fits pass, the data must be svyset (r(119); bank 3e2829dd);
+  // the survey variance itself is not built.
+  if (req.svy) {
+    if (!session.svyDesign.has_value())
+      return wrapBlock(e3::rcError("data not set up for svy, use svyset", 119));
+    return wrapBlock(outOfScope("suest, svy: not implemented in this version of PIET; nothing was estimated"));
+  }
 
   // ---- the union sample, its weights, its clusters ----
   const int64_t frameRows = frame->nRows();
@@ -596,6 +634,23 @@ nlohmann::ordered_json runSuest(const eval::ParsedCommand& parsed, SessionState&
   session.setLastModel(posted);
   session.lastEstBlock = block;
   e3::postBV(session, stackedNames, stackedB, stackedV);
+  // e(b_pclass): each parameter's display class, 0 (an ordinary coefficient)
+  // for every column of a regress stack, the log variances included (bank
+  // e9d66afe: 1 x 6 zeros over e(b)'s names).
+  {
+    eval::EvalMatrix pc;
+    pc.rownames = {"r1"};
+    pc.colnames = stackedNames;
+    pc.data.push_back(std::vector<double>(stackedNames.size(), 0.0));
+    bool replaced = false;
+    for (auto& kv : session.eval.eMatrices)
+      if (kv.first == "b_pclass") {
+        kv.second = pc;
+        replaced = true;
+      }
+    if (!replaced) session.eval.eMatrices.emplace_back("b_pclass", std::move(pc));
+    session.noteEOnFit("b_pclass");
+  }
 
   e3::setEScalarOnFit(session, "N", unionCount);
   e3::setEScalarOnFit(session, "rank", rank);

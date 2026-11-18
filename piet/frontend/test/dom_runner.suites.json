@@ -10,7 +10,12 @@
   "WS1: coeftable header uses Stata BE 19.5 labels (Coefficient / Std. err. / [95% conf. interval])",
   "WS1: correlate renders Stata lower-triangular matrix",
   "WS1: pwcorr,sig adds a significance (p-value) line under each coef row",
+  "vs-stata s3b_est_other: correlate, means draws the means table before the matrix",
+  "vs-stata s3b_est_other: pwcorr star() marks and print() blanks pairs by their p-value",
+  "vs-stata s3b_est_other: mean & proportion tables: CI type, vce(cluster) Robust and clusters line, noheader, stdize strata, percent, level",
+  "vs-stata s3b_est_other: proportion citype(agresti) notes an upper limit cut at 1",
   "WS1: summarize header uses Std. dev. and pipe+rule separator",
+  "s3b_tables: tabulate summarize() draws its column set (weighted Obs, obs)",
   "WS1: describe uses Stata two-row Storage/Display/Value + Variable label header",
   "WS2 (design decision 3): Run .do loads #doedit-text and OPENS the editor (foreground; nothing executes)",
   "WS4: graph blocks are collected into the gallery store",
@@ -43,6 +48,8 @@
   "BS-022: logistic coeftable header reads \"Odds ratio\"; logit keeps \"Coefficient\" (real dispatcher fixture)",
   "BS-026: reghdfe estimatorTitle + t-stat class coverage (real dispatcher fixture)",
   "MVP F6: coeftable-less estimation payloads render a generic fallback card",
+  "vs-stata: test, mtest() draws the per-constraint table from a real dispatcher block",
+  "vs-stata: test, notest lists the constraints and draws no statistic (real dispatcher block)",
   "BS-026: tabstat renders a vars×stats table from real dispatcher fixture (no empty shell)",
   "BS-026: tabstat by() renders the total table + an honest engine-pending note (no fabricated group rows)",
   "BS-028: pwcorr,obs renders the per-pair N beneath each coefficient (real dispatcher fixture)",
@@ -63,6 +70,7 @@
   "BUG-114 (P8.1): syncThemeButtons() — the 4-state mode×theme label matrix, and clicking mode-toggle cross-updates theme-toggle",
   "BUG-097 (P8.1-T2): Cmd/Ctrl+A scopes to #console-body when focus is outside any editable field; native select-all is untouched inside one",
   "T2 (P8.1): Cmd/Ctrl+, toggles #settings-overlay open/close; a no-op while #request-overlay is up (modal guard)",
+  "Settings: tabulate's table-size limits show Stata's limit for an empty box and Apply sends whole numbers",
   "A6 (P8.1-T2): #doedit-run-selection exists and shares _runEditorBuffer's busy-guard with ▶ Run",
   "T3 (P8.1): echo fold-heads group following siblings (.block-folded/.fold-closed/data-fold-count/aria-expanded); textContent is byte-identical across a fold cycle; pre-echo blocks are untouched",
   "A10 (P8.1): .block-copy-bar.console-action on estimation/summarize/tabulate/describe only; esttab's own bar also carries .console-action",
@@ -103,5 +111,6 @@
   "P1-A2B (UX-052 ②): the %tc oracle pins sub-second truncation, the epoch, a pre-1960 instant and a real time-of-day",
   "P1-A2B (UX-052 ①): the `c` suffix inserts Stata's thousands separators on both the g and f branches (real Stata 19.5 oracle)",
   "P1-A2 (UX-052) non-regression: A15 numeric branches and the %tc/%tC scope boundary are untouched",
-  "FIX:GRID-TFMT-DETAIL: %td detail-string token map renders Stata's exact layout (real Stata 19.5 oracle)"
+  "FIX:GRID-TFMT-DETAIL: %td detail-string token map renders Stata's exact layout (real Stata 19.5 oracle)",
+  "display _continue: an echo closes the open line; a loop body joins its pieces"
 ]

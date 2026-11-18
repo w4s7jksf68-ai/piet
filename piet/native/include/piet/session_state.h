@@ -118,11 +118,23 @@ class SessionState {
   // out of this item's minimal additive scope.
   // BETA A4 (BS-091): a successful `use` is the one point that resets
   // c(changed) to false — see load()'s corresponding true-set below.
-  void setCurrentFile(const std::string& path) {
+  //
+  // `saveTarget` says whether a name-less `save, replace` may write a .dta over
+  // `path`. A loader whose source is an archive or a delimited text file names it
+  // in c(filename) (zipuse leaves $S_FN) but the dataset's own file for `save` is
+  // not that file: writing .dta bytes there would destroy the source.
+  void setCurrentFile(const std::string& path, bool saveTarget = true) {
     currentFile_ = path;
+    currentFileIsSaveTarget_ = saveTarget;
     datasetChanged = false;
   }
   const std::string& currentFile() const { return currentFile_; }
+  // The file a name-less `save, replace` writes: empty when there is none or the
+  // loaded source is not a Stata dataset file.
+  const std::string& currentSaveTarget() const {
+    static const std::string none;
+    return currentFileIsSaveTarget_ ? currentFile_ : none;
+  }
 
   // See the constructor: process-level caches a new session must not inherit.
   static void resetProcessCaches();
@@ -616,9 +628,26 @@ class SessionState {
   // than rewritten into each `svy:` command line: the design is session state in
   // Stata too, and threading it as context keeps the engine stateless.
   struct SvySettings {
+    // What `svy:` hands the engine (one stage, a probability weight, strata).
     std::string psu;
     std::string pweight;
     std::string strata;
+    // The whole design as `svyset` keeps it (svyset.ado's characteristics): one entry per
+    // sampling stage, the global weight, and the global options. Empty = not set.
+    struct Stage {
+      std::string su, strata, fpc, weight;
+    };
+    std::vector<Stage> stage;
+    int stages = 0, stagesWt = 0;
+    std::string wtype, wvar;  // "pweight"/"iweight", the weight variable
+    std::string vce, mse, brr, fay, bsr, bsn, jkr, sdr, sdrfpc, dof, dofsubpop;
+    std::string poststrata, postweight, calmethod, calmodel, calopts, singleunit;
+    bool isSet() const {
+      return stages > 0 || !wvar.empty() || !vce.empty() || !brr.empty() || !fay.empty() ||
+             !bsr.empty() || !bsn.empty() || !jkr.empty() || !sdr.empty() || !dof.empty() ||
+             !dofsubpop.empty() || !poststrata.empty() || !calmethod.empty() ||
+             !singleunit.empty() || !mse.empty();
+    }
   };
   std::optional<SvySettings> svyDesign;
   // P7 — multiple-imputation declaration (`mi set STYLE`, `mi register imputed V`).
@@ -909,6 +938,11 @@ class SessionState {
   // (estimation/estimation_sample_install.cpp esampleInstallOnHead); pass the model's own otherwise.
   void setLastModelEsample(LastModel::EsampleState state, unsigned long long serial,
                            std::string installPath, std::string dataPath);
+  // Set one key of the LIVE fit's cached reply, in both copies the e() readers use
+  // (lastModel()->result and eval.lastModelResult), for a value only known once the
+  // fit is posted (logit/probit e(k): the e(b) stripe's column count). No-op when
+  // no fit is live or a copy is not an object.
+  void patchLastModelResult(const std::string& key, const nlohmann::ordered_json& value);
   // How many times a fit installed the mask column in this session
   // (estimation/estimation_sample_install.cpp esampleInstallColumn). Zero means no frame of this session
   // can carry it, so a writer that must leave it out (save) skips the check.
@@ -1009,11 +1043,17 @@ class SessionState {
   // is not claimed and keeps the honest refusal. `missingScalars` are listed
   // names Stata posts with a missing value (ivregress's e(df_r)), which
   // resolve to `.` without a store entry. Read only through eNameOrderFor.
+  // The lists name the fresh fit's order. A later command that Stata runs by
+  // holding or copying the live estimates (`estimates store`, lincom, margins,
+  // nlcom, ...) leaves the same names in another order (dispatcher.cpp
+  // applyEOrderRewrite); the `...Reordered` flags then withdraw the ORDER of
+  // that kind while the names stay known (eNameMembersFor).
   struct ENameContract {
     std::uint64_t fitSerial = 0;
     std::string cmd;
     std::optional<std::vector<std::string>> scalars, macros, matrices;
     std::vector<std::string> missingScalars;
+    bool scalarsReordered = false, macrosReordered = false, matricesReordered = false;
   };
   std::optional<ENameContract> eNameContract;
   // The contract's list for `kind`, only while the live e() is still exactly
@@ -1022,6 +1062,10 @@ class SessionState {
   // the list lacks (an estadd'ed scalar, say). Otherwise nullopt, and the
   // caller falls back to the completeness rule above. session_state.cpp.
   std::optional<std::vector<std::string>> eNameOrderFor(const std::string& kind) const;
+  // The same list as a set of names, whatever its order now is (a kind whose
+  // order a later command rewrote still knows its members): the matrix
+  // reader's "not an e() matrix" test (matrix_commands.cpp).
+  std::optional<std::vector<std::string>> eNameMembersFor(const std::string& kind) const;
   // `set rng NAME` (dispatcher.cpp), read back by c(rng).
   std::string rngSetting = "default";
   // `ereturn post ..., esample(VAR)` (results/ereturn_commands.cpp runPost): the posted
@@ -2672,6 +2716,7 @@ class SessionState {
 
   std::string workdir_;
   std::optional<std::string> currentHbin_;
+  bool currentFileIsSaveTarget_ = true;  // see setCurrentFile()
   std::string currentFile_;  // P8 U1: last successfully-loaded dataset path; "" initially
   std::unordered_map<std::string, int64_t> nMissCache_;  // C2-F13a: per-column nMissing carried across mutations
   std::unique_ptr<Datastore> datastore_;

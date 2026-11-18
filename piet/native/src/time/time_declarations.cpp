@@ -159,6 +159,16 @@ void runTimeDeclaration(const std::string& cmd, eval::ParsedCommand& parsed,
         std::nullopt, std::nullopt, std::nullopt, "r(101)")));
     return;
   }
+  if (cmd == "xtset" || cmd == "tsset" || cmd == "tset") {
+    // A period option takes no argument: `xtset id t, d(1)` is r(198).
+    for (const auto& [k, v] : parsed.opts)
+      if (kTssetPeriodFmt().count(k) && !v.isBool) {
+        blocks.push_back(ojson(eval::errorBlock(
+            "syntax_error", "option " + k + "() incorrectly specified", std::nullopt, std::nullopt,
+            std::nullopt, "r(198)")));
+        return;
+      }
+  }
   if (cmd == "xtset") {
     if (auto err = tsVarlistPass(session, parsed.varlist)) {
       blocks.push_back(*err);
@@ -250,7 +260,9 @@ void runTimeDeclaration(const std::string& cmd, eval::ParsedCommand& parsed,
       // So does a display option, which shows tsset's Query lines with it.
       bool anyPeriod = false;
       for (const auto& [k, v] : parsed.opts)
-        if ((kTssetPeriodFmt().count(k) || k == "format") && (!v.isBool || v.boolValue))
+        if (((kTssetPeriodFmt().count(k) || k == "format") && (!v.isBool || v.boolValue)) ||
+            k == "delta" || k == "force" || k == "noquery" || k == "panellabel" ||
+            k == "tsvarlabel")
           anyPeriod = true;
       handlers::TsDeclare look;
       auto rest = parsed.opts;
@@ -266,14 +278,15 @@ void runTimeDeclaration(const std::string& cmd, eval::ParsedCommand& parsed,
         handlers::TsDeclare decl = look;
         for (const auto& [k, v] : parsed.opts) {
           if (k == "delta" && !v.isBool) {
-            auto d = eval::pythonFloat(v.strValue);
-            if (!d.has_value() || *d <= 0.0) {
-              blocks.push_back(ojson(eval::errorBlock(
-                  "engine_error", "invalid argument in delta(): " + v.strValue, std::nullopt,
-                  std::nullopt, std::nullopt, "r(198)")));
-              return;
-            }
-            decl.delta = d;
+            decl.deltaText = strutil::trim(v.strValue);
+          } else if (k == "force") {
+            decl.force = true;
+          } else if (k == "noquery") {
+            decl.noQuery = true;
+          } else if (k == "panellabel" && !v.isBool) {
+            decl.panelAlias = strutil::trim(v.strValue);
+          } else if (k == "tsvarlabel" && !v.isBool) {
+            decl.timeAlias = strutil::trim(v.strValue);
           } else if (kTssetPeriodFmt().count(k) && (!v.isBool || v.boolValue)) {
             const std::string period = (k == "clock") ? std::string("clocktime") : k;
             if (!decl.period.empty() && decl.period != period) {
@@ -291,7 +304,8 @@ void runTimeDeclaration(const std::string& cmd, eval::ParsedCommand& parsed,
         }
         decl.panelvar = parsed.varlist[0];
         decl.timevar = *tvar;
-        blocks.push_back(handlers::runTsDeclare(decl, session, "xtset"));
+        ojson declared = handlers::runTsDeclare(decl, session, "xtset");
+        if (!(declared.is_array() && declared.empty())) blocks.push_back(std::move(declared));
         return;
       }
     }
@@ -385,15 +399,17 @@ void runTimeDeclaration(const std::string& cmd, eval::ParsedCommand& parsed,
     bool anyOption = false;
     for (const auto& [k, v] : parsed.opts) {
       if (k == "delta" && !v.isBool) {
-        auto d = eval::pythonFloat(v.strValue);
-        if (!d.has_value() || *d <= 0.0) {
-          blocks.push_back(ojson(eval::errorBlock(
-              "engine_error", "invalid argument in delta(): " + v.strValue, std::nullopt,
-              std::nullopt, std::nullopt, "r(198)")));
-          return;
-        }
-        decl.delta = d;
+        decl.deltaText = strutil::trim(v.strValue);
         anyOption = true;
+      } else if (k == "force") {
+        decl.force = true;
+        anyOption = true;
+      } else if (k == "noquery") {
+        decl.noQuery = true;
+      } else if (k == "panellabel" && !v.isBool) {
+        decl.panelAlias = strutil::trim(v.strValue);
+      } else if (k == "tsvarlabel" && !v.isBool) {
+        decl.timeAlias = strutil::trim(v.strValue);
       }
     }
     // B4-W3b: the PERIOD option names a %t format; `format(%fmt)` states one.
@@ -437,7 +453,10 @@ void runTimeDeclaration(const std::string& cmd, eval::ParsedCommand& parsed,
     } else {
       decl.timevar = parsed.varlist[0];
     }
-    blocks.push_back(handlers::runTsDeclare(decl, session, "tsset"));  // w2w_tsset_tsfill.log:96-99
+    {
+      ojson declared = handlers::runTsDeclare(decl, session, "tsset");  // w2w_tsset_tsfill.log:96-99
+      if (!(declared.is_array() && declared.empty())) blocks.push_back(std::move(declared));
+    }
     return;
   }
 

@@ -3,15 +3,60 @@
 #include "data_support.h"
 #include "text_support.h"
 #include "pipeline.h"
+#include "datamgmt/dataset_shape_support.h"
 #include "options.h"
 #include "handler_declarations.h"
 #include "estimation/estimation_internal.h"  // runExpandIf
 #include "piet/handlers/data_values.h"
+#include "piet/handlers/gtools_aliases.h"
 #include "piet/handlers/observations.h"
 #include "piet/handlers/session_commands.h"
 #include "piet/handlers/time_panel.h"
 #include "piet/handlers/variables.h"
 namespace piet::dispatch_detail {
+namespace {
+// Everything r() is made of, so that a command which leaves r() as it found it (gsort holds
+// the results and restores them) can put it back after the helper commands it runs.
+struct RClassSnapshot {
+  eval::OrderedFloatDict values;
+  std::vector<std::pair<std::string, std::uint64_t>> hidden, hiddenMacros, hiddenMatrices;
+  eval::OrderedDict strings;
+  std::vector<std::pair<std::string, eval::EvalMatrix>> matrices;
+  std::uint64_t tableGen, tableRefusalGen;
+  std::uintptr_t tableEid, tableRefusalEid;
+  std::string tableModel, tableRefusal, classCmd, declaredCmd;
+  std::vector<std::string> unposted;
+  bool classSetUnknown;
+  std::optional<std::vector<std::string>> declaredNames;
+  explicit RClassSnapshot(const eval::EvalSession& e)
+      : values(e.rValues), hidden(e.rHidden), hiddenMacros(e.rHiddenMacros),
+        hiddenMatrices(e.rHiddenMatrices), strings(e.rStrings), matrices(e.rMatrices),
+        tableGen(e.rTableGen), tableRefusalGen(e.rTableRefusalGen), tableEid(e.rTableEid),
+        tableRefusalEid(e.rTableRefusalEid), tableModel(e.rTableModel),
+        tableRefusal(e.rTableRefusal), classCmd(e.rClassCmd), declaredCmd(e.rDeclaredCmd),
+        unposted(e.rUnposted), classSetUnknown(e.rClassSetUnknown),
+        declaredNames(e.rDeclaredNames) {}
+  void restore(eval::EvalSession& e) const {
+    e.rValues = values;
+    e.rHidden = hidden;
+    e.rHiddenMacros = hiddenMacros;
+    e.rHiddenMatrices = hiddenMatrices;
+    e.rStrings = strings;
+    e.rMatrices = matrices;
+    e.rTableGen = tableGen;
+    e.rTableRefusalGen = tableRefusalGen;
+    e.rTableEid = tableEid;
+    e.rTableRefusalEid = tableRefusalEid;
+    e.rTableModel = tableModel;
+    e.rTableRefusal = tableRefusal;
+    e.rClassCmd = classCmd;
+    e.rDeclaredCmd = declaredCmd;
+    e.rUnposted = unposted;
+    e.rClassSetUnknown = classSetUnknown;
+    e.rDeclaredNames = declaredNames;
+  }
+};
+}  // namespace
 bool route_data_rows(std::string& cmd,
     std::string& cmdTyped,
     eval::ParsedCommand& parsed,
@@ -81,6 +126,13 @@ bool route_data_rows(std::string& cmd,
       blocks.push_back(ojson(*err));
       return true;
     }
+    // `drop varlist` and `drop if|in` are two forms; a varlist with a qualifier is
+    // neither (StataBE: `keep price mpg weight in 1/6` -> invalid syntax r(198)).
+    if (!parsed.varlist.empty() && (parsed.ifExpr.has_value() || parsed.inRange.has_value())) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                              std::nullopt, std::nullopt, std::string("r(198)"))));
+      return true;
+    }
     if (parsed.ifExpr.has_value() || parsed.inRange.has_value()) {
       // BUG-032: a string-referencing condition can't go to cobra's all-f64
       // eval --keepif; filter row-wise. Numeric stays cobra. BS-090 (BETA
@@ -122,6 +174,7 @@ bool route_data_rows(std::string& cmd,
     // x = 1` answers float, WSN 291a). A hidden column (the e(sample) mask)
     // keeps its name over zero rows, and rows `set obs` adds later hold missing
     // -- outside the sample, as Stata reads them (E11 counts 0).
+    bool droppedEveryVariable = false;
     if (dropped.is_object() && dropped.value("type", std::string()) == "data_mutation") {
       bool noVarsLeft = false;
       if (dropped.contains("varlist_after") && dropped["varlist_after"].is_array()) {
@@ -134,6 +187,7 @@ bool route_data_rows(std::string& cmd,
           noVarsLeft = false;  // unreadable head: leave it to the next verb's honest error
         }
       }
+      droppedEveryVariable = noVarsLeft;
       if (noVarsLeft && session.currentHbin().has_value()) {
         const std::string emptied = mintScratchPath(session.workdir(), "drop_all_rows");
         try {
@@ -150,6 +204,9 @@ bool route_data_rows(std::string& cmd,
         }
       }
     }
+    // c(changed): a dataset with no variables left is not a changed one
+    // (vs-stata bank: `drop _all` / `drop *`, then describe, r(changed) 0).
+    if (droppedEveryVariable) session.datasetChanged = false;
     postDropKeepR(dropped, false, varsBefore);
     blocks.push_back(dropped);
     return true;
@@ -160,6 +217,13 @@ bool route_data_rows(std::string& cmd,
     // BS-097: same zero-consumption argument as `drop` immediately above.
     if (auto err = eval::rejectUnknownOptions(parsed.opts, {})) {
       blocks.push_back(ojson(*err));
+      return true;
+    }
+    // `keep varlist` and `keep if|in` are two forms; a varlist with a qualifier is
+    // neither (StataBE: `keep price mpg weight in 1/6` -> invalid syntax r(198)).
+    if (!parsed.varlist.empty() && (parsed.ifExpr.has_value() || parsed.inRange.has_value())) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                              std::nullopt, std::nullopt, std::string("r(198)"))));
       return true;
     }
     if (parsed.ifExpr.has_value() || parsed.inRange.has_value()) {
@@ -192,22 +256,166 @@ bool route_data_rows(std::string& cmd,
 
   if (cmd == "sort") {
     // BUG-336 (batch 2): known set measured from the handler body -- runSort takes no options.
+    // `sort` with no varlist is r(100) "varlist required" in StataBE 19.5, and
+    // the varlist is checked before the options (truth bank: `so`, `so, d`,
+    // `so, bogus`, all r(100) -- 85 syntaxopt cells); it used to reach the
+    // engine as an empty key list and come back as its usage line, r(1).
+    // The varlist is also checked before the qualifiers, which this arm answers
+    // itself (registry.cpp kQualifiersRefusedByArm): `so in 5`, `so [fw=w]`,
+    // `so = price*2` and `so using "f"` are r(100) too -- a leading `=` or the
+    // word `using` is no variable name -- and with a varlist, `if` and weights
+    // are r(101) (`so price mpg if foreign [aw=weight] in 1/50` "if not
+    // allowed").
+    const bool noVarlist =
+        parsed.varlist.empty() || parsed.varlist[0] == "using" ||
+        !(std::isalpha(static_cast<unsigned char>(parsed.varlist[0][0])) != 0 ||
+          parsed.varlist[0][0] == '_' || static_cast<unsigned char>(parsed.varlist[0][0]) >= 0x80);
+    if (noVarlist) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "varlist required", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(100)")));
+      return true;
+    }
+    if (parsed.ifExpr.has_value()) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "if not allowed", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(101)")));
+      return true;
+    }
+    if (parsed.weightType.has_value()) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "weights not allowed", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(101)")));
+      return true;
+    }
+    if (parsed.inRange.has_value()) {
+      blocks.push_back(ojson(eval::unsupportedOption(
+          "in " + *parsed.inRange,
+          "`sort` does not support the `in` row-range qualifier in this engine.")));
+      return true;
+    }
     if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabSort.known, kVocabSort.unimplemented)) {
       blocks.push_back(ojson(*err));
       return true;
     }
-    blocks.push_back(ojson(handlers::runSort(parsed.varlist, session)));
+    {
+      // wildcards, ranges and `_all` name the variables sorted on
+      std::vector<std::string> sortKeys = parsed.varlist;
+      if (auto err = handlers::resolveByKeyNames(session, sortKeys)) {
+        blocks.push_back(*err);
+        return true;
+      }
+      blocks.push_back(ojson(handlers::runSort(sortKeys, session)));
+    }
     return true;
   }
 
 
   if (cmd == "gsort") {
     // BUG-336 (batch 2): known set measured from the handler body -- runGsort takes no options.
+    // gsort takes no qualifier: StataBE 19.5 answers a line with `if`, `in` or a
+    // weight r(100) "varlist required" (vs-stata bank 970b955e62d11fdb `gsort
+    // -price if foreign==1`; the in/weight twins). The `if` reached this arm
+    // and was dropped.
+    if (parsed.ifExpr.has_value() || parsed.inRange.has_value() || parsed.weightType.has_value()) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "varlist required", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(100)")));
+      return true;
+    }
     if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabGsort.known, kVocabGsort.unimplemented)) {
       blocks.push_back(ojson(*err));
       return true;
     }
-    blocks.push_back(ojson(handlers::runGsort(parsed.varlist, session)));
+    // generate(newvar): a group number, 1, 2, ... in the sorted order, shared by the observations
+    // that tie on every key; mfirst: the missing values of a DESCENDING numeric key come first
+    // instead of last (an ascending key always sorts them last)
+    // (vs-stata bank: `gsort -price, generate(ord)`, `gsort -union, mfirst`).
+    const RClassSnapshot gsortRBefore(session.eval);  // gsort leaves r() as it was
+    std::optional<std::string> gsortGen;
+    bool gsortMfirst = false;
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "generate" && !v.isBool) gsortGen = trimWs(v.strValue);
+      if (k == "mfirst" && (v.isBool ? v.boolValue : true)) gsortMfirst = true;
+    }
+    if (gsortGen.has_value() && session.hasData()) {
+      if (Datastore* gds = session.datastore(); gds != nullptr && gds->has(*gsortGen)) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error",
+                                                "variable " + *gsortGen + " already defined",
+                                                std::nullopt, std::nullopt, std::nullopt, "r(110)")));
+        return true;
+      }
+    }
+    // A key that is a wildcard stands for the variables it names, each with the key's sign.
+    std::vector<std::string> gsortKeys;
+    for (const auto& tok : parsed.varlist) {
+      const bool signd = !tok.empty() && (tok[0] == '+' || tok[0] == '-');
+      const std::string nm = signd ? tok.substr(1) : tok;
+      if (session.hasData() && nm.find_first_of("*?~") != std::string::npos) {
+        auto vr = piet::loops::expandVarlist(nm, session);
+        if (vr.isError) {
+          blocks.push_back(vr.error);
+          return true;
+        }
+        for (const auto& v : vr.tokens) gsortKeys.push_back((signd ? tok.substr(0, 1) : std::string()) + v);
+      } else {
+        gsortKeys.push_back(tok);
+      }
+    }
+    std::vector<std::string> mfFlags;
+    if (gsortMfirst && session.hasData()) {
+      std::vector<std::string> numericKey;
+      {
+        Datastore* gds = session.datastore();
+        for (const auto& tok : gsortKeys) {
+          const bool signd = !tok.empty() && (tok[0] == '+' || tok[0] == '-');
+          const std::string nm = signd ? tok.substr(1) : tok;
+          if (gds != nullptr && gds->has(nm) && gds->dtype(nm) == "f64") numericKey.push_back(nm);
+        }
+      }
+      std::vector<std::string> withFlags;
+      for (const auto& tok : gsortKeys) {
+        const bool signd = !tok.empty() && (tok[0] == '+' || tok[0] == '-');
+        const std::string nm = signd ? tok.substr(1) : tok;
+        if (signd && tok[0] == '-' &&
+            std::find(numericKey.begin(), numericKey.end(), nm) != numericKey.end()) {
+          const std::string flag = "__piet_gs_mf" + std::to_string(mfFlags.size());
+          (void)dispatch("quietly generate byte " + flag + " = missing(" + nm + ")", session);
+          mfFlags.push_back(flag);
+          withFlags.push_back("-" + flag);
+        }
+        withFlags.push_back(tok);
+      }
+      gsortKeys = std::move(withFlags);
+    }
+    ojson gsorted = ojson(handlers::runGsort(gsortKeys, session));
+    for (const auto& f : mfFlags) (void)dispatch("quietly drop " + f, session);
+    blocks.push_back(std::move(gsorted));
+    const bool gsortFailed = blocks.back().is_object() &&
+                             blocks.back().value("type", std::string()) == "error";
+    if (!gsortFailed && gsortGen.has_value() && !gsortGen->empty()) {
+      // The group number: it steps up where any key's value differs from the row above (an
+      // extended missing differs from `.`), is stored in the smallest integer type that holds
+      // it, and carries gsort's own label.
+      std::string differs = "_n == 1";
+      for (const auto& tok : gsortKeys) {
+        const bool signd = !tok.empty() && (tok[0] == '+' || tok[0] == '-');
+        const std::string nm = signd ? tok.substr(1) : tok;
+        if (nm.rfind("__piet_gs_mf", 0) == 0) continue;
+        differs += " | " + nm + " != " + nm + "[_n-1]";
+      }
+      std::vector<std::string> lines = {
+          "generate long " + *gsortGen + " = " + differs,
+          "quietly replace " + *gsortGen + " = sum(" + *gsortGen + ")",
+          "quietly compress " + *gsortGen,
+          "quietly label variable " + *gsortGen + " \"Unique group ID from gsort\""};
+      for (const auto& line : lines) {
+        ojson made = dispatch(line, session);
+        if (made.is_array()) {
+          for (const auto& b : made)
+            if (!(b.is_object() && b.value("type", std::string()) == "echo")) blocks.push_back(b);
+        } else {
+          blocks.push_back(std::move(made));
+        }
+      }
+    }
+    if (!gsortFailed) gsortRBefore.restore(session.eval);
     return true;
   }
 
@@ -302,20 +510,39 @@ bool route_data_rows(std::string& cmd,
         return true;
       }
       if (k != "frame") continue;
-      std::istringstream names(v.strValue);
-      std::string first, more;
-      names >> first >> more;
-      if (!more.empty()) {
+      // The names are read in order, a comma standing as a token of its own: the first that is not
+      // a name is `<token> invalid name` r(198) (vs-stata bank: `frame(cf, replace)` -> ", invalid
+      // name"), and only then do two or more names count as too many.
+      std::vector<std::string> nameTokens;
+      {
+        std::istringstream names(v.strValue);
+        for (std::string w; names >> w;) {
+          std::string cur;
+          for (char ch : w) {
+            if (ch == ',') {
+              if (!cur.empty()) nameTokens.push_back(cur);
+              nameTokens.push_back(",");
+              cur.clear();
+            } else {
+              cur += ch;
+            }
+          }
+          if (!cur.empty()) nameTokens.push_back(cur);
+        }
+      }
+      for (const auto& tok : nameTokens) {
+        if (!strutil::isValidStataIdentifier(tok)) {
+          blocks.push_back(ojson(eval::errorBlock("syntax_error", tok + " invalid name",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  std::string("r(198)"))));
+          return true;
+        }
+      }
+      if (nameTokens.size() > 1) {
         blocks.push_back(ojson(eval::errorBlock("syntax_error",
                                                 "option frame():  too many names specified",
                                                 std::nullopt, std::nullopt, std::nullopt,
                                                 std::string("r(103)"))));
-        return true;
-      }
-      if (!first.empty() && !strutil::isValidStataIdentifier(first)) {
-        blocks.push_back(ojson(eval::errorBlock("syntax_error", first + " invalid name",
-                                                std::nullopt, std::nullopt, std::nullopt,
-                                                std::string("r(198)"))));
         return true;
       }
     }
@@ -338,8 +565,29 @@ bool route_data_rows(std::string& cmd,
                                                     parsed.opts, parsed.weightVar,
                                                     parsed.inRange, collapseFlavor,
                                                     parsed.weightType));
-    if (collapseBlk.value("type", std::string()) != "error" && collapseNBefore >= 0)
-      session.eval.rValues.set("N", static_cast<double>(collapseNBefore));
+    if (collapseBlk.value("type", std::string()) != "error" && collapseNBefore >= 0) {
+      // r(N): the observations collapsed (after if/in, cw and a missing or zero
+      // weight), which runCollapse reports when it filtered.
+      const int64_t nUsed = collapseBlk.value("n_used", collapseNBefore);
+      session.eval.rValues.set("N", static_cast<double>(nUsed));
+      if (collapseBlk.contains("gtools_J")) {
+        session.eval.rValues.set("J", collapseBlk.value("gtools_J", 0.0));
+        session.eval.rValues.set("minJ", collapseBlk.value("gtools_minJ", 0.0));
+        session.eval.rValues.set("maxJ", collapseBlk.value("gtools_maxJ", 0.0));
+      }
+    }
+    // fcollapse.ado builds a helper variable when the run is restricted (if, in, a weight, cw)
+    // and drops it at the end: r(k_drop) is 1 then (vs-stata bank).
+    if (collapseBlk.value("type", std::string()) != "error" && cmdTyped == "fcollapse") {
+      bool restricted = parsed.ifExpr.has_value() || parsed.inRange.has_value() ||
+                        parsed.weightType.has_value();
+      for (const auto& kv : parsed.opts)
+        if (kv.first == "cw") restricted = true;
+      if (restricted) {
+        session.eval.rValues.set("k_drop", 1.0);
+        eval::declareRPosted(session.eval, "fcollapse", {"k_drop"});
+      }
+    }
     // e(sample) T2: runCollapse wrote collapse's marker rule (first observation
     // of each by-group, StataBE capture w2_esample_copies); the gtools/ftools
     // spellings reach the same engine verb, but their own rule is unmeasured.
@@ -372,6 +620,8 @@ bool route_data_rows(std::string& cmd,
     std::smatch m;
     std::string arg;
     if (std::regex_search(parsed.raw, m, reExpand)) arg = trimWs(m.str(1));
+    // `expand =exp` is `expand exp`.
+    if (!arg.empty() && arg[0] == '=') arg = trimWs(arg.substr(1));
     // B4-W3b: the regex above takes the whole rest of the line, so with an
     // option present it captured "2, generate(dupflag)" and runExpand rejected
     // it as a per-observation expression. The count is what precedes the option
@@ -395,8 +645,14 @@ bool route_data_rows(std::string& cmd,
       const int64_t factor = (end && *end == '\0' && k > 0) ? static_cast<int64_t>(k) : 2;
       if (preflight::gate("expand", session, "", factor, blocks) == preflight::Verdict::Cancel) return true;
     }
-    blocks.push_back(
-        ojson(handlers::runExpandIf(arg, expandGen, parsed.ifExpr, parsed.inRange, session)));
+    {
+      ojson er = ojson(handlers::runExpandIf(arg, expandGen, parsed.ifExpr, parsed.inRange, session));
+      if (er.is_array()) {
+        for (const auto& b : er) blocks.push_back(b);
+      } else {
+        blocks.push_back(std::move(er));
+      }
+    }
     return true;
   }
 
@@ -414,12 +670,26 @@ bool route_data_rows(std::string& cmd,
 
 
   if (cmd == "contract") {
-    if (auto err = eval::rejectUnknownOptions(parsed.opts, {})) {
+    if (auto err = eval::rejectUnknownOptions(
+            parsed.opts, {"freq", "cfreq", "percent", "cpercent", "format", "float", "zero",
+                          "nomiss"})) {
       blocks.push_back(ojson(*err));
       return true;
     }
-    // contract leaves r() alone too (BUG-1451, measured as for fillin).
-    blocks.push_back(ojson(handlers::runContract(parsed.varlist, session)));
+    // contract leaves r() alone too (BUG-1451, measured as for fillin), unless it works out
+    // percentages (then the summarize it reads the total from is what is left).
+    const bool plainContract = parsed.opts.empty() && !parsed.ifExpr.has_value() &&
+                               !parsed.inRange.has_value() && !parsed.weightVar.has_value();
+    if (plainContract) {
+      blocks.push_back(ojson(handlers::runContract(parsed.varlist, session)));
+    } else {
+      ojson cr = ojson(handlers::runContractFull(parsed, session));
+      if (cr.is_array()) {
+        for (const auto& b : cr) blocks.push_back(b);
+      } else {
+        blocks.push_back(std::move(cr));
+      }
+    }
     return true;
   }
 
@@ -462,11 +732,54 @@ bool route_data_rows(std::string& cmd,
     // Success is SILENT (Stata prints nothing) — the handler returns an empty
     // array, which must not be pushed as a block (same shape as preserve/
     // restore above); under `sort` it returns the sort and its note.
+    // `isid VARS using FILE` checks the file.
+    std::optional<size_t> usingAt;
+    for (size_t i = 0; i < parsed.varlist.size(); ++i)
+      if (lower(parsed.varlist[i]) == "using") {
+        usingAt = i;
+        break;
+      }
+    if (usingAt.has_value() && *usingAt + 1 < parsed.varlist.size()) {
+      std::vector<std::string> keys(parsed.varlist.begin(),
+                                    parsed.varlist.begin() + static_cast<long>(*usingAt));
+      std::string file = parsed.varlist[*usingAt + 1];
+      if (file.size() >= 2 && file.front() == '"' && file.back() == '"')
+        file = file.substr(1, file.size() - 2);
+      ojson ru = handlers::runIsidUsing(keys, file, session, missok, sort);
+      if (ru.is_array()) {
+        for (const auto& b : ru) blocks.push_back(b);
+      } else {
+        blocks.push_back(ru);
+      }
+      return true;
+    }
+    // isid.ado leaves r(N) (CheckUniq's count of the keys that are not missing) or, under
+    // `sort`, r(sorted) (CheckAlreadySorted: whether the data already led with the varlist).
+    bool sortedBefore = false;
+    {
+      std::istringstream in(session.eval.sortedBy ? session.eval.sortedBy() : std::string());
+      std::vector<std::string> marker;
+      for (std::string k; in >> k;) marker.push_back(k);
+      sortedBefore = !parsed.varlist.empty() && parsed.varlist.size() <= marker.size() &&
+                     std::equal(parsed.varlist.begin(), parsed.varlist.end(), marker.begin());
+    }
     ojson r = handlers::runIsid(parsed.varlist, session, missok, sort);
     if (r.is_array()) {
       for (const auto& b : r) blocks.push_back(b);
     } else {
       blocks.push_back(r);
+    }
+    const bool isidFailed = r.is_object() && r.value("type", std::string()) == "error";
+    if (!isidFailed && (sort || !missok)) {
+      eval::replaceRClass(session.eval);
+      if (sort) {
+        session.eval.rValues.set("sorted", sortedBefore ? 1.0 : 0.0);
+        eval::declareRPosted(session.eval, "isid", {"sorted"});
+      } else {
+        Datastore* nds = session.datastore();
+        session.eval.rValues.set("N", nds != nullptr ? static_cast<double>(nds->nRows()) : 0.0);
+        eval::declareRPosted(session.eval, "isid", {"N"});
+      }
     }
     return true;
   }
@@ -479,6 +792,13 @@ bool route_data_rows(std::string& cmd,
     std::string dsSub = parsed.varlist.empty() ? std::string() : lower(parsed.varlist[0]);
     // confirm abbreviates to conf; set and clear do not abbreviate (StataBE 19.5).
     if (dsSub.size() >= 4 && std::string("confirm").rfind(dsSub, 0) == 0) dsSub = "confirm";
+    // `datasignature if ...` / `in ...`: the word after the command is the subcommand, and `if` is not one.
+    if (dsSub.empty() && ((parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
+                          (parsed.inRange.has_value() && !parsed.inRange->empty()))) {
+      blocks.push_back(ojson(eval::errorBlock("engine_error", "invalid datasignature subcommand",
+                                              std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+      return true;
+    }
     if (!dsSub.empty()) {
       const bool usingForm =
           std::any_of(parsed.varlist.begin(), parsed.varlist.end(),
@@ -521,6 +841,18 @@ bool route_data_rows(std::string& cmd,
     // BUG-373: the signature itself is the whole point of the command, and it
     // was printed and not published — a do-file that compares signatures across
     // a run could not read it back.
+    // No data in memory (a cleared dataset, a file of zero variables): the
+    // signature of nothing, 0:0(0):0:0 (bank DSIG of every empty cell).
+    if (!session.hasData()) {
+      session.eval.rValues = eval::OrderedFloatDict();
+      session.eval.rStrings.clear();
+      session.eval.rStrings.set("datasignature", "0:0(0):0:0");
+      ojson empty;
+      empty["type"] = "display";
+      empty["text"] = "  0:0(0):0:0";
+      blocks.push_back(std::move(empty));
+      return true;
+    }
     ojson dsBlk = ojson(handlers::runDatasignature(session));
     if (dsBlk.value("type", std::string()) == "display") {
       session.eval.rStrings.set("datasignature", trimWs(dsBlk.value("text", std::string())));
@@ -532,6 +864,17 @@ bool route_data_rows(std::string& cmd,
 
 
   if (cmd == "preserve") {
+    // `preserve [, changed]`: any other option is r(198) "option X not
+    // allowed" (vs-stata bank fee7d08734dd0d8d, 2a1f897a0efbc661).
+    for (const auto& kv : parsed.opts) {
+      const std::string k = lower(kv.first);
+      if (k.empty() || std::string("changed").compare(0, k.size(), k) != 0 || !kv.second.isBool) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "option " + kv.first + " not allowed",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
+        return true;
+      }
+    }
     ojson r = handlers::runPreserve(session);
     if (!(r.is_array() && r.empty())) blocks.push_back(r);
     return true;
@@ -617,8 +960,12 @@ bool route_data_rows(std::string& cmd,
             return true;
           }
         } else {
-          blocks.push_back(ojson(eval::engineError(
-              "winsor2: cuts() requires exactly two values, got '" + v.strValue + "'")));
+          // cuts(numlist max=2 min=2): fewer than two is r(122), more r(123)
+          blocks.push_back(ojson(eval::errorBlock(
+              "engine_error",
+              std::string("cuts() invalid -- invalid numlist has too ") +
+                  (parts.size() < 2 ? "few" : "many") + " elements",
+              std::nullopt, std::nullopt, std::nullopt, parts.size() < 2 ? "r(122)" : "r(123)")));
           return true;
         }
       } else if (k == "suffix" && !v.isBool) {
@@ -649,6 +996,43 @@ bool route_data_rows(std::string& cmd,
       blocks.push_back(ojson(eval::engineError("winsor2: no variables specified")));
       return true;
     }
+    // winsor2.ado's `syntax varlist(min=1)`: wildcards and ranges name the variables, a name
+    // that is no variable is r(111) and a string variable r(109); then the checks of its own
+    // body, in its order -- cuts() given low above high (the ado swaps them through a tempname
+    // it then cannot read back: r(111)), and a result name that already exists.
+    std::vector<std::string> w2vars = parsed.varlist;
+    if (auto err = handlers::resolveByKeyNames(session, w2vars)) {
+      blocks.push_back(*err);
+      return true;
+    }
+    {
+      Datastore* wds = session.datastore();
+      auto rcBlock = [&](const std::string& msg, const char* rc) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error", msg, std::nullopt, std::nullopt,
+                                                std::nullopt, rc)));
+      };
+      if (wds != nullptr) {
+        for (const auto& nm : w2vars) {
+          if (!wds->has(nm)) { rcBlock("variable " + nm + " not found", "r(111)"); return true; }
+        }
+        for (const auto& nm : w2vars) {
+          if (wds->dtype(nm) == "factor") { rcBlock("type mismatch", "r(109)"); return true; }
+        }
+        if (cutLo > cutHi) { rcBlock("__000001 not found", "r(111)"); return true; }
+        if (!replace) {
+          for (const auto& nm : w2vars) {
+            if (wds->has(nm + suffix)) {
+              blocks.push_back(ojson(eval::errorBlock(
+                  "engine_error",
+                  "variable " + nm + suffix + " already exist, re-specify option -suffix()-\n"
+                      "Suffix " + suffix + " is invalid for " + nm,
+                  std::nullopt, std::nullopt, std::nullopt, "r(111)")));
+              return true;
+            }
+          }
+        }
+      }
+    }
     // BUG-373: winsor2 publishes r(r1)/r(r2) — the two CUT VALUES it winsorised
     // at, i.e. the cutLo/cutHi percentiles of the (last) variable. Verified
     // against the live StataBE capture on beertax: r(r1) 0.04766949 and r(r2)
@@ -657,9 +1041,9 @@ bool route_data_rows(std::string& cmd,
     std::vector<double> w2cuts;
     {
       Datastore* w2ds = session.datastore();
-      if (w2ds != nullptr && w2ds->has(parsed.varlist.back()) &&
-          w2ds->dtype(parsed.varlist.back()) == "f64") {
-        const double* col = w2ds->col(parsed.varlist.back()).f64();
+      if (w2ds != nullptr && w2ds->has(w2vars.back()) &&
+          w2ds->dtype(w2vars.back()) == "f64") {
+        const double* col = w2ds->col(w2vars.back()).f64();
         const int64_t wn = w2ds->nRows();
         std::vector<double> v;
         v.reserve(static_cast<size_t>(wn));
@@ -683,11 +1067,13 @@ bool route_data_rows(std::string& cmd,
         if (!v.empty()) { w2cuts.push_back(pct(cutLo)); w2cuts.push_back(pct(cutHi)); }
       }
     }
-    ojson w2Blk = ojson(handlers::runWinsor2(session, parsed.varlist, cutLo, cutHi, trim, byStr,
+    ojson w2Blk = ojson(handlers::runWinsor2(session, w2vars, cutLo, cutHi, trim, byStr,
                                              suffix, replace));
     if (w2Blk.value("type", std::string()) != "error" && w2cuts.size() == 2) {
-      session.eval.rValues.set("r1", w2cuts[0]);
+      // _pctile's r(r1) r(r2), listed r1 then r2 as Stata lists them (newest
+      // first: r2 is posted before r1; vs-stata truth bank).
       session.eval.rValues.set("r2", w2cuts[1]);
+      session.eval.rValues.set("r1", w2cuts[0]);
     }
     blocks.push_back(std::move(w2Blk));
     return true;
@@ -713,6 +1099,25 @@ bool route_data_rows(std::string& cmd,
     }
     std::string stub = trimWs(raw.substr(0, eqPos));
     std::string srcVar = trimWs(raw.substr(eqPos + 1));
+    if (stub.find_first_of(" \t") != std::string::npos) {
+      // the linear forms: the if/in sample is read here, the spline built by the handler
+      std::vector<char> inSample;
+      if (auto err = handlers::dataset_shape_detail::ifInMask(session, parsed, &inSample)) {
+        blocks.push_back(*err);
+        return true;
+      }
+      blocks.push_back(ojson(handlers::runMksplineSegments(session, stub, srcVar, parsed.opts, inSample)));
+      return true;
+    }
+    // The cubic form computes over every observation (see runMkspline), so an `in` range
+    // is refused by name rather than read and dropped, as its `if` is.
+    if (parsed.inRange.has_value() && !parsed.inRange->empty()) {
+      blocks.push_back(ojson(eval::unsupportedOption(
+          "in " + *parsed.inRange,
+          "`mkspline, cubic` computes over every observation. Restrict first (`preserve` + "
+          "`keep in ...`), then run mkspline.")));
+      return true;
+    }
     blocks.push_back(
         ojson(handlers::runMkspline(stub, srcVar, parsed.opts, parsed.ifExpr, session)));
     return true;
@@ -722,8 +1127,8 @@ bool route_data_rows(std::string& cmd,
   // BUG-370 — see registry.cpp for why these three exist and what they refuse.
   // All follow the mkspline arm's `stub = var` split (joinVarlist -> find('=')).
   if (cmd == "xtile") {
-    if (auto err = eval::rejectUnknownOptions(parsed.opts, {"nquantiles", "cutpoints"},
-                                              {"altdef"})) {
+    if (auto err = eval::rejectUnknownOptions(parsed.opts, {"nquantiles", "cutpoints", "altdef"},
+                                              {})) {
       blocks.push_back(ojson(*err));
       return true;
     }
@@ -773,9 +1178,26 @@ bool route_data_rows(std::string& cmd,
     }
     std::optional<std::string> xtWeight;
     if (parsed.weightType.has_value() && parsed.weightVar.has_value()) xtWeight = parsed.weightVar;
+    // cmdTyped is gquantiles when the gtools alias translated the line here.
     blocks.push_back(ojson(handlers::runXtileStata(trimWs(raw.substr(0, eqPos)), expText,
                                                    parsed.opts, parsed.ifExpr, parsed.inRange,
-                                                   xtWeight, session, parsed.weightType)));
+                                                   xtWeight, session, parsed.weightType,
+                                                   lower(cmdTyped) == "xtile")));
+    if (lower(cmdTyped) == "gquantiles" && blocks.back().is_object()) {
+      if (blocks.back().value("type", std::string()) != "error") {
+        handlers::gquantilesPublishXtile(parsed, session, trimWs(expText));
+      } else {
+        // gquantiles reads `newvar = exp` itself: an expression it cannot evaluate (a name
+        // that is not there, a string variable) is a syntax error, not "not found".
+        const std::string reason = blocks.back().value("reason", std::string());
+        const std::string what = blocks.back().value("message", std::string());
+        if (reason == "r(111)" || reason == "r(109)" ||
+            (what.size() > 10 && what.compare(what.size() - 10, 10, " not found") == 0))
+          blocks.back() = ojson(eval::errorBlock("syntax_error",
+                                                 "Invalid syntax. Requried: newvarname = exp",
+                                                 std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+      }
+    }
     return true;
   }
 
@@ -787,6 +1209,19 @@ bool route_data_rows(std::string& cmd,
     }
     blocks.push_back(
         ojson(handlers::runIpolate(parsed.varlist, parsed.opts, parsed.ifExpr, session)));
+    // ipolate.ado ends with `count if newvar >= .`: r(N) is the missing values it left
+    // (vs-stata bank).
+    if (!(blocks.back().is_object() && blocks.back().value("type", std::string()) == "error")) {
+      std::string newvar;
+      for (const auto& [k, v] : parsed.opts)
+        if (k == "generate" && !v.isBool) newvar = trimWs(v.strValue);
+      if (!newvar.empty()) {
+        const std::string savedLeaf = session.leafCmdExpanded;
+        (void)dispatch("quietly count if missing(" + newvar + ")", session);
+        session.leafCmdExpanded = savedLeaf;
+        eval::declareRPosted(session.eval, "ipolate", {"N"});
+      }
+    }
     return true;
   }
 
@@ -795,6 +1230,45 @@ bool route_data_rows(std::string& cmd,
     // Two-word command, registered under the first word: the sub-verb arrives as
     // varlist[0] (the duplicates/estat convention).
     std::string sub = parsed.varlist.empty() ? std::string() : lower(parsed.varlist[0]);
+    // tssmooth's smoothers ([TS] tssmooth): ma, exponential, dexponential,
+    // hwinters, shwinters, nl, each with its documented minimum (e, d, h, s).
+    // Any other word is r(198) "<word> is not a valid smoother" (vs-stata bank
+    // 9a81954fe3a6ba87 `tssmooth zzmethod sm = gnp96`).
+    if (!sub.empty()) {
+      static const std::pair<const char*, size_t> kSmoothers[] = {
+          {"ma", 2}, {"exponential", 1}, {"dexponential", 1}, {"hwinters", 1},
+          {"shwinters", 1}, {"nl", 2}};
+      bool known = false;
+      for (const auto& [full, minLen] : kSmoothers) {
+        const std::string f(full);
+        known = known || (sub.size() >= minLen && sub.size() <= f.size() &&
+                          f.compare(0, sub.size(), sub) == 0);
+      }
+      if (!known) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", sub + " is not a valid smoother",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
+        return true;
+      }
+    }
+    // The new variable is checked before the options, as Stata's syntax reads a
+    // line: `tssmooth ma gnp96 = gnp96, window(2 1 2) re` .. `replac` (and `r`)
+    // are r(110) "variable gnp96 already defined" (vs-stata bank b37db5600da94ae7,
+    // bad362d2be2a88c6) -- replace takes no abbreviation.
+    if (sub == "ma" && session.hasData()) {
+      std::string rawMa =
+          joinVarlist(std::vector<std::string>(parsed.varlist.begin() + 1, parsed.varlist.end()));
+      const size_t eq = rawMa.find('=');
+      const std::string nv = eq == std::string::npos ? std::string() : trimWs(rawMa.substr(0, eq));
+      bool fullReplace = false;
+      for (const auto& kv : parsed.opts) fullReplace = fullReplace || kv.first == "replace";
+      if (!nv.empty() && !fullReplace && targetVarExists(session, nv).value_or(false)) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error", "variable " + nv + " already defined",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(110)")));
+        return true;
+      }
+    }
     if (sub != "ma") {
       blocks.push_back(ojson(eval::engineError(
           sub.empty()
@@ -816,6 +1290,16 @@ bool route_data_rows(std::string& cmd,
     if (eqPos == std::string::npos) {
       blocks.push_back(ojson(eval::engineError(
           "syntax_error: `tssmooth ma` requires `newvar = varname`", "syntax_error")));
+      return true;
+    }
+    if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) {
+      // The smoother's window over a restricted sample (do rows outside it count as missing
+      // in the window?) is not something this build computes; running it over every
+      // observation would answer a different question at rc 0.
+      blocks.push_back(ojson(eval::unsupportedOption(
+          "if " + *parsed.ifExpr,
+          "`tssmooth ma` in this build smooths over every observation. Restrict first "
+          "(`preserve` + `keep if ...`), then run tssmooth.")));
       return true;
     }
     blocks.push_back(ojson(handlers::runTssmoothMa(trimWs(raw.substr(0, eqPos)),

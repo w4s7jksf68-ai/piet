@@ -314,8 +314,11 @@ ojson runSencode(const eval::ParsedCommand& parsed, SessionState& session) {
   if (haveGen && srcLabel.has_value() && !srcLabel->empty()) vm.label = srcLabel;
   session.implicitFloatVars.erase(target);
   session.userFormattedVars.erase(target);
-  if (haveGen) return mutationResult(session, "gen", {target});
-  return mutationResult(session, "gen", {}, {}, {target});
+  // sencode.ado's last r-class command summarizes the coded variable.
+  ojson done = haveGen ? mutationResult(session, "gen", {target})
+                       : mutationResult(session, "gen", {}, {}, {target});
+  dispatch("quietly summarize " + target, session);
+  return done;
 }
 
 }  // namespace piet::handlers

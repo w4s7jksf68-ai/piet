@@ -11,7 +11,7 @@ namespace piet::handlers::utility_detail {
 // memory with the distinct rows, and either accepted-and-ignored would answer a
 // different question at rc 0.
 const piet::eval::OptVocab& kVocabUnique = piet::eval::registerOptVocab(
-    {"unique", "gunique"}, {{"by", "gen", "generate"}, {"detail", "replace"}});
+    {"unique", "gunique"}, {{"by", "gen", "generate", "missing"}, {"detail", "replace"}});
 
 // `abbrev()` shortens the displayed names, `min()`/`max()` filter the rows this
 // build prints in full. None is read; each changes what the table SAYS.
@@ -29,19 +29,9 @@ const piet::eval::OptVocab& kVocabMissings = piet::eval::registerOptVocab(
 const piet::eval::OptVocab& kVocabMdesc = piet::eval::registerOptVocab(
     {"mdesc"}, {{}, {"abbreviate", "any", "all", "none"}});
 
-// `decode` runs labmask in reverse (label -> a new string variable), which is a
-// different command's output, not an option on this one's.
+// `decode` takes the text from the value label of the values variable.
 const piet::eval::OptVocab& kVocabLabmask = piet::eval::registerOptVocab(
-    {"labmask"}, {{"values", "lblname"}, {"decode"}});
-
-// This build's renvarlab is the NAME-transform half: prefix/suffix/case. The
-// package's label-driven renaming (rename each variable to a token of its
-// variable LABEL) is a different derivation of the new names and is refused
-// rather than approximated.
-const piet::eval::OptVocab& kVocabRenvarlab = piet::eval::registerOptVocab(
-    {"renvarlab"}, {{"prefix", "suffix", "upper", "lower"},
-                    {"label", "postfix", "subst", "presub", "postsub", "trim", "map", "symbol",
-                     "display", "test"}});
+    {"labmask"}, {{"values", "lblname", "decode"}, {}});
 
 // ---- AER scope 2, bundle B2 (2026-09-07) ----------------------------------
 // strdist's own `syntax` line is
@@ -54,20 +44,21 @@ const piet::eval::OptVocab& kVocabStrdist = piet::eval::registerOptVocab(
 // `nobreak` suppresses the chopping this command exists to do; `recode()`
 // renumbers the codes r(relabel) carries.
 const piet::eval::OptVocab& kVocabSplitvallabels = piet::eval::registerOptVocab(
-    {"splitvallabels"}, {{"length"}, {"nobreak", "recode"}});
+    {"splitvallabels"}, {{"length", "nobreak", "recode", "vals", "local"}, {}});
 
 // `strok` tells marksample to KEEP observations whose string variables are
-// non-empty rather than marking them out, and `zeroweight` keeps zero-weight
-// observations. Both change which rows the marker selects, so neither may be
-// accepted-and-ignored -- the plan's scope table calls them "accept-ignore",
-// which is precisely the shape defect class 3 forbids.
+// non-empty rather than marking them all out, and `zeroweight` keeps
+// zero-weight observations. Both change which rows the marker selects, and
+// runMarksample (sample.cpp) implements both ([P] mark rules 1 and 6).
 const piet::eval::OptVocab& kVocabMarksample = piet::eval::registerOptVocab(
-    {"marksample"}, {{"novarlist"}, {"strok", "zeroweight"}});
+    {"marksample"}, {{"novarlist", "strok", "zeroweight"}, {}});
 
-// `save()`/`replace` write the file list OUT to a .dta; this build's filelist
-// only builds it in memory.
+// `save(file)` writes the file list OUT to a .dta (with `replace` over an existing
+// file) and leaves the data in memory as they were; `list` and `maxdeep()` are
+// not implemented.
 const piet::eval::OptVocab& kVocabFilelist = piet::eval::registerOptVocab(
-    {"filelist"}, {{"directory", "pattern", "norecursive"}, {"save", "replace"}});
+    {"filelist"}, {{"directory", "pattern", "norecursive", "recursive", "save", "replace"},
+                   {"list", "maxdeep"}});
 
 // `by` arrives from the dispatcher's by-prefix branch as an ordinary option.
 // `carryalong()` drags other variables along with each filled value,
@@ -82,12 +73,14 @@ const piet::eval::OptVocab& kVocabCarryforward = piet::eval::registerOptVocab(
 // rows missing on ANY of the requested variables -- both change which
 // observations enter every statistic.
 const piet::eval::OptVocab& kVocabRangestat = piet::eval::registerOptVocab(
-    {"rangestat"}, {{"interval", "by"}, {"excludeself", "casewise"}});
+    {"rangestat"}, {{"interval", "by", "excludeself", "casewise", "describe", "local", "nocheck"},
+                    {},
+                    {{"d", "describe"}}});
 
-// `fcond()`/`pcond()` are tsspell's forward/previous-observation conditions:
-// they change where a spell BEGINS, which is the one thing this command decides.
+// `fcond()` and `pcond()` set where a spell BEGINS and where its run continues; each is
+// read as tsspell.ado reads it. `replace` drops existing _spell/_seq/_end first.
 const piet::eval::OptVocab& kVocabTsspell = piet::eval::registerOptVocab(
-    {"tsspell"}, {{"cond", "spell", "seq", "end", "by"}, {"fcond", "pcond"}});
+    {"tsspell"}, {{"cond", "fcond", "pcond", "spell", "seq", "end", "by", "replace"}, {}});
 
 
 

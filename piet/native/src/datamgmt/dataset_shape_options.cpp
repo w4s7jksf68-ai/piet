@@ -93,18 +93,17 @@ const piet::eval::OptVocab& kVocabInsobs =
 const piet::eval::OptVocab& kVocabStack = piet::eval::registerOptVocab(
     {"stack"}, {{"into", "clear", "wide", "group"}, {}});
 
-// `veryshortlabel` and `sequential` change the NAMES/LABELS separate produces,
-// so accepting them unread would rename columns behind the user's back.
 const piet::eval::OptVocab& kVocabSeparate = piet::eval::registerOptVocab(
-    {"separate"}, {{"by", "shortlabel", "generate"}, {"veryshortlabel", "sequential"}});
+    {"separate"}, {{"by", "shortlabel", "veryshortlabel", "sequential", "missing", "indicator",
+                    "generate"},
+                   {},
+                   {{"g", "generate"}, {"i", "indicator"}}});
 
 const piet::eval::OptVocab& kVocabMvencode =
     piet::eval::registerOptVocab({"mvencode"}, {{"mv", "override"}, {}});
 
-// `by()` makes sample draw WITHIN groups; forwarding it as a plain sample would
-// answer a different question at rc 0.
 const piet::eval::OptVocab& kVocabSample =
-    piet::eval::registerOptVocab({"sample"}, {{"count"}, {"by"}});
+    piet::eval::registerOptVocab({"sample"}, {{"count", "by"}, {}});
 
 const piet::eval::OptVocab& kVocabSplitsample = piet::eval::registerOptVocab(
     {"splitsample"}, {{"generate", "nsplit", "rseed", "show"},
@@ -115,13 +114,15 @@ const piet::eval::OptVocab& kVocabSplitsample = piet::eval::registerOptVocab(
 // declares an alternative corr()/cov() matrix layout and `forcepsd` silently
 // repairs a non-PD matrix -- both would change the numbers drawn.
 const piet::eval::OptVocab& kVocabDrawnorm = piet::eval::registerOptVocab(
-    {"drawnorm"}, {{"n", "means", "sds", "corr", "cov", "seed", "double", "clear"},
-                   {"cstorage", "forcepsd"}});
+    {"drawnorm"}, {{"n", "means", "sds", "corr", "cov", "seed", "double", "clear", "cstorage",
+                    "forcepsd"},
+                   {}});
 
-// `input` takes no option this build reads. Registering the EMPTY known set is
-// not a no-op: it is what makes `input x, automatic` reach the net at all.
+// `automatic` and `label` build value labels from the text met in a numeric
+// variable. The labelling is not implemented: runInput refuses a line that
+// would need it by name, and reads every other line as it would without them.
 const piet::eval::OptVocab& kVocabInput =
-    piet::eval::registerOptVocab({"input"}, {{}, {"automatic", "label"}});
+    piet::eval::registerOptVocab({"input"}, {{"automatic", "label"}, {}});
 
 // `notes` has no option tail at all -- everything after the colon is NOTE TEXT,
 // including any comma in it, so this handler reads `parsed.raw` and never
@@ -142,15 +143,15 @@ const piet::eval::OptVocab& kVocabCumul = piet::eval::registerOptVocab(
 const piet::eval::OptVocab& kVocabBsample = piet::eval::registerOptVocab(
     {"bsample"}, {{"cluster", "idcluster"}, {"strata", "weight"}});
 
-// `altdef` selects Stata's ALTERNATIVE percentile definition. This build has
-// exactly one percentile rule (see stataPercentile below) and answering a
-// different definition's question with this one's number is the silent-wrong
-// -number shape, so it is refused rather than accepted.
+// `altdef` selects Stata's ALTERNATIVE percentile definition, the interpolating
+// rule of [D] pctile "Methods and formulas" (pctile.cpp stataAltdefPercentile).
+// pctile.ado's syntax line has no percentiles(): `pctile pc = x, p(10 50)` is
+// "option p() not allowed" r(198) (StataBE 19.5); only _pctile takes it.
 const piet::eval::OptVocab& kVocabPctile = piet::eval::registerOptVocab(
-    {"pctile"}, {{"nquantiles", "nq", "percentiles", "p", "genp"}, {"altdef"}});
+    {"pctile"}, {{"nquantiles", "nq", "genp", "altdef"}, {}});
 
 const piet::eval::OptVocab& kVocabPctileR = piet::eval::registerOptVocab(
-    {"_pctile"}, {{"nquantiles", "nq", "percentiles", "p"}, {"altdef"}});
+    {"_pctile"}, {{"nquantiles", "nq", "percentiles", "p", "altdef"}, {}});
 
 namespace {
 

@@ -443,9 +443,14 @@ void testAdjacentGroups(const std::string& workdir) {
   dfCheck(shown(session, "display (\"a\"==\"b\") (\"a\"==\"a\")") == "01",
           "BUG-816: `display (\"a\"==\"b\") (\"a\"==\"a\")` prints 01 (the lt_* shape)");
   {
+    // Two groups with nothing between them are a call of the first: StataBE
+    // 19.5 answers r(133) `unknown function ()` (vs-stata bank
+    // 1db2c412562ac97f `display (1)(2)`, 216e8483bc7e1875 `display
+    // ("a")("b")`). This arm used to pin rc 0 / 01, which no Stata run backed.
     const std::string rc = rcOf(session, "display (\"a\"==\"b\")(\"a\"==\"a\")");
-    dfCheck(rc == "0" && shown(session, "display (\"a\"==\"b\")(\"a\"==\"a\")") == "01",
-            "BUG-816: groups with no space between them split too, 01 -- main r(198). Got rc " + rc);
+    dfCheck(rc == "133",
+            "BUG-816: groups with no space between them are r(133) unknown function (). Got rc " +
+                rc);
   }
   dfCheck(shown(session, "display (\"(\" == \")\") (\"a)\" == \"a)\")") == "01" &&
               shown(session, "display ((1+2)*(3)) (4)") == "94",

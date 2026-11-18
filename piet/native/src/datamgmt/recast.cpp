@@ -41,6 +41,7 @@
 #include "piet/eval/pyvalue.h"  // pythonFloatRepr -- round-trippable CSV numerics
 #include "piet/eval/session.h"
 #include "piet/eval/tokenizer.h"
+#include "piet/loops.h"  // expandVarlist
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
@@ -61,15 +62,32 @@ using namespace dataset_shape_detail;
 //
 // Exact recasts change only metadata; force narrows the actual values through
 // the same store boundary as generate/replace (w2e_float_default:1565–1637).
-ojson runRecast(const eval::ParsedCommand& parsed, SessionState& session) {
-  if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabRecast.known,
+ojson runRecast(const eval::ParsedCommand& parsedIn, SessionState& session) {
+  if (auto err = eval::rejectUnknownOptions(parsedIn.opts, kVocabRecast.known,
                                             kVocabRecast.unimplemented))
     return ojson(*err);
-  if (auto q = refuseQualifiers(parsed, "recast")) return *q;
+  if (auto q = refuseQualifiers(parsedIn, "recast")) return *q;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
-  if (parsed.varlist.size() < 2)
-    return rsSyntax("recast: syntax is `recast type varlist [, force]`");
-
+  // StataBE 19.5 (vs-stata bank 2026-11-10): a type and no varlist, or a lone
+  // varlist, is r(100) "varlist required" (`recast double`, `recast price`); a
+  // word that is no storage type, a str# outside 1..2045, and a numeric type
+  // for a string variable (or the reverse) are r(109) "VAR:  TYPE invalid",
+  // per variable after the names are found (`recast zznotatype price`, `recast
+  // str0 make`, `recast str3000 make`, `recast double make`).
+  if (parsedIn.varlist.size() < 2)
+    return rsErrorRc("varlist required", 100);
+  // The names after the type are a varlist: ranges (`price-weight`), wildcards
+  // and abbreviations expand first.
+  eval::ParsedCommand parsed = parsedIn;
+  {
+    std::string spec;
+    for (size_t i = 1; i < parsedIn.varlist.size(); ++i)
+      spec += (spec.empty() ? "" : " ") + parsedIn.varlist[i];
+    loops::VarlistExpandResult ex = loops::expandVarlist(spec, session);
+    if (ex.isError) return ex.error;
+    parsed.varlist.resize(1);
+    for (const auto& t : ex.tokens) parsed.varlist.push_back(t);
+  }
   const std::string type = lowerOf(parsed.varlist[0]);
   static const std::set<std::string> kNumericTypes = {"byte", "int", "long", "float", "double"};
   bool isNumeric = kNumericTypes.count(type) > 0;
@@ -79,18 +97,14 @@ ojson runRecast(const eval::ParsedCommand& parsed, SessionState& session) {
     std::smatch m;
     if (std::regex_match(type, m, reStr)) {
       isString = true;
-      const long long w = std::stoll(m.str(1));
-      if (w < 1 || w > 2045)
-        return rsSyntax("recast: `" + type + "' — a str# width must be between 1 and 2045");
+      const long long w = m.str(1).size() > 6 ? 0 : std::stoll(m.str(1));
+      if (w < 1 || w > 2045) isString = false;  // r(109) per variable below
     } else if (type == "strl") {
       return rsError("recast: strL is not implemented in this build (the .dta writer has no strL "
                      "write path).",
                      "unimplemented");
     }
   }
-  if (!isNumeric && !isString)
-    return rsSyntax("recast: `" + parsed.varlist[0] +
-                    "' is not a storage type — expected byte, int, long, float, double or str#");
 
   Datastore* ds = nullptr;
   try {
@@ -105,14 +119,12 @@ ojson runRecast(const eval::ParsedCommand& parsed, SessionState& session) {
   for (size_t i = 1; i < parsed.varlist.size(); ++i) {
     const std::string& v = parsed.varlist[i];
     if (!ds->has(v)) return rsError("variable " + v + " not found");
+  }
+  for (size_t i = 1; i < parsed.varlist.size(); ++i) {
+    const std::string& v = parsed.varlist[i];
     const bool colIsString = ds->dtype(v) == "factor";
-    if (colIsString && isNumeric)
-      return rsError("recast: `" + v +
-                     "' is a string variable and " + type +
-                     " is numeric; recast never converts between the two (use `destring`).");
-    if (!colIsString && isString)
-      return rsError("recast: `" + v + "' is a numeric variable and " + type +
-                     " is a string type; recast never converts between the two (use `tostring`).");
+    if ((!isNumeric && !isString) || (colIsString && isNumeric) || (!colIsString && isString))
+      return rsErrorRc(v + ":  " + parsed.varlist[0] + " invalid", 109);
   }
   const bool force = hasFlag(parsed.opts, "force");
   const std::map<std::string, cecon::StoreType> storeTypes = {
@@ -124,27 +136,45 @@ ojson runRecast(const eval::ParsedCommand& parsed, SessionState& session) {
   std::vector<std::string> accepted, changed;
   std::vector<std::string> args = {"eval", "--data", *session.currentHbin()};
   std::set<std::string> seen;
+  std::optional<int64_t> lastCount;
   for (size_t i = 1; i < parsed.varlist.size(); ++i) {
     const std::string& name = parsed.varlist[i];
     if (!seen.insert(name).second) continue;
     bool changes = false;
+    // recast tests every variable by counting the values a copy in the new type
+    // would change (`count if x ~= copy`), and that count is the last r(N) it
+    // leaves behind -- the variable already held in the requested type is
+    // skipped before any count (vs-stata bank: `recast double price` r(N) 0,
+    // `recast byte price` 74, `recast int f, force` 37).
+    const auto heldIt = session.varMeta.find(name);
+    const bool alreadyThatType = heldIt != session.varMeta.end() &&
+                                 heldIt->second.stataType.has_value() &&
+                                 *heldIt->second.stataType == type;
+    int64_t nDiff = 0;
     if (isNumeric) {
       const auto& col = ds->col(name);
       for (int64_t row = 0; row < ds->nRows(); ++row) {
         const double old = col.f64()[row];
         const double value = cecon::frame_detail::round_to_store(old, storeTypes.at(type));
-        if (!std::isnan(old) && (std::isnan(value) || value != old)) { changes = true; break; }
+        if (!std::isnan(old) && (std::isnan(value) || value != old)) { changes = true; ++nDiff; }
       }
     } else {
       const auto& col = ds->col(name);
       const size_t width = static_cast<size_t>(std::stoll(type.substr(3)));
-      for (const auto& value : col.levels)
-        if (value.size() > width) { changes = true; break; }
+      for (int64_t row = 0; row < ds->nRows(); ++row) {
+        const int32_t code = col.codes()[row];
+        if (code >= 0 && static_cast<size_t>(code) < col.levels.size() &&
+            col.levels[static_cast<size_t>(code)].size() > width) {
+          changes = true;
+          ++nDiff;
+        }
+      }
       // A string force truncation needs a byte-preserving string store. Do not
       // mislabel an unchanged payload as a narrower string in its absence.
       if (changes && force)
         return rsError("recast: forced string truncation is not implemented", "unimplemented");
     }
+    if (!alreadyThatType) lastCount = nDiff;
     if (changes && !force) continue;
     accepted.push_back(name);
     if (changes) {
@@ -160,8 +190,22 @@ ojson runRecast(const eval::ParsedCommand& parsed, SessionState& session) {
     session.load(out);
   }
   for (const auto& name : accepted) {
+    // c(changed): a storage type that moves marks the data changed; a recast
+    // refused for loss ("74 values would be changed; not changed") or to the
+    // type already held does not (vs-stata bank: `recast str5 make` -> 0,
+    // `recast byte foreign rep78` -> 1).
+    auto mit = session.varMeta.find(name);
+    const bool hadType = mit != session.varMeta.end() && mit->second.stataType.has_value();
+    if (!hadType || *mit->second.stataType != type) session.datasetChanged = true;
     session.varMeta[name].stataType = type;
     session.implicitFloatVars.erase(name);
+  }
+  if (lastCount.has_value()) {
+    // The `count` that tested the last variable is an r-class command: it
+    // replaces r() with r(N).
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", static_cast<double>(*lastCount));
+    eval::declareRPosted(session.eval, "recast", {"N"});
   }
   if (!changed.empty()) return mutationResult(session, "gen", {}, {}, changed);
   return silent();

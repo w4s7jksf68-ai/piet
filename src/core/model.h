@@ -44,6 +44,12 @@ struct ModelData {
     // StataBE probes (`x o.z` for all three). Set by the caller after build_model
     // (cmd_feols and the post-estimation refits' `--collinear-forward`).
     bool collinear_forward = false;
+    // Stata `poisson` (no absorbed effects): after the IRLS solution, refit by ml's
+    // modified Newton-Raphson from poisson's own starting values, so the posted
+    // iterate, e(ic), e(ilog) and e(gradient) are those of Stata's ml (fepois.cpp).
+    bool stata_ml = false;
+    // iterate(#) of that ml fit (Stata's c(maxiter) 300 by default)
+    int ml_maxiter = 300;
     // Under collinear_forward, the design columns scanned LAST: the cells of a
     // standalone `a#b` that hold a factor's base level. StataBE (AER 007
     // TA17: `treatment##i.husb ... treatment#i.edu_nohs_BL`) keeps
@@ -137,6 +143,13 @@ struct IvModelData {
     // (sigma2 = rss/(N-dofminus), robust meat * N/(N-dofminus), cluster untouched)
     // and are never counted in the cluster small-sample K. See iv2sls_fit.
     bool dofminus_fe = false;
+    // ivreg2's gmm2s: the efficient two-step GMM variance (X'Z W Z'X)^-1, W the
+    // inverse of the first-step (2SLS-residual) meat that also weights the estimate,
+    // in place of ivregress gmm's sandwich rebuilt on the final residuals.
+    bool gmm_efficient_vce = false;
+    // ivregress's instrument check (ivregress_check2collin): an excluded instrument
+    // collinear with [endog exog constant] (or an earlier instrument) is dropped by Stata.
+    bool inst_collin_check = false;
     // Set by iv2sls_fit when weights meet absorbed effects: the (weighted) within
     // transform has already been applied, so the later demeaning passes are skipped.
     bool fe_absorbed = false;
@@ -150,6 +163,19 @@ struct IvModelData {
 // ivreghdfe's default (Correia 2015), before returning. No effect without FE.
 // row_mask: see build_model's row_mask doc (E1) — same contract, applied in the
 // IV listwise-deletion pass.
+// `ibn.` with no model intercept (Stata `regress y ibn.g, noconstant`): every level
+// is a column and none is dropped (with an intercept the design is rank-deficient
+// and the last level goes). The model builders do not know whether the fit will
+// keep its intercept, so a caller that fits without one holds this scope while it
+// builds the design (build_iv_model sets it from its own no_intercept).
+struct IbnNoInterceptScope {
+    explicit IbnNoInterceptScope(bool on);
+    ~IbnNoInterceptScope();
+    IbnNoInterceptScope(const IbnNoInterceptScope&) = delete;
+    IbnNoInterceptScope& operator=(const IbnNoInterceptScope&) = delete;
+    bool prev;
+};
+
 IvModelData build_iv_model(const Dataset& ds, const std::string& yname,
                            const std::vector<std::string>& exog,
                            const std::vector<std::string>& endog,

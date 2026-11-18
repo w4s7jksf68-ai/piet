@@ -7,8 +7,8 @@
 namespace piet::handlers::data_mutation_detail {
 const piet::eval::OptVocab& kVocabOrder = piet::eval::registerOptVocab(
     {"order"}, {{"first", "last", "before",
-                                                                   "after", "alphabetic"},
-     {"sequential"}});
+                                                                   "after", "alphabetic", "sequential"},
+     {}});
 }
 namespace piet::handlers {
 using namespace data_mutation_detail;
@@ -158,7 +158,45 @@ ojson runOrder(const std::vector<std::string>& varlistIn,
       if (std::find(expanded.begin(), expanded.end(), v) == expanded.end()) expanded.push_back(v);
     }
     varlist = std::move(expanded);
+    bool sequential = false;
+    for (const auto& [k, v] : opts)
+      if (k == "sequential") sequential = true;
+    if (sequential && alphabetic)
+      return ojson(eval::errorBlock("syntax_error", "sequential may not be combined with alphabetic",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(198)"));
     if (alphabetic) std::sort(varlist.begin(), varlist.end());
+    if (sequential) {
+      // aorder: alphabetical by the text before the first digit, a name without digits first,
+      // and the digits that follow compared as a number (x2 before x10). A name whose digits
+      // are not the plain number they spell (x01, x1a) takes aorder's regrouping pass, which
+      // this build does not carry; it is refused rather than ordered by guess.
+      struct Key { std::string stub; bool hasNum; double digits; std::string name; };
+      std::vector<Key> keys;
+      for (const auto& nm : varlist) {
+        Key k{nm, false, 0.0, nm};
+        const size_t d = nm.find_first_of("0123456789");
+        if (d != std::string::npos) {
+          size_t e = d;
+          while (e < nm.size() && std::isdigit(static_cast<unsigned char>(nm[e]))) ++e;
+          const std::string run = nm.substr(d, e - d);
+          if (e != nm.size() || (run.size() > 1 && run[0] == '0') || run.size() > 15)
+            return engineErrorBlock("order, sequential: `" + nm +
+                                    "' has digits that aorder's regrouping pass would handle; "
+                                    "this build does not implement that pass.");
+          k.stub = nm.substr(0, d);
+          k.hasNum = true;
+          k.digits = std::strtod(run.c_str(), nullptr);
+        }
+        keys.push_back(std::move(k));
+      }
+      std::stable_sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) {
+        if (a.stub != b.stub) return a.stub < b.stub;
+        if (a.hasNum != b.hasNum) return !a.hasNum;
+        return a.digits < b.digits;
+      });
+      varlist.clear();
+      for (const auto& k : keys) varlist.push_back(k.name);
+    }
   }
   for (const auto& v : varlist) {
     if (!hasName(v)) return engineErrorBlock("order: variable '" + v + "' not found in dataset");

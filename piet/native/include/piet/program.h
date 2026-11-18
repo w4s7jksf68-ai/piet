@@ -80,14 +80,8 @@ using DispatchFn = piet::loops::DispatchFn;
 //   - `program define NAME` / `program NAME` headers, optionally `, rclass`.
 //   - `program drop NAME` / `program dir` are left as pass-through lines
 //     (handled by the dispatcher's native handler when they reach dispatch
-//     as plain commands) EXCEPT for the redefine-idiom stripping below.
-//   - The redefine idiom: a `[capture] program drop NAME` that immediately
-//     precedes (skipping blank/comment lines) a `program define NAME` for
-//     the SAME name is stripped from the output. In sequential Stata that
-//     drop targets a pre-existing NAME; in this whole-file pre-pass capture
-//     it would otherwise run LATER (after defines are pulled out, it
-//     becomes adjacent to the driver) and delete the just-captured program.
-//     A drop AFTER a define (genuine mid-script undefine) is left in place.
+//     as plain commands), the drop of the redefine idiom too: it runs at its
+//     own position, before the definition's install sentinel.
 //   - Nested `program … end` blocks are NOT supported (Stata does not allow
 //     them either). A bare `end` without a matching `program` header is
 //     silently dropped (defensive — Stata does the same).
@@ -118,8 +112,11 @@ std::vector<std::string> captureProgams(const std::vector<std::string>& lines, S
 // before.
 extern const std::string kProgInstallSentinelPrefix;
 
-// If `line` is an install sentinel, return true and write the program name to
-// `nameOut`. Cheap prefix test first — this runs once per top-level item.
+// If `line` is an install sentinel, return true and write its archive key to
+// `nameOut` (the program name + 0x1C + a hash of that definition, so each
+// definition site installs its own body; the archive entry's ProgramDef::name
+// is the program's name). Cheap prefix test first — this runs once per
+// top-level item.
 bool isProgInstallSentinel(const std::string& line, std::string* nameOut);
 
 // Build the positional-arg locals map from a raw argument string. Sets:

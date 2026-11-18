@@ -329,19 +329,52 @@ ojson runMatrixDef(const std::string& raw, SessionState& session) {
       std::string name = mm.str(1);
       std::function<std::string(double)> cellText;
       const std::string opts = trim(mm.str(2));
+      MatrixListOptions listOpts;
+      std::string fmtOpt;
       if (!opts.empty()) {
-        // format(%fmt) is the one option this renderer implements; any other
-        // is refused by name rather than accepted and ignored.
-        static const std::regex reFmtOpt(R"(^f(?:o(?:r(?:m(?:a(?:t)?)?)?)?)?\(\s*(%[^)\s]+)\s*\)$)");
-        std::smatch fm;
-        if (!std::regex_match(opts, fm, reFmtOpt))
-          // Stata's `matrix list` has noblank/nohalf/noheader/nonames/title()
-          // ([P] matrix utility); this version renders only format() (the one
-          // option any golden uses), so the rest are unsupported, not "not
-          // allowed" (eb-order DIAGNOSIS ruling 4d).
-          return ojson(eval::unsupportedOption(opts, "", std::nullopt, std::string("matrix list"),
-                                               std::string("r(198)")));
-        const std::string f = fm.str(1);
+        // [P] matrix utility: format(%fmt) title(text) noblank noheader
+        // nonames nohalf nodotz, and half (the default for a symmetric
+        // matrix). Any other word keeps the named refusal.
+        static const std::regex reOpt(R"(^\s*([A-Za-z]+)\s*(?:\(([^)]*)\))?\s*)");
+        std::string rest = opts;
+        while (!trim(rest).empty()) {
+          std::smatch om;
+          if (!std::regex_search(rest, om, reOpt))
+            return ojson(eval::unsupportedOption(opts, "", std::nullopt, std::string("matrix list"),
+                                                 std::string("r(198)")));
+          const std::string k = om.str(1);
+          const bool hasArg = om[2].matched;
+          const auto abbrevOf = [&k](const char* full, size_t shortest) {
+            const std::string f(full);
+            return k.size() >= shortest && k.size() <= f.size() && f.compare(0, k.size(), k) == 0;
+          };
+          if (hasArg && abbrevOf("format", 1)) {
+            fmtOpt = trim(om.str(2));
+          } else if (hasArg && abbrevOf("title", 5)) {
+            std::string t = trim(om.str(2));
+            if (t.size() >= 2 && t.front() == '"' && t.back() == '"') t = t.substr(1, t.size() - 2);
+            listOpts.title = t;
+          } else if (!hasArg && k == "noblank") {
+            listOpts.noblank = true;
+          } else if (!hasArg && k == "noheader") {
+            listOpts.noheader = true;
+          } else if (!hasArg && k == "nonames") {
+            listOpts.nonames = true;
+          } else if (!hasArg && k == "nohalf") {
+            listOpts.nohalf = true;
+          } else if (!hasArg && k == "half") {
+          } else if (!hasArg && k == "nodotz") {
+            listOpts.nodotz = true;
+          } else {
+            return ojson(eval::unsupportedOption(opts, "", std::nullopt, std::string("matrix list"),
+                                                 std::string("r(198)")));
+          }
+          rest = rest.substr(static_cast<size_t>(om.length(0)));
+        }
+      }
+      if (!fmtOpt.empty()) {
+        if (fmtOpt[0] != '%') return engineErrorBlockRc("matrix list: invalid format " + fmtOpt, 120);
+        const std::string f = fmtOpt;
         static const std::regex reHex(R"(^%-?21x$)");
         static const std::regex reNum(R"(^%(-)?(0)?([0-9]+)?(?:\.([0-9]+))?([fgeFGE])(c)?$)");
         std::smatch nm;
@@ -395,7 +428,7 @@ ojson runMatrixDef(const std::string& raw, SessionState& session) {
       }
       ojson block;
       block["type"] = "display";  // output, not the command echo (BUG-1505, runEreturnList)
-      block["text"] = renderMatrixList(name, *mat, cellText);
+      block["text"] = renderMatrixList(name, *mat, cellText, listOpts);
       return block;
     }
     if (std::regex_search(work, mm, reStripe)) {
@@ -463,6 +496,14 @@ ojson runMatrixDef(const std::string& raw, SessionState& session) {
     const Subcommand* hit = nullptr;
     for (const auto& s : kSubcommands)
       if (sub.size() >= s.shortest && std::string(s.full).compare(0, sub.size(), sub) == 0) hit = &s;
+    // `matrix 1A = (1,2)`: a definition whose name is no name is r(198) "1A
+    // invalid name" (StataBE 19.5, vs-stata bank 2fbcb262ff45e73e).
+    if (hit == nullptr && sub.empty()) {
+      static const std::regex reBadDef(R"(^\s*mat(?:rix)?\s+([^\s=]+)\s*=)");
+      std::smatch bm;
+      if (std::regex_search(work, bm, reBadDef))
+        return engineErrorBlockRc(bm.str(1) + " invalid name", 198);
+    }
     if (hit == nullptr) return engineErrorBlockRc("matrix operation not found", 501);
     const std::string full = hit->full;
     const bool stripe =
@@ -474,6 +515,20 @@ ojson runMatrixDef(const std::string& raw, SessionState& session) {
     }
     if (full == "list" && args.empty())
       return engineErrorBlockRc("matrix name required", 100);
+    // `matrix list` takes a matrix NAME: an expression (`A*2`, `A'*A`,
+    // `get(Cns)`, `A/73`) is no matrix, r(111) "matrix ... not found"
+    // (StataBE 19.5, vs-stata bank caa54168a2946cb9, 4d19e89966be3217,
+    // 374dfe079497282e, 6bdca0cffc8744bf).
+    if (full == "list") {
+      static const std::regex reLead(std::string("^(") + eval::kRxName + ")");
+      std::smatch lm;
+      const std::string head = args.substr(0, args.find(','));
+      std::string rest = trim(head);
+      if (std::regex_search(rest, lm, reLead))
+        rest = trim(rest.substr(static_cast<size_t>(lm.length(0))));
+      if (!rest.empty() && rest.find_first_of(" \t") == std::string::npos)
+        return engineErrorBlockRc("matrix " + rest + " not found", 111);
+    }
     size_t words = 0;
     {
       std::istringstream iss(args);
@@ -548,8 +603,8 @@ ojson runMatrixDef(const std::string& raw, SessionState& session) {
     return engineErrorBlockRc("type mismatch", 109);
   if (!resolved.has_value() && cls == 'e' && which != "b" && which != "V") {
     bool notAMatrix = !session.eval.eLive();
-    if (!notAMatrix && session.eval.eNameOrder) {
-      const std::optional<std::vector<std::string>> mats = session.eval.eNameOrder("matrices");
+    if (!notAMatrix) {
+      const std::optional<std::vector<std::string>> mats = session.eNameMembersFor("matrices");
       notAMatrix = mats.has_value() && std::find(mats->begin(), mats->end(), which) == mats->end();
     }
     double v = 0.0;

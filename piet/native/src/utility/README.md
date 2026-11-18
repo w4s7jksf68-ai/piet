@@ -10,6 +10,7 @@ point; `utility_support.h` lists the shared helpers it uses.
 |---|---|
 | `unique`, `gunique` (one handler, `gunique`-only options refused), `distinct` | `uniqueness.cpp` |
 | `missings` (report, dropvars, dropobs, tag), `mdesc` | `missingness.cpp` |
+| `misstable summarize`, `patterns`, `tree` (StataCorp's; `nested` refused) | `misstable.cpp` |
 | `labmask`, `renvarlab`, `splitvallabels` | `labels.cpp` |
 | `strdist` (byte-wise Levenshtein, `gen()` or two-literal form) | `string_distance.cpp` |
 | `marksample` (program-internal marker) | `sample.cpp` |
@@ -22,7 +23,9 @@ point; `utility_support.h` lists the shared helpers it uses.
 | Shared errors, text and option access, column reads and writes, CSV staging | `utility_support.cpp`, `utility_support.h` |
 
 `utility_support.h` and `utility_options.h` are private to this directory; every
-file here except `geodesic_distance.cpp` includes both. `utility_support.h` carries
+file here except `geodesic_distance.cpp` and `misstable.cpp` includes both
+(`misstable.cpp` registers its own vocabulary and uses
+`language/command_reply_support.h`). `utility_support.h` carries
 the `utility_detail` helpers (`utilError`, `utilSyntax`, `optStr`, `hasFlag`,
 `writeColumn`, `writeAndConvert`, `viewOf`, `groupIds`, `materializeIndicator`),
 `ReadScope`, `ColView` and `CsvTable`. Several of its names also exist, with

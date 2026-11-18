@@ -376,6 +376,17 @@ ojson runFillmissing(const eval::ParsedCommand& parsed, SessionState& session) {
   ojson out = ojson::array();
   if (!text.empty()) out.push_back(displayBlock(text));
   if (!rewritten.empty()) out.push_back(mutationResult(session, "gen", {}, {}, rewritten));
+  // fillmissing.ado drops its working variable last, so r(k_drop) is 1; the default filling
+  // (with(any)) sorts through one variable and leaves s(k) 1 and s(varlist) its name
+  // (vs-stata bank). Other with() modes name a temporary variable in s(varlist), which this
+  // build does not.
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("k_drop", 1.0);
+  eval::declareRPosted(session.eval, "fillmissing", {"k_drop"});
+  if (with == "any" && vars.size() == 1) {
+    session.eval.rStrings.set("\x01s:k", "1");
+    session.eval.rStrings.set("\x01s:varlist", vars[0]);
+  }
   return out;
 }
 

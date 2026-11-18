@@ -163,8 +163,13 @@ std::optional<ojson> parseNumlist(const std::string& text, std::vector<double>* 
 // The grammar and its three messages are mvdecode's own (official log mvdecode_*; probe p2
 // mvbad r(121), mvbadcode r(198)). An extended-missing code (.a-.z) cannot be stored by this
 // build, which has one missing value, so that rule is refused by name.
-std::optional<ojson> parseMv(const std::string& spec, std::vector<double>* values) {
-  if (spec.find_first_of("=\\") == std::string::npos) return parseNumlist(spec, values);
+std::optional<ojson> parseMv(const std::string& spec, std::vector<double>* values,
+                             std::vector<double>* lastLhs) {
+  if (spec.find_first_of("=\\") == std::string::npos) {
+    if (auto e = parseNumlist(spec, values)) return e;
+    *lastLhs = *values;
+    return std::nullopt;
+  }
   std::vector<std::string> toks;
   std::string cur;
   auto flush = [&]() {
@@ -198,6 +203,7 @@ std::optional<ojson> parseMv(const std::string& spec, std::vector<double>* value
           "mvdecode: the rule `= " + code + "' stores an extended missing value; this version "
           "of PIET stores one missing value (.), so .a-.z cannot be kept apart. Use `= .`."));
     values->insert(values->end(), lhs.begin(), lhs.end());
+    *lastLhs = lhs;
     const std::string sep = next();
     if (!sep.empty() && sep != "\\") return syntaxError(sep + " found, where \\ expected");
     tok = next();
@@ -225,10 +231,21 @@ ojson runMvdecode(const eval::ParsedCommand& parsed, SessionState& session) {
   // is rc 0).
   std::vector<char> mask;
   if (auto e = sampleMask(session, parsed, &mask)) return *e;
-  if (std::find(mask.begin(), mask.end(), 1) == mask.end()) return ojson::array();
+  if (std::find(mask.begin(), mask.end(), 1) == mask.end()) {
+    eval::replaceRClass(session.eval);  // the ado's `quietly count if touse` leaves r(N) = 0
+    session.eval.rValues.set("N", 0.0);
+    eval::declareRPosted(session.eval, "mvdecode", {"N"});
+    return ojson::array();
+  }
   std::vector<double> values;
-  if (auto e = parseMv(*mv, &values)) return *e;
+  std::vector<double> lastLhs;  // the numlist of the last rule: what r(numlist) holds
+  if (auto e = parseMv(*mv, &values, &lastLhs)) return *e;
 
+  // The ado's `capture numlist` is the last r-class command before the loop, and `count`
+  // (inside the loop, once per numeric variable) replaces it: r(N) is the number of
+  // missing values the LAST numeric variable holds afterwards. With no numeric variable
+  // the numlist's r(numlist) is what is left.
+  std::optional<double> lastMissing;
   std::string text;
   std::vector<std::string> rewritten;
   for (const auto& v : vars) {
@@ -250,6 +267,12 @@ ojson runMvdecode(const eval::ParsedCommand& parsed, SessionState& session) {
         ++changed;
       }
     }
+    {
+      int64_t nMiss = 0;
+      for (size_t i = 0; i < col.size(); ++i)
+        if (mask[i] && std::isnan(col[i])) ++nMiss;
+      lastMissing = static_cast<double>(nMiss);
+    }
     if (changed == 0) continue;
     std::vector<std::string> cells;
     cells.reserve(col.size());
@@ -258,6 +281,23 @@ ojson runMvdecode(const eval::ParsedCommand& parsed, SessionState& session) {
     if (std::find(rewritten.begin(), rewritten.end(), v) == rewritten.end()) rewritten.push_back(v);
     text += rightAlign(abbrev12(v), 12) + ": " + std::to_string(changed) + " missing value" +
             (changed > 1 ? "s" : "") + " generated\n";
+  }
+  eval::replaceRClass(session.eval);
+  if (lastMissing.has_value()) {
+    session.eval.rValues.set("N", *lastMissing);
+    eval::declareRPosted(session.eval, "mvdecode", {"N"});
+  } else {
+    std::string nl;
+    for (double x : lastLhs) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%.15g", x);
+      std::string t = buf;
+      if (t.rfind("0.", 0) == 0) t.erase(0, 1);
+      else if (t.rfind("-0.", 0) == 0) t.erase(1, 1);
+      nl += (nl.empty() ? "" : " ") + t;
+    }
+    session.eval.rStrings.set("numlist", nl);
+    eval::declareRPosted(session.eval, "mvdecode", {"numlist"});
   }
   ojson out = ojson::array();
   if (!text.empty()) out.push_back(displayBlock(text));

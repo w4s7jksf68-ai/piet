@@ -3,6 +3,7 @@
 // xi and the xi: prefix: indicator-variable expansion.
 
 #include "piet/handlers/estimation.h"
+#include "piet/dispatcher.h"
 
 #include <algorithm>
 #include <array>
@@ -703,6 +704,57 @@ ojson runXi(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!expansion.listing().empty()) blocks.push_back(displayBlock(expansion.listing()));
   if (expansion.changedData()) blocks.push_back(mutationResult(session, "xi", expansion.made(), expansion.gone()));
   if (refusal) blocks.push_back(*refusal);
+  else if (expansion.changedData() || !line.tokens.empty()) {
+    // xi.ado leaves the results of the last r-class command it ran for the last factor it
+    // coded (a factor an earlier term already coded runs nothing): `egen g = group(v)` then
+    // `summarize g`; and for a numeric v of non-negative whole numbers `summarize v` as
+    // well. With noomit the loop over the levels counts each one, so the last count -- the
+    // highest level's -- is what is left; otherwise the variable (or the group code) was
+    // summarized last.
+    std::vector<std::string> seen;
+    for (const auto& tok : line.tokens) {
+      XiTermShape shape;
+      if (xiReadShape(tok, &shape)) continue;
+      if (std::find(seen.begin(), seen.end(), shape.left) == seen.end()) seen.push_back(shape.left);
+      if (shape.rightIsFactor && std::find(seen.begin(), seen.end(), shape.right) == seen.end())
+        seen.push_back(shape.right);
+    }
+    Datastore* ds = session.datastore();
+    if (!seen.empty() && ds != nullptr && ds->has(seen.back())) {
+      const std::string v = seen.back();
+      bool useUser = false;
+      if (ds->dtype(v) == "f64") {
+        useUser = true;
+        const double* d = ds->col(v).f64();
+        for (int64_t i = 0; i < ds->nRows() && useUser; ++i) {
+          const double x = d[i];
+          if (std::isnan(x)) continue;
+          if (x != std::floor(x) || x < 0 || x >= 1e9) useUser = false;
+        }
+      }
+      const std::string g = "__piet_xi_g";
+      // egen group() leaves an observation with a missing value (a blank string) out
+      dispatch("quietly egen " + g + " = group(" + v + ")" +
+                   (ds->dtype(v) == "factor" ? " if " + v + " != \"\"" : std::string()),
+               session);
+      if (line.keepEveryLevel) {
+        dispatch("quietly summarize " + g, session);
+        const double* mx = session.eval.rValues.find("max");
+        const std::string top = mx != nullptr ? eval::pythonFloatRepr(*mx) : std::string("1");
+        dispatch("quietly count if " + g + " == " + top, session);
+      } else {
+        dispatch("quietly summarize " + (useUser ? v : g), session);
+      }
+      {
+        // dropping the scaffolding posts r(k_drop); the results kept are the summary's
+        const eval::OrderedFloatDict keepValues = session.eval.rValues;
+        const eval::OrderedDict keepStrings = session.eval.rStrings;
+        dispatch("quietly drop " + g, session);
+        session.eval.rValues = keepValues;
+        session.eval.rStrings = keepStrings;
+      }
+    }
+  }
   return blocks;
 }
 

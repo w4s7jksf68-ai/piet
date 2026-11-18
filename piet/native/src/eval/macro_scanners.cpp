@@ -54,7 +54,7 @@ namespace piet::eval::macro_detail {
 // cheapest statement the language has — paid both.
 //
 // EQUIVALENCE, not approximation. These two functions reproduce
-//     reLocalDef()  = ^local\s+([A-Za-z_][A-Za-z0-9_]*|[0-9]+(?![A-Za-z0-9_]))\s*(.*)?$
+//     reLocalDef()  = ^local\s+([A-Za-z_][A-Za-z0-9_]*|[0-9][A-Za-z0-9_]*)\s*(.*)?$
 //                                                                  (icase; BUG-923)
 //     reGlobalDef() = ^global\s+([A-Za-z_][A-Za-z0-9_]*)\s*(.*)?$  (icase)
 // (each identifier class also admits the bytes \x80-\xff -- Unicode names)
@@ -134,9 +134,10 @@ bool matchMacroDef(const std::string& s, const char* kw, size_t kwLen, std::stri
     if (kwLen == 6 && !globalNameStartOk(s.substr(i, j - i))) return false;
   } else if (kwLen == 5 && std::isdigit(static_cast<unsigned char>(s[i]))) {
     // BUG-923: a positional local (`local 1 "alpha"`, the do-file-level form
-    // `args` reads) is a digit run; `local 1x 3` stays a non-match.
-    while (j < s.size() && std::isdigit(static_cast<unsigned char>(s[j]))) ++j;
-    if (j < s.size() && isIdentChar(s[j])) return false;
+    // `args` reads) is a digit run; a local name may go on with letters too
+    // (StataBE 19.5 `local 1abc x` then `1abc' is x, vs-stata bank
+    // 23af9103bfaca1cc, 7083b6321399a601).
+    while (j < s.size() && isIdentChar(s[j])) ++j;
   } else {
     return false;
   }
@@ -161,7 +162,7 @@ const std::regex& reScalarDef() {
 
 const std::regex& reLocalDef() {
   // BUG-923: or a positional digit run (`local 1 "alpha"`); see matchMacroDef.
-  static const std::regex r(R"(^local\s+([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*|[0-9]+(?![A-Za-z0-9_\x80-\xff]))\s*(.*)?$)",
+  static const std::regex r(R"(^local\s+([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*|[0-9][A-Za-z0-9_\x80-\xff]*)\s*(.*)?$)",
                              std::regex::icase);
   return r;
 }
@@ -172,7 +173,12 @@ const std::regex& reGlobalDef() {
 }
 
 const std::regex& reLocalRef() {
-  static const std::regex r(R"(`([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*|[0-9]+)')");
+  // `*' is Stata's own macro for the positional arguments `1' `2' ... as they
+  // stand (after any `macro shift`); expandPass splices it.
+  // A name may begin with a digit (`1abc'); `++i' / `i--' are the inline
+  // increments expandPass applies (vs-stata bank 9ce1692b99de7bbd).
+  static const std::regex r(
+      R"(`((?:\+\+|--)?[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*|[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*(?:\+\+|--)|[0-9][A-Za-z0-9_\x80-\xff]*|\*)')");
   return r;
 }
 
@@ -433,14 +439,23 @@ bool hasBareLetterParen(const std::string& s, char letter) {
 bool hasLocalMacroRef(const std::string& s) {
   for (size_t t = s.find('`'); t != std::string::npos; t = s.find('`', t + 1)) {
     size_t j = t + 1;
-    if (j < s.size() && isIdentStart(s[j])) {
+    const auto incOp = [&](size_t at) {
+      return at + 1 < s.size() && (s[at] == '+' || s[at] == '-') && s[at + 1] == s[at];
+    };
+    if (incOp(j) && j + 2 < s.size() && isIdentStart(s[j + 2])) {
+      j += 3;  // `++NAME'
+      while (j < s.size() && isIdentChar(s[j])) ++j;
+    } else if (j < s.size() && isIdentStart(s[j])) {
       ++j;
       while (j < s.size() && isIdentChar(s[j])) ++j;
+      if (incOp(j) && j + 2 < s.size() && s[j + 2] == '\'') j += 2;  // `NAME++'
     } else if (j < s.size() && s[j] >= '0' && s[j] <= '9') {
       ++j;
-      while (j < s.size() && s[j] >= '0' && s[j] <= '9') ++j;
+      while (j < s.size() && isIdentChar(s[j])) ++j;
+    } else if (j < s.size() && s[j] == '*') {
+      ++j;  // `*': the positional arguments (reLocalRef's third alternative)
     } else {
-      continue;  // nothing after the backtick can start either alternative
+      continue;  // nothing after the backtick can start an alternative
     }
     if (j < s.size() && s[j] == '\'') return true;
   }

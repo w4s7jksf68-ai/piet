@@ -21,6 +21,10 @@ bool resolveProgramCommand(std::string& cmd,
   // parsed.cmd (ORIGINAL case) for case-insensitive program-name lookup,
   // mirroring dispatcher.py's `_find_program(session, parsed.cmd)`.
   {
+    // Stata's own command abbreviations are looked up before the programs in
+    // memory (registry.h isStataCommandAbbreviation): a program named `so` is
+    // defined, but `so` runs `sort`.
+    if (registry::isStataCommandAbbreviation(parsed.cmd)) return false;
     // Inside an ado file's program, that file's private programs come first.
     std::optional<std::string> progMatch;
     if (!session.adoContext.empty())

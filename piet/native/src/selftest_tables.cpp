@@ -395,6 +395,44 @@ void testAerTables() {
               "`");
   }
 
+  // ── (v-b) esttab stores r(coefs) as estout does (vs-stata bank: StataBE
+  // `esttab m1 m2 using t.tex` after `eststo m1: regress price mpg weight` and
+  // `eststo m2: regress price mpg weight i.foreign`, cell 835e0b79c59d1305): one
+  // row per coefficient that survives, the factor's base row stored `0bn.`, one
+  // `model:stat` column per model and statistic (b, t, and the p the stars
+  // add), `.z` where a model lacks the row, b 0 with t and p missing on the base
+  // row, r(ccols) 3. -- The writer used to post no r(coefs) at all.
+  {
+    piet::SessionState s(workdir);
+    s.eval.cwd = workdir;
+    s.cwd = workdir;
+    auto r = exec(kMake30 +
+                      "gen byte g = mod(_n, 2)\n"
+                      "eststo clear\n"
+                      "eststo m1: quietly regress y x1\n"
+                      "eststo m2: quietly regress y x1 i.g\n"
+                      "esttab m1 m2\n"
+                      "matrix C = r(coefs)\n"
+                      "local rn : rowfullnames C\n"
+                      "local cn : colfullnames C\n"
+                      "display \"RN|`rn'|\"\n"
+                      "display \"CN|`cn'|\"\n"
+                      "display \"V|\" (C[2,1] == .z) \"|\" C[2,4] \"|\" (C[2,5] == .) \"|\" r(ccols)\n",
+                  s);
+    std::string rn, cn, v;
+    for (const auto& d : displays(r.blocks)) {
+      if (d.rfind("RN|", 0) == 0) rn = d;
+      if (d.rfind("CN|", 0) == 0) cn = d;
+      if (d.rfind("V|", 0) == 0) v = d;
+    }
+    check(firstError(r.blocks).is_null() && rn == "RN|x1 0bn.g 1.g _cons|" &&
+              cn == "CN|m1:b m1:t m1:p m2:b m2:t m2:p|" && v == "V|1|0|1|3",
+          "vs-stata esttab: r(coefs) rows `x1 0bn.g 1.g _cons`, columns `m1:b m1:t m1:p m2:b "
+          "m2:t m2:p`, `.z` for m1's missing base row, b 0 and t missing on m2's, r(ccols) 3 "
+          "(StataBE cell 835e0b79c59d1305's shape). Got `" + errText(firstError(r.blocks)) +
+              "` / `" + rn + "` / `" + cn + "` / `" + v + "`");
+  }
+
   // ── (vi) regsave with no `using` REPLACES the dataset with the estimates. ──
   {
     piet::SessionState s(workdir);
@@ -647,12 +685,16 @@ void testAerTables() {
       check(has(t, "confidence intervals in brackets") && has(t, "["),
             "W5 (x.3): ci() renders bracketed intervals and says so in the legend. Got:\n" + t);
       auto r2 = exec("esttab w5a using \"w5c2.txt\", replace ci(3) level(90)\n", s);
-      auto err = firstError(r2.blocks);
-      check(!err.is_null() && errField(err, "code") == "unsupported_option",
-            "W5 (x.3): ...and `level(90)` is REFUSED. This build reports the interval the "
-            "ESTIMATION stored; printing that 95% interval under a `90% confidence intervals` "
-            "legend is the silent-wrong-answer shape, so the option is named rather than "
-            "swallowed. Got code `" + errField(err, "code") + "`");
+      // vs-stata bank b18d9176db0e04ea / bf627f6c1f644a24 (StataBE 19.5): estout and esttab
+      // recompute the interval at level(#) as b -/+ invttail(e(df_r), (100-level)/200) * se,
+      // whatever level the fit was stored at, and label it `90% confidence intervals`.
+      check(firstError(r2.blocks).is_null(),
+            "W5 (x.3): `level(90)` runs (the interval is recomputed at 90%, as estout does). Got `" +
+                errText(firstError(r2.blocks)) + "`");
+      const std::string t90 = slurp(at("w5c2.txt"));
+      check(has(t90, "90% confidence intervals in brackets") && t90 != t,
+            "W5 (x.3): ...labels the legend 90% and prints intervals different from the 95% ones. "
+            "Got:\n" + t90);
     }
 
     // (x.4) The quoted-list options. `substitute("_cons" "CONST")` is eight
@@ -2184,6 +2226,40 @@ void testAerTables() {
                 errText(firstError(re.blocks)));
     }
 
+    // -- (x.19b) review findings of the results-table lane (vs-stata bank 2026-11-12). outreg2's
+    // `p-values` legend is the ado's exact "coef pval" test, which only the pvalue option meets: a
+    // TYPED stats(coef pval) names the statistic ("pval in parentheses", real StataBE 19.5 capture
+    // tests/eval/golden/aer_b4/tables/o_stats.txt). `bracket` beside a typed stats() brackets every
+    // statistic except coef and writes no legend row. esttab, md names the file `.md`. parmest's
+    // stars() is `numlist descending >=0 <=1`: r(124) out of order, r(125) out of range.
+    {
+      piet::SessionState sb(workdir);
+      sb.eval.cwd = workdir;
+      sb.cwd = workdir;
+      (void)exec(kMake30 + "regress y x1 x2\n", sb);
+      (void)exec("outreg2 using \"w5s1\", replace text stats(coef pval)\n", sb);
+      const std::string s1 = slurp(at("w5s1.txt"));
+      check(has(s1, "pval in parentheses") && !has(s1, "p-values in parentheses"),
+            "o_stats.txt: a typed stats(coef pval) says `pval in parentheses`. Got:\n" + s1);
+      (void)exec("outreg2 using \"w5s2\", replace text pvalue\n", sb);
+      check(has(slurp(at("w5s2.txt")), "p-values in parentheses"),
+            "the pvalue option says `p-values in parentheses`");
+      (void)exec("outreg2 using \"w5s3\", replace text stats(coef se tstat) bracket\n", sb);
+      const std::string s3 = slurp(at("w5s3.txt"));
+      check(has(s3, "[") && !has(s3, "in brackets") && !has(s3, "in parentheses"),
+            "outreg2 bracket with a typed stats(): every statistic is bracketed and there is no "
+            "legend row. Got:\n" + s3);
+      (void)exec("esttab using \"w5md\", md replace\n", sb);
+      check(!slurp(at("w5md.md")).empty(),
+            "esttab using w5md, md writes w5md.md (the suffix is chosen before md becomes mmd)");
+      auto stars = exec("parmest, list(parm p stars) stars(0.01 0.05)\n", sb);
+      check(has(errText(firstError(stars.blocks)), "out of order"),
+            "parmest stars(0.01 0.05) is not descending: r(124)");
+      auto stars2 = exec("parmest, list(parm p stars) stars(0.05 2)\n", sb);
+      check(has(errText(firstError(stars2.blocks)), "outside allowed range"),
+            "parmest stars(0.05 2) has a threshold above 1: r(125)");
+    }
+
     // -- (x.20) W1a-5f: outreg2 `adec(#)` (106 corpus uses, three papers) and
     // the ado's own separator bug the User ruled we follow bug-for-bug.
     // Oracle: w1b_adec_rule{,2,3,4,5}.log. Every value asserted here is a
@@ -2791,6 +2867,97 @@ void testW1aTableOptionMinimums() {
   rejects("list fatal in 1/2, ab", "abbreviate",
           "W1a-1 list: bare `ab` with no width is refused — the number IS the option");
   rejects("list fatal in 1/2, ab(x)", "abbreviate", "W1a-1 list: a non-numeric width is refused");
+
+  // ---- vs-stata bank (stage 3, 2026-11-12): the results-table commands ------------------------
+  {
+    auto textOf = [&](const std::string& cmd) {
+      std::string t;
+      for (const auto& b : piet::dispatch(cmd, session)) {
+        if (b.is_object() && b.value("type", std::string()) == "display") t += b.value("text", std::string()) + "\n";
+      }
+      return t;
+    };
+    auto contains = [](const std::string& hay, const std::string& needle) {
+      return hay.find(needle) != std::string::npos;
+    };
+    ok("regress fatal beertax", "bank setup: a first model");
+    ok("eststo bkm1", "bank setup: store it");
+    ok("regress fatal beertax spirits", "bank setup: a second model");
+    ok("eststo bkm2", "bank setup: store it");
+    // estimates table's whole option set (bank 5b6813ac, 7e3d3acc, 571b2370, 29561649): the legend
+    // names the statistics shown, star() names its cut-offs as typed, a format sets the column width.
+    const std::string t1 = textOf("estimates table bkm1 bkm2, b se t p");
+    check(contains(t1, "Legend: b/se/t/p"),
+          "bank 5b6813ac: `estimates table, b se t p` ends in the legend `b/se/t/p`; got: " + t1);
+    const std::string t2 = textOf("estimates table bkm1 bkm2, star(.1 .05 .01)");
+    check(contains(t2, "Legend: * p<.1; ** p<.05; *** p<.01"),
+          "bank 571b2370: `star(.1 .05 .01)` prints its cut-offs as typed in the legend; got: " + t2);
+    const std::string t3 = textOf("estimates table bkm1 bkm2, b(%9.3f) stats(N)");
+    check(contains(t3, "           N |"),
+          "bank 9e031abd: stats(N) is a footer row labelled N, with no Statistics header on a "
+          "one-equation table; got: " + t3);
+    check(!contains(t3, "Statistics"), "bank 9e031abd: ...and no `Statistics` row; got: " + t3);
+    // keep() / drop() narrow the table and the stored r(coef) alike (bank 5b6813ac, 57d3f818)
+    const std::string t4 = textOf("estimates table bkm1 bkm2, keep(beertax)");
+    check(contains(t4, "beertax |") && !contains(t4, "spirits |") && !contains(t4, "_cons |"),
+          "bank 5b6813ac: keep(beertax) keeps that one row only; got: " + t4);
+    // esttab's html and markdown writers (bank 51f385a4, 5c862f15): the table is written through the
+    // html presets, one <tr> per row, the notes in a row across the table
+    const std::string h1 = textOf("esttab bkm1 bkm2, html");
+    check(contains(h1, "<table border=\"0\" width=\"*\">") && contains(h1, "<tr><td colspan=") &&
+              contains(h1, "</table>"),
+          "bank 04704d12: `esttab, html` writes an html table; got: " + h1);
+    const std::string m1 = textOf("esttab bkm1 bkm2, mmd");
+    check(contains(m1, "| ------------ |"),
+          "bank 5c862f15: `esttab, mmd` writes the markdown divider row; got: " + m1);
+    // eststo, addscalars() (bank b217934c, bb828e9e)
+    ok("eststo bkm3, addscalars(zz 3.5): regress fatal beertax", "bank 6d14d974: addscalars adds an e() scalar");
+    {
+      const auto err = firstError(piet::dispatch("eststo bkm4, addscalars(r2 0.5): regress fatal beertax", session));
+      check(!err.is_null() && err.value("message", std::string()).find("already defined") != std::string::npos,
+            "bank bb828e9e: e(r2) is already defined (r(110))");
+    }
+    // eststo pairs each addscalars() name with ONE expression token; a blank inside an expression leaves
+    // a left-hand token that is no name, and `eret scalar` refuses it (r(198)).
+    {
+      const auto err = firstError(piet::dispatch("eststo bkm5, addscalars(zz2 2 + 3): regress fatal beertax", session));
+      check(!err.is_null() && err.value("message", std::string()).find("addscalars() invalid") != std::string::npos,
+            "eststo addscalars(zz2 2 + 3): the token `+` is not a scalar name -> addscalars() invalid");
+    }
+    // starkeep() / stardrop() read their lists like keep() / drop(): wildcards expand against the
+    // coefficients shown (estout's ExpandEqVarlist), and a name that matches nothing is r(111).
+    {
+      const std::string sd = textOf("esttab bkm1 bkm2, stardrop(_c*)");
+      check(contains(sd, "878.3") && !contains(sd, "878.3***") && contains(sd, "1100.4"),
+            "esttab, stardrop(_c*) drops the stars of _cons only; got: " + sd);
+      const std::string sk = textOf("esttab bkm1 bkm2, starkeep(spir*)");
+      check(contains(sk, "878.3") && !contains(sk, "878.3***") && !contains(sk, "1100.4***"),
+            "esttab, starkeep(spir*) shows stars on spirits alone, so _cons carries none; got: " + sk);
+      const auto err = firstError(piet::dispatch("esttab bkm1 bkm2, stardrop(nosuchvar)", session));
+      check(!err.is_null() && err.value("message", std::string()).find("not found") != std::string::npos,
+            "esttab, stardrop(nosuchvar): a name that matches no coefficient is refused (r(111))");
+    }
+    // estpost summarize / tabstat: e(N) counts the observations marksample keeps -- a missing or zero
+    // weight takes the row out -- and summarize refuses iweights with detail (r(101)).
+    {
+      ok("generate bkw = mod(_n, 4)", "bank setup: a weight with zeros");
+      ok("replace bkw = . in 1/3", "bank setup: ...and a missing weight");
+      (void)piet::dispatch("estpost summarize fatal beertax [aw=bkw]", session);
+      check(contains(textOf("display e(N)"), "249"),
+            "estpost summarize [aw=]: e(N) is the 249 rows with a nonzero, nonmissing weight; got: " +
+                textOf("display e(N)"));
+      (void)piet::dispatch("estpost tabstat fatal beertax [aw=bkw], statistics(mean n)", session);
+      check(contains(textOf("display e(N)"), "249"),
+            "estpost tabstat [aw=]: e(N) is the 249 rows with a nonzero, nonmissing weight; got: " +
+                textOf("display e(N)"));
+      const auto err = firstError(piet::dispatch("estpost summarize fatal [iw=bkw], detail", session));
+      check(!err.is_null() && err.value("message", std::string()).find("iweights not allowed") != std::string::npos,
+            "estpost summarize [iw=], detail: summarize refuses iweights with detail (r(101))");
+    }
+    // regsave's `se` is the positive form of its noSE option, so it is a known option.
+    ok("regress fatal beertax", "bank setup: a model for regsave");
+    ok("regsave, se", "regsave, se: the positive form of noSE is accepted");
+  }
 
   fs::remove_all(workdir, ec);
 }

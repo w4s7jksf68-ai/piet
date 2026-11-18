@@ -11,7 +11,7 @@ the command owner below. Routing from a typed line to these entry points is in
 | `scalar list`, `scalar dir` column format | `scalar_results.cpp` (`runScalarList`) |
 | `ereturn list` dump of the stored e() scalars, macros and matrices | `scalar_results.cpp` (`runEreturnList`) |
 | Matrix names as printed by listings (`bn.` factor-level marker dropped) | `scalar_results.cpp` (`matrixNameAsListed`, used by `matrix/matrix_expression.cpp`) |
-| `return list` (r() scalars, macros, matrices, newest first) | `return_list.cpp` |
+| `return list` (r() scalars, macros, matrices, newest first; hidden scalars and empty sections left out), `sreturn list`/`sreturn clear` | `return_list.cpp` |
 | `ereturn clear`, `ereturn post`, `ereturn local`, `ereturn matrix`, bare `ereturn repost`, named refusals of other sub-verbs | `ereturn_commands.cpp` |
 | Emptying every e() store (`clearEResults`, also opens `ereturn post`) | `ereturn_commands.cpp` |
 | `ereturn post ..., esample()` mask column | `ereturn_commands.cpp` (`installPostedMask`) |

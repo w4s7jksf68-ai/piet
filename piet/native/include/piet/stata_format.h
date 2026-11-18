@@ -121,7 +121,10 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <algorithm>
+#include <cctype>
 #include <string>
+#include <vector>
 
 namespace piet::fmt {
 
@@ -419,49 +422,236 @@ inline const char* stataDayAbbrev(long long days) {
   return kDay[i];
 }
 
-inline std::optional<std::string> renderTdDetail(double v, const std::string& detail) {
-  if (std::isnan(v) || std::fabs(v) > 4.0e6) return std::nullopt;
-  const long long days = static_cast<long long>(std::floor(v));
-  int y;
-  unsigned mo, d;
-  civilFromDays(days - 3653, y, mo, d);
-  char num[16];
-  std::string out;
+// --- the %t detail codes ([D] Datetime display formats) ---------------------
+// One scan of a detail string into its codes, longest match first, shared by
+// the renderer and the field width: the year (CC cc YY yy), day of year (JJJ
+// jjj), month (Month month Mon mon NN nn), day (DD dd), weekday (DAYNAME
+// Dayname Day Da day da), half (h), quarter (q), week (WW ww), hour (HH Hh hH
+// hh), minute (MM mm), second (SS ss .s .ss .sss), am/pm (am a.m. AM A.M.),
+// `_` a blank, `!c` the character c, `+` nothing; any other character is
+// itself. Times are truncated, not rounded, as the help says.
+struct TDetailToken {
+  std::string code;  // empty for a literal
+  std::string text;  // the literal's text
+};
+
+inline std::vector<TDetailToken> scanTDetail(const std::string& detail) {
+  static const char* const kCodes[] = {
+      "DAYNAME", "Dayname", "Month", "month", "A.M.", "a.m.", ".sss", "JJJ", "jjj", "Mon",
+      "mon",     "Day",     "day",   ".ss",   "CC",   "cc",   "YY",   "yy",  "NN",  "nn",
+      "DD",      "dd",      "Da",    "da",    "WW",   "ww",   "HH",   "Hh",  "hH",  "hh",
+      "MM",      "mm",      "SS",    "ss",    "am",   "AM",   ".s",   "h",   "q"};
+  std::vector<TDetailToken> out;
   size_t i = 0;
   while (i < detail.size()) {
-    if (detail.compare(i, 4, "CCYY") == 0) {
-      std::snprintf(num, sizeof(num), "%04d", y);
-      out += num; i += 4;
-    } else if (detail.compare(i, 5, "Month") == 0) {
-      out += stataMonthFull(mo); i += 5;
-    } else if (detail.compare(i, 3, "Mon") == 0) {
-      out += std::string(stataMonthFull(mo)).substr(0, 3); i += 3;
-    } else if (detail.compare(i, 3, "Day") == 0) {
-      out += stataDayAbbrev(days); i += 3;
-    } else if (detail.compare(i, 2, "DD") == 0) {
-      std::snprintf(num, sizeof(num), "%02u", d);
-      out += num; i += 2;
-    } else if (detail.compare(i, 2, "dd") == 0) {
-      std::snprintf(num, sizeof(num), "%u", d);
-      out += num; i += 2;
-    } else if (detail.compare(i, 2, "NN") == 0) {
-      std::snprintf(num, sizeof(num), "%02u", mo);
-      out += num; i += 2;
-    } else if (detail.compare(i, 2, "nn") == 0) {
-      std::snprintf(num, sizeof(num), "%u", mo);
-      out += num; i += 2;
-    } else if (detail.compare(i, 2, "YY") == 0) {
-      int yy = y % 100;
-      if (yy < 0) yy += 100;
-      std::snprintf(num, sizeof(num), "%02d", yy);
-      out += num; i += 2;
+    bool hit = false;
+    for (const char* c : kCodes) {
+      const size_t n = std::char_traits<char>::length(c);
+      if (detail.compare(i, n, c) == 0) {
+        out.push_back({c, ""});
+        i += n;
+        hit = true;
+        break;
+      }
+    }
+    if (hit) continue;
+    if (detail[i] == '!' && i + 1 < detail.size()) {
+      out.push_back({"", std::string(1, detail[i + 1])});
+      i += 2;
+    } else if (detail[i] == '+') {
+      ++i;
     } else if (detail[i] == '_') {
-      out += ' '; ++i;
+      out.push_back({"", " "});
+      ++i;
     } else {
-      out += detail[i]; ++i;
+      out.push_back({"", std::string(1, detail[i])});
+      ++i;
     }
   }
   return out;
+}
+
+// The inverse of civilFromDays, counted from 01jan1960.
+inline long long daysFromCivil1960(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const long long era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(y - era * 400);
+  const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<long long>(doe) - 719468 + 3653;
+}
+
+// The calendar day (days since 01jan1960) and the milliseconds into it that a
+// %t value of family `fam` stands for: a period's first day, a %tc time's day
+// and time. %tC counts the leap seconds UTC inserted from 1972 to 2016, so
+// its value is first brought back to %tc (`leap` says the instant IS a leap
+// second, shown as :60).
+inline bool tValueToDayTime(char fam, double v, long long& day, long long& msOfDay, bool& leap) {
+  leap = false;
+  msOfDay = 0;
+  if (std::isnan(v)) return false;
+  const auto daysFromCivil = daysFromCivil1960;
+  const auto periodic = [&](int perYear) -> bool {
+    if (std::fabs(v) > 1.0e7) return false;
+    const long long p = static_cast<long long>(std::floor(v));
+    long long yoff = p / perYear;
+    long long rem = p - yoff * perYear;
+    if (rem < 0) {
+      rem += perYear;
+      yoff -= 1;
+    }
+    const int y = static_cast<int>(1960 + yoff);
+    if (perYear == 52) {
+      day = daysFromCivil(y, 1, 1) + 7 * rem;
+    } else {
+      const unsigned month = static_cast<unsigned>(1 + rem * (12 / perYear));
+      day = daysFromCivil(y, month, 1);
+    }
+    return true;
+  };
+  switch (fam) {
+    case 'd':
+      if (std::fabs(v) > 4.0e6) return false;
+      day = static_cast<long long>(std::floor(v));
+      return true;
+    case 'c':
+    case 'C': {
+      if (std::fabs(v) > 4.0e6 * 86400000.0) return false;
+      long long ms = static_cast<long long>(std::floor(v));
+      if (fam == 'C') {
+        // Leap seconds were inserted at the end of these days (UTC).
+        static const int kLeap[][3] = {
+            {1972, 6, 30},  {1972, 12, 31}, {1973, 12, 31}, {1974, 12, 31}, {1975, 12, 31},
+            {1976, 12, 31}, {1977, 12, 31}, {1978, 12, 31}, {1979, 12, 31}, {1981, 6, 30},
+            {1982, 6, 30},  {1983, 6, 30},  {1985, 6, 30},  {1987, 12, 31}, {1989, 12, 31},
+            {1990, 12, 31}, {1992, 6, 30},  {1993, 6, 30},  {1994, 6, 30},  {1995, 12, 31},
+            {1997, 6, 30},  {1998, 12, 31}, {2005, 12, 31}, {2008, 12, 31}, {2012, 6, 30},
+            {2015, 6, 30},  {2016, 12, 31}};
+        long long passed = 0;
+        for (const auto& l : kLeap) {
+          // %tc milliseconds of the midnight that ends the leap day
+          const long long t = (daysFromCivil(l[0], static_cast<unsigned>(l[1]),
+                                             static_cast<unsigned>(l[2])) + 1) * 86400000LL;
+          if (ms >= t + (passed + 1) * 1000) {
+            ++passed;
+          } else if (ms >= t + passed * 1000) {
+            leap = true;
+            ms = t - 1000 + (ms - t - passed * 1000);  // 23:59:59.xxx, shown as :60
+            passed = -1;
+            break;
+          } else {
+            break;
+          }
+        }
+        if (passed > 0) ms -= passed * 1000;
+      }
+      day = ms / 86400000LL;
+      msOfDay = ms - day * 86400000LL;
+      if (msOfDay < 0) {
+        msOfDay += 86400000LL;
+        day -= 1;
+      }
+      return true;
+    }
+    case 'w': return periodic(52);
+    case 'm': return periodic(12);
+    case 'q': return periodic(4);
+    case 'h': return periodic(2);
+    case 'y': {
+      if (std::fabs(v) > 1.0e4) return false;
+      day = daysFromCivil(static_cast<int>(std::floor(v)), 1, 1);
+      return true;
+    }
+    default: return false;
+  }
+}
+
+inline std::optional<std::string> renderTDetail(char fam, double v, const std::string& detail) {
+  long long days = 0, msOfDay = 0;
+  bool leap = false;
+  if (!tValueToDayTime(fam, v, days, msOfDay, leap)) return std::nullopt;
+  int y;
+  unsigned mo, d;
+  civilFromDays(days - 3653, y, mo, d);
+  // the period numbers: a %tw value keeps its own week, the others the date's
+  long long week = 0;
+  if (fam == 'w') {
+    long long p = static_cast<long long>(std::floor(v));
+    week = ((p % 52) + 52) % 52 + 1;
+  }
+  const auto lowerOf = [](std::string t) {
+    for (char& c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return t;
+  };
+  static const char* kDayFull[7] = {"Friday",  "Saturday", "Sunday",  "Monday",
+                                    "Tuesday", "Wednesday", "Thursday"};
+  long long wd = days % 7;
+  if (wd < 0) wd += 7;
+  const std::string dayFull = kDayFull[wd];
+  const long long doy = days - daysFromCivil1960(y, 1, 1) + 1;  // day within year
+  if (fam != 'w') week = std::min<long long>((doy - 1) / 7 + 1, 52);
+  const long long hour = msOfDay / 3600000LL;
+  const long long minute = (msOfDay / 60000LL) % 60;
+  const long long second = leap ? 60 : (msOfDay / 1000LL) % 60;
+  const long long milli = msOfDay % 1000;
+  const long long h12 = hour % 12 == 0 ? 12 : hour % 12;
+  char num[32];
+  std::string out;
+  for (const auto& tok : scanTDetail(detail)) {
+    const std::string& c = tok.code;
+    if (c.empty()) {
+      out += tok.text;
+      continue;
+    }
+    const auto put = [&](const char* f, long long x) {
+      std::snprintf(num, sizeof(num), f, x);
+      out += num;
+    };
+    if (c == "CC") put("%02lld", static_cast<long long>(y) / 100);
+    else if (c == "cc") put("%lld", static_cast<long long>(y) / 100);
+    else if (c == "YY") put("%02lld", ((static_cast<long long>(y) % 100) + 100) % 100);
+    else if (c == "yy") put("%lld", ((static_cast<long long>(y) % 100) + 100) % 100);
+    else if (c == "JJJ") put("%03lld", doy);
+    else if (c == "jjj") put("%lld", doy);
+    else if (c == "Month") out += stataMonthFull(mo);
+    else if (c == "month") out += lowerOf(stataMonthFull(mo));
+    else if (c == "Mon") out += std::string(stataMonthFull(mo)).substr(0, 3);
+    else if (c == "mon") out += stataMonthName(mo);
+    else if (c == "NN") put("%02lld", static_cast<long long>(mo));
+    else if (c == "nn") put("%lld", static_cast<long long>(mo));
+    else if (c == "DD") put("%02lld", static_cast<long long>(d));
+    else if (c == "dd") put("%lld", static_cast<long long>(d));
+    else if (c == "DAYNAME") out += dayFull + std::string(9 - dayFull.size(), ' ');
+    else if (c == "Dayname") out += dayFull;
+    else if (c == "Day") out += dayFull.substr(0, 3);
+    else if (c == "Da") out += dayFull.substr(0, 2);
+    else if (c == "day") out += lowerOf(dayFull.substr(0, 3));
+    else if (c == "da") out += lowerOf(dayFull.substr(0, 2));
+    else if (c == "h") put("%lld", mo <= 6 ? 1LL : 2LL);
+    else if (c == "q") put("%lld", static_cast<long long>((mo - 1) / 3 + 1));
+    else if (c == "WW") put("%02lld", week);
+    else if (c == "ww") put("%lld", week);
+    else if (c == "HH") put("%02lld", hour);
+    else if (c == "hH") put("%lld", hour);
+    else if (c == "Hh") put("%02lld", h12);
+    else if (c == "hh") put("%lld", h12);
+    else if (c == "MM") put("%02lld", minute);
+    else if (c == "mm") put("%lld", minute);
+    else if (c == "SS") put("%02lld", second);
+    else if (c == "ss") put("%lld", second);
+    else if (c == ".s") put(".%01lld", milli / 100);
+    else if (c == ".ss") put(".%02lld", milli / 10);
+    else if (c == ".sss") put(".%03lld", milli);
+    else if (c == "am") out += hour < 12 ? "am" : "pm";
+    else if (c == "AM") out += hour < 12 ? "AM" : "PM";
+    else if (c == "a.m.") out += hour < 12 ? "a.m." : "p.m.";
+    else if (c == "A.M.") out += hour < 12 ? "A.M." : "P.M.";
+  }
+  return out;
+}
+
+inline std::optional<std::string> renderTdDetail(double v, const std::string& detail) {
+  return renderTDetail('d', v, detail);
 }
 
 // --- BUG-296: the %t families' DISPLAY field width ---------------------------
@@ -477,28 +667,27 @@ inline std::optional<std::string> renderTdDetail(double v, const std::string& de
 // only the display surface calls it.
 inline int tokenMaxWidth(const std::string& detail) {
   int w = 0;
-  size_t i = 0;
-  while (i < detail.size()) {
-    if (detail.compare(i, 4, "CCYY") == 0)       { w += 4; i += 4; }
-    else if (detail.compare(i, 5, "Month") == 0) { w += 9; i += 5; }  // September
-    else if (detail.compare(i, 3, "Mon") == 0)   { w += 3; i += 3; }
-    else if (detail.compare(i, 3, "Day") == 0)   { w += 3; i += 3; }
-    else if (detail.compare(i, 2, "DD") == 0)    { w += 2; i += 2; }
-    else if (detail.compare(i, 2, "dd") == 0)    { w += 2; i += 2; }
-    else if (detail.compare(i, 2, "NN") == 0)    { w += 2; i += 2; }
-    else if (detail.compare(i, 2, "nn") == 0)    { w += 2; i += 2; }
-    else if (detail.compare(i, 2, "YY") == 0)    { w += 2; i += 2; }
-    else                                          { w += 1; i += 1; }
+  for (const auto& tok : scanTDetail(detail)) {
+    const std::string& c = tok.code;
+    if (c.empty()) w += static_cast<int>(tok.text.size());
+    else if (c == "DAYNAME" || c == "Dayname" || c == "Month" || c == "month") w += 9;  // September
+    else if (c == ".sss" || c == "a.m." || c == "A.M.") w += 4;
+    else if (c == "JJJ" || c == "jjj" || c == "Mon" || c == "mon" || c == "Day" || c == "day" ||
+             c == ".ss")
+      w += 3;
+    else if (c == "h" || c == "q") w += 1;
+    else w += 2;
   }
   return w;
 }
 
 // fam is the letter after %t. 0 = no default width claimed for this family.
 inline int tFamilyWidth(char fam, const std::string& detail) {
-  if (fam == 'd' && !detail.empty()) return tokenMaxWidth(detail);
+  if (!detail.empty()) return tokenMaxWidth(detail);
   switch (fam) {
     case 'd': return 9;   // 04oct2014
     case 'c': return 18;  // 13feb1999 23:31:30
+    case 'C': return 18;
     case 'q': return 6;   // 1970q3
     case 'h': return 6;   // 1981h1
     case 'm': return 7;   // 1959m10

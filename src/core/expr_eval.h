@@ -109,7 +109,7 @@ struct Options {
 enum class Op {
     Num, Add, Sub, Mul, Div, Pow, Neg,
     Ln, Exp, Sqrt, Abs, Float, Cond,
-    Invlogit, Logit, Normal, Normalden, Pi,
+    Invlogit, Logit, Normal, Normalden, Pi, Tanh,
     ParamRef, VarRef, CoefRef,
 };
 
@@ -216,6 +216,7 @@ class Program {
                 return 0.3989422804014327 * std::exp(-0.5 * z * z);
             }
             case Op::Pi: return M_PI;
+            case Op::Tanh: return std::tanh(eval_node(*n.a, params, vars, coefs));
             case Op::ParamRef:
                 if (!params) die("no parameter values supplied for '{" + n.name + "}'");
                 return params[n.idx];
@@ -400,6 +401,31 @@ struct Parser {
             ++i;
             return n;
         }
+        // `[eq]_b[name]` / `[eq]name`: the coefficient `eq:name` (Stata's equation-
+        // qualified reference after a multi-equation fit; vs-stata bank 1a17eea8
+        // `nlcom exp([2]_b[age])` after mlogit)
+        if (p.opts_.allow_coefs && i < s.size() && s[i] == '[') {
+            const size_t close = s.find(']', i);
+            if (close == std::string::npos) p.die("missing ']'");
+            const std::string eq = trim(s.substr(i + 1, close - i - 1));
+            size_t j = close + 1;
+            std::string nm;
+            if (s.compare(j, 3, "_b[") == 0) {
+                const size_t c2 = s.find(']', j + 3);
+                if (c2 == std::string::npos) p.die("missing ']'");
+                nm = trim(s.substr(j + 3, c2 - j - 3));
+                j = c2 + 1;
+            } else {
+                const size_t st = j;
+                while (j < s.size() && cecon::ident::isIdentByte(s[j])) ++j;
+                nm = s.substr(st, j - st);
+            }
+            if (eq.empty() || nm.empty()) p.die("invalid syntax near '" + s.substr(i) + "'");
+            i = j;
+            NodeP n = mk(Op::CoefRef);
+            n->name = eq + ":" + nm;
+            return n;
+        }
         if (p.opts_.allow_params && i < s.size() && s[i] == '{') return param_ref();
         if (i < s.size() && cecon::ident::isIdentStartByte(s[i])) {
             size_t st = i;
@@ -433,6 +459,7 @@ struct Parser {
                 if (id == "logit") return mk(Op::Logit, std::move(x));
                 if (id == "normal") return mk(Op::Normal, std::move(x));
                 if (id == "normalden") return mk(Op::Normalden, std::move(x));
+                if (id == "tanh") return mk(Op::Tanh, std::move(x));
                 p.die("unknown function '" + id + "'");
             }
             // `_pi` is a NULLARY constant, recognised before the bare-identifier

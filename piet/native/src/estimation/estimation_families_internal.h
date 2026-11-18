@@ -31,6 +31,11 @@ void cacheLastModelM4(SessionState& session, const std::string& cobraCmd,
                        const std::vector<std::string>& argv, const ojson& block, const ojson& raw,
                        const std::string& esampleValues = std::string(),
                        const std::string& stataCmd = std::string());
+// BUG-1482 (panel_estimation.cpp): the rank of a one-way clustered e_V, Stata's
+// r(rankc); nullopt when e_V is absent or not square.
+std::optional<double> clusteredVRankM4(const ojson& raw);
+// One-way cluster with G - 1 < k: Stata's e(rank) (panel_estimation.cpp).
+std::optional<double> fewClustersRankM4(const ojson& raw, double G, double k);
 }  // namespace fit_detail
 void applyBuiltinMultiwayReplyM4(ojson& result);
 void postBuiltinMultiwayEM4(SessionState& session, const ojson& raw);

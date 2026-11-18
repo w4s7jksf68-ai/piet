@@ -153,7 +153,7 @@ nlohmann::ordered_json runXtreg(const eval::ParsedCommand& parsed, SessionState&
 // --- P7 wave: vector autoregression -----------------------------------------
 // One engine verb backs all three; vargranger and irf create re-render the fit.
 nlohmann::ordered_json runVar(const eval::ParsedCommand& parsed, SessionState& session);
-nlohmann::ordered_json runVargranger(SessionState& session);
+nlohmann::ordered_json runVargranger(const eval::ParsedCommand& parsed, SessionState& session);
 nlohmann::ordered_json runIrf(const eval::ParsedCommand& parsed, SessionState& session);
 
 // --- P7 wave: multiple imputation -------------------------------------------
@@ -388,7 +388,8 @@ nlohmann::ordered_json runWntestq(const eval::ParsedCommand& parsed, SessionStat
 nlohmann::ordered_json runSdtest(const std::string& varName,
                                   const std::optional<std::string>& againstVal,
                                   const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-                                  const std::optional<std::string>& ifExpr, SessionState& session);
+                                  const std::optional<std::string>& ifExpr, SessionState& session,
+                                  const std::optional<std::string>& inRange = std::nullopt);
 
 // `hausman NAME1 NAME2` — BS-083. Validates both eststo/estimates-store
 // names exist and are the `xtreg ,fe`/`xtreg ,re` pair of the SAME spec

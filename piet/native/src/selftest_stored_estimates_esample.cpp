@@ -1116,19 +1116,34 @@ static void testW2EsampleT2(const fs::path& root) {
                 (fails.empty() ? std::string() : ", fails:" + fails));
 
     // (e) the e(sample) predicate is LastModel's esample state, not the macro
-    // layer's absent-e() test: pca installs a model with no result JSON and no
-    // mask, so every layer refuses by name (never 0 at rc 0, which the
-    // `!lastModelResult` predicate would have answered).
-    (void)runLine("quietly pca x1 x2", session);
+    // layer's absent-e() test: a fit PIET records no mask for refuses by name at
+    // every layer (never 0 at rc 0, which the `!lastModelResult` predicate would
+    // have answered). The fit is `qreg ..., vce(robust)` (its engine path reports no
+    // admitted rows); this arm used `pca`, then `ivregress liml`, until each recorded
+    // its sample (pca: (e2) below; liml since the vs-stata bank wave, bank 447495d2
+    // `ivregress liml ...` ESAMPLE 74). When qreg's is wired too, move the arm to a
+    // fit that still is not -- the property is the refusal.
+    const LineResult lf = runLine("quietly qreg y x1, vce(robust)", session);
     const CountRes pc = countIf("e(sample)", session);
     const LineResult pd = runLine("display e(sample)", session);
     const LineResult pl = runLine("local s = e(sample)", session);
-    w2check(pc.rc == "198" && pc.msg.find("pca") != std::string::npos && pd.rc == "198" &&
-                pd.text.empty() && pl.rc == "198",
-            "W2 esample T2 (e) pca: after `pca x1 x2` (a model with no e() result and no mask) "
-            "`count if e(sample)`, `display e(sample)` and `local s = e(sample)` are r(198) naming "
-            "pca, never 0 at rc 0. Got count " + show(pc) + ", display rc " + pd.rc + " `" +
-                pd.text + "`, local rc " + pl.rc);
+    w2check(lf.rc == "0" && pc.rc == "198" && pc.msg.find("qreg") != std::string::npos &&
+                pd.rc == "198" && pd.text.empty() && pl.rc == "198",
+            "W2 esample T2 (e) qreg vce(robust): after `qreg y x1, vce(robust)` (a model with no "
+            "recorded mask) `count if e(sample)`, `display e(sample)` and `local s = e(sample)` are "
+            "r(198) naming qreg, never 0 at rc 0. Got fit rc " + lf.rc + ", count " + show(pc) +
+                ", display rc " + pd.rc + " `" + pd.text + "`, local rc " + pl.rc);
+    // (e2) pca records its estimation sample, as Stata's does: `count if
+    // e(sample)` is e(N) -- 60 here, x1 is missing in row 13 of the 61 (vs-stata
+    // bank 0d3e9e5fc9c7aaf1: pca on auto, count if e(sample) 74 = e(N) 74;
+    // 92895b267256687f under `if foreign==0`: 52 = e(N) 52).
+    (void)runLine("quietly pca x1 x2", session);
+    const CountRes pca = countIf("e(sample)", session);
+    const auto pcaN = readNumber("e(N)", session);
+    w2check(pca.rc == "0" && near(pca.n, 60.0) && near(pcaN, 60.0),
+            "W2 esample T2 (e2) pca: after `pca x1 x2` `count if e(sample)` is e(N), 60 of the "
+            "61 rows (x1 missing in row 13; bank 0d3e9e5fc9c7aaf1 74 = e(N), 92895b267256687f "
+            "52 = e(N)). Got count " + show(pca) + ", e(N) " + num(pcaN));
   }
 
   // ---- merge 1:m copies; the install's frame reuse; setcol --ones-as ------------

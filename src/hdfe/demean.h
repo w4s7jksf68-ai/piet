@@ -28,4 +28,13 @@ DemeanReport demean(double* M, int64_t n, int m, const std::vector<Factor>& fe,
                     const double* w = nullptr, double tol = 1e-12, int maxiter = 10000,
                     bool serial = false);
 
+// reghdfe's iteration count e(ic) for two or more absorbed factors: its default
+// solver (technique map, transform symmetric_kaczmarz, acceleration
+// conjugate_gradient, tolerance 1e-8) run on the n x m columns of M (column-major),
+// returning the iteration at which every column meets its stopping rule. Only the
+// count is returned; M is not modified. 0 when fewer than two factors or no
+// convergence within maxiter.
+int hdfe_map_cg_iterations(const double* M, int64_t n, int m, const std::vector<Factor>& fe,
+                           const double* w = nullptr, double tol = 1e-8, int maxiter = 16000);
+
 }  // namespace cecon

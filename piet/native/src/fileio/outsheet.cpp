@@ -51,8 +51,8 @@ namespace {
 // quotes it otherwise puts round every string (log:865). `names` IS the
 // default and is therefore honoured by construction.
 const piet::eval::OptVocab& kVocabOutsheet = piet::eval::registerOptVocab(
-    {"outsheet"}, {{"comma", "replace", "noquote", "nolabel", "names", "nonames", "delimiter",
-                    "delim"},
+    {"outsheet"}, {{"comma", "replace", "noquote", "quote", "nolabel", "names", "nonames",
+                    "delimiter", "delim"},
                    {"double"}});
 
 }  // namespace
@@ -76,8 +76,24 @@ ojson runOutsheet(const eval::ParsedCommand& parsed, SessionState& session) {
                                             kVocabOutsheet.unimplemented)) {
     return ojson(*err);
   }
+  // StataBE 19.5: `names nonames` is r(198) "option nonames not allowed"
+  // (vs-stata bank 1b721a1de52225f3) and `comma delimiter(";")` r(198) "both
+  // comma and delimiter() not allowed" (fa6d85b38005f3b7).
+  if (hasFlag(parsed.opts, "names") && hasFlag(parsed.opts, "nonames"))
+    return ioErrorRc("option nonames not allowed", 198);
+  if (hasFlag(parsed.opts, "comma") && optStr(parsed.opts, "delimiter").has_value())
+    return ioErrorRc("both comma and delimiter() not allowed", 198);
   if (!session.hasData()) return ojson(eval::noDataLoaded());
 
+  // `using filename` is required by the syntax: a line without it is r(100)
+  // "using required" (vs-stata bank 42ef5288cc36d378 `outsheet make price mpg rep78 foreign`); the last word is not taken as
+  // the file.
+  {
+    bool sawUsing = false;
+    for (const auto& w : quoteAwareWords(preCommaArgs(parsed.raw)))
+      sawUsing = sawUsing || lowerOf(w) == "using";
+    if (!sawUsing) return ioErrorRc("using required", 100);
+  }
   std::vector<std::string> varlist;
   std::string pathArg;
   if (!splitUsing(dropQualifierWords(quoteAwareWords(preCommaArgs(parsed.raw))), &varlist,

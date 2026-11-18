@@ -45,6 +45,7 @@
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
 #include "piet/storage_type.h"  // FU-944: input's c(type) and float store
+#include "piet/serset.h"        // serset::storageType: xpose, promote
 #include "piet/strutil.h"
 #include "estimation/estimation_internal.h"  // esampleHeadMask / esampleRewriteHeadMask
 #include "engine/scratch_columns.h"          // cumul's if/in restriction and weight columns
@@ -69,20 +70,54 @@ ojson echoBlock(const std::string& text) {
 // ===========================================================================
 // xpose
 // ===========================================================================
+//
+// base/x/xpose.ado (StataBE 19.5), and the vs-stata bank (2026-11-10):
+//  - `clear` is required, r(198); no observations r(2000); no variables
+//    "(no variables)" r(2000).
+//  - EVERY variable becomes an observation, in dataset order; a string variable
+//    becomes a row of missing values (Read_out: `drop v ; gen byte v = .`), it is
+//    not dropped (auto `keep make price` -> 2 observations).
+//  - The new variables are v1..vN, of type c(type) -- or, with `promote`, the
+//    narrowest type that holds every numeric source type -- so under the default
+//    `set type float` the values are stored as floats.
+//  - An existing `_varname` names the new variables (row i's value names v_i)
+//    and is not itself transposed; `varname` adds `_varname` (the source names)
+//    as the LAST variable.
+//  - r() is what xpose's last r-class step left: `file read` -> r(eof) = 1.
+// Not implemented: format / format() (refused by the vocabulary).
+
+namespace {
+
+bool xposeValidName(const std::string& nm) {
+  if (nm.empty() || nm.size() > 32) return false;
+  const unsigned char c0 = static_cast<unsigned char>(nm[0]);
+  if (!(std::isalpha(c0) || nm[0] == '_')) return false;
+  for (unsigned char c : nm)
+    if (!(std::isalnum(c) || c == '_')) return false;
+  return true;
+}
+
+double xposeStore(double v, const std::string& type) {
+  if (std::isnan(v)) return v;
+  if (type == "float") {
+    if (std::fabs(v) > static_cast<double>(std::numeric_limits<float>::max()))
+      return std::numeric_limits<double>::quiet_NaN();
+    return static_cast<double>(static_cast<float>(v));
+  }
+  return v;
+}
+
+}  // namespace
 
 ojson runXpose(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabXpose.known,
                                             kVocabXpose.unimplemented))
     return ojson(*err);
   if (auto q = refuseQualifiers(parsed, "xpose")) return *q;
-  if (!session.hasData()) return ojson(eval::noDataLoaded());
-  if (!hasFlag(parsed.opts, "clear")) {
-    // Stata's own rc for "this would lose the data in memory".
-    return rsErrorRc("xpose: you must specify the `clear` option — transposing replaces every "
-                     "variable and observation in memory.",
-                     4);
-  }
+  if (!hasFlag(parsed.opts, "clear")) return rsErrorRc("you must specify ', clear'", 198);
+  if (!session.hasData()) return rsErrorRc("no observations", 2000);
   const bool wantVarname = hasFlag(parsed.opts, "varname");
+  const bool promote = hasFlag(parsed.opts, "promote");
 
   Datastore* ds = nullptr;
   try {
@@ -90,65 +125,119 @@ ojson runXpose(const eval::ParsedCommand& parsed, SessionState& session) {
   } catch (const std::exception& e) {
     return rsError(std::string("xpose: ") + e.what(), "data_io");
   }
-  if (ds == nullptr) return ojson(eval::noDataLoaded());
+  if (ds == nullptr) return rsErrorRc("no observations", 2000);
   const int64_t n = ds->nRows();
-  if (n == 0) return rsErrorRc("xpose: no observations", 2000);
-
+  if (n == 0) return rsErrorRc("no observations", 2000);
   const std::vector<std::string> before = ds->names();
-  std::vector<std::string> numeric;
-  int dropped = 0;
-  for (const auto& nm : before) {
-    if (ds->dtype(nm) == "f64")
-      numeric.push_back(nm);
-    else
-      ++dropped;
-  }
-  if (numeric.empty())
-    return rsError("xpose: every variable is a string variable; there is nothing numeric to "
-                   "transpose (this build drops string variables, as Stata does).");
+  if (before.empty()) return rsErrorRc("(no variables)", 2000);
 
-  // The transpose: one row per surviving ORIGINAL column, one column per
-  // original observation, named v1..vn. `varname` puts the original names in a
-  // leading string column `_varname`.
+  // An existing _varname supplies the new names, one per observation.
+  std::vector<std::string> newNames;
+  bool haveVns = false;
+  for (const auto& nm : before) haveVns = haveVns || nm == "_varname";
+  if (haveVns) {
+    const cecon::Column& c = ds->col("_varname");
+    for (int64_t i = 0; i < n; ++i) {
+      std::string vn;
+      if (c.dtype == cecon::DType::Factor) {
+        const int32_t code = c.codes()[i];
+        if (code >= 0 && static_cast<size_t>(code) < c.levels.size())
+          vn = c.levels[static_cast<size_t>(code)];
+      } else {
+        vn = numCell(c.f64()[i]);
+      }
+      newNames.push_back(strutil::trim(vn));
+    }
+  }
+  std::vector<std::string> invars;
+  for (const auto& nm : before)
+    if (nm != "_varname") invars.push_back(nm);
+  if (invars.empty()) return rsErrorRc("varlist required", 100);
+
+  // The storage type of the new variables.
+  std::string newType = session.defaultStorageType.empty() ? std::string("float")
+                                                           : session.defaultStorageType;
+  if (promote) {
+    bool hasByte = false, hasInt = false, hasLong = false, hasFloat = false, hasDouble = false;
+    for (const auto& nm : invars) {
+      if (ds->dtype(nm) != "f64") continue;
+      const std::string t = serset::storageType(session, *ds, nm);
+      hasDouble = hasDouble || t == "double";
+      hasFloat = hasFloat || t == "float";
+      hasLong = hasLong || t == "long";
+      hasInt = hasInt || t == "int";
+      hasByte = hasByte || t == "byte";
+    }
+    if (hasDouble || (hasFloat && hasLong)) newType = "double";
+    else if (hasFloat) newType = "float";
+    else if (hasLong) newType = "long";
+    else if (hasInt) newType = "int";
+    else newType = "byte";
+  }
+
+  std::vector<std::string> outNames;
+  for (int64_t i = 0; i < n; ++i) {
+    std::string nm = "v" + std::to_string(i + 1);
+    if (haveVns && i < static_cast<int64_t>(newNames.size()) && !newNames[static_cast<size_t>(i)].empty())
+      nm = newNames[static_cast<size_t>(i)];
+    outNames.push_back(nm);
+  }
+  {
+    std::set<std::string> seen;
+    for (const auto& nm : outNames) {
+      if (!xposeValidName(nm)) return rsErrorRc(nm + " invalid name", 198);
+      if (!seen.insert(nm).second) return rsErrorRc("variable " + nm + " already defined", 110);
+    }
+  }
+
+  // The transpose: one row per ORIGINAL variable, one column per original
+  // observation; `varname` appends the source names as `_varname`.
   CsvTable t;
+  for (const auto& nm : outNames) {
+    t.names.push_back(nm);
+    t.isFactor.push_back(0);
+  }
   if (wantVarname) {
     t.names.push_back("_varname");
     t.isFactor.push_back(1);
   }
-  for (int64_t i = 0; i < n; ++i) {
-    t.names.push_back("v" + std::to_string(i + 1));
-    t.isFactor.push_back(0);
-  }
-  t.rows.reserve(numeric.size());
-  for (const auto& nm : numeric) {
+  t.rows.reserve(invars.size());
+  for (const auto& nm : invars) {
     std::vector<std::string> row;
     row.reserve(t.names.size());
+    if (ds->dtype(nm) == "f64") {
+      const double* d = ds->col(nm).f64();
+      for (int64_t i = 0; i < n; ++i) row.push_back(numCell(xposeStore(d[i], newType)));
+    } else {
+      for (int64_t i = 0; i < n; ++i) row.emplace_back();
+    }
     if (wantVarname) row.push_back(nm);
-    const double* d = ds->col(nm).f64();
-    for (int64_t i = 0; i < n; ++i) row.push_back(numCell(d[i]));
     t.rows.push_back(std::move(row));
   }
 
   std::string outPath;
   if (auto err = writeAndConvert(session, t, "xpose", &outPath)) return *err;
   session.load(outPath);
-  if (auto bad = assertRowCount(session, "xpose", static_cast<int64_t>(numeric.size())))
+  if (auto bad = assertRowCount(session, "xpose", static_cast<int64_t>(invars.size())))
     return *bad;
+  for (const auto& nm : outNames) {
+    session.varMeta.erase(nm);
+    storage::recordCreateType(session, nm, newType, newType);
+  }
+  if (wantVarname) {
+    // `gen str8 _varname = ""`, then each name replaced in: str8, or the
+    // longest name's width (auto: str12 for displacement).
+    size_t w = 8;
+    for (const auto& nm : invars) w = std::max(w, nm.size());
+    session.varMeta.erase("_varname");
+    session.varMeta["_varname"].stataType = "str" + std::to_string(w);
+    session.implicitFloatVars.erase("_varname");
+  }
 
-  ojson out = ojson::array();
-  if (dropped > 0) {
-    out.push_back(echoBlock("(xpose: " + std::to_string(dropped) + " string variable(s) dropped)"));
-  }
-  if (hasFlag(parsed.opts, "promote")) {
-    // READ, not ignored: this build stores every column as a double, so there
-    // is no narrower type to promote to. Saying so beats accepting a storage
-    // decision that never happened.
-    out.push_back(echoBlock(
-        "(xpose: promote has no effect in this build — every transposed variable is stored as "
-        "double)"));
-  }
-  out.push_back(mutationResult(session, "xpose", t.names, before));
-  return out;
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("eof", 1.0);
+  eval::declareRPosted(session.eval, "xpose", {"eof"});
+  return mutationResult(session, "xpose", t.names, before);
 }
 
 }  // namespace piet::handlers

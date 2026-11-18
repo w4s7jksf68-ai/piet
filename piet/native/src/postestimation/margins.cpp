@@ -121,6 +121,7 @@ struct MarginsRInfoM4 {
   std::string bRow = "r1";        // r(b)'s row name
   std::vector<std::vector<double>> jacobian;  // r(Jacobian) rows over fit.ebNames; empty = unknown
   bool nKnown = false;            // r(_N): r(N) per column, 0 for a dydx() base level
+  std::vector<double> marginLevels;  // the marginlist factor's e(sample) levels, when read
 };
 
 // _marg_work.class :900-913 titles the results by `.noasobs` (:4001-4016): no
@@ -189,6 +190,265 @@ std::vector<std::string> marginsDeclaredRM4(const MarginsRInfoM4& info) {
   return names;
 }
 
+// margins' hidden r() bookkeeping (left out of `return list`, read by name;
+// marginsplot reads it): r(marg_dims), r(mlist#)/r(k_mlist), r(predict),
+// r(est_depvar), r(isloco), r(predict_label), and the prediction's r(is_xb1),
+// r(deriv1), r(numeric), r(j1_1), r(j2_1), r(outcomeIsEq1). Their values are
+// the vs-stata truth bank's, every margins cell of StataBE 19.5 (342 records):
+//   * r(marg_dims) lists the dimensions of the result: the marginlist terms'
+//     variables, `at(v)` for each at() variable given more than one value, the
+//     over() variables, `_deriv` for a dydx()/eyex()/dyex()/eydx() form, and
+//     `_atopt` when an at() variable has more than one value (`margins foreign,
+//     at(mpg=(15 20 25 30))` "foreign at(mpg) _atopt"; `margins, dydx(weight)
+//     at(mpg=20)` "_deriv"; `margins, at(mpg=(20 30)) over(foreign)` "at(mpg)
+//     foreign _atopt"; 294 of 294 such cells);
+//   * r(mlist1) is the marginlist term without its operators (`r.foreign` ->
+//     `foreign`), `_cons` with no marginlist; r(k_mlist) their count;
+//   * r(predict) `_no_predict`, r(isloco) `0`, r(j1_1)/r(j2_1)/r(outcomeIsEq1) 0
+//     in every record;
+//   * r(is_xb1)/r(deriv1)/r(numeric) describe the default prediction of the
+//     fit: the linear prediction of regress/areg is xb (1 0 0); the probability
+//     and count predictions of logit, logistic, probit, cloglog, poisson and
+//     nbreg carry an analytic derivative (0 1 0); the other fits measured
+//     (xtreg, ivregress, reghdfe, qreg, glm, clogit, xtpoisson, ...) 0 0 0;
+//     predict(xb) is xb after any of them (1 0 0). Posted only for those.
+// A form whose dimensions this does not know (pwcompare, contrast, within(),
+// expression(), several at() options) posts none of them.
+// atmeans: the e(sample) values (and fit weights, or empty) the unfixed
+// covariates are averaged over for r(at).
+struct MarginsAtMeansM4 {
+  const std::map<std::string, std::vector<double>>* data = nullptr;
+  const std::vector<double>* weights = nullptr;
+};
+void postMarginsAtM4(SessionState& session, const std::vector<std::string>& modelNames,
+                     const std::vector<std::string>& fitEbNames,
+                     const std::vector<cecon::MarginsGridPoint>& points, bool post,
+                     const MarginsAtMeansM4* means = nullptr);
+
+namespace {
+
+std::string marginsAtomVarM4(const std::string& atom) {
+  const size_t dot = atom.rfind('.');
+  return dot == std::string::npos ? atom : atom.substr(dot + 1);
+}
+
+bool marginsAtMultiM4(std::string v) {
+  v = trimM4(v);
+  if (!v.empty() && v.front() == '(') {
+    const size_t close = v.rfind(')');
+    v = v.substr(1, close == std::string::npos ? std::string::npos : close - 1);
+  }
+  if (splitTokensM4(v).size() > 1) return true;
+  static const std::regex range(R"(\d\s*\(|[:/])");
+  return std::regex_search(v, range);
+}
+
+void postMarginsHiddenRM4(SessionState& session, const MarginsRInfoM4& info) {
+  auto& ev = session.eval;
+  const std::string& cl = info.fit.cmdline;
+  if (cl.compare(0, 7, "margins") != 0) return;
+  const std::string rest = cl.substr(7);
+  const long long comma = eval::findUnquotedComma(rest);
+  std::string head = comma >= 0 ? rest.substr(0, static_cast<size_t>(comma)) : rest;
+  std::vector<std::pair<std::string, eval::OptValue>> opts;
+  if (comma >= 0) {
+    try {
+      opts = eval::parseOpts(rest.substr(static_cast<size_t>(comma) + 1));
+    } catch (const std::exception&) {
+      return;
+    }
+  }
+  // the marginlist: the text before an if/in qualifier or a weight
+  static const std::regex qual(R"((^|\s)(if|in)\s|\[)");
+  std::smatch qm;
+  const bool qualified = std::regex_search(head, qm, qual);
+  if (qualified) head = head.substr(0, static_cast<size_t>(qm.position(0)));
+  std::vector<std::string> dims, mlist;
+  for (const auto& term : splitTokensM4(head)) {
+    std::string clean;
+    size_t start = 0;
+    for (;;) {
+      const size_t h = term.find('#', start);
+      const std::string v =
+          marginsAtomVarM4(term.substr(start, h == std::string::npos ? std::string::npos : h - start));
+      clean += (clean.empty() ? "" : "#") + v;
+      if (std::find(dims.begin(), dims.end(), v) == dims.end()) dims.push_back(v);
+      if (h == std::string::npos) break;
+      start = h + 1;
+    }
+    mlist.push_back(clean);
+  }
+  int nAt = 0;
+  bool deriv = false, anyMulti = false, xbPredict = false, otherPredict = false, atmeans = false;
+  std::vector<std::string> atDims, overDims, atVars;
+  std::string atText;
+  for (const auto& [k, v] : opts) {
+    const std::string key = strutil::lower(k);
+    if (key == "at") {
+      if (v.isBool || ++nAt > 1) return;
+      static const std::regex assign(R"(([A-Za-z_][A-Za-z0-9_]*)\s*=)");
+      const std::string& s = v.strValue;
+      std::vector<std::pair<std::string, size_t>> vars;  // name, end of `name=`
+      std::vector<size_t> starts;
+      for (std::sregex_iterator it(s.begin(), s.end(), assign), end; it != end; ++it) {
+        vars.emplace_back((*it)[1].str(), static_cast<size_t>(it->position(0) + it->length(0)));
+        starts.push_back(static_cast<size_t>(it->position(0)));
+      }
+      if (vars.empty()) return;  // `at((mean) _all)` and the like: not read here
+      atText = trimM4(s);
+      for (size_t i = 0; i < vars.size(); ++i) {
+        atVars.push_back(vars[i].first);
+        const size_t stop = i + 1 < vars.size() ? starts[i + 1] : s.size();
+        if (marginsAtMultiM4(s.substr(vars[i].second, stop - vars[i].second))) {
+          atDims.push_back("at(" + vars[i].first + ")");
+          anyMulti = true;
+        }
+      }
+    } else if (key == "atmeans" || key == "atmean") {
+      atmeans = true;
+    } else if (key == "dydx" || key == "eyex" || key == "dyex" || key == "eydx") {
+      deriv = true;
+    } else if (key == "over") {
+      if (v.isBool) return;
+      for (const auto& t : splitTokensM4(v.strValue)) overDims.push_back(marginsAtomVarM4(t));
+    } else if (key == "predict") {
+      if (v.isBool) return;
+      if (strutil::lower(trimM4(v.strValue)) == "xb") xbPredict = true;
+      else otherPredict = true;
+    } else if (key.rfind("pw", 0) == 0 || key.rfind("contr", 0) == 0 || key == "within" ||
+               key.rfind("exp", 0) == 0 || key.rfind("asbal", 0) == 0) {
+      return;
+    }
+  }
+  for (const auto& d : atDims) dims.push_back(d);
+  for (const auto& d : overDims) dims.push_back(d);
+  if (deriv) dims.push_back("_deriv");
+  if (anyMulti) dims.push_back("_atopt");
+  std::string md;
+  for (const auto& d : dims) md += (md.empty() ? "" : " ") + d;
+  std::vector<std::pair<std::string, std::string>> macros = {{"marg_dims", md}};
+  // r(margins) (visible): a one-factor marginlist over the whole sample is the
+  // factor's levels and base as e(b) carries them, `i(0 1)b0.foreign` (bank:
+  // 169 records after `margins foreign`; `i(1 2 3 4 5)b1.rep78`). Posted only
+  // when that term is the factor itself and nothing restricts the sample.
+  if (mlist.size() == 1 && !qualified && mlist[0].find('#') == std::string::npos &&
+      ev.rStrings.find("margins") == nullptr) {
+    std::vector<double> levels;
+    int nBase = 0;
+    double base = 0;
+    bool ok = true, onlyOmitted = true;
+    for (const auto& full : info.fit.ebNames) {
+      const size_t c = full.rfind(':');
+      const std::string nm = c == std::string::npos ? full : full.substr(c + 1);
+      if (nm.find('#') != std::string::npos) continue;
+      double lv = 0;
+      std::string var;
+      if (!cecon::postest::parse_level_ref(nm, lv, var) || var != mlist[0]) continue;
+      const std::string flags = nm.substr(0, nm.find('.'));
+      size_t d = 0;
+      while (d < flags.size() && std::isdigit(static_cast<unsigned char>(flags[d]))) ++d;
+      const std::string f = flags.substr(d);
+      if (f == "b") {
+        ++nBase;
+        base = lv;
+      } else if (!f.empty()) {
+        ok = false;  // `bn`/`o`: a spelling not measured
+        if (f != "o") onlyOmitted = false;
+      }
+      if (std::find(levels.begin(), levels.end(), lv) == levels.end()) levels.push_back(lv);
+    }
+    // The levels are the factor's e(sample) values when the caller read them: a
+    // level e(b) carries but the sample lost (perfect prediction) is not one, and
+    // the base is then the first sample level (vs-stata bank 2d6a09e7 `margins
+    // rep78` after a logit whose sample keeps levels 3-5, e(b) 1b.rep78 2o.rep78
+    // ... 5o.rep78: r(margins) `i(3 4 5)b3.rep78`).
+    if (!info.marginLevels.empty() && nBase == 1 && onlyOmitted) {
+      levels = info.marginLevels;
+      if (std::find(levels.begin(), levels.end(), base) == levels.end()) base = levels.front();
+      ok = true;
+    }
+    if (ok && nBase == 1 && levels.size() > 1) {
+      auto num = [](double v) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%.15g", v);
+        return std::string(buf);
+      };
+      std::string m = "i(";
+      for (size_t i = 0; i < levels.size(); ++i) m += (i ? " " : "") + num(levels[i]);
+      m += ")b" + num(base) + "." + mlist[0];
+      ev.rStrings.set("margins", m);
+    }
+  }
+  if (mlist.empty()) mlist.push_back("_cons");
+  for (size_t i = 0; i < mlist.size(); ++i) macros.emplace_back("mlist" + std::to_string(i + 1), mlist[i]);
+  macros.emplace_back("predict", "_no_predict");
+  macros.emplace_back("isloco", "0");
+  if (const std::string* dv = ev.eStrings.find("depvar"); dv != nullptr && !dv->empty())
+    macros.emplace_back("est_depvar", *dv);
+  else if (const auto& lm = session.lastModel(); lm.has_value() && !lm->depvar.empty())
+    macros.emplace_back("est_depvar", lm->depvar);
+  if (!otherPredict && !info.fit.predictLabel.empty())
+    macros.emplace_back("predict_label", xbPredict ? std::string("Linear prediction") : info.fit.predictLabel);
+  // The at() specification (bank: `margins, at(mpg=(20 30))` r(atopt1)
+  // "mpg=(20 30)", r(u_at_vars) "mpg"; atmeans prefixes "(mean) _factor (mean)
+  // _continuous"; r(atdims) 1 x 1 holds the number of at() points).
+  if (atmeans || !atText.empty()) {
+    std::string opt = atmeans ? std::string("(mean) _factor (mean) _continuous") : std::string();
+    if (!atText.empty()) opt += (opt.empty() ? "" : " ") + atText;
+    macros.emplace_back("atopt1", opt);
+    if (!atVars.empty()) {
+      std::string u;
+      for (const auto& v : atVars) u += (u.empty() ? "" : " ") + v;
+      macros.emplace_back("u_at_vars", u);
+    }
+    if (info.atPoints > 0) {
+      eval::EvalMatrix ad;
+      ad.rownames = {"r1"};
+      ad.colnames = {"c1"};
+      ad.data = {{static_cast<double>(info.atPoints)}};
+      ev.rHiddenMatrices.emplace_back("atdims", ad.gen);
+      ev.rMatrices.emplace_back("atdims", std::move(ad));
+    }
+  }
+  for (const auto& [k, v] : macros) {
+    ev.rStrings.set(k, v);
+    ev.markRMacroHidden(k);
+  }
+  // r(at)/r(atstats#) for an at() form without atmeans, whatever path served it
+  // (the grid also posts e(at) under `post`).
+  if (!atText.empty() && !atmeans && ev.findClassMatrix('r', "at") == nullptr) {
+    const cecon::MarginsAtParse p = cecon::margins_parse_at(atText);
+    if (p.rc == 0 && static_cast<int>(p.points.size()) == info.atPoints)
+      postMarginsAtM4(session, info.fit.ebNames, info.fit.ebNames, p.points, false);
+  }
+  std::vector<std::pair<std::string, double>> scalars = {{"k_mlist", static_cast<double>(mlist.size())}};
+  if (!otherPredict) {
+    static const std::set<std::string> kXb = {"regress", "areg"};
+    static const std::set<std::string> kDeriv = {"logit", "logistic", "probit", "cloglog", "poisson", "nbreg"};
+    static const std::set<std::string> kPlain = {"xtreg", "ivregress", "reghdfe", "qreg", "newey", "prais",
+                                                 "glm", "clogit", "xtpoisson", "fracreg", "ppmlhdfe"};
+    const std::string& c = info.fit.estCmd;
+    int isXb = -1, der = 0;
+    if (xbPredict || kXb.count(c)) isXb = 1;
+    else if (kDeriv.count(c)) { isXb = 0; der = 1; }
+    else if (kPlain.count(c)) isXb = 0;
+    if (isXb >= 0) {
+      scalars.emplace_back("numeric", 0.0);
+      scalars.emplace_back("is_xb1", static_cast<double>(isXb));
+      scalars.emplace_back("deriv1", static_cast<double>(der));
+      scalars.emplace_back("j1_1", 0.0);
+      scalars.emplace_back("j2_1", 0.0);
+      scalars.emplace_back("outcomeIsEq1", 0.0);
+    }
+  }
+  for (const auto& [k, v] : scalars) {
+    ev.rValues.set(k, v);
+    ev.markRHidden(k);
+  }
+}
+
+}  // namespace
+
 // FU-179/FU-276: margins is r-class. Every served form replaces r() wholesale --
 // a stale r() from the previous command must not answer for it -- posts the
 // results this handler knows exactly, and declares Stata's set for the
@@ -251,6 +511,7 @@ void postMarginsRClassM4(SessionState& session, const ojson& block, const Margin
     if (!info.fit.predictLabel.empty()) ev.rStrings.set("predict1_label", info.fit.predictLabel);
     if (!info.fit.cmdline.empty()) ev.rStrings.set("cmdline", info.fit.cmdline);
     if (info.dydx && info.continuous == 1) ev.rStrings.set("continuous", "continuous");
+    postMarginsHiddenRM4(session, info);
   }
   if (!names.empty() && b.size() == names.size() && V.size() == names.size()) {
     eval::EvalMatrix rb;
@@ -294,6 +555,13 @@ void postMarginsRClassM4(SessionState& session, const ojson& block, const Margin
         if (info.dydx)
           for (auto& nm : ncols)
             if (nm.find(':') == std::string::npos) nm += ":_cons";
+        // When no covariate is left as observed (the "Adjusted predictions" /
+        // "Conditional marginal effects" titles) every column of r(_N) is named
+        // `c1` (vs-stata bank 02260732 `margins foreign, at(mpg=(15 20 25 30))`
+        // after `regress price i.foreign##c.mpg`: `c1 c1 ... c1`; `margins,
+        // at(weight=(2000 3000 4000))` after a fit on weight alone: `c1 c1 c1`).
+        if (info.title == "Adjusted predictions" || info.title == "Conditional marginal effects")
+          for (auto& nm : ncols) nm = "c1";
         for (const auto& nm : names) {
           // A dydx() base level: the head's level flags carry `b` but not `bn`.
           const std::string head = nm.substr(0, nm.find(':'));
@@ -325,6 +593,30 @@ void postMarginsRClassM4(SessionState& session, const ojson& block, const Margin
         jm.rownames = names;
         jm.colnames = eb;
         jm.data = info.jacobian;
+        // Base and omitted parameters are not in the delta method: their
+        // columns are 0 whatever the analytic derivative there (bank
+        // 330a280aa12cba1a `qreg price i.foreign##c.mpg weight` dydx(*) and
+        // ad03c6f501a4ddb6 `regress c.mpg##i.foreign` dydx(foreign): row
+        // 1.foreign, column 0b.foreign = 0; 52797b7ee2e1e257 column 1b.rep78).
+        // An element is base/omitted when an operator of one of its factors
+        // carries b (not bn) or o: 0b.foreign, 1o.rep78, o.mpg, 0b.foreign#co.mpg.
+        auto baseOrOmitted = [](const std::string& full) {
+          const size_t c = full.find(':');
+          std::stringstream parts(c == std::string::npos ? full : full.substr(c + 1));
+          std::string part;
+          while (std::getline(parts, part, '#')) {
+            const size_t dot = part.rfind('.');
+            if (dot == std::string::npos) continue;
+            std::string letters;
+            for (const char ch : part.substr(0, dot))
+              if (!std::isdigit(static_cast<unsigned char>(ch))) letters += ch;
+            if (letters == "b" || letters.find('o') != std::string::npos) return true;
+          }
+          return false;
+        };
+        for (size_t j = 0; j < eb.size(); ++j)
+          if (baseOrOmitted(eb[j]))
+            for (auto& row : jm.data) row[j] = 0.0;
         ev.rMatrices.emplace_back("Jacobian", std::move(jm));
       }
     }
@@ -355,6 +647,8 @@ MarginsFitInfoM4 marginsFitInfoM4(SessionState& session) {
       f.predictLabel = "Predicted number of events";
     else if (lm->cobraCmd == "xtlogit" && !lm->depvar.empty())
       f.predictLabel = "Pr(" + lm->depvar + "|fixed effect is 0)";  // clogit_p.ado's pu0
+    else if (lm->cobraCmd == "glm" && !lm->depvar.empty())
+      f.predictLabel = "Predicted mean " + lm->depvar;  // glm's default mu (bank 78f09bd8)
   }
   // margins' `0` with its leading blanks dropped, after "margins " (the leaf's
   // macro-expanded line, as the fit hook's e(cmdline) reads it).
@@ -373,6 +667,183 @@ MarginsFitInfoM4 marginsFitInfoM4(SessionState& session) {
     f.ebValues = eb.matrix->data[0];
   }
   return f;
+}
+
+// A coefficient name's identity for placing a Jacobian column: the equation
+// prefix dropped, each `#` atom without its `c.` operator and level flags
+// (`1b.rep78` -> `1.rep78`), atoms sorted, the constant spelled `_cons` (the
+// engine's design calls it `(intercept)`). `omitted` is set for a base or
+// omitted e(b) column (`1b.`, `2o.`, `o.x`, `co.x`), whose derivative is 0.
+std::string marginsJacobianKeyM4(std::string nm, bool* omitted) {
+  if (omitted) *omitted = false;
+  const size_t colon = nm.rfind(':');
+  if (colon != std::string::npos) nm = nm.substr(colon + 1);
+  if (nm == "(intercept)") return "_cons";
+  std::vector<std::string> atoms;
+  size_t start = 0;
+  for (;;) {
+    const size_t h = nm.find('#', start);
+    std::string a = nm.substr(start, h == std::string::npos ? std::string::npos : h - start);
+    const size_t dot = a.find('.');
+    if (dot != std::string::npos) {
+      const std::string op = a.substr(0, dot);
+      size_t d = 0;
+      while (d < op.size() && std::isdigit(static_cast<unsigned char>(op[d]))) ++d;
+      const std::string flags = op.substr(d);
+      const bool base = flags.find('b') != std::string::npos && flags.find("bn") == std::string::npos;
+      if (omitted && (flags.find('o') != std::string::npos || base)) *omitted = true;
+      if (d > 0) a = op.substr(0, d) + a.substr(dot);  // `2o.x` -> `2.x`
+      else if (op == "c" || op == "o" || op == "co") a = a.substr(dot + 1);
+    }
+    atoms.push_back(a);
+    if (h == std::string::npos) break;
+    start = h + 1;
+  }
+  std::sort(atoms.begin(), atoms.end());
+  std::string key;
+  for (const auto& a : atoms) key += (key.empty() ? "" : "#") + a;
+  return key;
+}
+
+// r(Jacobian) from the engine's per-row d(effect)/d(beta) over its design
+// columns `jNames`, placed on e(b)'s stripe: every design column lands on the
+// one e(b) column of the same identity, a base or omitted e(b) column is 0.
+// Empty when any column cannot be placed exactly once.
+std::vector<std::vector<double>> marginsEngineJacobianM4(const std::vector<std::vector<double>>& rowsJ,
+                                                         const std::vector<std::string>& jNames,
+                                                         const std::vector<std::string>& ebNames) {
+  if (rowsJ.empty() || jNames.empty() || ebNames.empty()) return {};
+  std::map<std::string, size_t> engineCol;
+  for (size_t j = 0; j < jNames.size(); ++j)
+    if (!engineCol.emplace(marginsJacobianKeyM4(jNames[j], nullptr), j).second) return {};
+  std::vector<long> from(ebNames.size(), -1);
+  std::set<size_t> used;
+  for (size_t c = 0; c < ebNames.size(); ++c) {
+    bool omitted = false;
+    const std::string key = marginsJacobianKeyM4(ebNames[c], &omitted);
+    const auto it = engineCol.find(key);
+    if (omitted) {
+      // Stata's row is 0 there: the coefficient is held at 0 (vs-stata bank
+      // 2d6a09e7 `margins rep78` after a logit omitting 5o.rep78: row 3 is 0 in
+      // that column though the level-5 prediction moves with it)
+      if (it != engineCol.end()) used.insert(it->second);
+      continue;
+    }
+    if (it == engineCol.end() || !used.insert(it->second).second) return {};
+    from[c] = static_cast<long>(it->second);
+  }
+  if (used.size() != jNames.size()) return {};
+  std::vector<std::vector<double>> out;
+  for (const auto& r : rowsJ) {
+    if (r.size() != jNames.size()) return {};
+    std::vector<double> row(ebNames.size(), 0.0);
+    for (size_t c = 0; c < ebNames.size(); ++c)
+      if (from[c] >= 0) row[c] = r[static_cast<size_t>(from[c])];
+    out.push_back(std::move(row));
+  }
+  return out;
+}
+
+std::vector<double> marginsJRowM4(const ojson& row) {
+  std::vector<double> v;
+  if (!row.is_object() || !row.contains("J") || !row["J"].is_array()) return v;
+  for (const auto& x : row["J"]) {
+    if (!x.is_number()) return {};
+    v.push_back(x.get<double>());
+  }
+  return v;
+}
+
+// `margins, post`: e() then holds margins' own results -- every r() scalar but
+// r(level), every r() macro (the hidden bookkeeping too), every r() matrix but
+// r(table), and e(properties) `b V` (vs-stata bank 79d162ff `margins foreign,
+// post` after regress: e(cmdline) e(est_cmd) e(marg_dims) e(margins) e(vce)
+// delta e(k_mlist) e(is_xb1) e(df_r) e(Jacobian) e(_N) e(chainrule) e(error)
+// ...). e(b)/e(V) are the path's own when it posted them, else r(b)/r(V).
+// e(sample) is the fit's (`fitSample`, read before `post` replaced the model)
+// when margins took no if/in of its own (79d162ff: 69 = the regress sample).
+struct MarginsFitSampleM4 {
+  bool have = false;
+  LastModel::EsampleState state = LastModel::EsampleState::kUnavailable;
+  unsigned long long serial = 0;
+  std::string installPath, dataPath;
+};
+MarginsFitSampleM4 marginsFitSampleM4(SessionState& session) {
+  MarginsFitSampleM4 f;
+  const auto& lm = session.lastModel();
+  if (!lm.has_value()) return f;
+  static const std::regex qual(R"((^|\s)(if|in)\s)");
+  if (std::regex_search(session.leafCmdExpanded, qual)) return f;
+  f.have = true;
+  f.state = lm->esample;
+  f.serial = lm->esampleSerial;
+  f.installPath = lm->esampleInstallPath;
+  f.dataPath = lm->dataPath;
+  return f;
+}
+//
+// e() is REPLACED, not added to: nothing of the fit's e() (e(title), e(depvar),
+// e(r2), a previous margins' e(at)) is left, and every name written here is
+// recorded on the install (noteEOnFit), so the next fit's install drops it the
+// way Stata's next estimation replaces e() whole (a probit after `margins, post`
+// reports its own e(cmdline) and e(title)). Not carried over: the results
+// margins' report posts after the post -- r(level), r(table), r(mcmethod),
+// r(citype), r(k_eform), r(PT), r(isloco), r(nofvlabel), r(put_tables) and the
+// table's r(label#) notes (79d162ff's M|e records have none of them, its M|r
+// records have r(mcmethod) r(isloco) r(citype) r(k_eform) r(PT)). A hidden r()
+// result stays hidden in e() (79d162ff: e(marg_dims) e(mlist1) e(is_xb1)
+// e(k_mlist) ... are stored and `ereturn list` does not show them).
+bool marginsReportOnlyRM4(const std::string& k) {
+  static const std::set<std::string> kReport = {"level",   "table",     "mcmethod",  "citype",    "k_eform",
+                                                "PT",      "isloco",    "nofvlabel", "put_tables"};
+  if (kReport.count(k)) return true;
+  return k.size() > 5 && k.compare(0, 5, "label") == 0 &&
+         std::all_of(k.begin() + 5, k.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); });
+}
+void marginsPostRToEM4(SessionState& session, const MarginsFitSampleM4& fitSample) {
+  if (fitSample.have && fitSample.state == LastModel::EsampleState::kColumn)
+    session.setLastModelEsample(fitSample.state, fitSample.serial, fitSample.installPath, fitSample.dataPath);
+  auto& ev = session.eval;
+  // the path's own e(b)/e(V), when it posted them; nothing else survives
+  std::vector<std::pair<std::string, eval::EvalMatrix>> kept;
+  for (const auto& p : ev.eMatrices)
+    if (p.first == "b" || p.first == "V") kept.push_back(p);
+  std::vector<std::string> stale;
+  for (const auto& [k, v] : ev.eScalars.items())
+    if (!eval::isReservedStoreKey(k)) stale.push_back(k);
+  for (const auto& k : stale) ev.eScalars.erase(k);
+  stale.clear();
+  for (const auto& [k, v] : ev.eStrings.items())
+    if (!eval::isReservedStoreKey(k)) stale.push_back(k);
+  for (const auto& k : stale) ev.eStrings.erase(k);
+  ev.eMatrices = std::move(kept);
+  for (const auto& [k, v] : ev.rValues.items()) {
+    if (marginsReportOnlyRM4(k) || eval::isReservedStoreKey(k)) continue;
+    const bool hidden = ev.isRHidden(k);
+    ev.setEScalar(k, v);
+    if (hidden) ev.markEHidden(k, ev.eScalars.generationOf(k));
+  }
+  for (const auto& [k, v] : ev.rStrings.items()) {
+    if (marginsReportOnlyRM4(k) || eval::isReservedStoreKey(k)) continue;
+    const bool hidden = ev.isRMacroHidden(k);
+    ev.setEString(k, v);
+    if (hidden) ev.markEHidden(k, ev.eStrings.generationOf(k));
+  }
+  ev.setEString("properties", "b V");
+  for (const auto& [nm, m] : ev.rMatrices) {
+    if (marginsReportOnlyRM4(nm)) continue;
+    if (std::any_of(ev.eMatrices.begin(), ev.eMatrices.end(), [&](const auto& p) { return p.first == nm; }))
+      continue;  // the path's own e(b)/e(V)
+    bool hidden = false;
+    for (const auto& [n, g] : ev.rHiddenMatrices) hidden = hidden || (n == nm && g == m.gen);
+    eval::EvalMatrix copy = m;
+    if (nm == "b") copy.rownames = {"y1"};
+    if (hidden) ev.markEHidden(nm, copy.gen);
+    ev.eMatrices.emplace_back(nm, std::move(copy));
+  }
+  for (const auto& [k, v] : ev.eScalars.items()) session.noteEOnFit(k);
+  for (const auto& [k, v] : ev.eStrings.items()) session.noteEOnFit(k);
+  for (const auto& p : ev.eMatrices) session.noteEOnFit(p.first);
 }
 
 double marginsNumM4(const ojson& row, const char* key) {
@@ -400,6 +871,7 @@ void postMarginsFromBlockM4(SessionState& session, const ojson& block, const ojs
                             const MarginsRInfoM4& info, bool levelBn = false) {
   std::vector<std::string> names;
   std::vector<double> b, se;
+  std::vector<std::vector<double>> rowsJ;  // the engine's d(row)/d(beta), when it sent them
   ojson rows = ojson::array();
   auto tableRow = [](const std::string& name, const ojson& src, const char* bKey) {
     ojson r;
@@ -419,6 +891,17 @@ void postMarginsFromBlockM4(SessionState& session, const ojson& block, const ojs
       b.push_back(marginsNumM4(row, "b"));
       se.push_back(marginsNumM4(row, "se"));
       rows.push_back(tableRow(names.back(), row, "b"));
+      // the engine row of the same name carries its Jacobian row
+      std::vector<double> jr;
+      if (raw.is_object())
+        for (const char* key : {"coefs", "coeftable"})
+          if (jr.empty() && raw.contains(key) && raw[key].is_array())
+            for (const auto& er : raw[key])
+              if (er.is_object() && er.value("name", std::string()) == row.value("name", std::string())) {
+                jr = marginsJRowM4(er);
+                break;
+              }
+      rowsJ.push_back(std::move(jr));
     }
   } else if (block.contains("margins") && block["margins"].is_array()) {
     const auto& arr = block["margins"];
@@ -430,6 +913,7 @@ void postMarginsFromBlockM4(SessionState& session, const ojson& block, const ojs
       b.push_back(marginsNumM4(arr[i], "margin"));
       se.push_back(marginsNumM4(arr[i], "se"));
       rows.push_back(tableRow(names.back(), arr[i], "margin"));
+      rowsJ.push_back(marginsJRowM4(arr[i]));
     }
   }
   std::vector<std::vector<double>> V = marginsDiagVM4(se);
@@ -447,6 +931,55 @@ void postMarginsFromBlockM4(SessionState& session, const ojson& block, const ojs
       full.push_back(std::move(row));
     }
     if (ok) V = std::move(full);
+  }
+  // r(Jacobian) of an engine-computed (maximum-likelihood) margin: the engine's
+  // delta-method rows d(margin)/d(beta) over its design, on e(b)'s stripe
+  // (vs-stata bank 3ca86257 `margins, dydx(*)` after `logit foreign mpg weight`:
+  // 2 x 3 over foreign:mpg foreign:weight foreign:_cons).
+  if (info.jacobian.empty() && raw.is_object() && raw.contains("J_names") && raw["J_names"].is_array() &&
+      rowsJ.size() == names.size() &&
+      std::none_of(rowsJ.begin(), rowsJ.end(), [](const std::vector<double>& r) { return r.empty(); })) {
+    std::vector<std::string> jNames;
+    for (const auto& x : raw["J_names"])
+      if (x.is_string()) jNames.push_back(x.get<std::string>());
+    MarginsRInfoM4 withJ = info;
+    withJ.jacobian = marginsEngineJacobianM4(rowsJ, jNames, info.fit.ebNames);
+    if (!withJ.jacobian.empty()) {
+      // A covariance the engine did not send (its AME path reports each row's
+      // se only) is the delta method's J e(V) J' -- the formula the engine's
+      // se came from -- provided it reproduces every se it did send
+      // (vs-stata bank 4a1f2b13 `margins, dydx(*)` after cloglog: el(r(V),1,2)).
+      const bool gaps = std::any_of(V.begin(), V.end(), [](const std::vector<double>& r) {
+        return std::any_of(r.begin(), r.end(), [](double x) { return std::isnan(x); });
+      });
+      const auto eVa = session.eval.resolveEMatrixFor("V", eval::EvalSession::EReader::kCopy);
+      const size_t k = info.fit.ebNames.size();
+      if (gaps && eVa.matrix.has_value() && eVa.matrix->data.size() == k &&
+          eVa.matrix->colnames == info.fit.ebNames) {
+        const auto& eV = eVa.matrix->data;
+        const auto& J = withJ.jacobian;
+        const size_t m = J.size();
+        std::vector<std::vector<double>> W(m, std::vector<double>(m, 0.0));
+        bool ok = true;
+        for (size_t a = 0; ok && a < m; ++a)
+          for (size_t c = 0; ok && c < m; ++c) {
+            double s = 0;
+            for (size_t i = 0; i < k; ++i) {
+              if (eV[i].size() != k) { ok = false; break; }
+              for (size_t j = 0; j < k; ++j) s += J[a][i] * eV[i][j] * J[c][j];
+            }
+            W[a][c] = s;
+          }
+        for (size_t a = 0; ok && a < m; ++a)
+          ok = std::isfinite(V[a][a]) && std::fabs(W[a][a] - V[a][a]) <= 1e-7 * std::fabs(V[a][a]);
+        if (ok)
+          for (size_t a = 0; a < m; ++a)
+            for (size_t c = 0; c < m; ++c)
+              if (std::isnan(V[a][c])) V[a][c] = W[a][c];
+      }
+      postMarginsRClassM4(session, block, withJ, names, b, V, rows);
+      return;
+    }
   }
   postMarginsRClassM4(session, block, info, names, b, V, rows);
 }
@@ -594,17 +1127,26 @@ std::optional<ojson> marginsCovariateRefusalM4(const LastModel& lm,
 // `margins` 5.25 2.31 0 .25 .25 .25 1; `margins c`, level 1: 5.25 2.31 0 1 0 0
 // 1). A base or omitted column is 0. Each row must reproduce its margin (J b),
 // or nothing is returned.
-bool marginsLinearJacobianM4(SessionState& session, const MarginsFitInfoM4& fit,
-                             const std::string& factorVar, const std::vector<double>& levels,
-                             const std::vector<double>& margins,
-                             std::vector<std::vector<double>>& J) {
+// The same over at() points (each fixing some covariates, a factor to a level):
+// every column's e(sample) mean with the fixed covariates set to the point's
+// values (vs-stata bank 02260732 `margins foreign, at(mpg=(15 20 25 30))` after
+// `regress price i.foreign##c.mpg`: row 2 `0 1 15 0 15 1`).
+bool marginsLinearPointsJacobianM4(SessionState& session, const MarginsFitInfoM4& fit,
+                                   const std::vector<cecon::MarginsGridPoint>& points,
+                                   const std::vector<double>& margins,
+                                   std::vector<std::vector<double>>& J,
+                                   const std::string& noDerivedFrom = std::string()) {
   const std::vector<std::string>& eb = fit.ebNames;
-  if (eb.empty() || fit.ebValues.size() != eb.size() || margins.size() != levels.size()) return false;
+  if (eb.empty() || fit.ebValues.size() != eb.size() || margins.size() != points.size()) return false;
+  std::set<std::string> fixedVars;
+  for (const auto& pt : points)
+    for (const auto& f : pt.fix) fixedVars.insert(f.first);
   struct Atom {
     const double* v = nullptr;
     bool factor = false;
     double level = 0;
-    bool fixed = false;  // the marginlist factor: set per row
+    bool fixed = false;  // a covariate the points set
+    std::string var;
   };
   struct Col {
     bool constant = false, zero = false;
@@ -659,8 +1201,9 @@ bool marginsLinearJacobianM4(SessionState& session, const MarginsFitInfoM4& fit,
       }
       if (var.empty() || !ds->has(var) || ds->col(var).f64() == nullptr) return false;
       a.v = ds->col(var).f64();
-      a.fixed = !factorVar.empty() && var == factorVar;
-      if (a.fixed) {
+      a.var = var;
+      a.fixed = fixedVars.count(var) > 0;
+      if (!noDerivedFrom.empty() && var == noDerivedFrom) {
         if (!a.factor) return false;
         mentionsFactor = true;
       }
@@ -672,8 +1215,8 @@ bool marginsLinearJacobianM4(SessionState& session, const MarginsFitInfoM4& fit,
     if (mentionsFactor && c.atoms.size() > 1) return false;
     cols.push_back(std::move(c));
   }
-  J.assign(levels.size(), std::vector<double>(eb.size(), 0.0));
-  for (size_t li = 0; li < levels.size(); ++li) {
+  J.assign(points.size(), std::vector<double>(eb.size(), 0.0));
+  for (size_t li = 0; li < points.size(); ++li) {
     double fitted = 0.0, scale = 0.0;
     for (size_t j = 0; j < cols.size(); ++j) {
       const Col& c = cols[j];
@@ -685,7 +1228,10 @@ bool marginsLinearJacobianM4(SessionState& session, const MarginsFitInfoM4& fit,
         for (int64_t r : rows) {
           double v = 1.0;
           for (const Atom& a : c.atoms) {
-            const double x = a.fixed ? levels[li] : a.v[r];
+            double x = a.v[r];
+            if (a.fixed)
+              for (const auto& f : points[li].fix)
+                if (f.first == a.var) x = f.second;
             v *= a.factor ? (x == a.level ? 1.0 : 0.0) : x;
           }
           s += v;
@@ -699,6 +1245,16 @@ bool marginsLinearJacobianM4(SessionState& session, const MarginsFitInfoM4& fit,
     if (!std::isfinite(fitted) || std::fabs(fitted - margins[li]) > 1e-9 * std::max(1.0, scale)) return false;
   }
   return true;
+}
+
+bool marginsLinearJacobianM4(SessionState& session, const MarginsFitInfoM4& fit,
+                             const std::string& factorVar, const std::vector<double>& levels,
+                             const std::vector<double>& margins,
+                             std::vector<std::vector<double>>& J) {
+  std::vector<cecon::MarginsGridPoint> points;
+  for (double l : levels) points.push_back(cecon::MarginsGridPoint{{{factorVar, l}}});
+  if (factorVar.empty()) points.assign(levels.size(), cecon::MarginsGridPoint{});
+  return marginsLinearPointsJacobianM4(session, fit, points, margins, J, factorVar);
 }
 
 // BUG-1549: margins takes e(df_r) only when every prediction is `xb`, which the
@@ -823,7 +1379,11 @@ ojson runLinearPredictiveMarginsM4(const LastModel& lm, SessionState& session,
       info.jacobian.clear();
   }
   postMarginsFromBlockM4(session, est, raw, info, !marginVar.empty());
-  if (postOpt) postEstimationBlockM4(session, est, "margins", lm.depvar, lm.dataPath);
+  if (postOpt) {
+    const MarginsFitSampleM4 fs = marginsFitSampleM4(session);
+    postEstimationBlockM4(session, est, "margins", lm.depvar, lm.dataPath);
+    marginsPostRToEM4(session, fs);
+  }
   return est;
 }
 
@@ -1208,6 +1768,13 @@ bool marginsGridWantedM4(const LastModel& lm, const std::vector<std::string>& ma
     }
   // A marginlist after logit/probit (F6 `margins year[, atmeans post]`); after a
   // least-squares fit the landed per-level path answers it.
+  // A one-factor marginlist with at() (a predictive margin) after a
+  // least-squares fit without absorbed effects or weights: the grid crosses the
+  // points with the levels (bank 02260732 `margins foreign, at(mpg=(15 20 25
+  // 30))` after `regress price i.foreign##c.mpg`).
+  if (!marginlist.empty() && hasAt && linear && !binary && marginlist.size() == 1 && !hasDydx &&
+      !atmeans && lm.fe.empty() && lm.fitWeight.empty())
+    return true;
   if (!marginlist.empty()) return binary && !hasAt;
   // After an fweighted logit/probit (F6's `[fweight=w]`) the landed engine path
   // cannot carry the weight (cmd_margins takes --wtype pw only, which surfaced
@@ -1262,41 +1829,127 @@ bool marginsGridWantedM4(const LastModel& lm, const std::vector<std::string>& ma
 // is one per level (`1.g 2.g ...`), which is not built here, so then nothing is
 // posted and every reader keeps its refusal.
 void postMarginsAtM4(SessionState& session, const std::vector<std::string>& modelNames,
-                     const std::vector<cecon::MarginsGridPoint>& points, bool post) {
+                     const std::vector<std::string>& fitEbNames,
+                     const std::vector<cecon::MarginsGridPoint>& points, bool post,
+                     const MarginsAtMeansM4* means) {
   if (points.empty()) return;
-  std::vector<std::string> cov;
-  for (const auto& nm : modelNames) {
+  // The covariates are e(b)'s main-effect columns in e(b) order: a continuous
+  // variable's own column and every level of a factor, its base included
+  // (vs-stata bank 6749fc98 `margins, at(mpg=(20 30))` after `regress price mpg
+  // weight i.foreign i.rep78`: r(at) columns `mpg weight 0b.foreign 1.foreign
+  // 1b.rep78 2.rep78 ... 5.rep78`; interactions and _cons have none). A fixed
+  // factor sets its level columns to the indicator of the fixed level. Stata's
+  // stripe is taken from e(b) when it has one equation; the engine's names
+  // (no base level) serve only a model without factors.
+  // The stripe is the FIT's e(b) as the caller read it before any `post`
+  // (`fitEbNames`): after `margins, at() post` the live e(b) is margins' own
+  // (`1._at 2._at`), which names no covariate, and r(at)/e(at) were lost.
+  std::vector<std::string> names = modelNames;
+  bool stataNames = false;
+  if (!fitEbNames.empty()) {
+    std::string eq0;
+    bool oneEq = true;
+    std::vector<std::string> bare;
+    for (size_t i = 0; i < fitEbNames.size(); ++i) {
+      const std::string& n = fitEbNames[i];
+      const size_t c = n.rfind(':');
+      const std::string eq = c == std::string::npos ? std::string() : n.substr(0, c);
+      if (i == 0) eq0 = eq;
+      else if (eq != eq0) oneEq = false;
+      bare.push_back(c == std::string::npos ? n : n.substr(c + 1));
+    }
+    if (!oneEq) return;
+    names = std::move(bare);
+    stataNames = true;
+  }
+  struct AtCol {
+    std::string name, var;
+    bool factor = false;
+    double level = 0;
+  };
+  std::vector<AtCol> cols;
+  for (const auto& nm : names) {
     bool ok = true;
     const std::vector<cecon::MarginsAtom> atoms = cecon::margins_parse_column(nm, &ok);
     if (!ok) return;
-    for (const auto& a : atoms) {
-      if (a.factor) return;
-      if (std::find(cov.begin(), cov.end(), a.var) == cov.end()) cov.push_back(a.var);
+    if (atoms.size() != 1) continue;  // _cons, an interaction
+    const auto& a = atoms.front();
+    std::string colName = nm;
+    if (a.factor) {
+      if (!stataNames) return;
+      const size_t dot = nm.find('.');
+      std::string head = nm.substr(0, dot);
+      // An omitted level is its plain level (vs-stata bank afb75d4a, after a
+      // logit omitting 2o.rep78 and 5o.rep78: r(at) columns `1b.rep78 2.rep78
+      // 3.rep78 4.rep78 5.rep78`); any other spelling with `o` is unmeasured.
+      if (head.size() > 1 && head.back() == 'o' &&
+          std::all_of(head.begin(), head.end() - 1, [](char ch) { return std::isdigit(static_cast<unsigned char>(ch)); }))
+        colName = head.substr(0, head.size() - 1) + nm.substr(dot);
+      else if (head.find('o') != std::string::npos)
+        return;
     }
+    if (std::any_of(cols.begin(), cols.end(), [&](const AtCol& c) { return c.name == colName; })) continue;
+    cols.push_back({a.factor ? colName : a.var, a.var, a.factor, a.level});
   }
-  if (cov.empty()) return;
+  if (cols.empty()) return;
   for (const auto& p : points)
     for (const auto& [v, val] : p.fix) {
       (void)val;
-      if (std::find(cov.begin(), cov.end(), v) == cov.end()) return;
+      if (std::none_of(cols.begin(), cols.end(), [&](const AtCol& c) { return c.var == v; })) return;
     }
   eval::EvalMatrix at;
-  at.colnames = cov;
+  for (const auto& c : cols) at.colnames.push_back(c.name);
+  // A covariate given one value is `value`, a list `values` (vs-stata bank
+  // 2a2d5569 `margins, dydx(foreign) at(foreign=1)`: "asobserved asobserved value
+  // value ..."; 6749fc98 `at(mpg=(20 30))`: "values ...").
+  std::map<std::string, std::set<double>> distinct;
+  for (const auto& p : points)
+    for (const auto& [fv, fval] : p.fix) distinct[fv].insert(fval);
+  // atmeans: an unfixed covariate is its e(sample) mean, in double (vs-stata
+  // bank 1efe2958 `margins, dydx(*) atmeans` after regress: r(at) mpg
+  // 21.2972972972973 = 1576/74), a factor level the share of the sample at that
+  // level (362d50c0: 0b.foreign .6956521739130435), and its statistic is `mean`.
+  std::map<std::string, double> meanOf;
+  if (means != nullptr) {
+    if (means->data == nullptr) return;
+    const std::vector<double>* w = means->weights;
+    for (const auto& c : cols) {
+      const auto it = means->data->find(c.var);
+      if (it == means->data->end() || it->second.empty() ||
+          (w != nullptr && !w->empty() && w->size() != it->second.size()))
+        return;
+      double s = 0, ws = 0;
+      for (size_t i = 0; i < it->second.size(); ++i) {
+        const double wi = (w != nullptr && !w->empty()) ? (*w)[i] : 1.0;
+        const double v = it->second[i];
+        s += wi * (c.factor ? (v == c.level ? 1.0 : 0.0) : v);
+        ws += wi;
+      }
+      if (!(ws > 0)) return;
+      meanOf[c.name] = s / ws;
+    }
+  }
   std::vector<std::string> stats;
   for (size_t i = 0; i < points.size(); ++i) {
-    at.rownames.push_back(std::to_string(i + 1) + "._at");
+    // `1bn._at 2._at ...`; one point is the row `r1` (bank: 173 records of
+    // `1bn._at`, 33 of `r1`).
+    at.rownames.push_back(points.size() == 1 ? std::string("r1")
+                                             : std::to_string(i + 1) + (i == 0 ? "bn._at" : "._at"));
     std::vector<double> row;
     std::string st;
-    for (const auto& v : cov) {
+    for (const auto& c : cols) {
       double val = std::numeric_limits<double>::quiet_NaN();
       bool fixed = false;
       for (const auto& [fv, fval] : points[i].fix)
-        if (fv == v) {
-          val = fval;
+        if (fv == c.var) {
+          val = c.factor ? (fval == c.level ? 1.0 : 0.0) : fval;
           fixed = true;
         }
+      if (!fixed && means != nullptr) val = meanOf[c.name];
       row.push_back(val);
-      st += (st.empty() ? "" : " ") + std::string(fixed ? "values" : "asobserved");
+      st += (st.empty() ? "" : " ") +
+            std::string(!fixed ? (means != nullptr ? "mean" : "asobserved")
+                               : distinct[c.var].size() == 1 ? "value" : "values");
     }
     at.data.push_back(std::move(row));
     stats.push_back(st);
@@ -1306,8 +1959,19 @@ void postMarginsAtM4(SessionState& session, const std::vector<std::string>& mode
   // `margins, at(x1=(2 4))`: r(k_at) 1 with r(at) 2 x 6), and this handler
   // takes one at() (BUG-1449).
   ev.rValues.set("k_at", 1.0);
-  ev.rMatrices.emplace_back("at", at);
+  bool rReplaced = false;
+  for (auto& m : ev.rMatrices)
+    if (m.first == "at") {
+      m.second = at;
+      m.second.gen = eval::nextStoreGeneration();
+      rReplaced = true;
+    }
+  if (!rReplaced) ev.rMatrices.emplace_back("at", at);
   for (size_t i = 0; i < stats.size(); ++i) ev.rStrings.set("atstats" + std::to_string(i + 1), stats[i]);
+  // r(atspec1), hidden: the at() option's statistics, the first point's row
+  // (vs-stata bank, every at() record: equal to r(atstats1)).
+  ev.rStrings.set("atspec1", stats.front());
+  ev.markRMacroHidden("atspec1");
   if (!post) return;
   ev.setEScalar("k_at", 1.0);
   bool replaced = false;
@@ -1343,7 +2007,11 @@ std::optional<ojson> runMarginsGrid(SessionState& session, const MarginsGridFit&
   std::string over;
   if (!marginlist.empty()) {
     over = marginlist[0].rfind("i.", 0) == 0 ? marginlist[0].substr(2) : marginlist[0];
-    if (over.find_first_of("#()") != std::string::npos || hasAt) return std::nullopt;
+    // A marginlist factor with at() is served for a predictive margin only (no
+    // dydx(), no atmeans): each at() point crossed with the factor's levels.
+    if (over.find_first_of("#()") != std::string::npos ||
+        (hasAt && (atmeans || !trimM4(dydxText).empty())))
+      return std::nullopt;
   }
   std::vector<std::string> dydx;
   bool dydxAll = false;
@@ -1384,6 +2052,7 @@ std::optional<ojson> runMarginsGrid(SessionState& session, const MarginsGridFit&
   in.atmeans = atmeans;
   in.dydx = dydx;
   std::vector<double> overLevels;
+  std::vector<cecon::MarginsGridPoint> atOnlyPoints;
   size_t atPoints = 0;
   if (!over.empty()) {
     // The marginlist term is a factor of the model (FU-94's r(322) otherwise);
@@ -1397,9 +2066,26 @@ std::optional<ojson> runMarginsGrid(SessionState& session, const MarginsGridFit&
     if (!factor || it == fit.data.end())
       return marginsRefusalM4("factor " + over + " not found in list of covariates", 322, "engine_error");
     std::set<double> lv(it->second.begin(), it->second.end());
-    for (double l : lv) {
-      overLevels.push_back(l);
-      in.points.push_back(cecon::MarginsGridPoint{{{over, l}}});
+    for (double l : lv) overLevels.push_back(l);
+    if (hasAt) {
+      // the at() points slowest, the levels fastest (`1bn._at#0bn.foreign
+      // 1bn._at#1.foreign 2._at#0bn.foreign ...`, bank 02260732)
+      const cecon::MarginsAtParse p = cecon::margins_parse_at(atText);
+      if (p.rc != 0) return marginsAtRefusalM4(session, p);
+      for (const auto& pt : p.points)
+        if (std::any_of(pt.fix.begin(), pt.fix.end(),
+                        [&](const std::pair<std::string, double>& f) { return f.first == over; }))
+          return std::nullopt;
+      atOnlyPoints = p.points;
+      atPoints = p.points.size();
+      for (const auto& pt : p.points)
+        for (double l : overLevels) {
+          cecon::MarginsGridPoint q = pt;
+          q.fix.emplace_back(over, l);
+          in.points.push_back(std::move(q));
+        }
+    } else {
+      for (double l : overLevels) in.points.push_back(cecon::MarginsGridPoint{{{over, l}}});
     }
   } else if (hasAt) {
     const cecon::MarginsAtParse p = cecon::margins_parse_at(atText);
@@ -1417,7 +2103,21 @@ std::optional<ojson> runMarginsGrid(SessionState& session, const MarginsGridFit&
     return marginsRefusalM4(r.error + "; nothing was computed.", 198);
   }
   const bool single = over.empty() && in.points.size() == 1;
-  const std::vector<std::string> names = cecon::margins_grid_colnames(r, single, over, overLevels);
+  std::vector<std::string> names;
+  if (!over.empty() && hasAt) {
+    auto lvName = [](double v) {
+      char buf[64];
+      std::snprintf(buf, sizeof buf, "%.15g", v);
+      return std::string(buf);
+    };
+    for (size_t a = 0; a < atPoints; ++a)
+      for (size_t l = 0; l < overLevels.size(); ++l)
+        names.push_back(std::to_string(a + 1) + (a == 0 ? "bn" : "") + "._at#" + lvName(overLevels[l]) +
+                        (l == 0 ? "bn" : "") + "." + over);
+    if (names.size() != r.b.size()) return std::nullopt;
+  } else {
+    names = cecon::margins_grid_colnames(r, single, over, overLevels);
+  }
   const size_t m = r.b.size();
 
   double nObs = static_cast<double>(fit.n);
@@ -1480,12 +2180,27 @@ std::optional<ojson> runMarginsGrid(SessionState& session, const MarginsGridFit&
   for (const auto& v : dydx) info.xvars += (info.xvars.empty() ? "" : " ") + v;
   info.kMargins = over.empty() ? 0 : 1;
   info.atPoints = hasAt ? static_cast<int>(atPoints) : (atmeans ? 1 : 0);
+  // r(Jacobian) of a linear predictive margin over the points (each row's J b
+  // must reproduce its margin, or none is posted).
+  if (dydx.empty() && !atmeans && fit.link == static_cast<int>(cecon::GlmLinkFn::Identity) &&
+      fit.weights.empty()) {
+    const MarginsFitInfoM4 fi = marginsFitInfoM4(session);
+    if (!marginsLinearPointsJacobianM4(session, fi, in.points, r.b, info.jacobian)) info.jacobian.clear();
+  }
   info.cluster = fit.cluster;
   // BUG-1449: e() is still the fit's here (`post` is below).
   info.fit = marginsFitInfoM4(session);
+  // r(Jacobian): the grid's own d(column)/d(beta) rows over the fit's columns,
+  // placed on e(b)'s stripe (base and omitted columns 0).
+  if (info.jacobian.empty() && r.J.size() == m)
+    info.jacobian = marginsEngineJacobianM4(r.J, fit.names, info.fit.ebNames);
   info.kAt = hasAt || atmeans ? 1 : 0;
   info.title = marginsTitleM4(info.dydx, atmeans, atText, over, info.fit.ebNames);
-  info.nKnown = !atmeans;
+  if (!over.empty()) info.marginLevels = overLevels;
+  // r(_N) under atmeans too: every column is `c1` there (the title is "Adjusted
+  // predictions" / "Conditional marginal effects"), each the sample size
+  // (vs-stata bank 1efe2958, 362d50c0, 753d9ac9).
+  info.nKnown = true;
   if (info.dydx) {
     bool factor = false;
     for (const auto& c : r.cols) factor = factor || c.factor;
@@ -1501,9 +2216,11 @@ std::optional<ojson> runMarginsGrid(SessionState& session, const MarginsGridFit&
     }
     if (factor) info.bRow = "y1";  // r(b)'s row after a factor dydx() (s2.do B_dxc_br)
   }
+  MarginsFitSampleM4 gridFitSample;
   if (post) {
     // `post` replaces e() with the margins (w2v_margins_corpus *_post_e: e(cmd)
     // margins, e(N) = r(N)); e(b)/e(V) carry Stata's column names.
+    gridFitSample = marginsFitSampleM4(session);
     postEstimationBlockM4(session, est, "margins", fit.depvar, fit.dataPath);
     eval::EvalMatrix eb, eV;
     eb.rownames = {"y1"};
@@ -1528,17 +2245,64 @@ std::optional<ojson> runMarginsGrid(SessionState& session, const MarginsGridFit&
   // under the fit would be retired with it (F1_dydx_at_post_rt reads r(table)
   // after `post`, StataBE keeps it).
   postMarginsRClassM4(session, est, info, names, r.b, V, tableRows);
-  if (hasAt && !atmeans) postMarginsAtM4(session, fit.names, in.points, post);
+  if (hasAt && !atmeans)
+    postMarginsAtM4(session, fit.names, info.fit.ebNames, over.empty() ? in.points : atOnlyPoints, post);
+  if (atmeans) {
+    // r(at) under atmeans: one row per at() point (one `r1` row without at()),
+    // the marginlist factor left at its mean like every unfixed covariate.
+    const MarginsAtMeansM4 mm{&fit.data, &fit.weights};
+    const std::vector<cecon::MarginsGridPoint> pts =
+        hasAt ? (over.empty() ? in.points : atOnlyPoints) : std::vector<cecon::MarginsGridPoint>{cecon::MarginsGridPoint{}};
+    postMarginsAtM4(session, fit.names, info.fit.ebNames, pts, post, &mm);
+  }
+  if (post) marginsPostRToEM4(session, gridFitSample);
   return est;
 }
 
+namespace {
+// The glm fit's half of margins' r() set, read by the router before
+// runGlmMargins runs (its `post` replaces e() before the r() posting below).
+thread_local std::optional<std::pair<const SessionState*, MarginsFitInfoM4>> tGlmMarginsFit;
+}  // namespace
+
+void captureGlmMarginsFit(SessionState& session) {
+  tGlmMarginsFit.emplace(&session, marginsFitInfoM4(session));
+}
+
+void clearGlmMarginsFit() { tGlmMarginsFit.reset(); }
+
 void postGlmDydxRClass(SessionState& session, const ojson& block, const std::vector<std::string>& names,
                        const std::vector<double>& b, const std::vector<std::vector<double>>& V,
-                       const ojson& tableRows, const std::string& xvars, bool cluster) {
+                       const ojson& tableRows, const std::string& xvars, bool cluster,
+                       const std::vector<std::vector<double>>* jacobian) {
   MarginsRInfoM4 info;
   info.dydx = true;
   info.xvars = xvars;
   info.cluster = cluster;
+  if (tGlmMarginsFit.has_value() && tGlmMarginsFit->first == &session) {
+    // `margins, dydx()` without at(): the average marginal effects over the
+    // estimation sample, the rest of Stata's set as the grid path posts it
+    // (bank 78f09bd8 after `glm ..., family(binomial)`: r(title) "Average
+    // marginal effects", r(k_at) 0, r(xvars) "mpg weight" for dydx(*)).
+    info.fit = tGlmMarginsFit->second;
+    info.title = "Average marginal effects";
+    info.kAt = 0;
+    info.nKnown = true;
+    bool factor = false;
+    std::string xv;
+    for (const auto& nm : names) {
+      const std::string head = nm.substr(0, nm.find(':'));
+      factor = factor || head.find('.') != std::string::npos;
+      if ((" " + xv + " ").find(" " + head + " ") == std::string::npos) xv += (xv.empty() ? "" : " ") + head;
+    }
+    info.continuous = factor ? 0 : 1;
+    info.xvars = xv;
+    if (factor) info.bRow = "y1";
+    // r(Jacobian): the delta method's own d(effect)/d(e(b)) rows, over e(b)'s
+    // stripe in posted order (kept only when the widths agree).
+    if (jacobian != nullptr) info.jacobian = *jacobian;
+  }
+  tGlmMarginsFit.reset();
   postMarginsRClassM4(session, block, info, names, b, V, tableRows);
 }
 
@@ -1797,6 +2561,17 @@ ojson runMargins(const std::vector<std::string>& marginlist,
   if (lm.esample == LastModel::EsampleState::kNone)
     return eval::errorBlock("engine_error", "e(sample) does not identify the estimation sample",
                             std::nullopt, std::nullopt, std::nullopt, "r(322)");
+  // `poisson ..., iterate(#)` posts ml's iterate there; margins' poisson refits run
+  // to convergence and would answer for other coefficients than e(b)'s.
+  if (postestPoissonIterateFitM4(lm))
+    return eval::errorBlock("unsupported_option",
+                            "margins after `poisson ..., iterate(#)` is not supported in this version of "
+                            "PIET -- its re-fit runs to convergence, not to the iterate the fit posted; "
+                            "nothing was computed.",
+                            std::nullopt, std::nullopt, std::nullopt, "r(198)");
+  // An offset()/exposure() ML fit: margins' refits drop the offset (r(b) 83.93 for
+  // 220.88 after `poisson ..., exposure(pop)`); refused by name.
+  if (postestOffsetFitM4(lm)) return postestOffsetRejectM4("margins", lm);
   // BUG-1449: the fit's half of r(), read before any path's `post` replaces e().
   const MarginsFitInfoM4 fitInfo = marginsFitInfoM4(session);
   // FU-475: after a least-squares fit the engine's margins refit applies a TS
@@ -2339,6 +3114,25 @@ ojson runMargins(const std::vector<std::string>& marginlist,
                                                       : std::numeric_limits<double>::quiet_NaN();
           }
           if (vOk) {
+            // r(Jacobian): each cell's engine row d(effect)/d(beta), on e(b)'s stripe.
+            std::vector<std::vector<double>> rowsJ;
+            for (const auto& c : cells) {
+              std::vector<double> jr = marginsJRowM4(c.row);
+              const ojson& eq = raw["equations"][c.point];
+              if (jr.empty() && eq.contains("coefs") && eq["coefs"].is_array())
+                for (const auto& er : eq["coefs"])
+                  if (er.is_object() && er.value("name", std::string()) == c.var) {
+                    jr = marginsJRowM4(er);
+                    break;
+                  }
+              rowsJ.push_back(std::move(jr));
+            }
+            std::vector<std::string> jNames;
+            if (raw.contains("J_names") && raw["J_names"].is_array())
+              for (const auto& x : raw["J_names"])
+                if (x.is_string()) jNames.push_back(x.get<std::string>());
+            if (std::none_of(rowsJ.begin(), rowsJ.end(), [](const std::vector<double>& r) { return r.empty(); }))
+              info.jacobian = marginsEngineJacobianM4(rowsJ, jNames, fitInfo.ebNames);
             postMarginsRClassM4(session, block, info, names, bv, V, tableRows);
           } else {
             postMarginsRClassM4(session, block, info, {}, {}, {});
@@ -2347,7 +3141,11 @@ ojson runMargins(const std::vector<std::string>& marginlist,
           postMarginsRClassM4(session, block, info, {}, {}, {});
         }
       }
-      if (postOpt) postEstimationBlockM4(session, block, "margins", lm.depvar, lm.dataPath);
+      if (postOpt) {
+        const MarginsFitSampleM4 fs = marginsFitSampleM4(session);
+        postEstimationBlockM4(session, block, "margins", lm.depvar, lm.dataPath);
+        marginsPostRToEM4(session, fs);
+      }
       return block;
     }
     // BUG-188-nonOLS: mirror of the dydx+at() branch above. `margins, at(...)`
@@ -2664,7 +3462,18 @@ ojson runMargins(const std::vector<std::string>& marginlist,
   MarginsRInfoM4 info;
   info.leastSquares = leastSquares && !marginsNormalRefM4(lm);  // BUG-1549
   info.dydx = hasDydx;
-  if (hasDydx && !factorEffect && dydxVal->find('*') == std::string::npos) {
+  // dydx(*) over a fit whose e(b) has no factor and no interaction column is
+  // every covariate, each its own effect row, in e(b) order (vs-stata bank
+  // 3ca86257 `margins, dydx(*)` after `logit foreign mpg weight`: r(xvars)
+  // "mpg weight").
+  const bool dydxAllPlain =
+      hasDydx && dydxVal->find('*') != std::string::npos &&
+      std::none_of(fitInfo.ebNames.begin(), fitInfo.ebNames.end(), [](const std::string& nm) {
+        const size_t c = nm.rfind(':');
+        const std::string t = c == std::string::npos ? nm : nm.substr(c + 1);
+        return t.find('#') != std::string::npos || (!t.empty() && std::isdigit(static_cast<unsigned char>(t[0])));
+      });
+  if (hasDydx && !factorEffect && (dydxVal->find('*') == std::string::npos || dydxAllPlain)) {
     // In e(b) order, as the effects (StataBE 19.5 s4.do `dydx(x2 x1)` after
     // regress and after logit: r(xvars) "x1 x2"); the rows above are sorted so.
     std::string xv;
@@ -2709,6 +3518,7 @@ ojson runMargins(const std::vector<std::string>& marginlist,
   // asked for), not from every row cobra returned. Also after
   // lastMargins/lastMarginsDydx (just above), so marginsplot keeps working.
   if (postOpt) {
+    const MarginsFitSampleM4 fs = marginsFitSampleM4(session);
     postEstimationBlockM4(session, est, "margins", lm.depvar, lm.dataPath);
     if (linR) {
       // e(b)/e(V) are r(b)/r(V) (BUG-1237, StataBE `margins, dydx(c) post`:
@@ -2731,6 +3541,7 @@ ojson runMargins(const std::vector<std::string>& marginlist,
         if (!replaced) session.eval.eMatrices.emplace_back(nm, *m);
       }
     }
+    marginsPostRToEM4(session, fs);
   }
   return est;
 }

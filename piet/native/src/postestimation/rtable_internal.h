@@ -7,6 +7,7 @@
 #include "piet/eval/tokenizer.h"
 #include "vendor/nlohmann/json.hpp"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,16 @@ std::string omittedColumnName(const std::string& name);
 bool stataColumns(SessionState& session, const LastModel& lm, const ojson& ct,
                   std::vector<RtCol>& cols);
 void annotateEbStripe(SessionState& session);
+// baseOnly: post only the `(base)` notes (margins' table, whose other notes come
+// from its error codes).
+void postCoefficientLabels(SessionState& session, const eval::EvalMatrix& tbl, bool baseOnly = false);
+// The coefficient-table note of each column (`(base)`, `(omitted)`, `(empty)`,
+// `(constrained)`, "" for none); nullopt where it cannot be decided.
+std::vector<std::optional<std::string>> coefficientNotes(SessionState& session,
+                                                        const std::vector<std::string>& names,
+                                                        const std::vector<double>& b,
+                                                        const std::vector<double>& se,
+                                                        const std::vector<bool>& eform);
 
 std::string commandWord(const std::string& rawCmd);
 void postDefaultCmdline(SessionState& session);

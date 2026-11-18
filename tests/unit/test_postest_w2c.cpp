@@ -683,6 +683,20 @@ int test_postest_w2c_main() {
                "an unknown interaction stays not found", 0, 0);
     }
 
+    // A base-none column (`0bn.foreign`, `c.wage@1bn.race`, as mean / proportion post)
+    // is named without its `bn` (vs-stata bank f73b4f13 `nlcom _b[0.foreign]/_b[1.foreign]`,
+    // 873f8125 `test _b[c.wage@1.race] = _b[c.wage@2.race]`).
+    {
+        const std::vector<std::string> nm = {"0bn.foreign", "1.foreign"};
+        const auto a = postest::resolve_coef(nm, "0.foreign", nullptr);
+        expect(a.kind == postest::CoefKind::Column && a.idx == 0, "0.f resolves to 0bn.f",
+               static_cast<double>(a.idx), 0);
+        const std::vector<std::string> ov = {"c.wage@1bn.race", "c.wage@2.race", "c.wage@3.race"};
+        const auto b = postest::resolve_coef(ov, "_b[c.wage@1.race]", nullptr);
+        expect(b.kind == postest::CoefKind::Column && b.idx == 0, "c.w@1.r resolves to c.w@1bn.r",
+               static_cast<double>(b.idx), 0);
+    }
+
     // Abbreviated variables inside a coefficient name resolve against the model's
     // variables (StataBE uni-oracle/hz.do Z1/Z2: `1.treatment#1.husb`,
     // `_b[weight]`); two model candidates is not found (Z5).

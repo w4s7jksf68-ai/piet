@@ -81,7 +81,9 @@ void pushLoopBlock(ojson& allBlocks, bool& truncated, const ojson& b) {
     truncated = true;
     return;
   }
-  allBlocks.push_back(b);
+  // A loop body's lines are not echoed in Stata: `_continue` joins across
+  // the echo blocks PIET records (doexec::appendJoiningBodyContinue).
+  doexec::appendJoiningBodyContinue(allBlocks, b);
 }
 
 }  // namespace loops_detail
@@ -194,7 +196,30 @@ std::vector<std::string> splitForeachTokens(const std::string& itemsStr) {
   std::string s = trim(itemsStr);
   size_t i = 0;
   while (i < s.size()) {
-    if (s[i] == '"') {
+    if (s[i] == '`' && i + 1 < s.size() && s[i + 1] == '"') {
+      // Compound quotes `"..."' bind a token and are stripped like plain
+      // quotes; they nest, and the text inside may hold spaces and plain
+      // double quotes (levelsof's string local is a list of them).
+      size_t j = i + 2;
+      int depth = 1;
+      while (j < s.size()) {
+        if (s[j] == '`' && j + 1 < s.size() && s[j + 1] == '"') {
+          ++depth;
+          j += 2;
+        } else if (s[j] == '"' && j + 1 < s.size() && s[j + 1] == '\'') {
+          if (--depth == 0) break;
+          j += 2;
+        } else {
+          ++j;
+        }
+      }
+      if (j >= s.size()) {
+        tokens.push_back(s.substr(i + 2));
+        break;
+      }
+      tokens.push_back(s.substr(i + 2, j - i - 2));
+      i = j + 2;
+    } else if (s[i] == '"') {
       size_t j = s.find('"', i + 1);
       if (j == std::string::npos) {
         tokens.push_back(s.substr(i + 1));
@@ -980,6 +1005,19 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
       std::vector<std::string> tokens = splitForeachTokens(trim(m.str(2)));
+      // A name that is already a variable is r(110) `variable NAME already
+      // defined` before the loop runs (StataBE 19.5 `foreach v of newlist a
+      // price`, vs-stata bank 4200f3acfbe4e958).
+      if (session.hasData()) {
+        if (Datastore* ds = session.datastore()) {
+          for (const auto& t : tokens)
+            if (ds->has(t))
+              return ojson::array({eval::errorBlock("engine_error",
+                                                    "variable " + t + " already defined",
+                                                    std::nullopt, std::nullopt, std::nullopt,
+                                                    "r(110)")});
+        }
+      }
       return runForeach(m.str(1), tokens, bodyLines, session, dispatchFn);
     }
   }
@@ -1008,7 +1046,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   // `1(3)9` form is untouched — this is a syntactically distinct header.
   {
     static const std::regex re(
-        R"(^forvalues\s+([\w\x80-\xff]+)\s*=\s*([+-]?\d+(?:\.\d+)?)\s+([+-]?\d+(?:\.\d+)?)\s*(?:to|:)\s*([+-]?\d+(?:\.\d+)?))",
+        R"(^forvalues\s+([\w\x80-\xff]+)\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s+([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(?:to|:)\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?))",
         std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -1024,7 +1062,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   // forvalues i=START(STEP)END
   {
     static const std::regex re(
-        R"(^forvalues\s+([\w\x80-\xff]+)\s*=\s*([+-]?\d+(?:\.\d+)?)\s*\(([+-]?\d+(?:\.\d+)?)\)\s*([+-]?\d+(?:\.\d+)?))",
+        R"(^forvalues\s+([\w\x80-\xff]+)\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*\(([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\)\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?))",
         std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -1039,7 +1077,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   // forvalues i=START/END  (step=1)
   {
     static const std::regex re(
-        R"(^forvalues\s+([\w\x80-\xff]+)\s*=\s*([+-]?\d+(?:\.\d+)?)\s*/\s*([+-]?\d+(?:\.\d+)?))",
+        R"(^forvalues\s+([\w\x80-\xff]+)\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*/\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?))",
         std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -1120,6 +1158,12 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
     return runParallelBlock(hdr, bodyLines, session, dispatchFn);
   }
 
+  // A forvalues range none of the forms above reads (`forvalues i = a/b`,
+  // `forvalues i=1[2]9`) is r(198) invalid syntax (StataBE 19.5, vs-stata bank
+  // 6b7c9ac4d1c111cf, e9503e6063e0b502).
+  if (fw.size() >= 4 && std::string("forvalues").compare(0, fw.size(), fw) == 0)
+    return ojson::array({eval::errorBlock("engine_error", "invalid syntax", std::nullopt,
+                                          std::nullopt, std::nullopt, "r(198)")});
   return ojson::array({errBlock("loops: unrecognised loop header: '" + hdr + "'")});
 }
 

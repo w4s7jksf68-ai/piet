@@ -46,6 +46,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "piet/session_state.h"
 
@@ -80,6 +81,11 @@ inline const char* const kProgramBodyLocal = " __piet_progbody";
 // refused from then on instead of answering the default.
 inline const char* const kSetMarkerPrefix = " __piet_set_";
 
+// `set varabbrev off` is in force: a name stands only for the variable of that
+// exact name, never for one it merely begins ([U] 11.2; `~` patterns still
+// match). Every abbreviation resolver asks this one question.
+bool varAbbreviationOff(SessionState& session);
+
 // Resolves ONE c(name) (case-sensitive, matching Stata's own mostly-lowercase
 // c()-class naming). `session` is non-const: c(N)/c(k) may lazily construct
 // the Datastore (SessionState::datastore() is non-const).
@@ -103,6 +109,35 @@ std::string substituteCRefs(const std::string& expr, SessionState& session);
 // `function c() is not supported` at rc 1.
 // `rc` gets the code it carries (eval::cClassRefusalRc).
 std::optional<std::string> unservedCRefError(const std::string& expr, std::string* rc = nullptr);
+
+// The settings PIET keeps as values (environment/stata_settings.cpp): linesize,
+// pagesize, maxiter, adosize, niceness, reventries, maxdb, tracedepth,
+// dtascomplevel, fvwrap, linegap, timeout1/2, min_memory, max_memory,
+// segmentsize, emptycells, fvwrapon, scheme, showemptycells, showomitted, and
+// the edition's fixed limits (c(max_N_theory), c(max_k_theory),
+// c(max_width_theory), c(min_matsize), c(max_matsize), c(namelenchar)), and
+// c(mode) ("batch" in a headless `--do` run, "" with a window).
+// settingCValue answers c(NAME) for them: the value `set NAME` kept, else
+// StataBE 19.5's initial value; nullopt for any other name, and for a setting
+// whose value is not known (no measured default, or a value it did not keep).
+std::optional<CValue> settingCValue(const std::string& name, SessionState& session);
+
+// `set WORD ARGS...` for one of those settings: *handled = WORD names one (an
+// accepted abbreviation included), and then the value is checked as Stata checks
+// it and kept under kSetMarkerPrefix + the full name. A refusal carries Stata's
+// message and code (`linesize must be between 20 and 255`, r(198)).
+struct SettingRefusal {
+  std::string message;
+  std::string rc;  // digits only
+};
+bool isKeptStataSetting(const std::string& word);
+std::optional<SettingRefusal> storeStataSetting(const std::string& word,
+                                                const std::vector<std::string>& args,
+                                                SessionState& session, bool* handled);
+// A `set` word that only abbreviates one of those settings (one this table does
+// not take in short form) leaves the setting's value unknown: c() then refuses
+// by name rather than answer the default the do-file may have changed.
+void forgetAbbreviatedSetting(const std::string& word, SessionState& session);
 
 }  // namespace piet
 

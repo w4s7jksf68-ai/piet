@@ -692,21 +692,24 @@ void testC3BS039EreturnList() {
   check(text.find("e(V)") != std::string::npos && text.find("2 x 2") != std::string::npos,
         "C3/BS-039: e(V) dims 2 x 2");
 
-  // Regression guard: `ereturn list` with nothing estimated is an honest
-  // reject, not an empty/misleading dump.
+  // `ereturn list` with nothing estimated prints nothing at rc 0 (StataBE 19.5,
+  // vs-stata truth bank: `capture noisily ereturn list` shows no line after a
+  // command that posts no e()). This arm pinned r(301) "last estimates not
+  // found" until 2026-11-11; the captured error also cleared r().
   {
     std::string freshWorkdir = workdir + "_fresh";
     std::error_code ec2;
     fs::create_directories(freshWorkdir, ec2);
     piet::SessionState freshSession(freshWorkdir);
     auto blocksNone = piet::dispatch("ereturn list", freshSession);
-    bool sawNoModelError = false;
+    bool sawAnyBlock = false;
     for (const auto& b : blocksNone) {
-      if (b.is_object() && b.value("type", std::string()) == "error") sawNoModelError = true;
+      if (b.is_object() && (b.value("type", std::string()) == "error" ||
+                            b.value("type", std::string()) == "display"))
+        sawAnyBlock = true;
     }
-    check(sawNoModelError,
-          "C3/BS-039 regression guard: `ereturn list` with no estimation in memory is an "
-          "honest reject");
+    check(!sawAnyBlock,
+          "C3/BS-039: `ereturn list` with no estimation in memory prints nothing and is rc 0");
     fs::remove_all(freshWorkdir, ec2);
   }
 
@@ -880,6 +883,53 @@ void testG_BUG373DeclaredReturnsLock() {
             "BUG-373: datasignature publishes r(datasignature) — a do-file can compare it now");
     }
     fs::remove_all(wd2, ec2);
+  }
+
+  // Every r-class command REPLACES r(), also when its handler lays r() out in
+  // Stata's listing order (eval::orderRResults). That helper once re-posted the
+  // names it moved, so a result the PREVIOUS run of the same command left (and
+  // this run does not post) looked freshly written and survived the replacement:
+  // `tabulate c d` kept the r(chi2) of a `tabulate c d, chi2`, and `tsset t` the
+  // r(panelvar) of a `tsset id t` (integration build 2026-11-11). Stata: r(chi2)
+  // is `.` after a plain two-way tabulate (w2as_summary_stats_family.log:1159),
+  // r(panelvar) "" after a panel-less tset (BUG-1163.do, StataBE 2026-10-29); the
+  // other three are the same rule on the other re-laid commands.
+  {
+    std::string wd3 = (fs::temp_directory_path() / "piet_native_selftest_rorder_stale").u8string();
+    std::error_code ec3;
+    fs::remove_all(wd3, ec3);
+    fs::create_directories(wd3, ec3);
+    piet::SessionState s3(wd3);
+    for (const char* line :
+         {"clear", "set obs 60", "generate id = ceil(_n/6)", "generate t = mod(_n-1,6)+1",
+          "generate c = mod(_n,4)", "generate d = mod(_n*7,3)", "generate year = _n",
+          "generate x1 = mod(_n*7,11) + mod(_n,5)/10", "generate x2 = mod(_n*3,5) + mod(_n*13,7)/10"})
+      (void)piet::dispatch(line, s3);
+    auto shown3 = [&s3](const std::string& expr) {
+      auto blocks = piet::dispatch("display " + expr, s3);
+      const auto* d = firstBlockOfTypeD1(blocks, "display");
+      return d == nullptr ? std::string("<none>") : d->value("text", std::string());
+    };
+    std::string got;
+    bool ok = true;
+    auto leg = [&](const char* with, const char* without, const std::string& expr,
+                   const std::string& want) {
+      (void)piet::dispatch(std::string("quietly ") + with, s3);
+      const std::string had = shown3(expr);
+      (void)piet::dispatch(std::string("quietly ") + without, s3);
+      const std::string now = shown3(expr);
+      got += std::string(" [") + without + ": " + expr + " `" + now + "` (after `" + with +
+             "`: `" + had + "`)]";
+      if (had == want || had == "<none>" || now != want) ok = false;
+    };
+    leg("tabulate c d, chi2", "tabulate c d", "r(chi2)", ".");
+    leg("tabulate c d, gamma", "tabulate c", "r(c)", ".");
+    leg("tsset id t", "tsset year", "\"<`r(panelvar)'>\"", "<>");
+    leg("summarize x1, detail", "summarize x1", "r(p50)", ".");
+    leg("correlate x1 x2, covariance", "correlate x1 x2", "r(cov_12)", ".");
+    check(ok, "r() order: a command re-run without the option that posted a result leaves "
+              "that result `.`/empty, never the previous run's value." + got);
+    fs::remove_all(wd3, ec3);
   }
 
   fs::remove_all(workdir, ec);

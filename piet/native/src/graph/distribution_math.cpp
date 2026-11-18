@@ -318,8 +318,20 @@ std::vector<double> kdensityAt(const std::vector<double>& x, const std::vector<d
       continue;
     }
     double acc = 0.0;
+    // The rectangle kernel is the one kernel that is not 0 at the edge of its
+    // support, so the edge test decides its value. StataBE's is a window on the
+    // data scale, p - h < x < p + h (strict), not |(p - x)/h| < 1: the two part
+    // when the grid's first point is min - h, where (p - x)/h rounds to
+    // -0.9999999999999998 but (min - h) + h == min. Measured: auto price,
+    // rectangle, r(scale) 284.55578673702786 (the quotient test gives
+    // 283.65529374102465, one observation more in the first window).
+    const bool window = kernel == "rectangle";
     for (size_t i = 0; i < x.size(); ++i) {
-      const double kv = K((p - x[i]) / h);
+      double kv;
+      if (window)
+        kv = (x[i] > p - h && x[i] < p + h) ? 0.5 : 0.0;
+      else
+        kv = K((p - x[i]) / h);
       acc += weighted ? w[i] * kv : kv;
     }
     dens[j] = acc / divisor;

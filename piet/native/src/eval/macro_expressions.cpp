@@ -751,6 +751,18 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
   // subscript (substituteVarSubscripts skips both).
   if (session != nullptr && session->varObs && cleaned.find('[') != std::string::npos)
     cleaned = substituteVarSubscripts(cleaned, *session, nullptr, nullptr, &litSpans);
+  // `**` is no Stata operator (power is `^`): `display 2**3` is r(198) "2*
+  // invalid name" (vs-stata bank 60defc91f5222239), where the evaluator's own
+  // power operator answered 8. The literals are placeholders here.
+  if (const size_t star = cleaned.find("**"); star != std::string::npos) {
+    size_t w = star;
+    while (w > 0 && (std::isalnum(static_cast<unsigned char>(cleaned[w - 1])) ||
+                     cleaned[w - 1] == '_' || cleaned[w - 1] == '.'))
+      --w;
+    if (raisedError) *raisedError = "r(198): " + cleaned.substr(w, star - w) + "* invalid name";
+    dprof::ezoneEnd(dprof::kEEvalArithPre);
+    return std::nullopt;
+  }
   // ^ -> ** (Stata exponentiation)
   {
     std::string tmp;
@@ -807,7 +819,8 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
     if (cleaned.find('[') != std::string::npos || lower.find("colsof") != std::string::npos ||
         lower.find("rowsof") != std::string::npos || lower.find("colnumb") != std::string::npos ||
         lower.find("rownumb") != std::string::npos ||
-        lower.find("el(") != std::string::npos || lower.find("mreldif") != std::string::npos) {
+        lower.find("el(") != std::string::npos || lower.find("mreldif") != std::string::npos ||
+        lower.find("det(") != std::string::npos || lower.find("trace(") != std::string::npos) {
       cleaned = substituteMatrixRefs(cleaned, *session);
       // FU-118: a matrix operand the pass could not answer is a named error
       // here, on the r(NNN) channel every caller already maps (display,
@@ -1172,6 +1185,8 @@ std::optional<std::string> evalMacroExpr(const std::string& expr, EvalSession& s
     if (whole) return whole;
   }
 
+  // `**` is no Stata operator: left to evalArith, which refuses it.
+  if (cleaned.find("**") != std::string::npos) return std::nullopt;
   {
     std::string tmp;
     tmp.reserve(cleaned.size() + 8);
@@ -1197,7 +1212,8 @@ std::optional<std::string> evalMacroExpr(const std::string& expr, EvalSession& s
     std::string lower = toLower(cleaned);
     if (cleaned.find('[') != std::string::npos || lower.find("colsof") != std::string::npos ||
         lower.find("rowsof") != std::string::npos || lower.find("el(") != std::string::npos ||
-        lower.find("mreldif") != std::string::npos) {
+        lower.find("mreldif") != std::string::npos || lower.find("det(") != std::string::npos ||
+        lower.find("trace(") != std::string::npos) {
       cleaned = substituteMatrixRefs(cleaned, session);
     }
   }

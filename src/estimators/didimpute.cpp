@@ -273,17 +273,21 @@ DidImputeResult didimpute_run(const double* y, const double* ivar, const double*
     // cells are an error, and an error must not ship a coefficient payload
     // computed off the very sample the caller has not agreed to drop.
     std::vector<std::string> lost;
-    for (double h : cfg.horizons) {
+    // The estimated rows: one per requested horizon, or the single pooled `tau`.
+    const std::vector<double> rowsH = cfg.pooled ? std::vector<double>{0.0} : cfg.horizons;
+    auto rowName = [&](double h) { return cfg.pooled ? std::string("tau") : "tau" + fmt_h(h); };
+    auto inRow = [&](int64_t i, double h) { return cfg.pooled || time[i] - treat_time[i] == h; };
+    for (double h : rowsH) {
         int64_t all_cells = 0, ok_cells = 0;
         for (int64_t i = 0; i < n_obs; ++i) {
             if (!treated[static_cast<size_t>(i)]) continue;
-            if (time[i] - treat_time[i] != h) continue;
+            if (!inRow(i, h)) continue;
             ++all_cells;
             if (imputable(i)) ++ok_cells;
         }
         if (all_cells > ok_cells) {
             R.n_dropped += all_cells - ok_cells;
-            lost.push_back("tau" + fmt_h(h));
+            lost.push_back(rowName(h));
         }
     }
     if (!lost.empty() && !cfg.autosample) {
@@ -310,15 +314,15 @@ DidImputeResult didimpute_run(const double* y, const double* ivar, const double*
     std::vector<double> vrow(static_cast<size_t>(n_obs));
     std::vector<double> eps(static_cast<size_t>(n_obs));
     std::vector<double> cs(static_cast<size_t>(NC));
-    for (double h : cfg.horizons) {
+    for (double h : rowsH) {
         DidImputeCoef row;
-        row.name = "tau" + fmt_h(h);
+        row.name = rowName(h);
         row.horizon = h;
         std::vector<int64_t> cells;
         int64_t all_cells = 0;
         for (int64_t i = 0; i < n_obs; ++i) {
             if (!treated[static_cast<size_t>(i)]) continue;
-            if (time[i] - treat_time[i] != h) continue;
+            if (!inRow(i, h)) continue;
             ++all_cells;
             if (imputable(i)) cells.push_back(i);
         }
@@ -360,14 +364,16 @@ DidImputeResult didimpute_run(const double* y, const double* ivar, const double*
         }
         // Treated-cell residuals: deviation from the cell's own (cohort, horizon)
         // mean, so cross-cohort effect heterogeneity is not read as noise.
-        std::map<double, std::pair<double, double>> coh;  // cohort -> (sum, count)
+        // (cohort, period): within one horizon the period is the cohort's, so the
+        // key is the cohort there; the pooled row spans every period.
+        std::map<std::pair<double, double>, std::pair<double, double>> coh;  // -> (sum, count)
         for (int64_t i : cells) {
-            auto& s = coh[treat_time[i]];
+            auto& s = coh[{treat_time[i], cfg.pooled ? time[i] : 0.0}];
             s.first += y[i] - fitted(i);
             s.second += 1.0;
         }
         for (int64_t i : cells) {
-            const auto& s = coh[treat_time[i]];
+            const auto& s = coh[{treat_time[i], cfg.pooled ? time[i] : 0.0}];
             vrow[static_cast<size_t>(i)] = 1.0 / nh;
             eps[static_cast<size_t>(i)] = (y[i] - fitted(i)) - s.first / s.second;
         }

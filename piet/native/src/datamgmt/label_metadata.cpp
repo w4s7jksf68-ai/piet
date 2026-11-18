@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "piet/eval/result_order.h"  // orderRResults (label list lists r() as Stata does)
 #include "piet/bcal.h"
 // Copyright (C) 2026 M.K. Kim
 // Label metadata.
@@ -19,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
@@ -26,7 +28,9 @@
 #include "piet/cobra_runner.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/exprfns.h"  // BUG-540: stataMissingWithKind — `.a`-`.z` identity in matrix literals
+#include "piet/cclass.h"  // settingCValue: c(linesize)
 #include "piet/eval/macros.h"
+#include "piet/eval/result_order.h"  // orderRResults
 #include "piet/eval/pyvalue.h"
 #include "piet/inrange_filter.h"
 #include "piet/mutation_result.h"
@@ -128,6 +132,10 @@ ojson runLabelValues(const std::string& varname, const std::optional<std::string
     session.valueLabels.erase(varname);
     return ojson::array();
   }
+  // A value-label name obeys the variable-name rule (<= 32 characters ...):
+  // Stata answers `<name> invalid name`, r(198), and attaches nothing.
+  if (!strutil::isValidStataIdentifier(*lblname))
+    return engineErrorBlockRc(*lblname + " invalid name", 198);
   session.varLblname[varname] = *lblname;
   refreshValueLabelsForVar(session, varname, *lblname);
   if (!nofix) widenFormatForSet(session, varname, *lblname);
@@ -198,6 +206,15 @@ ojson runFormat(const std::vector<std::string>& varlist, const std::string& fmt,
   for (const auto& v : varlist) {
     if (!ds->has(v)) return engineErrorBlockRc("variable " + v + " not found", 111);
   }
+  // One format cannot serve a varlist that holds both kinds: Stata refuses the
+  // mixed list before it looks at the format (vs-stata bank ae57bdf9e2fd451c,
+  // `format _all %9.0g` on auto: r(109)).
+  if (!fmt.empty()) {
+    bool anyStr = false, anyNum = false;
+    for (const auto& v : varlist) (ds->dtype(v) == "factor" ? anyStr : anyNum) = true;
+    if (anyStr && anyNum)
+      return engineErrorBlockRc("varlist must contain all numeric or all string variables", 109);
+  }
   if (fmt.empty()) {
     // `format [varlist]` with no %fmt displays the current formats ([D] format:
     // "format varlist lists the formats for the specified variables"; `format`
@@ -229,6 +246,15 @@ ojson runFormat(const std::vector<std::string>& varlist, const std::string& fmt,
   // string variable, is refused before any variable is touched: a half-applied
   // `format` would leave the varlist in a state no Stata run produces.
   const bool strFmt = isStringDisplayFormat(fmt);
+  // A varlist that mixes numeric and string variables is r(109) whatever the
+  // format (bank import delimited cell 70dde59a94b86c14: `format _all %21.0g`
+  // over a byte and a str1; 1a48b1a8925d00c1 `format p* m* %8.1f` over price mpg make).
+  {
+    bool anyStr = false, anyNum = false;
+    for (const auto& v : varlist) (ds->dtype(v) == "factor" ? anyStr : anyNum) = true;
+    if (anyStr && anyNum)
+      return engineErrorBlockRc("varlist must contain all numeric or all string variables", 109);
+  }
   for (const auto& v : varlist) {
     const bool strVar = ds->dtype(v) == "factor";
     if (strFmt && !strVar)
@@ -512,6 +538,8 @@ ojson runLabelList(const std::vector<std::string>& namesIn, SessionState& sessio
     session.eval.rValues.set("min", sorted.empty() ? nan : static_cast<double>(sorted.front().first));
     session.eval.rValues.set("max", sorted.empty() ? nan : static_cast<double>(sorted.back().first));
     session.eval.rValues.set("hasemiss", emiss.empty() ? 0.0 : 1.0);
+    // Stata lists them `min max hasemiss k` (vs-stata truth bank).
+    eval::orderRResults(session.eval, {"min", "max", "hasemiss", "k"});
   }
 
   std::string joined;
@@ -556,71 +584,508 @@ ojson runLabelDir(SessionState& session) {
   return block;
 }
 
-ojson runLabelbook(const std::vector<std::string>& namesIn, SessionState& session) {
-  std::vector<std::string> lblnames = namesIn;
-  if (lblnames.empty()) {
-    for (const auto& [name, _] : session.labelDefs) lblnames.push_back(name);
-    std::sort(lblnames.begin(), lblnames.end());
+namespace {
+
+// One value of a value label: a code (an integer, or an extended missing
+// `.a`-`.z`) and its text, ordered as Stata sorts a value: numbers first, then
+// the missing codes in the order .a < .b < ... < .z.
+struct LbValue {
+  bool missing = false;
+  long long num = 0;
+  int missIdx = 0;
+  std::string codeText;
+  std::string text;
+  double rnd = 0;  // the uniform() draw list() selects the sample by
+  bool show = true;
+};
+
+bool lbValueLess(const LbValue& a, const LbValue& b) {
+  if (a.missing != b.missing) return !a.missing;
+  return a.missing ? a.missIdx < b.missIdx : a.num < b.num;
+}
+
+// Text that real() reads as a number: optional blanks, a decimal number with an
+// optional exponent, no `.` alone (that is missing).
+bool lbRealIsNumber(const std::string& t) {
+  size_t i = 0, n = t.size();
+  while (i < n && std::isspace(static_cast<unsigned char>(t[i]))) ++i;
+  while (n > i && std::isspace(static_cast<unsigned char>(t[n - 1]))) --n;
+  if (i >= n) return false;
+  const std::string core = t.substr(i, n - i);
+  static const std::regex reNum(R"(^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$)");
+  return std::regex_match(core, reNum);
+}
+
+size_t lbUtf8Len(const std::string& t) {
+  size_t n = 0;
+  for (unsigned char c : t)
+    if ((c & 0xC0) != 0x80) ++n;
+  return n;
+}
+
+std::string lbUtf8Prefix(const std::string& t, size_t chars) {
+  size_t n = 0, i = 0;
+  while (i < t.size()) {
+    if ((static_cast<unsigned char>(t[i]) & 0xC0) != 0x80) {
+      if (n == chars) break;
+      ++n;
+    }
+    ++i;
   }
+  return t.substr(0, i);
+}
+
+// A paragraph as SMCL sets it ({p first cont}): greedy word wrap at `width`,
+// the first line indented `first`, the rest `cont`.
+std::vector<std::string> lbWrap(const std::string& lead, const std::string& body, size_t width,
+                                size_t cont) {
+  std::vector<std::string> out;
+  std::string line = lead;
+  bool lineHasWord = !strutil::trim(lead).empty();
+  std::istringstream words(body);
+  std::string w;
+  while (words >> w) {
+    if (lineHasWord && line.size() + 1 + w.size() > width) {
+      out.push_back(line);
+      line = std::string(cont, ' ');
+      lineHasWord = false;
+    }
+    if (lineHasWord) line += " ";
+    line += w;
+    lineHasWord = true;
+  }
+  out.push_back(line);
+  return out;
+}
+
+std::string lbPad(const std::string& s, size_t col) {  // move to 1-based column `col`
+  return s.size() + 1 >= col ? s : s + std::string(col - 1 - s.size(), ' ');
+}
+
+}  // namespace
+
+// `codebook`'s problem lists, from codebook's own per-variable tests: a variable
+// with fewer than two distinct non-missing values is constant (or all missing); a
+// value label attached but not defined; a labeled variable with a non-missing
+// value that has no label text (or whose text is the code itself); a str# whose
+// longest value is shorter than its width; string values with leading, trailing,
+// or (after trimming) embedded blanks; a date-formatted variable with
+// non-integer values. A variable appears once in a list.
+ojson runCodebookProblems(Datastore& ds, const std::vector<std::string>& names,
+                          SessionState& session, bool report) {
+  std::vector<std::string> cons, labelnotfound, notlabeled, strType, strLeading, strTrailing,
+      strEmbedded, realdate;
+  const int64_t n = ds.nRows();
+  auto addOnce = [](std::vector<std::string>& v, const std::string& nm) {
+    if (std::find(v.begin(), v.end(), nm) == v.end()) v.push_back(nm);
+  };
+  for (const auto& nm : names) {
+    const std::string dt = ds.dtype(nm);
+    const cecon::Column& col = ds.col(nm);
+    if (dt == "factor") {
+      const int32_t* codes = col.codes();
+      std::set<std::string> distinct;
+      bool lead = false, trail = false, embedded = false;
+      size_t longest = 0;
+      for (int64_t r = 0; r < n; ++r) {
+        const int32_t c = codes[r];
+        const std::string v = (c >= 0 && static_cast<size_t>(c) < col.levels.size())
+                                  ? col.levels[static_cast<size_t>(c)]
+                                  : std::string();
+        longest = std::max(longest, v.size());
+        if (!v.empty()) distinct.insert(v);
+        if (!v.empty() && v.front() == ' ') lead = true;
+        if (!v.empty() && v.back() == ' ') trail = true;
+        size_t b = v.find_first_not_of(' '), e = v.find_last_not_of(' ');
+        if (b != std::string::npos && v.find(' ', b) != std::string::npos && v.find(' ', b) < e)
+          embedded = true;
+      }
+      if (distinct.size() < 2) addOnce(cons, nm);
+      const auto mi = session.varMeta.find(nm);
+      if (mi != session.varMeta.end() && mi->second.stataType.has_value()) {
+        const std::string& ty = *mi->second.stataType;
+        if (ty.size() > 3 && ty.compare(0, 3, "str") == 0 && ty != "strL") {
+          try {
+            if (n > 0 && static_cast<size_t>(std::stoul(ty.substr(3))) != longest) addOnce(strType, nm);
+          } catch (const std::exception&) {
+          }
+        }
+      }
+      if (lead) addOnce(strLeading, nm);
+      if (trail) addOnce(strTrailing, nm);
+      if (embedded) addOnce(strEmbedded, nm);
+      continue;
+    }
+    const double* d = col.f64();
+    std::set<double> distinct;
+    bool nonint = false;
+    for (int64_t r = 0; r < n; ++r) {
+      if (std::isnan(d[r])) continue;
+      distinct.insert(d[r]);
+      if (d[r] != std::round(d[r])) nonint = true;
+    }
+    if (distinct.size() < 2) addOnce(cons, nm);
+    // Date-formatted: the second character of the format is d or t and, for t,
+    // the third names a period codebook knows (else it is described as a number).
+    const std::string fmt = session.displayFormat(ds.varinfo(nm));
+    if (fmt.size() >= 3 && nonint) {
+      const char c1 = fmt[1], c2 = fmt[2];
+      if (c1 == 'd' || (c1 == 't' && std::string("dwmqhy").find(c2) != std::string::npos))
+        addOnce(realdate, nm);
+    }
+    const auto li = session.varLblname.find(nm);
+    if (li != session.varLblname.end() && !li->second.empty()) {
+      const auto def = session.labelDefs.find(li->second);
+      if (def == session.labelDefs.end()) {
+        addOnce(labelnotfound, nm);
+      } else {
+        int uncoded = 0;
+        for (double v : distinct) {
+          char buf[64];
+          if (v == std::round(v) && std::fabs(v) < 1e15) {
+            std::snprintf(buf, sizeof(buf), "%.0f", v);
+          } else {
+            uncoded++;
+            continue;
+          }
+          const auto t = def->second.find(buf);
+          if (t == def->second.end() || t->second == buf) uncoded++;
+        }
+        if (uncoded > 0) addOnce(notlabeled, nm);
+      }
+    }
+  }
+  auto join = [](const std::vector<std::string>& v) {
+    std::string out;
+    for (const auto& x : v) out += (out.empty() ? "" : " ") + x;
+    return out;
+  };
+  const bool changed = report && !session.currentFile().empty() && session.datasetChanged;
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted;
+  auto post = [&](const char* key, const std::string& val) {
+    if (val.empty()) return;
+    session.eval.rStrings.set(key, val);
+    posted.push_back(key);
+  };
+  post("datachanged", changed ? "1" : "");
+  post("cons", join(cons));
+  post("labelnotfound", join(labelnotfound));
+  post("notlabeled", join(notlabeled));
+  post("str_type", join(strType));
+  post("str_leading", join(strLeading));
+  post("str_trailing", join(strTrailing));
+  post("str_embedded", join(strEmbedded));
+  post("realdate", join(realdate));
+  eval::declareRPosted(session.eval, "codebook", posted);
+  if (!report) return ojson();
+
+  int ls = 80;
+  if (auto lv = settingCValue("linesize", session)) {
+    try {
+      ls = std::stoi(lv->text);
+    } catch (const std::exception&) {
+    }
+  }
+  std::string dataset = "[unnamed]";
+  if (const std::string cf = session.currentFile(); !cf.empty()) {
+    // _shortenpath: past linesize-36 characters the leading directories become
+    // `*`, cut at a separator, until the rest fits.
+    const size_t len = static_cast<size_t>(std::max(ls - 36, 1));
+    dataset = cf;
+    if (dataset.size() > len) {
+      std::string rest = dataset;
+      if (!rest.empty() && rest[0] == '/') rest = rest.substr(1);
+      std::string sep = "/";
+      while (rest.size() > len - 1 - 1) {
+        const size_t at = rest.find('/');
+        if (at == std::string::npos) break;
+        rest = rest.substr(at + 1);
+      }
+      dataset = "*" + sep + rest;
+    }
+  }
+  std::vector<std::string> lines;
+  size_t len = 0;
+  for (const auto* l : {&cons, &labelnotfound, &notlabeled, &strType, &strLeading, &strTrailing,
+                        &strEmbedded, &realdate})
+    len = std::max(len, join(*l).size());
+  lines.push_back("");
+  if (len == 0) {
+    lines.push_back("No potential problems in dataset " + dataset);
+  } else {
+    lines.push_back("Potential problems in dataset " + dataset);
+    lines.push_back("");
+    const size_t hlen = std::min<size_t>(std::max<size_t>(35 + len, 50), static_cast<size_t>(ls));
+    lines.push_back(std::string(15, ' ') + "Potential problem   Variables");
+    lines.push_back(std::string(hlen, '-'));
+    auto msg = [&](const std::vector<std::string>& v, const std::string& txt) {
+      if (v.empty()) return;
+      const size_t pad = txt.size() < 32 ? 32 - txt.size() : 0;
+      for (const auto& l : lbWrap(std::string(pad, ' ') + txt + "  ", join(v), static_cast<size_t>(ls), 35))
+        lines.push_back(l);
+    };
+    msg(cons, "constant (or all missing) vars");
+    msg(labelnotfound, "vars with nonexisting label");
+    msg(notlabeled, "incompletely labeled vars");
+    msg(strType, "str# vars that may be compressed");
+    msg(strLeading, "string vars with leading blanks");
+    msg(strTrailing, "string vars with trailing blanks");
+    msg(strEmbedded, "string vars with embedded blanks");
+    msg(realdate, "noninteger-valued date vars");
+    lines.push_back(std::string(hlen, '-'));
+  }
+  std::string text;
+  for (size_t i = 0; i < lines.size(); ++i) text += (i ? "\n" : "") + lines[i];
+  ojson b;
+  b["type"] = "display";
+  b["text"] = text;
+  return b;
+}
+
+ojson runLabelbook(const std::vector<std::string>& namesIn, SessionState& session,
+                   const LabelbookOptions& opt) {
+  // labelbook.ado: `length(#)` is in 1..c(maxstrvarlen) (2045); `list(#)` >= 0;
+  // `detail` is the default unless `problems` is given.
+  if (opt.length < 1 || opt.length > 2045)
+    return engineErrorBlockRc("length() should be in range [1,2045]", 198);
+  if (opt.list < 0) return engineErrorBlockRc("list() should be positive", 198);
+  const bool showDetail = opt.detail || !opt.problems;
+  int ls = 80;
+  if (auto lv = settingCValue("linesize", session)) {
+    try {
+      ls = std::stoi(lv->text);
+    } catch (const std::exception&) {
+    }
+  }
+  const size_t sh = static_cast<size_t>(opt.length);
+
+  // The label sets walked: those named (already checked to exist), else every
+  // one, in the order Stata sorts a name.
+  std::vector<std::string> lblnames = namesIn;
+  if (lblnames.empty())
+    for (const auto& [name, _] : session.labelDefs) lblnames.push_back(name);
+  std::sort(lblnames.begin(), lblnames.end());
+  lblnames.erase(std::unique(lblnames.begin(), lblnames.end()), lblnames.end());
   if (lblnames.empty()) {
+    // uselabel leaves no observations: nothing to report, r() left empty.
+    eval::replaceRClass(session.eval);
+    eval::declareRPosted(session.eval, "labelbook", {});
     ojson block;
     block["type"] = "display";
     block["text"] = "(no value labels defined)";
     return block;
   }
 
-  std::vector<std::string> lines;
-  std::vector<std::string> errors;
-  bool first = true;
-  for (const auto& name : lblnames) {
-    auto it = session.labelDefs.find(name);
-    if (it == session.labelDefs.end()) {
-      errors.push_back(name);
-      continue;
+  // The variables each label set is attached to, in dataset order.
+  std::vector<std::string> varOrder;
+  if (session.hasData()) {
+    if (const std::vector<VarInfo>* card = session.residentReadCard()) {
+      for (const auto& v : *card) varOrder.push_back(v.name);
+    } else if (Datastore* ds = session.datastore()) {
+      varOrder = ds->names();
     }
-    if (!first) lines.push_back("");
-    first = false;
-    lines.push_back(std::string(88, '-'));
-    lines.push_back("Value label " + name);
-    lines.push_back(std::string(88, '-'));
-    lines.push_back("  Definition");
-    std::vector<std::pair<int, std::string>> sorted;
-    for (const auto& [codeStr, text] : it->second) {
-      try {
-        sorted.emplace_back(std::stoi(codeStr), text);
-      } catch (const std::exception&) {
+  }
+
+  std::vector<std::string> lines;
+  std::string vlGaps, vlNumeric, vlBlanks, vlNull, vlNuniq, vlNuniqSh, vlNotused, alab;
+  auto addTo = [](std::string& list, const std::string& name) {
+    list += (list.empty() ? "" : " ") + name;
+  };
+  for (const auto& name : lblnames) {
+    const auto defIt = session.labelDefs.find(name);
+    if (defIt == session.labelDefs.end()) continue;
+    std::vector<LbValue> vals;
+    for (const auto& [codeStr, text] : defIt->second) {
+      LbValue v;
+      v.codeText = codeStr;
+      v.text = text;
+      if (!codeStr.empty() && codeStr[0] == '.') {
+        v.missing = true;
+        v.missIdx = codeStr.size() >= 2 ? codeStr[1] - 'a' + 1 : 0;
+      } else {
+        try {
+          v.num = std::stoll(codeStr);
+        } catch (const std::exception&) {
+          continue;
+        }
+      }
+      vals.push_back(std::move(v));
+    }
+    if (vals.empty()) continue;
+    // list(#) shows a random sample of each set's definitions: labelbook draws one uniform() per
+    // entry, the data in (label name, value) order, from the session's stream, and keeps the # entries
+    // of each set with the smallest draws.
+    if (opt.list != 32000) {
+      std::sort(vals.begin(), vals.end(), [](const LbValue& a, const LbValue& b) { return lbValueLess(a, b); });
+      for (auto& v : vals) v.rnd = session.seed.stream().runiform();
+      std::vector<double> r;
+      for (const auto& v : vals) r.push_back(v.rnd);
+      std::sort(r.begin(), r.end());
+      const size_t keep = static_cast<size_t>(std::max<long long>(opt.list, 0));
+      if (keep < r.size()) {
+        const double cut = r[keep - (keep > 0 ? 1 : 0)];
+        for (auto& v : vals) v.show = keep > 0 && v.rnd <= cut;
       }
     }
-    std::sort(sorted.begin(), sorted.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
-    for (const auto& [code, text] : sorted) {
-      char buf[16];
-      std::snprintf(buf, sizeof(buf), "%6d", code);
-      lines.push_back(std::string(buf) + "   " + text);
+    if (opt.alpha)
+      std::sort(vals.begin(), vals.end(), [](const LbValue& a, const LbValue& b) {
+        if (a.text != b.text) return a.text < b.text;
+        return lbValueLess(a, b);
+      });
+    else
+      std::sort(vals.begin(), vals.end(), [](const LbValue& a, const LbValue& b) {
+        if (lbValueLess(a, b)) return true;
+        if (lbValueLess(b, a)) return false;
+        return a.text < b.text;
+      });
+    addTo(alab, name);
+
+    // Per-set facts, as labelbook computes them.
+    const size_t n = vals.size();
+    size_t nmiss = 0;
+    bool lNull = false, lBlanks = false, lNum = false, dupFull = false, dupSh = false;
+    size_t lMin = std::string::npos, lMax = 0;
+    std::map<std::string, int> seenFull, seenSh;
+    bool haveNum = false;
+    long long vmin = 0, vmax = 0;
+    for (const auto& v : vals) {
+      if (v.missing) {
+        ++nmiss;
+      } else {
+        if (!haveNum || v.num < vmin) vmin = v.num;
+        if (!haveNum || v.num > vmax) vmax = v.num;
+        haveNum = true;
+      }
+      const std::string tr = strutil::trim(v.text);
+      if (tr.empty()) lNull = true;
+      if (tr != v.text) lBlanks = true;
+      if (lbRealIsNumber(v.text)) lNum = true;
+      lMin = std::min(lMin, v.text.size());
+      lMax = std::max(lMax, v.text.size());
+      if (++seenFull[v.text] > 1) dupFull = true;
+      if (++seenSh[lbUtf8Prefix(v.text, sh)] > 1) dupSh = true;
     }
-    // Attached variables: session.varLblname is varname -> lblname (the
-    // reverse index of session.labelDefs' lblname -> {code:text}).
-    std::vector<std::string> vars;
-    for (const auto& [varname, lname] : session.varLblname) {
-      if (lname == name) vars.push_back(varname);
+    const long long gap = haveNum ? (vmax - vmin + 1) - static_cast<long long>(n - nmiss) : 0;
+    if (dupFull) addTo(vlNuniq, name);
+    if (dupSh) addTo(vlNuniqSh, name);
+    if (lNull) addTo(vlNull, name);
+    if (lBlanks) addTo(vlBlanks, name);
+    if (gap > 0) addTo(vlGaps, name);
+    if (lNum) addTo(vlNumeric, name);
+    std::string vars;
+    for (const auto& vn : varOrder) {
+      const auto it = session.varLblname.find(vn);
+      if (it != session.varLblname.end() && it->second == name) vars += (vars.empty() ? "" : " ") + vn;
     }
-    std::sort(vars.begin(), vars.end());
-    std::string varsJoined;
-    for (size_t i = 0; i < vars.size(); ++i) {
-      if (i) varsJoined += " ";
-      varsJoined += vars[i];
+    if (vars.empty()) addTo(vlNotused, name);
+
+    if (!showDetail) continue;
+    const std::string rule(static_cast<size_t>(ls), '-');
+    lines.push_back("");
+    lines.push_back(rule);
+    lines.push_back("Value label " + name + " ");
+    lines.push_back(rule);
+    lines.push_back("");
+    lines.push_back(lbPad("", 7) + "Values" + std::string(36, ' ') + "Labels");
+    const std::string minTxt = haveNum ? std::to_string(vmin) : vals.front().codeText;
+    const std::string maxTxt = haveNum ? std::to_string(vmax) : std::string(".");
+    lines.push_back(lbPad(lbPad("", 8) + "Range:  [" + minTxt + "," + maxTxt + "]", 42) +
+                    "String length:  [" + std::to_string(lMin) + "," + std::to_string(lMax) + "]");
+    lines.push_back(lbPad(lbPad("", 12) + "N:  " + std::to_string(n), 34) +
+                    "Unique at full length:  " + (dupFull ? "no" : "yes"));
+    {
+      std::string lab = "Unique at length " + std::to_string(sh) + ":";
+      if (lab.size() < 20) lab = std::string(20 - lab.size(), ' ') + lab;
+      lines.push_back(lbPad(lbPad("", 9) + "Gaps:  " + (gap > 0 ? "yes" : "no"), 36) + lab + "  " +
+                      (dupSh ? "no" : "yes"));
+    }
+    lines.push_back(lbPad(lbPad("", 3) + "Missing .*:  " + std::to_string(nmiss), 44) +
+                    "Null string:  " + (lNull ? "yes" : "no"));
+    lines.push_back(lbPad("", 32) + "Leading/trailing blanks:  " + (lBlanks ? "yes" : "no"));
+    lines.push_back(lbPad("", 37) + "Numeric -> numeric:  " + (lNum ? "yes" : "no"));
+    if (opt.list > 0) {
+      lines.push_back("  Definition");
+      if (static_cast<long long>(n) > opt.list)
+        lines.push_back(lbPad("", 8) + std::to_string(opt.list) + " random examples out of " +
+                        std::to_string(n) + " labels");
+      if (static_cast<long long>(n) > opt.list) lines.push_back("");
+      for (const auto& v : vals) {
+        if (!v.show) continue;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%12s", v.codeText.c_str());
+        if (strutil::trim(v.text).empty()) {
+          lines.push_back(buf);
+          continue;
+        }
+        for (const auto& l : lbWrap(std::string(buf) + "  ", v.text, static_cast<size_t>(ls) - 2, 15))
+          lines.push_back(l);
+      }
     }
     lines.push_back("");
-    lines.push_back("   Variables:  " + (vars.empty() ? std::string("(none)") : varsJoined));
+    for (const auto& l : lbWrap("   Variables:", vars, static_cast<size_t>(ls), 15))
+      lines.push_back(l == "   Variables:" ? "   Variables:  " : l);
+    lines.push_back("");
   }
-  if (!errors.empty()) {
-    std::string errText;
-    for (size_t i = 0; i < errors.size(); ++i) {
-      if (i) errText += ", ";
-      errText += errors[i];
+
+  if (opt.problems) {
+    std::string dataset = "[unnamed]";
+    if (const std::string cf = session.currentFile(); !cf.empty()) {
+      const size_t room = static_cast<size_t>(std::max(ls - 35, 1));
+      dataset = cf;
+      if (dataset.size() > room) {
+        // _shortenpath: the front of a long path becomes `*`, cut at a `/`.
+        size_t at = dataset.find('/', dataset.size() - room + 1);
+        dataset = at == std::string::npos ? "*" + dataset.substr(dataset.size() - room + 1)
+                                          : "*" + dataset.substr(at);
+      }
     }
-    lines.push_back("warning: " + errText + ": not defined");
+    size_t vlen = 0;
+    for (const std::string* l : {&vlNumeric, &vlGaps, &vlBlanks, &vlNull, &vlNuniq, &vlNuniqSh, &vlNotused})
+      vlen = std::max(vlen, l->size());
+    lines.push_back("");
+    if (vlen == 0) {
+      lines.push_back("no potential problems in dataset " + dataset);
+    } else {
+      lines.push_back("   Potential problems in dataset   " + dataset);
+      lines.push_back("");
+      lines.push_back(std::string(15, ' ') + "Potential problem   Value labels");
+      const size_t hlen = std::min<size_t>(std::max<size_t>(35 + vlen, 50), static_cast<size_t>(ls));
+      lines.push_back(std::string(hlen, '-'));
+      auto msg = [&](const std::string& mac, const std::string& txt) {
+        if (mac.empty()) return;
+        const size_t pad = txt.size() < 32 ? 32 - txt.size() : 0;
+        for (const auto& l : lbWrap(std::string(pad, ' ') + txt + "  ", mac, static_cast<size_t>(ls), 35))
+          lines.push_back(l);
+      };
+      msg(vlNumeric, "Numeric -> numeric");
+      msg(vlGaps, "Gaps in mapped values");
+      msg(vlBlanks, "Leading or trailing blanks");
+      msg(vlNull, "Numeric -> null str");
+      msg(vlNuniq, "Duplicate labels");
+      msg("", "Duplicate lab. at length 2045");
+      msg(vlNuniqSh, "Duplicate lab. at length " + std::to_string(sh));
+      msg(vlNotused, "Not used by variables");
+      lines.push_back(std::string(hlen, '-'));
+    }
   }
+
+  // r(): the names walked and the problem lists, each posted only when it is not
+  // empty; Stata lists the last posted first.
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted;
+  const std::vector<std::pair<std::string, const std::string*>> macros = {
+      {"names", &alab},         {"gaps", &vlGaps},       {"numeric", &vlNumeric},
+      {"blanks", &vlBlanks},    {"null", &vlNull},       {"nuniq", &vlNuniq},
+      {"nuniq_sh", &vlNuniqSh}, {"notused", &vlNotused}};
+  for (const auto& [key, val] : macros) {
+    if (val->empty()) continue;
+    session.eval.rStrings.set(key, *val);
+    posted.push_back(key);
+  }
+  eval::orderRResults(session.eval, {"notused", "nuniq_sh", "nuniq", "null", "blanks", "numeric",
+                                     "gaps", "names"});
+  eval::declareRPosted(session.eval, "labelbook", std::move(posted));
 
   std::string joined;
   for (size_t i = 0; i < lines.size(); ++i) {

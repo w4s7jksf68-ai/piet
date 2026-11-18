@@ -1200,6 +1200,110 @@ BarGraphResult runGraphBarBox(SessionState& session, Datastore& ds, const std::s
   if (const long long comma = eval::findUnquotedComma(parsed.raw); comma >= 0) {
     opts = eval::parseOpts(parsed.raw.substr(static_cast<size_t>(comma) + 1));
   }
+  // `graph bar y, over(x), title(T)`: the option list ends at the first top-level comma's
+  // options; a SECOND top-level comma is a syntax error that names the next word (bank:
+  // `graph bar (mean) price, over(foreign), ylabel(0(5000)15000)` r(198) "invalid 'ylabel'").
+  if (const long long c1 = eval::findUnquotedComma(parsed.raw); c1 >= 0) {
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = static_cast<size_t>(c1) + 1; i < parsed.raw.size(); ++i) {
+      const char ch = parsed.raw[i];
+      if (quote != 0) {
+        if (ch == quote) quote = 0;
+        continue;
+      }
+      if (ch == '"') quote = ch;
+      else if (ch == '(') ++depth;
+      else if (ch == ')' && depth > 0) --depth;
+      else if (ch == ',' && depth == 0) {
+        size_t a = i + 1;
+        while (a < parsed.raw.size() && std::isspace(static_cast<unsigned char>(parsed.raw[a]))) ++a;
+        size_t b = a;
+        while (b < parsed.raw.size() &&
+               (std::isalnum(static_cast<unsigned char>(parsed.raw[b])) || parsed.raw[b] == '_'))
+          ++b;
+        return refuse(barRefusal("invalid '" + parsed.raw.substr(a, b - a) + "'", 198));
+      }
+    }
+  }
+  // The options of the twoway bar PLOT that `graph bar` hands to bar() instead are not its own
+  // (bank: `graph bar (mean) price, over(foreign) base(0)` r(198) "option base() not allowed");
+  // `as` and `c` are no abbreviation of aspectratio / caption here.
+  for (const auto& [key, v] : opts) {
+    const std::string k = lowered(key);
+    if (k == "as" || k == "c" || k == "barwidth" || k == "base" || k == "bcolor" || k == "fcolor" ||
+        k == "lcolor") {
+      return refuse(barRefusal("option " + k + (v.isBool ? "" : "()") + " not allowed", 198));
+    }
+  }
+  // yvaroptions() takes the over() suboptions; its label(...) holds the categorical axis' label OPTIONS
+  // (labsize(), angle(), nolabels ...), never a label text: a quoted text inside it is read as an option name
+  // and refused (bank: `graph bar (mean) price, over(foreign) yvaroptions(label("Avg"))` r(198)
+  // `option "Avg  not allowed`); label(labsize(small)) is a valid spelling and stays accepted.
+  for (const auto& [key, v] : opts) {
+    const std::string k = lowered(key);
+    if (v.isBool || !(k == "yvaroptions" || (k.size() >= 4 && std::string("yvaroptions").compare(0, k.size(), k) == 0)))
+      continue;
+    const std::string& t = v.strValue;
+    const std::string tl = lowered(t);
+    for (size_t at = tl.find("label("); at != std::string::npos; at = tl.find("label(", at + 1)) {
+      if (!(at == 0 || !(std::isalnum(static_cast<unsigned char>(tl[at - 1])) || tl[at - 1] == '_'))) continue;
+      // the text between label( and its closing parenthesis (nested groups and quotes skipped)
+      size_t i = at + 6;
+      int depth = 1;
+      char quote = 0;
+      size_t close = i;
+      for (; close < t.size(); ++close) {
+        const char c = t[close];
+        if (quote != 0) {
+          if (c == quote) quote = 0;
+        } else if (c == '"') {
+          quote = c;
+        } else if (c == '(') {
+          ++depth;
+        } else if (c == ')' && --depth == 0) {
+          break;
+        }
+      }
+      // every word of it must be an option name, with its own (...) group when it has one
+      while (i < close) {
+        const char c = t[i];
+        if (std::isspace(static_cast<unsigned char>(c))) {
+          ++i;
+          continue;
+        }
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+          while (i < close && (std::isalnum(static_cast<unsigned char>(t[i])) || t[i] == '_')) ++i;
+          if (i < close && t[i] == '(') {
+            int d = 0;
+            char q = 0;
+            for (; i < close; ++i) {
+              if (q != 0) {
+                if (t[i] == q) q = 0;
+              } else if (t[i] == '"') {
+                q = t[i];
+              } else if (t[i] == '(') {
+                ++d;
+              } else if (t[i] == ')' && --d == 0) {
+                ++i;
+                break;
+              }
+            }
+          }
+          continue;
+        }
+        // a quoted text, a number or a rule is not an option name
+        size_t e = i;
+        if (c == '"') {
+          for (++e; e < close && t[e] != '"'; ++e) {
+          }
+          return refuse(barRefusal("option " + t.substr(i, e - i) + "  not allowed", 198));
+        }
+        while (e < close && !std::isspace(static_cast<unsigned char>(t[e]))) ++e;
+        return refuse(barRefusal("option " + t.substr(i, e - i) + " not allowed", 198));
+      }
+    }
+  }
   const BarOptions opt = readBarOptions(opts, kind);
   if (opt.by) {
     return refuse(ojson(eval::unsupportedOption(

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
+#include <cstring>
 #include "data_support.h"
 #include "expression_support.h"
 #include "prefix_support.h"
@@ -36,6 +37,9 @@ bool executeByPrefix(std::string& cmd,
   // calling parseBysortPrefix so its existing cmdLower=="bysort" checks
   // (sortFirst included) need no changes of their own.
   if (cmd == "bysort" || cmd == "by" || cmd == "bys" || cmd == "byso" || cmd == "bysor") {
+    // A subscript in an expression counts within the group here; the row evaluator reads
+    // the whole frame and does not read subscripts under a by-prefix.
+    const strmutate::GroupRelativeSubscripts groupRelative;
     // BUG-535: `by KEYS, sort: CMD` is Stata's long spelling of `bysort KEYS:
     // CMD` (w2_bykeep.log arm by_sortopt, rc 0). The prefix parser below has no
     // notion of prefix options — the comma sent `sort:` into the option list and
@@ -85,6 +89,18 @@ bool executeByPrefix(std::string& cmd,
         return true;
       }
     }
+    // No observations: `by` has no group to run the command in, so it runs it
+    // zero times and succeeds (vs-stata bank: `clear`, `set obs 0`, `gen x=.`,
+    // `bysort x: gen n=_n` is rc 0 with k 1 -- n is never created).
+    if (session.hasData()) {
+      Datastore* bds = session.datastore();
+      if (bds != nullptr && bds->nRows() == 0) {
+        bool keysExist = true;
+        for (const std::vector<std::string>* names : {&bp.byVars, &bp.sortVars})
+          for (const auto& k : *names) keysExist = keysExist && bds->has(k);
+        if (keysExist) return true;
+      }
+    }
     // BUG-105 (WS-K) — the by/bysort sibling of the resolution point above, so
     // `bysort region: summ price` reaches the same per-group implementation
     // `bysort region: summarize price` does. The typed spelling is kept for the
@@ -132,6 +148,7 @@ bool executeByPrefix(std::string& cmd,
       // 2.7 in a byte column promoted to float, where StataBE keeps byte b and
       // stores 2 (measured 2026-10-29).
       bool noPromote = false;
+      std::string placeWord, placeVar;  // generate ..., before(v) | after(v)
       // A replace reads its target before its options (replaceTargetError), so
       // the options' refusal waits for it.
       std::optional<ojson> optionError;
@@ -151,7 +168,15 @@ bool executeByPrefix(std::string& cmd,
           // was dropped: b promoted to float, where StataBE keeps byte b.
           const char* optCmd = isReplace ? "replace" : "generate";
           for (auto& kv : optParsed.opts) {
-            const OptKeyResolution optRes = resolveOptionKeyForCommand(optCmd, kv.first);
+            // The same measured spellings as the plain arms (`b(x)` means before(x)): the form
+            // the option was typed in selects the row.
+            const OptKeyResolution optRes =
+                resolveOptionKeyForCommand(optCmd, kv.first, kv.second.isBool ? 1 : 2);
+            if (std::strcmp(optRes.stage, "bank-refuse") == 0) {
+              blocks.push_back(ojson(eval::engineError(
+                  "option `" + kv.first + "` not allowed", "unsupported_option")));
+              return true;
+            }
             kv.first = optRes.resolved;
             if (optRes.exactOnly) kv.second.exactOnly = true;
           }
@@ -165,6 +190,12 @@ bool executeByPrefix(std::string& cmd,
           if (optionError.has_value() && !isReplace) {
             blocks.push_back(*optionError);
             return true;
+          }
+          if (!isReplace) {
+            if (auto perr = generatePlacementRequest(session, optParsed.opts, placeWord, placeVar)) {
+              blocks.push_back(*perr);
+              return true;
+            }
           }
           subJoined = trimWs(subJoined.substr(0, static_cast<size_t>(comma)));
         }
@@ -288,6 +319,10 @@ bool executeByPrefix(std::string& cmd,
         recordDeclaredStataType(session, genTargetName(info.expr),
                                 withSessionDefaultType(session, info), blocks.back());
         appendGenMissingNote(blocks, genTargetName(info.expr));  // BUG-1123
+        const bool madeFailed = mutBlock.is_object() &&
+                                mutBlock.value("type", std::string()) == "error";
+        if (!madeFailed && !placeWord.empty())
+          placeGeneratedVariable(session, genTargetName(info.expr), placeWord, placeVar, blocks);
       }
       return true;
     }
@@ -354,7 +389,16 @@ bool executeByPrefix(std::string& cmd,
     // AER tier-1: `by id: fillmissing x, with(any)` (023, all 35 lines) and
     // `bysort g: astile q = x, nq(3)` ride the same injection; both handlers
     // read by() as their grouping.
-    if ((subCmdLower == "carryforward" || subCmdLower == "tsspell" || subCmdLower == "cumul" ||
+    // tsspell is not byable: it groups by the tsset panel itself, and a by
+    // prefix is r(190) "tsspell may not be combined with by" (vs-stata bank
+    // 52348252ac3ce36c `bysort up: tsspell, cond(up)`).
+    if (subCmdLower == "tsspell" && !bp.byVars.empty()) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error",
+                                              "tsspell may not be combined with by", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(190)")));
+      return true;
+    }
+    if ((subCmdLower == "carryforward" || subCmdLower == "cumul" ||
          subCmdLower == "ipolate" || subCmdLower == "ipol" || subCmdLower == "ipo" ||
          subCmdLower == "fillmissing" || subCmdLower == "astile") &&
         !bp.byVars.empty()) {
@@ -538,8 +582,20 @@ bool executeByPrefix(std::string& cmd,
         }
       }
       // baseDs is not used past this point: the handler may replace the head.
-      blocks.push_back(ojson(handlers::runByKeepIf(session, cond, bp.byVars, sortOn,
-                                                   /*drop=*/subCmdLower == "drop")));
+      const int64_t byRowsBefore = baseDs->nRows();
+      ojson kept = ojson(handlers::runByKeepIf(session, cond, bp.byVars, sortOn,
+                                               /*drop=*/subCmdLower == "drop"));
+      // drop and keep are r-class: r(N_drop), the observations removed (vs-stata bank:
+      // `bysort foreign: drop if _n>3` -> 68).
+      if (kept.is_object() && kept.value("type", std::string()) != "error" &&
+          kept.contains("n_rows_after") && kept["n_rows_after"].is_number_integer()) {
+        eval::replaceRClass(session.eval);
+        session.eval.rValues.set("N_drop",
+                                 static_cast<double>(byRowsBefore -
+                                                     kept["n_rows_after"].get<int64_t>()));
+        eval::declareRPosted(session.eval, subCmdLower, {"N_drop"});
+      }
+      blocks.push_back(std::move(kept));
       return true;
     }
 
@@ -716,9 +772,23 @@ bool executeByPrefix(std::string& cmd,
       bool byMeanonly = false;
       if (byIsCount) {
         // The plain `count` arm's two nets, in the same order: leftover tokens
-        // (the BUG-010 fixed-arity guard) then the empty option vocabulary
-        // (BS-097). Both are rc 198; neither may degrade to rc 1.
+        // (the BUG-010 fixed-arity guard, stage_validation.cpp) then the empty
+        // option vocabulary (BS-097); neither may degrade to rc 1. A by prefix
+        // does not change the command's own syntax answer: a word in the
+        // varlist position is r(101) "varlist not allowed" as `count price` is
+        // (vs-stata bank 6c4f982fed18e7ae), and an option r(101) "options not
+        // allowed" as `count, zznotanoption` is (c69d5acda46a3296). A
+        // qualifier-shaped word keeps the r(198) below, as in the plain arm.
         if (!subParsed.varlist.empty()) {
+          const std::string& w = subParsed.varlist.front();
+          const bool qualifierShaped = w == "in" || w == "if" || w.rfind("in(", 0) == 0 ||
+                                       w.rfind("if(", 0) == 0;
+          if (!qualifierShaped) {
+            blocks.push_back(ojson(eval::errorBlock("engine_error", "varlist not allowed",
+                                                    std::nullopt, std::nullopt, std::nullopt,
+                                                    "r(101)")));
+            return true;
+          }
           blocks.push_back(ojson(eval::engineError(
               bp.subCmd + ": unexpected extra tokens after `count [if] [in] — takes no variable "
                        "list`: " + joinVarlist(subParsed.varlist) + ".",
@@ -834,9 +904,9 @@ bool executeByPrefix(std::string& cmd,
             } else {
               // Stata orders missing AFTER every number, so a NaN following a
               // number is sorted, and a number following a NaN is not.
+              // Missing values are ordered by kind too (. < .a < ... < .z).
               double a = c.f64()[r - 1], b = c.f64()[r];
-              bool an = std::isnan(a), bn = std::isnan(b);
-              decreasing = (an && !bn) ? true : ((!an && !bn) ? (b < a) : false);
+              decreasing = cecon::stata_cmp(b, a) < 0;
             }
             if (decreasing) { unsortedOn = bv; break; }
           }
@@ -966,10 +1036,9 @@ bool executeByPrefix(std::string& cmd,
           if (v.isFactor) {
             if (v.codes[a] != v.codes[b]) return false;
           } else {
-            double x = v.f64[a], y = v.f64[b];
-            bool xn = std::isnan(x), yn = std::isnan(y);
-            if (xn != yn) return false;
-            if (!xn && x != y) return false;
+            // Each missing kind is its own group (StataBE: `by x:` over . .a .z
+            // gives a group per kind, as the engine's by() does).
+            if (cecon::stata_cmp(v.f64[a], v.f64[b]) != 0) return false;
           }
         }
         return true;
@@ -997,7 +1066,7 @@ bool executeByPrefix(std::string& cmd,
           } else {
             double x = v.f64[row];
             if (std::isnan(x)) {
-              out += ".";
+              out += cecon::missing_text(cecon::missing_kind(x));
             } else if (x == std::floor(x) && std::fabs(x) < 1e15) {
               char buf[32];
               std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(x));

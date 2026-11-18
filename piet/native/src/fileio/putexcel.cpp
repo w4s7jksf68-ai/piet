@@ -29,7 +29,7 @@
 #include "piet/cobra_runner.h"
 #include "piet/datastore.h"
 #include "piet/delimited_io.h"  // insheet: the one native delimited reader
-#include "piet/display_hardening.h"  // evalScalarExpr -- `putexcel A1 = (expr)`
+#include "piet/display_hardening.h"  // evalScalarExpr, handleDisplay -- `putexcel A1 = (expr)`
 #include "piet/eval/errors.h"
 #include "piet/eval/exprfns.h"  // applyStataFmt -- outfile writes through display formats
 #include "piet/eval/pyvalue.h"  // pythonFloatRepr -- round-trippable numerics
@@ -64,18 +64,26 @@ const piet::eval::OptVocab& kVocabPutexcel = piet::eval::registerOptVocab(
     {{"replace", "modify", "sheet", "names", "merge", "open",
       // formatting -- accepted, ignored, announced (decision 6).
       "nformat", "bold", "italic", "underline", "font", "hcenter", "vcenter", "border",
-      "fpattern", "txtwrap", "shrinkfit", "locked", "hidden", "txtindent", "left", "right",
-      "top", "bottom"},
-     {"formula", "asdate", "asdatetime", "colwise", "rowwise", "returnset", "overwritefmt",
-      "dateformat", "keepcellformat"}});
+      "fpattern", "txtwrap", "shrinkfit", "txtindent", "left", "right",
+      "top", "bottom", "nobold", "noitalic", "nounderline", "strikeout", "nostrikeout", "script",
+      "txtrotate", "dborder", "overwritefmt", "gridoff", "split",
+      // read, then answered r(691) "could not write cell format unmerge to file"
+      // (bank: `putexcel A1:C1, unmerge`).
+      "unmerge",
+      // read: the matrix's names, and the Stata date -> Excel date number conversions.
+      "colnames", "rownames", "asdate", "asdatetime", "asdatenum", "asdatetimenum",
+      // a returnset is written down the rows, or across the columns with colwise
+      "colwise"},
+     {"formula", "rowwise", "returnset", "dateformat", "keepcellformat"}});
 
 // The formatting subset, named once so the note fires on exactly the options
 // the note describes.
 const std::set<std::string>& putexcelFormatOpts() {
   static const std::set<std::string> kSet = {
       "nformat", "bold", "italic",  "underline", "font",  "hcenter", "vcenter", "border",
-      "fpattern", "txtwrap", "shrinkfit", "locked", "hidden", "txtindent", "left", "right",
-      "top", "bottom"};
+      "fpattern", "txtwrap", "shrinkfit", "txtindent", "left", "right",
+      "top", "bottom", "nobold", "noitalic", "nounderline", "strikeout", "nostrikeout", "script",
+      "txtrotate", "dborder", "overwritefmt", "gridoff", "split", "asdate", "asdatetime"};
   return kSet;
 }
 
@@ -234,6 +242,35 @@ std::optional<ojson> rewriteWorkbook(SessionState& session, const PutexcelState&
 // multi-sheet, and `putexcel set ..., modify` refused all of them. Replaced by
 // `xlsx::worksheetCount`, which uses the same ZIP reader `xlsx::read` does.
 
+// A returnset name (putexcel.sthlp: escalars rscalars emacros rmacros ematrices rmatrices, their
+// ...names forms, e*, r*, enames, rnames), each with its documented minimum abbreviation.
+struct ReturnSet {
+  bool valid = false;
+  char cls = 'r';        // 'e' or 'r'
+  std::string what;      // scalars, macros, matrices or all
+  bool names = false;    // the names instead of the values
+};
+
+ReturnSet parseReturnSet(const std::string& typed) {
+  ReturnSet rs;
+  const std::string t = lowerOf(trimOf(typed));
+  if (t.size() < 2 || (t[0] != 'e' && t[0] != 'r')) return rs;
+  rs.cls = t[0];
+  const std::string rest = t.substr(1);
+  const auto abbr = [&rest](const std::string& full, size_t minLen) {
+    return rest.size() >= minLen && rest.size() <= full.size() && full.compare(0, rest.size(), rest) == 0;
+  };
+  if (rest == "*") { rs.valid = true; rs.what = "all"; return rs; }
+  if (abbr("scalars", 4)) { rs.valid = true; rs.what = "scalars"; return rs; }
+  if (abbr("scalarnames", 7)) { rs.valid = true; rs.what = "scalars"; rs.names = true; return rs; }
+  if (abbr("macros", 3)) { rs.valid = true; rs.what = "macros"; return rs; }
+  if (abbr("macronames", 6)) { rs.valid = true; rs.what = "macros"; rs.names = true; return rs; }
+  if (abbr("matrices", 3)) { rs.valid = true; rs.what = "matrices"; return rs; }
+  if (abbr("matrixnames", 7)) { rs.valid = true; rs.what = "matrices"; rs.names = true; return rs; }
+  if (abbr("names", 2)) { rs.valid = true; rs.what = "all"; rs.names = true; return rs; }
+  return rs;
+}
+
 // Scan one `putexcel` VALUE starting at `i`, leaving `i` just past it.
 // Returns false when the text at `i` is not a value this grammar accepts.
 bool scanValue(const std::string& s, size_t& i, std::string* out, char* kind) {
@@ -311,9 +348,63 @@ ojson runPutexcel(const std::string& rawCmd, SessionState& session) {
   // vocabulary before its own net -- otherwise an abbreviation the net accepts
   // would still reach the `k == "replace"` comparisons below unresolved.
   eval::canonicalizeForCommand(opts, "putexcel");
+  // `sheet()` takes `sh` as its shortest spelling (bank: `putexcel set a.xlsx, sh(second)
+  // replace`, rc 0); the prefix resolver sees `sh` as a prefix of both sheet and sheetset.
+  for (auto& kv : opts)
+    if (!kv.second.isBool && kv.first.size() >= 2 && std::string("sheet").compare(0, kv.first.size(), kv.first) == 0)
+      kv.first = "sheet";
+  // putexcel's syntax reads the cell expression list before any option: nothing
+  // before the comma is r(100) "cellexplist required" (bank: `putexcel ,
+  // zzabbrprobe`), whatever the option.
+  if (!opts.empty() && trimOf(dropCommandWord(statement)).empty()) {
+    return ioErrorRc("cellexplist required", 100);
+  }
   if (auto err = eval::rejectUnknownOptions(opts, kVocabPutexcel.known,
                                             kVocabPutexcel.unimplemented)) {
     return ojson(*err);
+  }
+
+  // border(side [, style [, color]]) and font([name] [, size [, color]]) are read
+  // before anything is written (bank: `border(zzz)` r(198) "invalid border zzz in
+  // option border()", `font(Arial, notnum)` r(198) "invalid font size notnum in
+  // option font()").
+  for (const auto& [k, v] : opts) {
+    if (v.isBool) continue;
+    std::vector<std::string> parts;
+    {
+      std::string cur;
+      int depth = 0;
+      bool inq = false;
+      for (char c : v.strValue) {
+        if (c == '"') inq = !inq;
+        if (!inq && c == '(') ++depth;
+        if (!inq && c == ')') --depth;
+        if (!inq && depth == 0 && c == ',') {
+          parts.push_back(trimOf(cur));
+          cur.clear();
+        } else {
+          cur.push_back(c);
+        }
+      }
+      parts.push_back(trimOf(cur));
+    }
+    auto unq = [](std::string t) {
+      if (t.size() >= 2 && t.front() == '"' && t.back() == '"') t = t.substr(1, t.size() - 2);
+      return t;
+    };
+    if (k == "border" && !parts.empty()) {
+      const std::string side = lowerOf(unq(parts[0]));
+      if (side != "all" && side != "left" && side != "right" && side != "top" && side != "bottom") {
+        return ioSyntax("invalid border " + unq(parts[0]) + " in option border()");
+      }
+    }
+    if (k == "font" && parts.size() >= 2) {
+      const std::string size = unq(parts[1]);
+      double d = 0.0;
+      if (!size.empty() && !parseStrictDouble(size, &d)) {
+        return ioSyntax("invalid font size " + size + " in option font()");
+      }
+    }
   }
 
   statement = dropCommandWord(statement);
@@ -354,7 +445,14 @@ ojson runPutexcel(const std::string& rawCmd, SessionState& session) {
       return ioSyntax("putexcel set: `replace` and `modify` cannot both be given");
     }
     const bool exists = pathExists(resolved);
-    // Stata's own default for an existing file is `modify`.
+    // An existing workbook needs `replace` or `modify` (bank: `putexcel set a.xlsx`
+    // with a.xlsx on disk is r(602) "file a.xlsx already exists; you must specify
+    // either option modify or option replace").
+    if (exists && !replace && !modify) {
+      return ioErrorRc("file " + spelling +
+                           " already exists; you must specify either option modify or option replace",
+                       602);
+    }
     const bool wantModify = modify || (exists && !replace);
     std::string sheet = optStr(opts, "sheet").value_or(std::string("Sheet1"));
     if (sheet.empty()) sheet = "Sheet1";
@@ -416,6 +514,18 @@ ojson runPutexcel(const std::string& rawCmd, SessionState& session) {
     return out;
   }
 
+  // ---- putexcel sheetset [, split(# [, #]) gridoff] ------------------------
+  // Worksheet-level display settings (a frozen split, no cell grid): layout only, so they are
+  // accepted, ignored and announced like the cell formats; they change no value.
+  if (head == "sheetset") {
+    PutexcelState sst = readPutexcelState(session);
+    if (!sst.ok) return ioSyntax("no Excel file specified");
+    ojson sout = ojson::array();
+    sout.push_back(displayBlock("(putexcel: sheetset options are accepted and ignored in this "
+                                "build — values only)"));
+    return sout;
+  }
+
   // ---- putexcel clear ----------------------------------------------------
   if (head == "clear") {
     session.putexcel = ojson::object();
@@ -424,9 +534,42 @@ ojson runPutexcel(const std::string& rawCmd, SessionState& session) {
 
   PutexcelState st = readPutexcelState(session);
   if (!st.ok) {
-    return ioError("putexcel set must be called first — name the workbook with `putexcel set "
-                   "\"file\"` before " +
-                   std::string(head == "describe" ? "describing it" : "writing a cell") + ".");
+    // bank: `putexcel clear` then `putexcel describe` / `putexcel A1 = ("x")` is
+    // r(198) "no Excel file specified".
+    return ioSyntax("no Excel file specified");
+  }
+  // `unmerge` separates a merged range again; on anything else (nothing merged
+  // there, a single cell, an assignment) Stata answers r(691) "could not write cell
+  // format unmerge to file" (bank: `putexcel A1:C1, unmerge` on a fresh workbook).
+  // The merged ranges are the ones `merge` recorded, so the range is looked up there.
+  bool unmergeRange = false;
+  if (hasFlag(opts, "unmerge")) {
+    const bool rangeForm = words.size() == 1 && statement.find('=') == std::string::npos &&
+                           words[0].find(':') != std::string::npos;
+    std::string canon;
+    if (rangeForm) {
+      const size_t colon = words[0].find(':');
+      CellAddr a, b;
+      if (parseAddr(words[0].substr(0, colon), &a) && parseAddr(words[0].substr(colon + 1), &b) &&
+          b.row >= a.row && b.col >= a.col) {
+        canon = addrOf(a.row, a.col) + ":" + addrOf(b.row, b.col);
+      }
+    }
+    bool merged = false;
+    if (!canon.empty() && session.putexcel.contains("merges") && session.putexcel["merges"].is_array()) {
+      for (const auto& m : session.putexcel["merges"]) {
+        if (m.is_string() && m.get<std::string>() == canon) merged = true;
+      }
+    }
+    if (!merged || hasFlag(opts, "merge")) {
+      return ioErrorRc("could not write cell format unmerge to file", 691);
+    }
+    ojson kept = ojson::array();
+    for (const auto& m : session.putexcel["merges"]) {
+      if (!(m.is_string() && m.get<std::string>() == canon)) kept.push_back(m);
+    }
+    session.putexcel["merges"] = kept;
+    unmergeRange = true;
   }
 
   // ---- putexcel describe -------------------------------------------------
@@ -437,6 +580,17 @@ ojson runPutexcel(const std::string& rawCmd, SessionState& session) {
         "putexcel: cells     " +
         std::to_string(session.putexcel.contains("cells") ? session.putexcel["cells"].size() : 0)));
     return out;
+  }
+
+  // ---- putexcel close ----------------------------------------------------
+  // Writes the workbook and ends the session: the file is shown as saved and the
+  // settings are cleared (bank import excel cell 9c3f02ebe5cc3684 prints
+  // "file t.xlsx saved" for it). The workbook on disk is already current, as
+  // for `save` below.
+  if (head == "close") {
+    const std::string shown = st.spelling;
+    session.putexcel = ojson::object();
+    return displayBlock("file " + shown + " saved");
   }
 
   // ---- putexcel save / open ---------------------------------------------
@@ -472,7 +626,14 @@ ojson runPutexcel(const std::string& rawCmd, SessionState& session) {
       return ioSyntax("putexcel: `" + range +
                       "` runs backwards — name the top-left cell first");
     }
+    if (unmergeRange) {
+      if (auto err = rewriteWorkbook(session, st)) return *err;
+      return out;
+    }
     if (!hasFlag(opts, "merge")) {
+      // A range with cell-format options (`putexcel A1:B2, bold border(all)`) formats the cells: layout
+      // only, accepted and ignored with the note above, writing nothing.
+      if (sawFormatOpt) return out;
       return ioSyntax("putexcel: `" + range +
                       "` names a range but says nothing to do with it — add `, merge`");
     }
@@ -498,6 +659,10 @@ ojson runPutexcel(const std::string& rawCmd, SessionState& session) {
         v["s"] = text;
       session.putexcel["cells"][addrOf(row, col)] = std::move(v);
     };
+    // A missing value is written as a blank cell (Mata's put_number leaves it blank unless
+    // set_missing() says otherwise, and putexcel never says): the cell holds nothing, whatever an
+    // earlier write put there.
+    auto setBlank = [&](int row, int col) { session.putexcel["cells"].erase(addrOf(row, col)); };
     while (true) {
       while (i < statement.size() && std::isspace(static_cast<unsigned char>(statement[i]))) ++i;
       if (i >= statement.size()) break;
@@ -506,11 +671,28 @@ ojson runPutexcel(const std::string& rawCmd, SessionState& session) {
              statement[j] != '=') {
         ++j;
       }
-      const std::string addrTok = statement.substr(i, j - i);
+      std::string addrTok = statement.substr(i, j - i);
       CellAddr at;
+      // `A1:C1 = (...)`, `, merge`: the value goes in the range's upper-left cell and the range
+      // is merged (bank: `putexcel A1:C1 = ("merged"), merge`).
+      std::string mergeRange;
+      if (const size_t colonAt = addrTok.find(':'); colonAt != std::string::npos) {
+        CellAddr lo, hi;
+        if (parseAddr(addrTok.substr(0, colonAt), &lo) && parseAddr(addrTok.substr(colonAt + 1), &hi) &&
+            hi.row >= lo.row && hi.col >= lo.col && hasFlag(opts, "merge")) {
+          mergeRange = addrOf(lo.row, lo.col) + ":" + addrOf(hi.row, hi.col);
+          addrTok = addrTok.substr(0, colonAt);
+        }
+      }
       if (!parseAddr(addrTok, &at)) {
         return ioSyntax("putexcel: `" + addrTok +
                         "` is not a cell address (expected something like `A1`)");
+      }
+      if (!mergeRange.empty()) {
+        bool already = false;
+        for (const auto& m : session.putexcel["merges"])
+          if (m.is_string() && m.get<std::string>() == mergeRange) already = true;
+        if (!already) session.putexcel["merges"].push_back(mergeRange);
       }
       i = j;
       while (i < statement.size() && std::isspace(static_cast<unsigned char>(statement[i]))) ++i;
@@ -531,44 +713,132 @@ ojson runPutexcel(const std::string& rawCmd, SessionState& session) {
       } else if (kind == 'n') {
         double d = 0.0;
         if (!parseStrictDouble(value, &d)) {
+          // A bare name is an expression: a scalar's value, else "<name> not found"
+          // r(111) (bank: `putexcel A1 = returnset`).
+          const std::string nm = trimOf(value);
+          if (const ReturnSet rs = parseReturnSet(nm); rs.valid) {
+            // r() scalars and macros, in the order `return list` shows them, as values (or
+            // names) in consecutive rows from the cell, or in consecutive columns with colwise.
+            // Matrices, the combined sets and e() are not written by this build.
+            if (rs.cls != 'r' || rs.what == "matrices" || rs.what == "all")
+              return ioRefusal("putexcel", "unsupported_returnset",
+                               "putexcel: the returnset `" + nm +
+                                   "` is not implemented in this version of PIET (r() scalars and "
+                                   "macros, and their names, are)");
+            const bool across = hasFlag(opts, "colwise");
+            int step = 0;
+            if (rs.what == "scalars") {
+              const auto& items = session.eval.rValues.items();
+              for (auto it = items.rbegin(); it != items.rend(); ++it) {
+                if (session.eval.isRHidden(it->first)) continue;
+                const int row = at.row + (across ? 0 : step), col = at.col + (across ? step : 0);
+                if (rs.names) setCell(row, col, false, 0.0, it->first);
+                else if (std::isnan(it->second)) setBlank(row, col);
+                else setCell(row, col, true, it->second, std::string());
+                ++step;
+              }
+            } else {
+              const auto& items = session.eval.rStrings.items();
+              for (auto it = items.rbegin(); it != items.rend(); ++it) {
+                if (!it->first.empty() && it->first[0] == '\x01') continue;  // the s() store
+                if (session.eval.isRMacroHidden(it->first)) continue;
+                const int row = at.row + (across ? 0 : step), col = at.col + (across ? step : 0);
+                setCell(row, col, false, 0.0, rs.names ? it->first : it->second);
+                ++step;
+              }
+            }
+            continue;
+          }
+          const bool nameLike = !nm.empty() && (std::isalpha(static_cast<unsigned char>(nm[0])) || nm[0] == '_') &&
+                                std::all_of(nm.begin(), nm.end(), [](unsigned char c) {
+                                  return std::isalnum(c) || c == '_';
+                                });
+          if (nameLike) {
+            std::optional<double> sv = evalScalarExpr(nm, session);
+            if (sv.has_value()) {
+              setCell(at.row, at.col, true, *sv, std::string());
+              continue;
+            }
+            return ioErrorRc(nm + " not found", 111);
+          }
           return ioSyntax("putexcel: `" + value +
                           "` is neither a number nor a quoted string — quote it to write it as "
                           "text");
         }
         setCell(at.row, at.col, true, d, std::string());
       } else if (kind == 'e') {
+        // `(exp)` is any Stata expression: a number, or a string (`("a" + "b")`). The numeric
+        // reader answers first; what it cannot read is evaluated the way `display` does, so a
+        // string expression is written as text and an unresolvable one carries display's own
+        // refusal (`nosuch not found`, r(111)).
         std::optional<double> d = evalScalarExpr(value, session);
-        if (!d.has_value()) {
-          return ioError("putexcel: (" + value + ") does not resolve to a number");
+        if (d.has_value()) {
+          double num = *d;
+          // asdate / asdatenum: a Stata %td day count becomes an Excel date number (days from
+          // 1899-12-30, 21916 days before 1960-01-01); asdatetime / asdatetimenum: a %tc
+          // millisecond count becomes a day fraction on the same scale. The cell format that
+          // would show it as a date is a formatting option, announced above.
+          if (!std::isnan(num)) {
+            if (hasFlag(opts, "asdate") || hasFlag(opts, "asdatenum")) num += 21916.0;
+            else if (hasFlag(opts, "asdatetime") || hasFlag(opts, "asdatetimenum"))
+              num = num / 86400000.0 + 21916.0;
+          }
+          if (std::isnan(num))
+            setBlank(at.row, at.col);  // a missing value leaves the cell blank, never 0
+          else
+            setCell(at.row, at.col, true, num, std::string());
+        } else {
+          const ojson shown = handleDisplay("(" + value + ")", session);
+          if (shown.value("type", std::string()) != "display") return shown;
+          const std::string shownText = shown.value("text", std::string());
+          // A numeric missing (`.`, `.a`, a result that is not set) reads back from display as that
+          // literal; so does the STRING ".". Only a number takes `+ 0`: a string answers r(109), so
+          // the string is written as text and the number leaves the cell blank, as for any missing.
+          const bool missingLiteral =
+              shownText == "." || (shownText.size() == 2 && shownText[0] == '.' &&
+                                   std::islower(static_cast<unsigned char>(shownText[1])));
+          bool numericMissing = false;
+          if (missingLiteral) {
+            const ojson probe = handleDisplay("(" + value + ") + 0", session);
+            numericMissing = probe.value("type", std::string()) == "display";
+          }
+          if (numericMissing)
+            setBlank(at.row, at.col);
+          else
+            setCell(at.row, at.col, false, 0.0, shownText);
         }
-        setCell(at.row, at.col, true, *d, std::string());
       } else {  // 'm' -- matrix(NAME)
         const std::string mname = trimOf(value);
         const eval::EvalMatrix* m = session.eval.findMatrix(mname);
         if (m == nullptr) return ioErrorRc("putexcel: matrix " + mname + " not found", 111);
+        // names = both, colnames = the column names across the top, rownames = the row
+        // names down the left; the three exclude one another (putexcel.sthlp).
         const bool names = hasFlag(opts, "names");
+        const bool colNames = hasFlag(opts, "colnames"), rowNames = hasFlag(opts, "rownames");
+        if ((names && (colNames || rowNames)) || (colNames && rowNames))
+          return ioSyntax("putexcel: options names, rownames and colnames may not be combined");
+        const bool writeCols = names || colNames, writeRows = names || rowNames;
         int r0 = at.row;
-        if (names) {
-          // Column names across the top, row names down the left -- so the
-          // block starts one row and one column in from the address given.
+        if (writeCols) {
+          // Column names across the top; with row names too, the block starts one column in.
           for (size_t c = 0; c < m->colnames.size(); ++c) {
-            setCell(r0, at.col + 1 + static_cast<int>(c), false, 0.0, m->colnames[c]);
+            setCell(r0, at.col + (writeRows ? 1 : 0) + static_cast<int>(c), false, 0.0, m->colnames[c]);
           }
           ++r0;
         }
         for (size_t r = 0; r < m->data.size(); ++r) {
           const int rowNo = r0 + static_cast<int>(r);
           int c0 = at.col;
-          if (names) {
+          if (writeRows) {
             setCell(rowNo, c0, false, 0.0,
                     r < m->rownames.size() ? m->rownames[r] : std::string());
             ++c0;
           }
           for (size_t c = 0; c < m->data[r].size(); ++c) {
             const double v = m->data[r][c];
-            // Missing is `.`, never 0.
+            // Missing leaves the cell blank, never 0.
             if (std::isnan(v))
-              setCell(rowNo, c0 + static_cast<int>(c), false, 0.0, ".");
+              setBlank(rowNo, c0 + static_cast<int>(c));
             else
               setCell(rowNo, c0 + static_cast<int>(c), true, v, std::string());
           }

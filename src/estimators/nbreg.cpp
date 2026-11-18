@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "core/linalg.h"
+#include "estimators/fepois.h"  // stata_poisson_ml: nbreg's comparison Poisson fit
 
 namespace cecon {
 
@@ -60,7 +61,7 @@ struct LlSum {
 NbregResult nbreg(const double* X, int64_t n_obs, int k,
                   const double* y, const double* offset,
                   const double* cluster_var,
-                  int maxit, double tol, const double* weights, bool freq) {
+                  int maxit, double tol, const double* weights, bool freq, int cons_col) {
     NbregResult R;
     // BUG-1537: Stata's fweight/iweight/pweight weight every term of the
     // log-likelihood (nbreg.h). wt_of is exactly 1.0 unweighted, and every weighted
@@ -102,6 +103,9 @@ NbregResult nbreg(const double* X, int64_t n_obs, int k,
             if (cons < 0) cons = c;
         }
     }
+    // A caller that knows the model's constant says so: under noconstant a regressor
+    // that is identically 1 is not one (Stata's nbreg runs no constant-only model then).
+    if (cons_col != -2) cons = (cons_col >= 0 && cons_col < k) ? cons_col : -1;
 
     std::vector<double> mu(static_cast<size_t>(n_obs));
     std::vector<double> negH_inv(static_cast<size_t>(k + 1) * (k + 1), 0.0);
@@ -154,7 +158,23 @@ NbregResult nbreg(const double* X, int64_t n_obs, int k,
             }
         }
     };
-    poisson_fit();  // bp: β at the Poisson MLE
+    poisson_fit();  // β at the Poisson MLE (the α→0 boundary's answer below)
+    // The comparison Poisson fit (bp, and e(ll_c) its log likelihood) is Stata's
+    // `poisson` run with nbreg's ml options: poisson's own starting values and ml's
+    // path, under the same iterate(#) limit (with a sandwich VCE or pweights too: there
+    // it only posts no e(ll_c)). With iterate(0) it posts that start, the
+    // full fit's start is adjusted from it and is itself the posted e(b). The exact
+    // MLE above stands when that path cannot run.
+    double pois_ll_c = pois_ll;
+    {
+        std::vector<double> bp;
+        double llp = 0.0;
+        if (stata_poisson_ml(X, n_obs, k, y, weights, offset, cons, maxit, bp, llp) &&
+            static_cast<int>(bp.size()) == k) {
+            R.beta = std::move(bp);
+            pois_ll_c = llp;
+        }
+    }
 
     // ---- the ml path (BUG-1550) -------------------------------------------------------
     // nbreg posts ml's iterate, not the exact MLE. The full fit starts at the point chosen
@@ -227,6 +247,8 @@ NbregResult nbreg(const double* X, int64_t n_obs, int k,
     // *bnd, Ainv is the inverse negative Hessian there; *steps counts the iterations.
     // false: the negative Hessian did not invert (a failure). *bnd: lnα crossed into
     // the α→0 boundary (handled after the full fit).
+    // ml_ilog / ml_grad: the last nb_ml run's ll at each iteration and its final gradient.
+    std::vector<double> ml_ilog, ml_grad;
     auto nb_ml = [&](const std::vector<int>& cols, std::vector<double>& th, double& ll,
                      std::vector<double>& Ainv, int& steps, bool& bnd, bool& cvg) {
         const size_t nd = cols.size() + 1;
@@ -234,8 +256,11 @@ NbregResult nbreg(const double* X, int64_t n_obs, int k,
         double prev_ll = 0.0;
         steps = 0;
         bnd = cvg = false;
+        ml_ilog.clear();
         for (;;) {
             ll = nb_eval(cols, th, &g, &A);
+            ml_ilog.push_back(ll);
+            ml_grad = g;
             // α→0 boundary, SECOND detector (the LNA_FLOOR check below is the first).
             // As α→0 the (lnα,lnα) observed information collapses toward 0, and with
             // r = 1/α ~ 1e7 the digamma/trigamma difference that forms it loses every
@@ -330,6 +355,8 @@ NbregResult nbreg(const double* X, int64_t n_obs, int k,
             th = poisson_with_unit_alpha();
         } else if (!boundary) {
             // `ll` is now the constant-only maximum.
+            R.has_ll_0 = true;
+            R.ll_0 = ll;
             const double null_cons = null_model[0], null_lnalpha = null_model[1];
             th.assign(static_cast<size_t>(k) + 1, 0.0);
             th[static_cast<size_t>(cons)] = null_cons;
@@ -348,13 +375,19 @@ NbregResult nbreg(const double* X, int64_t n_obs, int k,
         }
         // boundary: `th` stays empty, the Poisson-limit report below takes over.
     }
+    R.ll_c = pois_ll_c;  // the Poisson comparison fit (stata_poisson_ml above)
     if (!boundary) {
         const bool ok = nb_ml(all_cols, th, ll, Ainv, steps, boundary, conv);
         R.beta.assign(th.begin(), th.begin() + k);
         R.lnalpha = th[static_cast<size_t>(k)];
         R.loglik = ll;
         if (!ok) { R.converged = false; R.iters = steps; return R; }
+        if (!boundary) {
+            R.ilog = ml_ilog;
+            R.gradient = ml_grad;
+        }
     }
+    R.boundary = boundary;
     R.iters = steps;
     if (!boundary) negH_inv = Ainv;
     R.converged = conv;

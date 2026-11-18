@@ -134,14 +134,17 @@ void testW2UniW() {
                 hasPrefixLine(cl, "weightxyzabc |        12         50"),
             "UNI/W centile: ASCII long names abbreviate `displaceme~g` (p6.do)");
   }
-  // xtsum (p4.do): the 16-character stub is padded by characters.
+  // xtsum: the name is padded by CHARACTERS to column 9 and `overall` starts at column 10, as
+  // xtsum.ado lays it out (`abbrev(name,8) _col(10) "overall"`; StataBE 19.5 bank cell
+  // 7ee5c6986b4e5781: `fatal    overall |`). The earlier pin of a 16-character name+tag stub with
+  // three blanks after `overall` was not what the bank shows.
   {
     (void)displayOf(session, "xtset id t");
     const auto ls = linesOf(displayOf(session, "xtsum " + A + " yyyy"));
-    w2check(hasPrefixLine(ls, A + "  overall" + sp(3) + " |"),
-            "UNI/W xtsum: the name+tag stub is 16 CHARACTERS wide (3 blanks after `overall`)");
-    w2check(hasPrefixLine(ls, "yyyy  overall" + sp(3) + " |"),
-            "UNI/W xtsum: an ASCII stub is the same 16 characters (unchanged)");
+    w2check(hasPrefixLine(ls, A + sp(5) + "overall |"),
+            "UNI/W xtsum: a 4-character name is padded to column 9, `overall` from column 10");
+    w2check(hasPrefixLine(ls, "yyyy" + sp(5) + "overall |"),
+            "UNI/W xtsum: an ASCII name is padded the same way (bank 7ee5c698)");
   }
   // esttab: every line of the fixed-width table is the same number of characters
   // wide, however many bytes the names take.

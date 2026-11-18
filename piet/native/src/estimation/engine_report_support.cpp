@@ -313,7 +313,17 @@ EngineCall callEngine(std::vector<std::string> argv) {
     r.raw = runCobraJson(argv);
     r.ok = true;
   } catch (const CobraError& ce) {
-    r.error = qeError(cobraErrorMessage(ce), ce.code);
+    // An engine refusal that carries Stata's exact rc in `detail` ("r(125)", as
+    // core/error.h's require_sample does) answers with that rc, not the coarse
+    // code mapping (rdrobust's c() range check, vs-stata bank 1d7a0d89).
+    const std::string& d = ce.detail;
+    if (d.size() > 3 && d.compare(0, 2, "r(") == 0 && d.back() == ')' &&
+        d.find_first_not_of("0123456789", 2) == d.size() - 1)
+      r.error = ojson(eval::errorBlock(ce.code.empty() ? "engine_error" : ce.code,
+                                       cobraErrorMessage(ce), std::nullopt, std::nullopt,
+                                       std::nullopt, d));
+    else
+      r.error = qeError(cobraErrorMessage(ce), ce.code);
   }
   return r;
 }

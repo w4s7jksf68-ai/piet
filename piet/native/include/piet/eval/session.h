@@ -117,8 +117,31 @@ class OrderedDict {
     gens_.clear();
   }
   const std::vector<std::pair<std::string, std::string>>& items() const { return items_; }
+  // Move `k` to the end of the insertion order with its value and the generation
+  // of its last write: a re-layout, not a write, so the store generation is left
+  // alone too (eval/result_order.h). An entry a previous command left therefore
+  // stays left over, and the r() replacement still erases it. False if absent.
+  bool moveToEnd(const std::string& k) {
+    for (size_t i = 0; i < items_.size(); ++i) {
+      if (items_[i].first != k) continue;
+      auto item = std::move(items_[i]);
+      const std::uint64_t g = gens_[i];
+      items_.erase(items_.begin() + static_cast<std::ptrdiff_t>(i));
+      gens_.erase(gens_.begin() + static_cast<std::ptrdiff_t>(i));
+      items_.push_back(std::move(item));
+      gens_.push_back(g);
+      return true;
+    }
+    return false;
+  }
   // See nextStoreGeneration.
   std::uint64_t generation() const { return generation_; }
+  // The generation of `k`'s last write; 0 when `k` is not in the store.
+  std::uint64_t generationOf(const std::string& k) const {
+    for (size_t i = 0; i < items_.size(); ++i)
+      if (items_[i].first == k) return gens_[i];
+    return 0;
+  }
   // Erase every non-reserved entry last written at or before `gen`. Bookkeeping
   // that follows a write which already moved the store: the store generation is
   // left as it is. True if anything was erased.
@@ -183,7 +206,27 @@ class OrderedFloatDict {
     gens_.clear();
   }
   const std::vector<std::pair<std::string, double>>& items() const { return items_; }
+  // See OrderedDict::moveToEnd.
+  bool moveToEnd(const std::string& k) {
+    for (size_t i = 0; i < items_.size(); ++i) {
+      if (items_[i].first != k) continue;
+      const auto item = items_[i];
+      const std::uint64_t g = gens_[i];
+      items_.erase(items_.begin() + static_cast<std::ptrdiff_t>(i));
+      gens_.erase(gens_.begin() + static_cast<std::ptrdiff_t>(i));
+      items_.push_back(item);
+      gens_.push_back(g);
+      return true;
+    }
+    return false;
+  }
   std::uint64_t generation() const { return generation_; }  // see nextStoreGeneration
+  // The generation of `k`'s last write; 0 when `k` is not in the store.
+  std::uint64_t generationOf(const std::string& k) const {
+    for (size_t i = 0; i < items_.size(); ++i)
+      if (items_[i].first == k) return gens_[i];
+    return 0;
+  }
   // See OrderedDict::eraseWrittenAtOrBefore.
   bool eraseWrittenAtOrBefore(std::uint64_t gen) {
     bool any = false;
@@ -248,7 +291,68 @@ struct EvalSession {
     return v != nullptr && *v == it->second;
   }
   OrderedFloatDict rValues;   // _r_values
+  // Stata's hidden r() scalars (`return hidden scalar`): listed by `: r(scalars)`,
+  // left out of `return list` -- describe's r(N_max), r(k_max), r(widthmax).
+  // Each name carries the rValues generation it was marked at, so a later write
+  // of the same name by another command is not hidden (markRHidden / isRHidden).
+  std::vector<std::pair<std::string, std::uint64_t>> rHidden;
+  void markRHidden(const std::string& name) {
+    for (auto& [n, at] : rHidden)
+      if (n == name) {
+        at = rValues.generationOf(name);
+        return;
+      }
+    rHidden.emplace_back(name, rValues.generationOf(name));
+  }
+  bool isRHidden(const std::string& name) const {
+    const std::uint64_t g = rValues.generationOf(name);
+    if (g == 0) return false;
+    for (const auto& [n, at] : rHidden)
+      if (n == name && at == g) return true;
+    return false;
+  }
   OrderedDict rStrings;       // _r_strings
+  // The hidden r() macros, the same way: a coefficient table's r(label#) notes
+  // (`(base)`, `(omitted)`, `(empty)`) are read by name and left out of `return
+  // list` (vs-stata truth bank: `regress price mpg i.rep78` stores r(label2)
+  // `(base)` and its `return list` shows only r(table)/r(level)).
+  std::vector<std::pair<std::string, std::uint64_t>> rHiddenMacros;
+  void markRMacroHidden(const std::string& name) {
+    for (auto& [n, at] : rHiddenMacros)
+      if (n == name) {
+        at = rStrings.generationOf(name);
+        return;
+      }
+    rHiddenMacros.emplace_back(name, rStrings.generationOf(name));
+  }
+  bool isRMacroHidden(const std::string& name) const {
+    const std::uint64_t g = rStrings.generationOf(name);
+    if (g == 0) return false;
+    for (const auto& [n, at] : rHiddenMacros)
+      if (n == name && at == g) return true;
+    return false;
+  }
+  // Hidden r() matrices (margins' r(atdims)), keyed on the matrix's generation.
+  std::vector<std::pair<std::string, std::uint64_t>> rHiddenMatrices;
+  // Hidden e() results (`ereturn hidden`): read by name, left out of `ereturn
+  // list`. `margins, post` carries margins' hidden r() over (vs-stata bank
+  // 79d162ff: e(marg_dims) e(mlist1) e(is_xb1) ... are stored, `ereturn list`
+  // does not show them). Each entry is the name and the generation of the
+  // value marked -- a scalar's or macro's store generation, a matrix's `gen`
+  // -- so a later write of the same name is visible again; an e() copied
+  // whole (`estimates store`/`restore`) keeps its generations and so its marks.
+  std::vector<std::pair<std::string, std::uint64_t>> eHidden;
+  void markEHidden(const std::string& name, std::uint64_t gen) {
+    for (const auto& [n, at] : eHidden)
+      if (n == name && at == gen) return;
+    eHidden.emplace_back(name, gen);
+  }
+  bool isEHidden(const std::string& name, std::uint64_t gen) const {
+    if (gen == 0) return false;
+    for (const auto& [n, at] : eHidden)
+      if (n == name && at == gen) return true;
+    return false;
+  }
   OrderedFloatDict eScalars;  // _e_scalars
   // e-class macros. Until AER bundle H the only e() macros PIET could print
   // were e(cmd)/e(depvar)/e(vce), read straight off LastModel, and
@@ -667,6 +771,9 @@ bool ebHasUnsentColumns(const EvalSession& session);
 // it; the dispatch hook's replaceStaleRClass covers every handler that merges.
 inline void replaceRClass(EvalSession& ev) {
   ev.rValues = OrderedFloatDict();
+  ev.rHidden.clear();
+  ev.rHiddenMacros.clear();
+  ev.rHiddenMatrices.clear();
   std::vector<std::string> userKeys;
   for (const auto& kv : ev.rStrings.items())
     if (!isReservedStoreKey(kv.first)) userKeys.push_back(kv.first);

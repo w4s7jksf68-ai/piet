@@ -81,7 +81,15 @@ VarlistExpandResult expandVarlistImpl(const std::string& spec, SessionState& ses
     if (ds == nullptr) {
       std::istringstream iss(spec);
       std::string tok;
-      while (iss >> tok) r.tokens.push_back(tok);
+      while (iss >> tok) {
+        // `_all` over no variables is the empty list (bank 5c84924a56ffe4cd: the
+        // body of `foreach v of varlist _all` does not run, rc 0).
+        if (tok.size() == 4 && tok[0] == '_' && std::tolower(static_cast<unsigned char>(tok[1])) == 'a' &&
+            std::tolower(static_cast<unsigned char>(tok[2])) == 'l' &&
+            std::tolower(static_cast<unsigned char>(tok[3])) == 'l')
+          continue;
+        r.tokens.push_back(tok);
+      }
       return r;
     }
     allVars = ds->names();
@@ -167,6 +175,15 @@ VarlistExpandResult expandVarlistImpl(const std::string& spec, SessionState& ses
       }
       auto i1 = std::distance(allVars.begin(), it1);
       auto i2 = std::distance(allVars.begin(), it2);
+      // A range whose first name comes after its last is Stata's r(111)
+      // "variables out of order" (truth bank syntaxedge varlist_reverse_range:
+      // `mpg-price` on auto.dta); it used to expand to nothing, silently.
+      if (i1 > i2) {
+        r.isError = true;
+        r.error = eval::errorBlock("engine_error", "variables out of order", std::nullopt,
+                                   std::nullopt, std::nullopt, "r(111)");
+        return r;
+      }
       for (auto k = i1; k <= i2; ++k) r.tokens.push_back(allVars[static_cast<size_t>(k)]);
       continue;
     }
@@ -187,6 +204,9 @@ VarlistExpandResult expandVarlistImpl(const std::string& spec, SessionState& ses
 // runForeach ever sets the loop variable once.
 std::optional<ojson> checkKnownVarTokens(std::vector<std::string>& tokens,
                                          SessionState& session) {
+  // `foreach v of varlist _all` over no data has no names to check: it does not
+  // iterate, and is no error (bank 5c84924a56ffe4cd, a file of zero variables).
+  if (tokens.empty()) return std::nullopt;
   std::vector<std::string> known;
   if (const std::vector<VarInfo>* card = session.residentReadCard()) {
     for (const auto& vi : *card) known.push_back(vi.name);
@@ -198,9 +218,11 @@ std::optional<ojson> checkKnownVarTokens(std::vector<std::string>& tokens,
   // A unique prefix stands for its variable, as in every Stata varlist
   // (w2_openbugs.log:190-194 fe_abbrev: `foreach v of varlist alph` iterates
   // `alpha`, rc 0); several matches are r(111) "ambiguous abbreviation".
+  const bool abbrevOff = varAbbreviationOff(session);  // `set varabbrev off`
   for (auto& t : tokens) {
     if (std::find(known.begin(), known.end(), t) != known.end()) continue;
     std::vector<std::string> hits;
+    if (!abbrevOff)
     for (const auto& k : known)
       if (k.size() > t.size() && k.compare(0, t.size(), t) == 0) hits.push_back(k);
     if (hits.size() == 1) {

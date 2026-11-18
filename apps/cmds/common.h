@@ -62,7 +62,7 @@ using namespace cecon;
 // pen-holder — bumps when CONTRACT-engine.md changes, independently of the engine release
 // version (COBRA_VERSION). Source of truth mirrored in internal note CONTRACT-engine.md header.
 #ifndef CONTRACT_VERSION
-#define CONTRACT_VERSION "1.26.0"
+#define CONTRACT_VERSION "1.27.0"
 #endif
 
 namespace cecon {
@@ -386,6 +386,16 @@ std::string maybe_keepif(const std::string& data, const std::string& keepif);
 // length-n_rows() mask (element 1 = row satisfies the `if`).
 std::vector<char> eval_keepif_mask(const std::string& data_path, const std::string& keepif);
 
+// Time-series `if` on panel data: lag operators read within a panel, so the rows an
+// `if` excludes supply lagged values only to their own panel. Sets `mask` to the `if`
+// rows and, when `panelvar` is non-empty, reduces the data to the panels those rows
+// belong to (returning a scratch .hbin path, with `mask` aligned to it); otherwise
+// returns `data` unchanged. `source_rows` (optional) receives, for a reduced frame,
+// the `data` row each reduced row came from; it is left empty when nothing was reduced.
+std::string keepif_own_panels(const char* cmd, const std::string& data, const std::string& keepif,
+                              const std::string& panelvar, std::vector<char>& mask,
+                              std::vector<int64_t>* source_rows = nullptr);
+
 // True if any token in `names` carries a time-series operator (L./F./D./S.).
 bool varlist_has_ts(const std::vector<std::string>& names);
 
@@ -484,7 +494,9 @@ GlmInputs load_glm(const Dataset& ds, const char* cmd, const std::string& y,
 void drop_glm_intercept(GlmInputs& g, const char* cmd);
 
 // Callers span cmds_mle.cpp (logit/probit) and cmds_postest.cpp (margins).
+void binarize_outcome(std::vector<double>& y);  // nonzero -> 1 (logit/probit/cloglog)
 bool check_binary(const std::vector<double>& y, const char* cmd, const std::string& nm);
+bool check_outcome_varies(const std::vector<double>& y, const char* cmd);  // r(2000) when constant
 
 // Shared core for feols / run. Callers span cmds_linear.cpp (cmd_feols) and
 // cmds_data.cpp (cmd_run / grid_run_group) — needs external linkage.
@@ -550,7 +562,8 @@ json run_iv(const std::string& data, const std::string& y,
             bool multiway_subset_factors = false, bool no_intercept = false,
             const std::string& weight_var = "",
             cecon::WeightKind weight_kind = cecon::WeightKind::None,
-            bool multiway_no_psd_fix = false, bool dofminus_fe = false);
+            bool multiway_no_psd_fix = false, bool dofminus_fe = false,
+            bool gmm_efficient_vce = false, bool inst_collin_check = false);
 
 // Multi-outcome 2SLS batch. Callers span cmds_linear.cpp (cmd_iv) and
 // cmds_data.cpp (grid_run_group).

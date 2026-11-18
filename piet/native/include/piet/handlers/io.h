@@ -60,6 +60,8 @@ nlohmann::ordered_json runOutfile(const eval::ParsedCommand& parsed, SessionStat
 // SAYS so on every call rather than silently producing a 118 file under a name
 // that promises an older format -- the note is the whole point of the row.
 nlohmann::ordered_json runSaveold(const eval::ParsedCommand& parsed, SessionState& session);
+// `dtaversion filename` -- the file's .dta format in r(version) (fileio/dta_version.cpp).
+nlohmann::ordered_json runDtaversion(const eval::ParsedCommand& parsed, SessionState& session);
 // `putexcel set|A1 = ...|save|clear|describe`. Stateful across statements; the
 // cell map lives in `SessionState::putexcel` and the workbook is rewritten in
 // full on every assignment.
@@ -87,8 +89,11 @@ nlohmann::ordered_json runPostclose(const std::string& handle, SessionState& ses
 // `save FILE [, replace]` — persist the current dataset to FILE.
 // `dtaRelease` > 0 writes a genuine Stata .dta of that release (115/117/118)
 // whatever FILE's extension is (`saveold`'s target; a `.tmp` tempfile included).
+// `noLabel` leaves the value-label tables out (the variable-to-label-name
+// attachments stay), `orphans` writes every defined table, attached or not.
 nlohmann::ordered_json runSaveData(const std::string& filepath, bool replace,
-                                    SessionState& session, int dtaRelease = 0);
+                                    SessionState& session, int dtaRelease = 0,
+                                    bool noLabel = false, bool orphans = false);
 
 // `export delimited [varlist] using FILE [, replace delimiter(D) nolabel]` and
 // `import delimited [using] FILE [, clear delimiter(D)]` — P1 wave.

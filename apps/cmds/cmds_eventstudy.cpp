@@ -243,7 +243,10 @@ int cmd_did_imputation(const std::vector<std::string>& a) {
     const std::string ivar = opt(a, "--ivar");
     const std::string tvar = opt(a, "--time");
     const std::string gvar = opt(a, "--gvar");
-    const std::string horiz = opt(a, "--horizons", "0");
+    // No --horizons: the pooled `tau` over every treated observation (Stata's
+    // did_imputation without horizons(); bank 43d1f644: N 336 = all of e(sample)).
+    const std::string horiz = opt(a, "--horizons");
+    const bool pooled = horiz.empty();
     const std::string pres = opt(a, "--pretrends", "0");
     const bool autosample = has(a, "--autosample");
     const double level = std::stod(opt(a, "--level", "95"));
@@ -273,7 +276,7 @@ int cmd_did_imputation(const std::vector<std::string>& a) {
             "clustered on --ivar ('" + ivar + "'), the command's default",
             "--cluster");
     std::vector<double> horizons;
-    if (!parse_numlist(horiz, horizons))
+    if (!pooled && !parse_numlist(horiz, horizons))
         throw cecon::EngineError("bad_input",
                                  "did_imputation: --horizons '" + horiz +
                                      "' is not a numlist (e.g. 0/3 or 0,1,2,3)",
@@ -319,6 +322,7 @@ int cmd_did_imputation(const std::vector<std::string>& a) {
 
     DidImputeConfig cfg;
     cfg.horizons = horizons;
+    cfg.pooled = pooled;
     cfg.pretrends = npre;
     cfg.autosample = autosample;
     cfg.level = level;

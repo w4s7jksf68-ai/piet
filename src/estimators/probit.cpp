@@ -219,6 +219,7 @@ ProbitResult probit_fit_ml(const double* X, int64_t n, int k, const double* y,
     r.ilog = std::move(m.ilog);
     r.n_cdf = m.n_cdf;
     r.n_cds = m.n_cds;
+    r.gradient = std::move(m.gradient);
     return r;
 }
 

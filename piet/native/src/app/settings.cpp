@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -42,6 +44,44 @@ std::filesystem::path settingsNative(const std::string& p) {
 #else
   return std::filesystem::path(p);
 #endif
+}
+
+// The four table-size limits, shared by load() and settings.set. A key that is
+// absent or not a whole number (a string, 1.5, null) leaves the field as it was;
+// zero or a negative number means "Stata's limit" and is stored as 0; a number
+// above the field's ceiling is stored as the ceiling. A whole number written as
+// a float (100.0, 1e5) or too large for int64 counts as that number.
+struct TableLimitField {
+  const char* key;
+  int64_t Settings::*field;
+  int64_t ceiling;
+};
+constexpr TableLimitField kTableLimitFields[] = {
+    {"tab_oneway_max_rows", &Settings::tabOnewayMaxRows, kTabCellCeiling},
+    {"tab_twoway_max_rows", &Settings::tabTwowayMaxRows, kTabCellCeiling},
+    {"tab_twoway_max_cols", &Settings::tabTwowayMaxCols, kTabCellCeiling},
+    {"tab_summarize_max_cells", &Settings::tabSummarizeMaxCells, kTabSummarizeCellCeiling}};
+
+void readTableLimits(const nlohmann::json& j, Settings& s) {
+  for (const TableLimitField& f : kTableLimitFields) {
+    if (!j.contains(f.key)) continue;
+    const auto& v = j[f.key];
+    if (v.is_number_unsigned()) {  // before is_number_integer(): it is true for these too
+      const uint64_t u = v.get<uint64_t>();
+      s.*f.field = u > static_cast<uint64_t>(f.ceiling) ? f.ceiling : static_cast<int64_t>(u);
+    } else if (v.is_number_integer()) {
+      const int64_t n = v.get<int64_t>();
+      s.*f.field = n <= 0 ? 0 : (n > f.ceiling ? f.ceiling : n);
+    } else if (v.is_number_float()) {
+      const double d = v.get<double>();
+      if (!(d == d) || d != std::floor(d)) continue;  // NaN or a fraction: not a count
+      s.*f.field = d <= 0 ? 0 : (d > static_cast<double>(f.ceiling) ? f.ceiling : static_cast<int64_t>(d));
+    }
+  }
+}
+
+void writeTableLimits(nlohmann::ordered_json& j, const Settings& s) {
+  for (const TableLimitField& f : kTableLimitFields) j[f.key] = s.*f.field;
 }
 
 }  // namespace
@@ -161,6 +201,7 @@ Settings load() {
         s.extcompatConsentAt = j["extcompat_consent_at"].get<std::string>();
       if (j.contains("follow_do_file_folder") && j["follow_do_file_folder"].is_boolean())
         s.followDoFileFolder = j["follow_do_file_folder"].get<bool>();
+      readTableLimits(j, s);
     }
   } catch (const nlohmann::json::exception&) {
     // Malformed file -> defaults (never throw into a launch/route path).
@@ -184,6 +225,7 @@ bool save(const Settings& s) {
   j["extcompat"] = s.extcompat;                    // WS-B
   j["extcompat_consent_at"] = s.extcompatConsentAt;  // WS-B
   j["follow_do_file_folder"] = s.followDoFileFolder;
+  writeTableLimits(j, s);
   std::ofstream f(settingsNative(path), std::ios::binary | std::ios::trunc);
   if (!f) return false;
   f << j.dump(2) << "\n";
@@ -318,6 +360,53 @@ void invalidateExtcompatCache() {
   g_extcompat.store(-1, std::memory_order_relaxed);
 }
 
+// ── Table-size limits (tabulate, r(134)) ────────────────────────────────────
+
+namespace {
+// The limits in force and whether they have been read yet, under one lock: the
+// do-run thread reads them while settings.set (the UI thread) publishes new ones,
+// and the first read loads the settings file. One lock keeps the four numbers of
+// one publication together and stops a late first read from overwriting a
+// publication made meanwhile. tabulate takes it once per table, never per row.
+std::mutex g_tabLimitsMutex;
+bool g_tabLimitsResolved = false;
+TableLimits g_tabLimits;
+
+TableLimits limitsFrom(const Settings& s) {
+  const auto pick = [](int64_t set, int64_t stata, int64_t ceiling) {
+    return set <= 0 ? stata : (set > ceiling ? ceiling : set);
+  };
+  TableLimits t;
+  t.onewayMaxRows = pick(s.tabOnewayMaxRows, kTabOnewayMaxRowsDefault, kTabCellCeiling);
+  t.twowayMaxRows = pick(s.tabTwowayMaxRows, kTabTwowayMaxRowsDefault, kTabCellCeiling);
+  t.twowayMaxCols = pick(s.tabTwowayMaxCols, kTabTwowayMaxColsDefault, kTabCellCeiling);
+  t.summarizeMaxCells =
+      pick(s.tabSummarizeMaxCells, kTabSummarizeMaxCellsDefault, kTabSummarizeCellCeiling);
+  return t;
+}
+}  // namespace
+
+void setTableLimits(const Settings& s) {
+  const TableLimits t = limitsFrom(s);
+  std::lock_guard<std::mutex> lock(g_tabLimitsMutex);
+  g_tabLimits = t;
+  g_tabLimitsResolved = true;
+}
+
+TableLimits tableLimits() {
+  std::lock_guard<std::mutex> lock(g_tabLimitsMutex);
+  if (!g_tabLimitsResolved) {
+    g_tabLimits = limitsFrom(load());
+    g_tabLimitsResolved = true;
+  }
+  return g_tabLimits;
+}
+
+void invalidateTableLimitsCache() {
+  std::lock_guard<std::mutex> lock(g_tabLimitsMutex);
+  g_tabLimitsResolved = false;
+}
+
 // ── Component packs (WS-B step 6 — structure only; docs/PACKS.md) ───────────
 
 std::string packsDir() {
@@ -365,6 +454,18 @@ nlohmann::ordered_json toGetJson(const Settings& s, const SysInfo& sys,
   j["extcompat_consent_at"] = s.extcompatConsentAt;
   j["consent_required"] = s.extcompatConsentAt.empty() && !testIsolationActive();
   j["follow_do_file_folder"] = s.followDoFileFolder;
+  // The persisted table-size limits (0 = Stata's), Stata's limits themselves so
+  // the Settings panel can show what an empty box stands for, and the ceiling.
+  writeTableLimits(j, s);
+  nlohmann::ordered_json td;
+  td["tab_oneway_max_rows"] = kTabOnewayMaxRowsDefault;
+  td["tab_twoway_max_rows"] = kTabTwowayMaxRowsDefault;
+  td["tab_twoway_max_cols"] = kTabTwowayMaxColsDefault;
+  td["tab_summarize_max_cells"] = kTabSummarizeMaxCellsDefault;
+  j["table_limit_defaults"] = td;
+  nlohmann::ordered_json tc;  // the most each limit can be set to
+  for (const TableLimitField& f : kTableLimitFields) tc[f.key] = f.ceiling;
+  j["table_limit_ceilings"] = tc;
   // WS-B step 6: the boot-time pack scan. settings.get is the one call the
   // frontend already makes at boot (hydrateUiState), so the enumeration rides
   // it rather than inventing a route for a directory listing. Enumerate-only:
@@ -435,6 +536,7 @@ BridgeResult settingsSet(const std::string& body) {
         s.extcompatConsentAt = j["extcompat_consent_at"].get<std::string>();
       if (j.contains("follow_do_file_folder") && j["follow_do_file_folder"].is_boolean())
         s.followDoFileFolder = j["follow_do_file_folder"].get<bool>();
+      piet::settings::readTableLimits(j, s);
     }
   } catch (const nlohmann::json::exception& e) {
     nlohmann::ordered_json err;
@@ -456,6 +558,8 @@ BridgeResult settingsSet(const std::string& body) {
   // WS-B: a persisted extcompat choice applies to the very next command, so
   // publish it to the dispatch gate's cache instead of waiting for a restart.
   piet::settings::setExtcompatEnabled(s.extcompat);
+  // The table-size limits apply to the next command too.
+  piet::settings::setTableLimits(s);
 
   auto sys = piet::settings::detectSysInfo();
   return BridgeResult::success(

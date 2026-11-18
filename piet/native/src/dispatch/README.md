@@ -12,13 +12,13 @@ or route named by the symptom.
 | Stage and route signatures; the entry declaration `dispatchImpl` | `pipeline.h` |
 | `if`/`while`/`foreach` brace blocks, `input` data block, `mata`, `parallel:` prefix | `stage_raw_blocks.cpp` |
 | `do`, `run`, `include`, `!` shell escape | `stage_raw_files.cpp` |
-| `continue`, `args`, `gettoken`, `return scalar/local`, `program define`, `tempvar`/`tempfile`/`tempname`, `macro` verbs | `stage_raw_programs.cpp` |
+| `continue`, `args`, `gettoken`, `return scalar/local`, `program define` / `drop` / `dir` / `list`, `tempvar`/`tempfile`/`tempname`, `macro` verbs | `stage_raw_programs.cpp` |
 | `capture`/`quietly`/`noisily` prefixes, `eststo:`, `version:`, `svy:` prefixes | `stage_prefixes.cpp` |
 | `local`/`global` definitions, `` `: display' `` splice, macro expansion of the line, verbatim lines, `xi:` | `stage_macro_expansion.cpp` |
 | `bootstrap`, `jackknife`, `permute`, `rolling`, `statsby`, `ritest` lines | `stage_resampling.cpp` |
 | Command word, abbreviation, glued heads, variable-name abbreviation, weights and `in` gates | `stage_tokenization.cpp` |
 | `if` condition folded into a hidden mask column; per-form profile key | `stage_qualifiers.cpp` |
-| Option-name resolution, community-command gate, empty-dataset rules, data-required guard, arity | `stage_validation.cpp`, `validation.cpp` |
+| Option-name resolution, community-command gate, empty-dataset rules, data-required guard, arity, estimation replay with no estimates (r(301)) | `stage_validation.cpp`, `validation.cpp` |
 | `by`/`bysort` prefix: sort, grouping, per-group run of `summarize`, `tabstat`, `generate`, `keep`, `drop`, `count` | `stage_by_prefix.cpp`, `prefix_support.cpp` |
 | User-defined program or ado-style command invoked by name | `stage_program_resolution.cpp` |
 | `use`, `save`, `import`, `export`, `file`, `post*`, `putexcel`, `copy` | `route_io.cpp` |
@@ -29,17 +29,17 @@ or route named by the symptom.
 | `merge`, `append`, `joinby`, `reshape`, `frame`/`frlink`/`frget`, `duplicates` | `route_data_combine.cpp` |
 | Regression, IV, panel, count, discrete-choice, DID, RD, time-series and test commands | `route_estimation.cpp` |
 | `test`, `lincom`, `nlcom`, `margins`, `predict`, `estat` | `route_postestimation.cpp` |
-| `display`, `scalar`, `matrix`, `return`, `ereturn`, `estimates`, `eststo`, `esttab` | `route_results.cpp`, `results_support.cpp` |
+| `display`, `scalar`, `matrix`, `return`, `ereturn`, `sreturn`, `estimates`, `eststo`, `esttab` | `route_results.cpp`, `results_support.cpp` |
 | `tabulate`, `table`, `tabstat`, `correlate`, `pwcorr`, `ttest`, `mean`, `proportion` | `route_tabulation.cpp`, `summary_support.cpp` |
 | Table-command family beyond the arms above (single call, result flattened) | `route_table_family.cpp` |
 | `xtset`, `tsset`, `tset` | `route_time.cpp` |
 | `clear`, `set`, `version`, `compress`, `exit`, `cd`, `log`, `confirm`, `erase`, `ssc` | `route_session.cpp`, `session_support.cpp` |
 | `shell`, `dir`, `sleep`, `timer`, `bcal`, `frames`, `adopath`, `findfile`, `parallel` | `route_environment.cpp` |
-| Community and utility commands (`unique`, `missings`, `rangestat`, `filelist`, `lookfor`, `drawnorm`, `input`, `sample`) | `route_extensions.cpp` |
+| Community and utility commands (`unique`, `missings`, `rangestat`, `filelist`, `lookfor`, `drawnorm`, `input`, `sample`), and the table-routed `numlist`, `tsunab`, `fvexpand`, `dtaversion`, `misstable` | `route_extensions.cpp` |
 | `graph`, `twoway`, `histogram`, `kdensity`, `coefplot`, `marginsplot`, `serset`, `line`, `scatter` | `route_graphics.cpp`, `graphics_support.cpp` |
 | Inline `display`, `c()` locals, row-expression reference rewriting, `_rc` substitution | `expression_support.cpp` |
 | Small text helpers: echo block, glued-head split, `joinVarlist`, result-block pushing | `text_support.cpp` |
-| Command names, abbreviations, weight/`in` allow-lists, prefix registry, community-name table, `--dump-*` output | `registry.cpp` |
+| Command names, abbreviations, weight/`in` allow-lists, Stata's own qualifier and lead syntax (`StataQualifiers`, `StataLead`), prefix registry, community-name table, `--dump-*` output | `registry.cpp` |
 | Option vocabularies, minimum-abbreviation tables and the option-key resolver | `options_support.cpp` |
 
 Headers. `types.h` is the shared private header: it includes the engine and handler

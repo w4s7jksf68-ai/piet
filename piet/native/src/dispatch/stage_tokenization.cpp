@@ -26,13 +26,37 @@ bool tokenizeCommand(std::string& cmd,
       const std::string t = trimWs(cmdForDispatch);
       return t.substr(0, t.find_first_of(" \t"));
     }();
+    // The command name a user-program call is looked up by: the leading name
+    // characters (`pso,` and `pso(1 2)` call `pso`).
+    const std::string progHead = [&] {
+      size_t k = 0;
+      while (k < headWord0.size() &&
+             (std::isalnum(static_cast<unsigned char>(headWord0[k])) != 0 || headWord0[k] == '_'))
+        ++k;
+      return headWord0.substr(0, k);
+    }();
     try {
+      eval::setTokenizeCallerVersion(session.callerVersion);
       parsed = eval::tokenize(cmdVerbatim);
     } catch (const eval::TokenizerError& te) {
-      if (te.block.value("token", "") == "`\"" &&
-          program::findProgram(session, headWord0).has_value()) {
+      // The tokenizer's gates (`in` and weights against the command's registry
+      // row, trailing qualifiers, compound literals) guard PIET's built-in
+      // handlers. A user program parses its own `0' with `syntax`, so none of
+      // them speaks for it: `pso in 2/5 if mpg>20` was "command pso is not
+      // supported" (the `in` gate reads an unknown command), where StataBE
+      // binds `in' and `if' (truth bank syntaxedge cells). Only the
+      // unexpanded-macro net stays: text PIET could not expand is not passed on
+      // as if it had been. A Stata command abbreviation is not a program call
+      // (registry.h isStataCommandAbbreviation).
+      const bool userProgramCall =
+          !progHead.empty() && te.block.value("code", "") != "unsupported_macro" &&
+          !registry::isStataCommandAbbreviation(progHead) &&
+          (program::findProgram(session, progHead).has_value() ||
+           (!session.adoContext.empty() &&
+            program::findProgram(session, session.adoContext + "." + progHead).has_value()));
+      if (userProgramCall) {
         parsed = eval::ParsedCommand{};
-        parsed.cmd = headWord0;
+        parsed.cmd = progHead;
         parsed.raw = cmdForDispatch;
       } else {
         if (te.block.value("code", "") == "syntax_error" &&

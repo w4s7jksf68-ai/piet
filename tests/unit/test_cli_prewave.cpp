@@ -1598,8 +1598,11 @@ static void test_vmb_one_way() {
     check(same(mb({"id"}, Vcov::Cluster, "", WeightKind::None), p1) &&
               same(mb({"id"}, Vcov::HC1, "", WeightKind::None), p1),
           "areg / xtreg,fe robust / cluster: the extended bread, _cons included");
-    check(mb({}, Vcov::HC1, "w", WeightKind::Analytic).empty() && mb({}, Vcov::IID, "", WeightKind::None).empty(),
-          "aweight and the classic VCE: not sent");
+    // StataBE stores e(V_modelbased) after a weighted robust/cluster regress too (vs-stata
+    // bank 911986b4 `regress price mpg weight [aweight=w], vce(robust)`, b5807962 [aw=]
+    // vce(cluster)); the classic VCE has none.
+    check(!mb({}, Vcov::HC1, "w", WeightKind::Analytic).empty() && mb({}, Vcov::IID, "", WeightKind::None).empty(),
+          "aweight robust: sent; the classic VCE: not sent");
     native_unlink(path);
 }
 

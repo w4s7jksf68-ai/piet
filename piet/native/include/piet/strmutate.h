@@ -158,6 +158,16 @@ ConditionMaskInstall installRowExpression(SessionState& session, const std::stri
                                           const std::string& byVars, bool countValues);
 // namesObsPosition: `expr` names _n or _N outside a "..." literal.
 bool namesObsPosition(const std::string& expr);
+// GroupRelativeSubscripts: while one is open the row evaluator does not read an explicit
+// subscript (`s[_n-1]`, `s[1]`) -- the expression keeps failing to parse, as it did before
+// the evaluator had subscripts. Under a by-prefix or an egen by() a subscript counts within
+// the group, and this evaluator reads the whole frame: a value would come out, and be wrong.
+struct GroupRelativeSubscripts {
+  GroupRelativeSubscripts();
+  ~GroupRelativeSubscripts();
+  GroupRelativeSubscripts(const GroupRelativeSubscripts&) = delete;
+  GroupRelativeSubscripts& operator=(const GroupRelativeSubscripts&) = delete;
+};
 // removeConditionMask: drops a qualifier column from the working frame when it is
 // still there (a command that rebuilt the data, collapse, has none left).
 // c(changed) is left as the command left it.

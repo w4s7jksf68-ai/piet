@@ -1,0 +1,33 @@
+{
+ "blocks": [
+  {
+   "type": "echo",
+   "text": ".  display \"abc\" _continue"
+  },
+  {
+   "type": "display",
+   "text": "abc",
+   "continue": true
+  },
+  {
+   "type": "echo",
+   "text": ".  display \"def\""
+  },
+  {
+   "type": "display",
+   "text": "def"
+  },
+  {
+   "type": "echo",
+   "text": ".  display \"x\" _continue"
+  },
+  {
+   "type": "display",
+   "text": "xy"
+  },
+  {
+   "type": "echo",
+   "text": ".  display \"y\""
+  }
+ ]
+}

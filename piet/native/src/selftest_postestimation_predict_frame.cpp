@@ -447,28 +447,53 @@ void testW2PredictFrame() {
                 g.first + " missing " + std::to_string(zMissing) + ", summarize " + sm.first +
                 " N " + sN + ", local " + m.first + " s=" + sv);
   }
-  // The ONE kept refusal: a model PIET records no mask for (pca: the handler is
-  // not wired for the engine's sample) is a NAMED r(198) that writes nothing --
-  // never a guess, and never the mask an earlier fit left on the rows. PIET
-  // limit by design (SPEC §5.5/§7); no Stata arm reads e(sample) after pca.
+  // The ONE kept refusal: a model PIET records no mask for is a NAMED r(198)
+  // that writes nothing -- never a guess, and never the mask an earlier fit left
+  // on the rows. PIET limit by design (SPEC §5.5/§7). The fit is `qreg ...,
+  // vce(robust)`, whose engine path has no admitted-rows output; this arm used `pca`,
+  // then `ivregress liml`, until each recorded its sample (liml since the vs-stata bank
+  // wave, bank 447495d2 `ivregress liml ...` ESAMPLE 74). When qreg's is wired too, move
+  // the arm to a fit that still is not -- the property is the refusal, not the command.
   {
     piet::SessionState session(workdir);
     w2pfSmallsData(session);
     (void)piet::dispatch("quietly regress y x2 t if id < 4", session);
     auto before = w2pfRun("count if e(sample)", session);
-    (void)piet::dispatch("quietly pca x2 t", session);
+    auto fit = w2pfRun("quietly qreg y x2 t, vce(robust)", session);
     const int cols = w2pfCols(session);
     auto g = w2pfRun("generate z = 1 if e(sample)", session);
     auto c = w2pfRun("count if e(sample)", session);
     const bool named = g.second.find("e(sample)") != std::string::npos &&
-                       g.second.find("pca") != std::string::npos;
-    w2check(before.first == "0" && g.first == "198" && named && !w2pfHas(session, "z") &&
-                c.first == "198" && w2pfCols(session) == cols,
-            "W2 predictframe (e(sample) T2): after `pca` -- a fit with no recorded sample mask "
-            "-- `generate z = 1 if e(sample)` and `count if e(sample)` are a NAMED r(198) naming "
-            "pca, and nothing is written, although the regress before it left its mask on the "
-            "rows. Main: r(198) for the regress too (count before = " + before.first +
-                "). Got generate " + g.first + " `" + g.second + "`, count " + c.first);
+                       g.second.find("qreg") != std::string::npos;
+    w2check(before.first == "0" && fit.first == "0" && g.first == "198" && named &&
+                !w2pfHas(session, "z") && c.first == "198" && w2pfCols(session) == cols,
+            "W2 predictframe (e(sample) T2): after `qreg ..., vce(robust)` -- a fit with no "
+            "recorded sample mask -- `generate z = 1 if e(sample)` and `count if e(sample)` are a "
+            "NAMED r(198) naming qreg, and nothing is written, although the regress before it "
+            "left its mask on the rows. Main: r(198) for the regress too (count before = " +
+                before.first + "). Got fit " + fit.first + ", generate " + g.first + " `" +
+                g.second + "`, count " + c.first);
+  }
+  // pca records its estimation sample, as Stata's pca does: after `pca ... if`
+  // `count if e(sample)` is e(N) (vs-stata bank 92895b267256687f: `pca price mpg
+  // weight length turn displacement if foreign==0` -> count if e(sample) 52 =
+  // e(N) 52; 0d3e9e5fc9c7aaf1 unrestricted: 74 = e(N) 74). Here `if id < 4`
+  // leaves 9 of the 12 rows.
+  {
+    piet::SessionState session(workdir);
+    w2pfSmallsData(session);
+    (void)piet::dispatch("quietly regress y x2 t", session);
+    auto fit = w2pfRun("quietly pca x2 t if id < 4", session);
+    auto c = w2pfRun("count if e(sample)", session);
+    (void)piet::dispatch("scalar __w2pf_pn = r(N)", session);
+    (void)piet::dispatch("scalar __w2pf_pe = e(N)", session);
+    const std::string pn = session.eval.scalars.get("__w2pf_pn", "<unset>");
+    const std::string pe = session.eval.scalars.get("__w2pf_pe", "<unset>");
+    w2check(fit.first == "0" && c.first == "0" && (pn == "9" || pn == "9.0") && pn == pe,
+            "W2 predictframe (e(sample) T2): after `pca x2 t if id < 4`, `count if e(sample)` "
+            "is the estimation sample, 9 = e(N) (bank 92895b267256687f: 52 = e(N); "
+            "0d3e9e5fc9c7aaf1: 74 = e(N)). Got fit " + fit.first + ", count " + c.first +
+                " r(N) " + pn + ", e(N) " + pe);
   }
 
   // == 9. BUG-519: predict after a WEIGHTED fit is never the unweighted model ===

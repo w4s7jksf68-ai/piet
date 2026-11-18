@@ -251,6 +251,28 @@ GettokenScan scanGettoken(const std::string& s, const GettokenOpts& o) {
 
 }  // namespace
 
+// [P] tokenize: the tokens gettoken would peel off one by one (StataBE 19.5,
+// vs-stata bank tokargs / quoting2 / macro cells: `tokenize "a,b,,c",
+// parse(",")` is a , b , , c; `tokenize `"a "b,c" d,e"', parse(",")` is
+// `a "b,c" d`, `,`, `e`; `parse(",;")` makes each of , and ; a token).
+std::optional<nlohmann::json> tokenizeText(const std::string& text, const std::string& opts,
+                                           std::vector<std::string>& out) {
+  GettokenOpts o;
+  if (!strip(opts).empty()) {
+    if (auto err = parseGettokenOpts(", " + opts, o)) return err;
+    if (o.quotes || o.bind || !o.qed.empty() || !o.match.empty())
+      return syntaxError("invalid syntax");
+  }
+  std::string rest = text;
+  while (rest.find_first_not_of(' ') != std::string::npos) {
+    GettokenScan sc = scanGettoken(rest, o);
+    if (sc.rest.size() >= rest.size()) break;  // no progress: nothing left to read
+    out.push_back(sc.token);
+    rest = sc.rest;
+  }
+  return std::nullopt;
+}
+
 std::vector<nlohmann::json> runGettoken(const std::string& rawLine, LocalsStore& locals) {
   std::string stripped = strip(rawLine);
   // {kind, name} of TOK, REST (kind "-" when the 2-argument form has none), SRC.

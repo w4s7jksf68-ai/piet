@@ -235,6 +235,12 @@ ojson runPostfile(const std::string& rawLine, SessionState& session) {
   size_t sp = rest.find_first_of(" \t");
   std::string handle = (sp == std::string::npos) ? rest : rest.substr(0, sp);
   if (handle.empty()) return engineErrorBlock("postfile: handle name required");
+  // StataBE 19.5: the handle is a name -- `postfile , zzabbrprobe` is r(198) ",
+  // invalid name" -- and `using` is required: `postfile pf7 x y` is r(100)
+  // "using required" (vs-stata bank 2026-11-10).
+  if (handle[0] == ',')
+    return ojson(eval::errorBlock("syntax_error", ", invalid name", std::nullopt, std::nullopt,
+                                  std::nullopt, "r(198)"));
   rest = (sp == std::string::npos) ? std::string() : trim(rest.substr(sp));
 
   // Find ` using ` (last occurrence, case-insensitive).
@@ -246,7 +252,8 @@ ojson runPostfile(const std::string& rawLine, SessionState& session) {
       typeNamePart = "";
       pathPart = trim(rest.substr(6));
     } else {
-      return engineErrorBlock("postfile: missing `using` clause in: " + rawLine);
+      return ojson(eval::errorBlock("syntax_error", "using required", std::nullopt, std::nullopt,
+                                    std::nullopt, "r(100)"));
     }
   } else {
     typeNamePart = trim(rest.substr(0, usingIdx));
@@ -265,7 +272,20 @@ ojson runPostfile(const std::string& rawLine, SessionState& session) {
       } else if (ch == ',' && !inQ) {
         std::istringstream os(lower(pathPart.substr(i + 1)));
         for (std::string w; os >> w;) {
-          if (w == "replace") replaceOpt = true;
+          if (w == "replace") {
+            replaceOpt = true;
+          } else if (w.rfind("every(", 0) == 0) {
+            while (w.find(')') == std::string::npos && (os >> std::ws) && os.good()) {
+              std::string more;
+              if (!(os >> more)) break;
+              w += more;
+            }
+          } else {
+            // [P] postfile's options are replace and every(#): any other word
+            // is r(198) (bank ed1096d62f7be902).
+            return ojson(eval::errorBlock("syntax_error", "option " + w + " not allowed",
+                                          std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+          }
         }
         pathPart = trim(pathPart.substr(0, i));
         break;
@@ -336,6 +356,9 @@ ojson runPost(const std::string& rawLine, SessionState& session) {
   size_t sp = rest.find_first_of(" \t");
   std::string handle = (sp == std::string::npos) ? rest : rest.substr(0, sp);
   if (handle.empty()) return engineErrorBlock("post: handle name required");
+  if (handle[0] == ',')  // `post , zzabbrprobe`: r(198) ", invalid name" (bank 38aa3087a3a1165f)
+    return ojson(eval::errorBlock("syntax_error", ", invalid name", std::nullopt, std::nullopt,
+                                  std::nullopt, "r(198)"));
   std::string exprPart = (sp == std::string::npos) ? std::string() : trim(rest.substr(sp));
 
   auto it = session.postfiles.find(handle);
@@ -371,7 +394,14 @@ ojson runPost(const std::string& rawLine, SessionState& session) {
       if (!res.isString) {
         row.emplace_back("numeric", res.isNan ? "nan" : res.text);
       } else {
-        row.emplace_back("numeric", "nan");  // mismatch -> missing
+        // A string expression for a numeric variable is r(109) "type mismatch",
+        // with the position named (bank e87c2e2779edc7d7); the file keeps the
+        // rows posted so far.
+        return ojson(eval::errorBlock(
+            "engine_error",
+            "type mismatch\npost:  above message corresponds to expression " +
+                std::to_string(idx + 1) + ", variable " + ph.names[idx],
+            std::nullopt, std::nullopt, std::nullopt, "r(109)"));
       }
     }
   }

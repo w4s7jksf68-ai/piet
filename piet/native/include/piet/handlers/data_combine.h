@@ -59,7 +59,9 @@ nlohmann::ordered_json runMerge(const std::string& mergeType, const std::vector<
                                  const std::string& usingPath,
                                  const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                  SessionState& session, bool sequential = false,
-                                 bool oldSyntax = false, bool oldSort = false);
+                                 bool oldSyntax = false, bool oldSort = false,
+                                 bool fmerge = false,
+                                 std::vector<std::string>* broughtVars = nullptr);
 
 // `joinby key1 [key2 ...] using FILE` (bare form only) — BS-004/D5 (BETA
 // B-data): PIET-NATIVE inner key-join (the analysis.do:451 shape). For
@@ -84,7 +86,8 @@ nlohmann::ordered_json runMerge(const std::string& mergeType, const std::vector<
 nlohmann::ordered_json runJoinby(const std::vector<std::string>& keylist,
                                   const std::string& usingPathArg, SessionState& session,
                                   const std::string& unmatched = "none",
-                                  const std::optional<std::string>& mergeVar = std::nullopt);
+                                  const std::optional<std::string>& mergeVar = std::nullopt,
+                                  bool nolabel = false);
 
 // -- frames (P6 wave, frames.cpp) ----------------------------------
 // Stata `frame`s: additional named datasets beside the current one. A PIET

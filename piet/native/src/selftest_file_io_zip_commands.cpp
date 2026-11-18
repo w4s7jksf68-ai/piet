@@ -371,6 +371,16 @@ void zipsaveZipuseArms(const std::string& workdir, const std::string& dir) {
                  entryNames(dir + "/t1zsx.dta.zip") == "t1zsx.dta",
              "review st_zu zs1/zs_noname (c(filename) = archive, t1base.dta untouched)");
   }
+  // Review s3b_io: c(filename) names the archive after zipsave / zipuse, but the archive is not
+  // the dataset's own file -- a name-less `save, replace` is r(198) and leaves the zip bytes alone.
+  {
+    run(s, {"clear", "set obs 3", "generate a = _n", "zipsave t1nosave, replace",
+            "zipuse t1nosave, clear"});
+    const std::string sv = rcOf(s, "save, replace");
+    const bool stillZip = readFile(dir + "/t1nosave.dta.zip").compare(0, 2, "PK") == 0;
+    zipCheck(sv == "198" && stillZip,
+             "review s3b_io: name-less save, replace after zipuse is r(198), archive untouched");
+  }
   // Review st_zu finder: without dtafile() the FIRST file entry is the dataset (a Finder
   // archive's `__MACOSX/._x.dta` after it is ignored); st_zf notdta: an entry that is no
   // Stata dataset is r(610). No `use` memo survives keyed on the deleted scratch file.

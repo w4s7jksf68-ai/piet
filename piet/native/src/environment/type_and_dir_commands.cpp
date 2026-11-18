@@ -35,8 +35,11 @@ namespace {
 // canonicalize for, which is precisely how an ACCEPTED abbreviation reaches a
 // handler that then compares raw keys and drops it. Registered up front, read
 // back by the reject calls below, so each spelling is still written once.
+// `asis` is the plain-text reading this command already does; `smcl` (interpret
+// SMCL directives) is read too, and a file that holds SMCL directives is refused
+// by name, since none is interpreted.
 const eval::OptVocab& kVocabType =
-    eval::registerOptVocab({"type"}, {{"showtabs", "starbang", "lines"}, {}});
+    eval::registerOptVocab({"type"}, {{"showtabs", "starbang", "lines", "asis", "smcl"}, {}});
 // Both spellings register, because both are registry commands routed to
 // runDir: a vocabulary filed under "dir" alone leaves `ls x, wid' with no
 // canonicalization at the dispatcher's single resolution point, so the
@@ -63,8 +66,10 @@ nlohmann::ordered_json runType(const std::string& raw, const std::vector<std::st
 
   bool showtabs = false;
   bool starbang = false;
+  bool smcl = false;
   long long maxLines = -1;
   for (const auto& [k, v] : opts) {
+    if (k == "smcl" && v.isBool) smcl = v.boolValue;
     if (k == "showtabs" && v.isBool) showtabs = v.boolValue;
     else if (k == "starbang" && v.isBool) starbang = v.boolValue;
     else if (k == "lines") {
@@ -104,6 +109,10 @@ nlohmann::ordered_json runType(const std::string& raw, const std::vector<std::st
                         (sec ? std::string("?") : std::to_string(bytes)) + " bytes)");
   }
 
+  if (smcl && data.find('{') != std::string::npos)
+    return errBlockRc("type, smcl: SMCL directives in " + typedUserPath(arg) +
+                          " are not interpreted by this build",
+                      "r(198)");
   std::vector<std::string> lines;
   {
     std::string cur;
@@ -187,7 +196,10 @@ nlohmann::ordered_json runDir(const std::string& raw, const std::vector<std::str
       dirPath = np.parent_path().u8string();
       pattern = np.filename().u8string();
     } else {
-      return errBlockRc("directory " + resolved + " not found", "r(601)");
+      // `dir` hands the name to the system's own listing, which reports a
+      // missing one in its words and leaves rc 0 (StataBE 19.5, bank
+      // eb4db76657e15a20 `dir zzzdir/`: "ls: zzzdir/: No such file or directory").
+      return displayBlock("ls: " + arg + ": No such file or directory");
     }
   }
 
@@ -215,15 +227,32 @@ nlohmann::ordered_json runDir(const std::string& raw, const std::vector<std::str
     if (entries[i].second) text += "/";
   }
 
-  if (!wide) return displayBlock(text);
-  // `wide` is accepted so a corpus do-file does not halt on it, but accepting
-  // it silently would make PIET's answer look like Stata's multi-column one.
-  // The note says which layout the caller actually got -- appended to the SAME
-  // block, because the dispatcher's dir/ls arm pushes this return value as one
-  // element and a two-block array would arrive nested and render as nothing.
-  if (!text.empty()) text += "\n";
-  text += "(dir: option wide ignored -- one entry per line)";
-  return displayBlock(text);
+  if (!wide || entries.empty()) return displayBlock(text);
+  // Wide: names in columns, each a name plus three blanks wide, as many to a
+  // row as fit in 80 columns, filled down the columns (bank d4300f3fb3d52e48:
+  // `a.txt   b.txt   c.dat   sub/`).
+  std::vector<std::string> names;
+  size_t longest = 0;
+  for (const auto& [nm, isDir] : entries) {
+    names.push_back(isDir ? nm + "/" : nm);
+    longest = std::max(longest, names.back().size());
+  }
+  const size_t cell = longest + 3;
+  const size_t perRow = std::max<size_t>(1, 80 / cell);
+  const size_t rows = (names.size() + perRow - 1) / perRow;
+  std::string wideText;
+  for (size_t r = 0; r < rows; ++r) {
+    std::string row;
+    for (size_t c = 0; c < perRow; ++c) {
+      const size_t at = c * rows + r;
+      if (at >= names.size()) break;
+      row += names[at] + std::string(cell - names[at].size(), ' ');
+    }
+    while (!row.empty() && row.back() == ' ') row.pop_back();
+    if (r) wideText += "\n";
+    wideText += row;
+  }
+  return displayBlock(wideText);
 }
 
 }  // namespace piet::handlers

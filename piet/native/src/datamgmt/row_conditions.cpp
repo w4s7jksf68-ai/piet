@@ -392,6 +392,9 @@ ConditionMaskInstall installRowExpression(SessionState& session, const std::stri
   }
   Datastore* ds = byFrame ? byFrame.get() : (mini ? mini.get() : session.datastore());
   if (ds == nullptr) return fail(ojson(eval::noDataLoaded()));
+  // A subscript counts within the group under by(), the evaluator reads the whole frame.
+  std::optional<GroupRelativeSubscripts> groupRelative;
+  if (!byList.empty()) groupRelative.emplace();
   const EvalRowsResult er =
       evalRows(session, *ds, std::optional<std::string>(rewriteExpr(e)), std::nullopt);
   if (!er.ok) {

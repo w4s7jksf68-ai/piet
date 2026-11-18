@@ -188,7 +188,8 @@ const std::unordered_map<std::string, AliasPolicy>& aliasPolicies() {
         {},
         {"fast", "verbose"},
         {},
-        {},
+        // How gtools hashes and what it does on a collision change nothing in the result.
+        {"hashmethod", "oncollision", "forcestrl"},
         {},
         {"merge", "labelformat", "labelprogram", "freq", "rawstat", "unsorted", "missing",
          "wild", "sumcheck", "double", "pool", "register"}};
@@ -236,12 +237,15 @@ const std::unordered_map<std::string, AliasPolicy>& aliasPolicies() {
     // returned macro, `unsorted` changes the order it is returned in, and `gen`
     // creates a variable levelsof would not have created: all three are visible
     // in the answer, none is a speed knob.
+    // colseparate() and silent are glevelsof's own and are read by the levelsof
+    // arm when the typed command is glevelsof (runLevelsofCommand): silent is not
+    // a speed knob, it suppresses the level line.
     t.emplace("glevelsof", AliasPolicy{"levelsof",
                                        {"local", "clean", "missing", "separate"},
                                        {},
+                                       {"colseparate", "silent"},
                                        {},
                                        {},
-                                       {"silent"},
                                        {},
                                        {"numfmt", "unsorted", "gen"}});
 
@@ -252,11 +256,11 @@ const std::unordered_map<std::string, AliasPolicy>& aliasPolicies() {
     // greshape -> reshape. by()/keys() are i()/j() under different names.
     // `dropmiss` silently deletes rows reshape would have kept.
     t.emplace("greshape", AliasPolicy{"reshape",
-                                      {"i", "j"},
+                                      {"i", "j", "string"},
                                       {},
                                       {},
                                       {},
-                                      {"string", "nochecks", "fast"},
+                                      {"nochecks", "fast", "nodupcheck", "nomisscheck"},
                                       {{"by", "i"}, {"keys", "j"}},
                                       {"dropmiss"}});
 
@@ -449,11 +453,29 @@ std::string gtoolsCanonicalName(const std::string& canonical) {
 
 GtoolsTranslation translateGtoolsAlias(const eval::ParsedCommand& parsed,
                                        const std::string& canonical, SessionState& session) {
-  // Unused by every row today. It stays in the signature because the dispatcher
-  // hands every translation the same three arguments, and an alias whose
-  // refusal depends on session state (a mode that is only legal with a panel
-  // set, say) would need it without a call-site change.
-  (void)session;
+  // (session: greshape wide reads its key's type from the data.)
+
+  // `gquantiles source, xtile(newvar) ...` and `pctile(newvar)`: the same command as
+  // `gquantiles newvar = source, xtile ...`.
+  if (canonical == "gquantiles") {
+    for (size_t i = 0; i < parsed.opts.size(); ++i) {
+      const std::string key = strutil::lower(parsed.opts[i].first);
+      const eval::OptValue& value = parsed.opts[i].second;
+      if ((key != "xtile" && key != "pctile") || value.isBool || strutil::trim(value.strValue).empty())
+        continue;
+      eval::ParsedCommand rewritten = parsed;
+      rewritten.opts[i].second = eval::OptValue::ofBool(true);
+      const std::string head0 = headBeforeOpts(rawArgsAfterCmdLocal(parsed.raw));
+      rewritten.varlist.clear();
+      rewritten.varlist.push_back(strutil::trim(value.strValue));
+      rewritten.varlist.push_back("=");
+      for (const auto& w : splitWords(head0)) rewritten.varlist.push_back(w);
+      rewritten.raw = parsed.cmd + " " + strutil::trim(value.strValue) + " = " + head0;
+      const std::string tail = serialiseOpts(rewritten.opts);
+      if (!tail.empty()) rewritten.raw += ", " + tail;
+      return translateGtoolsAlias(rewritten, canonical, session);
+    }
+  }
 
   GtoolsTranslation out;
   out.parsed = parsed;
@@ -515,9 +537,40 @@ GtoolsTranslation translateGtoolsAlias(const eval::ParsedCommand& parsed,
     const std::string outKey = (ren == renameMap.end()) ? key : ren->second;
     if (outKey == "nquantiles") haveNquantiles = true;
     translated.emplace_back(outKey, parsed.opts[i].second);
+    // gquantiles reads nquantiles(0) as "not given", which means two groups.
+    if (canonical == "gquantiles" && outKey == "nquantiles" && !translated.back().second.isBool &&
+        strutil::trim(translated.back().second.strValue) == "0")
+      translated.back().second = eval::OptValue::ofString(std::to_string(kGquantilesDefaultNq));
   }
 
   std::string native = pol->native;
+  if (canonical == "reshape" || native == "reshape") {
+    // greshape's subcommands; anything else is r(198).
+    if (!parsed.varlist.empty()) {
+      const std::string sub = strutil::lower(parsed.varlist[0]);
+      if (sub != "long" && sub != "gather" && sub != "wide" && sub != "spread") {
+        out.error = ojson(eval::errorBlock(
+            "syntax_error", "Unknown subcommand '" + parsed.varlist[0] +
+                                "'; supported: long or gather, wide or spread",
+            std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+        return out;
+      }
+      // Wide with a string j is read as such: the key's own type says so.
+      if ((sub == "wide" || sub == "spread") && session.hasData() && session.datastore() != nullptr) {
+        bool haveString = false;
+        std::string jName;
+        for (const auto& kv : translated) {
+          const std::string k = strutil::lower(kv.first);
+          if (k == "string" || k == "s" || k == "st" || k == "str" || k == "stri" || k == "strin")
+            haveString = true;
+          if (k == "j" && !kv.second.isBool) jName = strutil::trim(kv.second.strValue);
+        }
+        if (!haveString && !jName.empty() && session.datastore()->has(jName) &&
+            session.datastore()->dtype(jName) != "f64")
+          translated.emplace_back("string", eval::OptValue::ofBool(true));
+      }
+    }
+  }
   if (canonical == "gquantiles") {
     if (mode.mode == "xtile") {
       out.canonical = "xtile";

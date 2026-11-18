@@ -2,6 +2,7 @@
 // Copyright (C) 2026 M.K. Kim
 // Binary estimation.
 #include "piet/handlers/estimation.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -101,6 +102,19 @@ ojson runLogitProbit(const std::string& cobraCmd, const eval::ParsedCommand& par
     if (ce.code == "no_obs" && std::string(ce.what()) == "insufficient observations")
       return ojson(eval::errorBlock("engine_error", "insufficient observations", std::nullopt,
                                     std::nullopt, std::nullopt, std::string("r(2001)")));
+    // cloglog's syntax takes numeric variables only: a string variable is r(109)
+    // (StataBE 19.5 bank 32c0e667 `cloglog make mpg weight`: "string variables not
+    // allowed in varlist; make is a string variable"), where logit and probit mark
+    // every row out (r(2000) below).
+    if (ce.code == "no_obs" && cobraCmd == "cloglog") {
+      const std::string w = ce.what();
+      const size_t open = w.find('('), at = w.find(" is a string variable");
+      if (open != std::string::npos && at != std::string::npos && at > open + 1)
+        return ojson(eval::errorBlock("engine_error",
+                                      "string variables not allowed in varlist;\n" +
+                                          w.substr(open + 1, at - open - 1) + " is a string variable",
+                                      std::nullopt, std::nullopt, std::nullopt, std::string("r(109)")));
+    }
     if (ce.code == "no_obs")
       return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
                                     std::nullopt, std::string("r(2000)")));
@@ -187,6 +201,16 @@ ojson runLogitProbit(const std::string& cobraCmd, const eval::ParsedCommand& par
     if (!replaced) session.eval.eMatrices.emplace_back("rules", std::move(m));
     session.noteEOnFit("rules");
   }
+  // ml's default iteration limit c(maxiter) reached without convergence is
+  // r(430) "convergence not achieved", the fit's results posted (StataBE 19.5
+  // bank 2932c709 `logit foreign mpg weight, offset(weight)`, a2967251 probit:
+  // 300 iterations backed up, rc 430). An explicit iterate(#) that stops the fit
+  // early is rc 0 with e(converged) 0 (bank 8c4dffd5 `logit ..., iterate(2)`).
+  if (raw.is_object() && raw.contains("converged") && raw["converged"].is_boolean() &&
+      !raw["converged"].get<bool>() &&
+      std::find(cobraArgs.begin(), cobraArgs.end(), "--iterate") == cobraArgs.end())
+    return ojson(eval::errorBlock("engine_error", "convergence not achieved", std::nullopt, std::nullopt,
+                                  std::nullopt, std::string("r(430)")));
   return block;
 }
 

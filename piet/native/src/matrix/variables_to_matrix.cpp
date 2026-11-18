@@ -277,6 +277,14 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
     // rowprefix(p) p3 p4 ...).
     const size_t k = rows.size();
     if (!rowVar.empty()) {
+      // A numeric rownames() variable that is missing in a selected row is
+      // r(198) (StataBE 19.5 `mkmat price mpg in 1/4, matrix(X)
+      // rownames(rep78)`, vs-stata bank d1ca14d19d129ebd).
+      if (ds->dtype(rowVar) != "factor") {
+        const double* rv = ds->col(rowVar).f64();
+        if (rv != nullptr && std::isnan(rv[i]))
+          return aerErrorRc("rownames() invalid; " + rowVar + " contains missing values", 198);
+      }
       rowNames.push_back(rowNameFromValue(*ds, rowVar, i));
     } else if (useObsNumbers) {
       const int64_t obs =
@@ -286,6 +294,14 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
       rowNames.push_back(rowPrefix + std::to_string(k));
     }
   }
+
+  // mkmat counts its sample (`count if touse`) before anything else can fail
+  // and is no r-class program itself, so that count's r() is what it leaves:
+  // r(N), the rows it takes (vs-stata bank 8f34184c9b65d0aa `mkmat price mpg in
+  // 1/5` r(N) 5, b21dd3f21df74b9f r(N) 74).
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("N", static_cast<double>(rows.size()));
+  eval::declareRPosted(session.eval, "mkmat", {"N"});
 
   if (rows.empty()) {
     // Stata's r(2000). coarseRc has no message rule for this phrase, so the rc

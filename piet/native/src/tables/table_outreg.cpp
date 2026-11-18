@@ -5,6 +5,7 @@
 #include "outreg2_internal.h"
 #include "piet/handlers/estimates_tables.h"
 #include "piet/user_paths.h"
+#include "core/distributions.h"  // stata_invttail / stata_invnormal (shared with cobra)
 namespace piet::handlers::table_detail {
 
 
@@ -1169,13 +1170,14 @@ ojson runOutreg2(const eval::ParsedCommand& parsed, SessionState& session) {
   };
   const std::optional<int> dec0 = readDec("dec"), bdec0 = readDec("bdec"),
                            sdec0 = readDec("sdec"), tdec0 = readDec("tdec"),
-                           pdec0 = readDec("pdec"), rdec0 = readDec("rdec");
+                           pdec0 = readDec("pdec"), rdec0 = readDec("rdec"), cdec0 = readDec("cdec");
   for (const auto& [nm, v] : {std::pair<const char*, std::optional<int>>{"dec", dec0},
                               {"bdec", bdec0},
                               {"sdec", sdec0},
                               {"tdec", tdec0},
                               {"pdec", pdec0},
-                              {"rdec", rdec0}}) {
+                              {"rdec", rdec0},
+                              {"cdec", cdec0}}) {
     if (v.has_value() && *v == -1) {
       return tblErrorRc(std::string(nm) + "() invalid -- invalid numlist", 121);
     }
@@ -1186,6 +1188,7 @@ ojson runOutreg2(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
   const int decBase = dec0.value_or(3);
+  const int cdec = cdec0.value_or(decBase);
   const int bdec = bdec0.value_or(decBase), sdec = sdec0.value_or(decBase),
             tdec = tdec0.value_or(decBase), pdec = pdec0.value_or(decBase),
             rdec = rdec0.value_or(decBase);
@@ -1207,7 +1210,16 @@ ojson runOutreg2(const eval::ParsedCommand& parsed, SessionState& session) {
   int adec = -1;
   if (auto av = optStr(opts, "adec")) {
     const std::vector<std::string> toks = splitWs(dequote(*av));
-    if (toks.size() != 1) return tblErrorRc("adec() invalid -- single number required", 123);
+    if (toks.size() != 1) {
+      // numlist reads the whole list first: a word that is not a number ends it as
+      // an invalid numlist, r(121); only a list of numbers can be too long, r(123).
+      for (const auto& t : toks) {
+        char* end = nullptr;
+        (void)std::strtod(t.c_str(), &end);
+        if (t.empty() || *end != '\0') return tblErrorRc("adec() invalid -- invalid numlist", 121);
+      }
+      return tblErrorRc("adec() invalid -- single number required", 123);
+    }
     size_t pos = 0;
     double d = 0;
     bool numeric = true;
@@ -1233,6 +1245,26 @@ ojson runOutreg2(const eval::ParsedCommand& parsed, SessionState& session) {
 
   // ---- stats() (:1491-1611) --------------------------------------------------
   const bool tstatOpt = hasFlag(opts, "tstat");
+  // pvalue / bracket / paren(): outreg2.ado's `Pvalue` (the p-value row in place of the standard
+  // error), `BRacket` (brackets for the statistics row) and `PARenthesis(list)` / `BRacketA(list)`
+  // (which statistics sit in parentheses / in brackets).
+  const bool pvalueOpt = hasFlag(opts, "pvalue");
+  const bool ciOpt = hasFlag(opts, "ci");
+  bool bracketFlag = false;
+  std::optional<std::string> bracketList, parenList;
+  for (const auto& [k, v] : opts) {
+    if (k == "bracket") {
+      if (v.isBool) bracketFlag = true;
+      else bracketList = dequote(v.strValue);
+    }
+    if ((k == "paren" || k == "parenthesis") && !v.isBool) parenList = dequote(v.strValue);
+  }
+  if ((tstatOpt ? 1 : 0) + (pvalueOpt ? 1 : 0) + (ciOpt ? 1 : 0) > 1) {
+    return tblErrorRc("choose only one of tstat, pvalue, ci, or beta", 198);
+  }
+  if (bracketFlag && bracketList.has_value()) {
+    return tblErrorRc("cannot choose both br:acket and br:acket() option", 198);
+  }
   // `nose` keeps the coefficient row only (StataBE: the file loses its two
   // standard-error rows, the legend stays), and is refused beside stats().
   const bool noSe = hasFlag(opts, "nose");
@@ -1250,32 +1282,62 @@ ojson runOutreg2(const eval::ParsedCommand& parsed, SessionState& session) {
     statsList = splitWs(spec);
     if (statsList.empty()) return tblErrorRc("stats() invalid", 198);
     if (tstatOpt) return tblErrorRc("cannot specify both st:ats( ) and tstat options", 198);
+    if (pvalueOpt) return tblErrorRc("cannot specify both st:ats( ) and p:value options", 198);
+    if (ciOpt) return tblErrorRc("cannot specify both st:ats( ) and ci options", 198);
   } else {
-    statsList = {"coef", tstatOpt ? "tstat" : "se"};
+    statsList = {"coef", ciOpt ? "ci" : (tstatOpt ? "tstat" : (pvalueOpt ? "pval" : "se"))};
   }
   for (auto& s : statsList) {
     s = strutil::lower(s);
-    if (s != "coef" && s != "se" && s != "tstat" && s != "pval") {
+    if (s != "coef" && s != "se" && s != "tstat" && s != "pval" && s != "ci") {
       return ojson(eval::unsupportedOption(
-          "stats", "outreg2 stats(): this build knows coef, se, tstat and pval; `" + s +
+          "stats", "outreg2 stats(): this build knows coef, se, tstat, pval and ci; `" + s +
                        "` names none of them"));
     }
   }
   // parenthesis: the EVEN positions of the list (:5784-5800), `se` when none.
   std::vector<bool> paren(statsList.size(), false);
+  std::vector<bool> bracketed(statsList.size(), false);
   std::string parenFirst;
-  for (size_t i = 1; i < statsList.size(); i += 2) {
-    paren[i] = true;
-    if (parenFirst.empty()) parenFirst = statsList[i];
+  bool noLegendRow = false;
+  if (parenList.has_value() || bracketList.has_value()) {
+    // explicit lists: the statistics named are wrapped, whatever their position
+    auto in = [&](const std::optional<std::string>& l, const std::string& nm) {
+      if (!l.has_value()) return false;
+      for (const auto& t : splitWs(*l)) {
+        if (strutil::lower(t) == nm) return true;
+      }
+      return false;
+    };
+    for (size_t i = 0; i < statsList.size(); ++i) {
+      paren[i] = in(parenList, statsList[i]);
+      bracketed[i] = in(bracketList, statsList[i]);
+      if ((paren[i] || bracketed[i]) && parenFirst.empty()) parenFirst = statsList[i];
+    }
+  } else if (bracketFlag && statsGiven) {
+    // `bracket` beside a typed stats() list: no parenthesis list is set (only the se / tstat /
+    // pvalue / ci options set one), so every statistic string except the coefficient is bracketed,
+    // whatever its position, and no "in brackets" legend row is written.
+    for (size_t i = 0; i < statsList.size(); ++i) bracketed[i] = statsList[i] != "coef";
+    noLegendRow = true;
+  } else {
+    for (size_t i = 1; i < statsList.size(); i += 2) {
+      paren[i] = !bracketFlag;
+      bracketed[i] = bracketFlag;
+      if (parenFirst.empty()) parenFirst = statsList[i];
+    }
   }
+  const bool anyBracket = bracketFlag || bracketList.has_value();
   if (parenFirst.empty()) parenFirst = "se";
   // The legend (:6215-6243). `statsList` carries a leading blank when stats()
   // was typed, so only the option forms meet the exact "coef se" test.
   std::string statxt;
-  if (!statsGiven && !tstatOpt) {
+  if (!statsGiven && !tstatOpt && !pvalueOpt && !ciOpt) {
     statxt = "Standard errors";
   } else if (parenFirst == "se") {
     statxt = "Standard errors";
+  } else if (!statsGiven && statsList.size() == 2 && statsList[1] == "pval") {
+    statxt = "p-values";  // only the pvalue option form meets the exact "coef pval" test
   } else if (parenFirst == "tstat") {
     statxt = "t-statistics";  // z when e(df_r) is missing, settled per model below
   } else {
@@ -1456,7 +1518,25 @@ ojson runOutreg2(const eval::ParsedCommand& parsed, SessionState& session) {
       if (!r.contains(k) || !r[k].is_number()) return kO2Missing;
       return r[k].get<double>();
     };
+    // outreg2 computes its own interval: coef -/+ T*se, T the t quantile on e(df_r) degrees of
+    // freedom (the normal quantile when e(df_r) is not stored) at the session's confidence level --
+    // not whatever interval the estimator itself stored.
+    const double ciCrit = [&]() {
+      const double tail = (1.0 - static_cast<double>(session.level) / 100.0) / 2.0;
+      if (dfMissing) return cecon::stata_invnormal(1.0 - tail);
+      return std::fabs(cecon::stata_invttail(m.escalars["df_r"].get<double>(), tail));
+    }();
     auto statCell = [&](const std::string& st, double b, double se, double t, double p) {
+      if (st == "ci") {
+        // ci_low - ci_high, each as the other statistics are (cdec() when given)
+        const double lo = (o2IsMissing(b) || o2IsMissing(se)) ? kO2Missing : b - ciCrit * se;
+        const double hi = (o2IsMissing(b) || o2IsMissing(se)) ? kO2Missing : b + ciCrit * se;
+        if (o2IsMissing(lo) || o2IsMissing(hi) || std::isnan(lo) || std::isnan(hi)) return std::string();
+        const bool fx = noauto || cdec0.has_value();
+        const std::string a = fx ? o2Fixed(lo, cdec) : o2AutoCell(lo, autoD, less);
+        const std::string z = fx ? o2Fixed(hi, cdec) : o2AutoCell(hi, autoD, less);
+        return a + " - " + z;
+      }
       double v = kO2Missing;
       bool fixed = noauto;
       int d = 3;
@@ -1498,6 +1578,7 @@ ojson runOutreg2(const eval::ParsedCommand& parsed, SessionState& session) {
             }
           }
           if (paren[si] && !cell.empty()) cell = "(" + cell + ")";
+          else if (bracketed[si] && !cell.empty()) cell = "[" + cell + "]";
         }
         col.push_back({si == 0 ? report : std::string(), cell, varname, 1});
       }
@@ -1577,7 +1658,9 @@ ojson runOutreg2(const eval::ParsedCommand& parsed, SessionState& session) {
                       : std::string();
       }
       if (vcetype == "Robust") st = "Robust " + strutil::lower(st);
-      col.push_back({st + " in parentheses", "", "", 3});
+      if (!noLegendRow) {
+        col.push_back({st + (anyBracket ? " in brackets" : " in parentheses"), "", "", 3});
+      }
       if (!noaster) col.push_back({"*** p<0.01, ** p<0.05, * p<0.1", "", "", 3});
     }
     if (!append || !fileExist) {

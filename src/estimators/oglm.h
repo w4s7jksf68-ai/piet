@@ -58,6 +58,11 @@ struct OglmResult {
     int iters = 0;
     bool converged = false;
     bool ok = false;
+    // ml's iteration log: the log likelihood at the start (iteration 0) and after
+    // each Newton iteration, and the gradient at the reported parameters (slopes,
+    // then cutpoints) -- Stata's e(ilog) and e(gradient).
+    std::vector<double> ilog;
+    std::vector<double> gradient;
 };
 
 namespace ogl {
@@ -100,7 +105,8 @@ inline double norm_ppf(double p) {
 // duplicated recompute costs nothing in practice.
 inline double ll_grad(const double* X, int64_t n, int k, const int* cat, int J, OrdLink link,
                       const std::vector<double>& theta, std::vector<double>* grad,
-                      std::vector<double>* scores = nullptr) {
+                      std::vector<double>* scores = nullptr, const double* wt = nullptr,
+                      const double* off = nullptr) {
     const int nc = J - 1;  // number of cutpoints
     const int np = k + nc;
     // LL is a Neumaier-compensated sum: oglm_fit's ml step rules compare it, and a
@@ -113,6 +119,7 @@ inline double ll_grad(const double* X, int64_t n, int k, const int* cat, int J, 
     for (int64_t i = 0; i < n; ++i) {
         double xb = 0;
         for (int p = 0; p < k; ++p) xb += X[static_cast<int64_t>(p) * n + i] * theta[p];
+        if (off) xb += off[i];  // offset(): a term with its coefficient fixed at 1
         const int j = cat[i];
         // f1/f2 stay 0 at the ±∞ boundaries (j == 0 has no lower cut, j == J-1 no
         // upper cut), which is exactly f(±∞) = 0 — no special-casing downstream.
@@ -129,21 +136,24 @@ inline double ll_grad(const double* X, int64_t n, int k, const int* cat, int J, 
         // row, so the line search rejects the step instead of carrying a NaN into
         // the Hessian.
         if (P < 1e-300) P = 1e-300;
-        const double lp = std::log(P), tsum = LL + lp;
+        // `wt`: the observation weights (fweight / iweight / pweight), 1 when null;
+        // a weight of exactly 1 leaves every product below unchanged.
+        const double wi = wt ? wt[i] : 1.0;
+        const double lp = wi * std::log(P), tsum = LL + lp;
         LLc += (std::fabs(LL) >= std::fabs(lp)) ? (LL - tsum) + lp : (lp - tsum) + LL;
         LL = tsum;
         if (grad) {
-            double c = (f1 - f2) / P;
+            double c = wi * (f1 - f2) / P;
             for (int p = 0; p < k; ++p) (*grad)[p] += c * X[static_cast<int64_t>(p) * n + i];
-            if (j > 0) (*grad)[k + j - 1] += -f1 / P;
-            if (j < nc) (*grad)[k + j] += f2 / P;
+            if (j > 0) (*grad)[k + j - 1] += wi * -f1 / P;
+            if (j < nc) (*grad)[k + j] += wi * f2 / P;
         }
         if (S) {
-            double c = (f1 - f2) / P;
+            double c = wi * (f1 - f2) / P;
             for (int p = 0; p < k; ++p)
                 S[static_cast<int64_t>(p) * n + i] = c * X[static_cast<int64_t>(p) * n + i];
-            if (j > 0) S[static_cast<int64_t>(k + j - 1) * n + i] = -f1 / P;
-            if (j < nc) S[static_cast<int64_t>(k + j) * n + i] = f2 / P;
+            if (j > 0) S[static_cast<int64_t>(k + j - 1) * n + i] = wi * -f1 / P;
+            if (j < nc) S[static_cast<int64_t>(k + j) * n + i] = wi * f2 / P;
         }
     }
     return LL + LLc;
@@ -155,13 +165,15 @@ inline double ll_grad(const double* X, int64_t n, int k, const int* cat, int J, 
 // f1'x / −f2'x across (β, κ_{j−1} / κ_j), −f1' and f2' on the cut diagonals;
 // f' = f(1 − 2F) (logistic) or −aφ(a) (normal).
 inline void neg_hessian(const double* X, int64_t n, int k, const int* cat, int J, OrdLink link,
-                        const std::vector<double>& theta, std::vector<double>& A) {
+                        const std::vector<double>& theta, std::vector<double>& A,
+                        const double* wt = nullptr, const double* off = nullptr) {
     const int nc = J - 1, np = k + nc;
     A.assign(static_cast<size_t>(np) * np, 0.0);
     std::vector<double> gP(static_cast<size_t>(np));
     for (int64_t i = 0; i < n; ++i) {
         double xb = 0;
         for (int p = 0; p < k; ++p) xb += X[static_cast<int64_t>(p) * n + i] * theta[p];
+        if (off) xb += off[i];
         const int j = cat[i];
         double F1 = 0.0, f1 = 0.0, d1 = 0.0, F2 = 1.0, f2 = 0.0, d2 = 0.0;
         if (link == OrdLink::Logit) {
@@ -173,15 +185,16 @@ inline void neg_hessian(const double* X, int64_t n, int k, const int* cat, int J
         }
         double P = F2 - F1;
         if (P < 1e-300) P = 1e-300;
+        const double wi = wt ? wt[i] : 1.0;
         std::fill(gP.begin(), gP.end(), 0.0);
         for (int p = 0; p < k; ++p) gP[static_cast<size_t>(p)] = (f1 - f2) * X[static_cast<int64_t>(p) * n + i];
         if (j > 0) gP[static_cast<size_t>(k + j - 1)] = -f1;
         if (j < nc) gP[static_cast<size_t>(k + j)] = f2;
         for (int a = 0; a < np; ++a)
             for (int b = 0; b < np; ++b)
-                A[static_cast<size_t>(a) * np + b] += gP[static_cast<size_t>(a)] * gP[static_cast<size_t>(b)] / (P * P);
+                A[static_cast<size_t>(a) * np + b] += wi * gP[static_cast<size_t>(a)] * gP[static_cast<size_t>(b)] / (P * P);
         for (int a = 0; a < k; ++a) {
-            const double xa = X[static_cast<int64_t>(a) * n + i];
+            const double xa = wi * X[static_cast<int64_t>(a) * n + i];
             for (int b = 0; b < k; ++b)
                 A[static_cast<size_t>(a) * np + b] -= (d2 - d1) * xa * X[static_cast<int64_t>(b) * n + i] / P;
             if (j > 0) {
@@ -193,8 +206,8 @@ inline void neg_hessian(const double* X, int64_t n, int k, const int* cat, int J
                 A[static_cast<size_t>(k + j) * np + a] += d2 * xa / P;
             }
         }
-        if (j > 0) A[static_cast<size_t>(k + j - 1) * np + (k + j - 1)] += d1 / P;
-        if (j < nc) A[static_cast<size_t>(k + j) * np + (k + j)] -= d2 / P;
+        if (j > 0) A[static_cast<size_t>(k + j - 1) * np + (k + j - 1)] += wi * d1 / P;
+        if (j < nc) A[static_cast<size_t>(k + j) * np + (k + j)] -= wi * d2 / P;
     }
 }
 
@@ -220,7 +233,11 @@ inline std::vector<double> ord_categories(const double* y, int64_t n, std::vecto
 
 // X is col-major n*k with NO intercept column (the caller must drop it — with an
 // intercept in the design the information matrix is singular against the cutpoints).
-inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, int J, OrdLink link) {
+// `max_iter` is ml's iterate(#): the Newton loop stops after that many iterations
+// whether or not it has converged, and `converged` then reports false.
+inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, int J, OrdLink link,
+                           int max_iter = 300, const double* wt = nullptr,
+                           const double* off = nullptr) {
     OglmResult r;
     r.n = n;
     r.n_cats = J;
@@ -229,12 +246,24 @@ inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, in
 
     r.cat_n.assign(static_cast<size_t>(J), 0);
     for (int64_t i = 0; i < n; ++i) ++r.cat_n[static_cast<size_t>(cat[i])];
+    // The category totals the null model reads: row counts, or the weight sums.
+    std::vector<double> catw(static_cast<size_t>(J), 0.0);
+    double totw = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        const double wi = wt ? wt[i] : 1.0;
+        catw[static_cast<size_t>(cat[i])] += wi;
+        totw += wi;
+    }
+    if (!wt) {
+        for (int j = 0; j < J; ++j) catw[static_cast<size_t>(j)] = static_cast<double>(r.cat_n[static_cast<size_t>(j)]);
+        totw = static_cast<double>(n);
+    }
     // Constant-only (β=0) log-likelihood. LINK-FREE: at β=0 with the starting
     // cutpoints below, P_ij is exactly the sample share of category j, so this is
     // both the ll_0 behind Pseudo R² AND the iteration-0 value Stata prints.
     for (int j = 0; j < J; ++j) {
-        double nj = static_cast<double>(r.cat_n[static_cast<size_t>(j)]);
-        if (nj > 0) r.ll_0 += nj * std::log(nj / static_cast<double>(n));
+        double nj = catw[static_cast<size_t>(j)];
+        if (nj > 0) r.ll_0 += nj * std::log(nj / totw);
     }
 
     std::vector<double> theta(static_cast<size_t>(np), 0.0);
@@ -242,7 +271,7 @@ inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, in
         // cutpoints-only fit, so the Newton loop starts AT the null model.
         double cum = 0;
         for (int j = 0; j < nc; ++j) {
-            cum += static_cast<double>(r.cat_n[static_cast<size_t>(j)]) / static_cast<double>(n);
+            cum += catw[static_cast<size_t>(j)] / totw;
             theta[static_cast<size_t>(k + j)] =
                 (link == OrdLink::Logit) ? std::log(cum / (1.0 - cum)) : ogl::norm_ppf(cum);
         }
@@ -251,17 +280,18 @@ inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, in
     // ml's Newton-Raphson (header comment). `V` holds inv(−H) at `theta`.
     std::vector<double> grad(static_cast<size_t>(np)), V, step(static_cast<size_t>(np));
     auto evaluate = [&](const std::vector<double>& th, std::vector<double>& g, std::vector<double>& Vinv) {
-        const double LL = ogl::ll_grad(X, n, k, cat, J, link, th, &g);
-        ogl::neg_hessian(X, n, k, cat, J, link, th, Vinv);
+        const double LL = ogl::ll_grad(X, n, k, cat, J, link, th, &g, nullptr, wt, off);
+        ogl::neg_hessian(X, n, k, cat, J, link, th, Vinv, wt, off);
         return la::spd_inverse(Vinv.data(), np) == 0 ? LL : std::nan("");
     };
-    auto llat = [&](const std::vector<double>& th) { return ogl::ll_grad(X, n, k, cat, J, link, th, nullptr); };
+    auto llat = [&](const std::vector<double>& th) { return ogl::ll_grad(X, n, k, cat, J, link, th, nullptr, nullptr, wt, off); };
     double LL = evaluate(theta, grad, V);
+    r.ilog.push_back(LL);
     int it = 0;
     bool conv = false;
     std::vector<double> cand(static_cast<size_t>(np)), tryth(static_cast<size_t>(np)), dd(static_cast<size_t>(np));
     std::vector<double> g2(static_cast<size_t>(np)), V2;
-    while (it < 300 && !conv && std::isfinite(LL)) {
+    while (it < max_iter && !conv && std::isfinite(LL)) {
         la::matvec(V.data(), np, grad.data(), step.data());  // step = inv(−H) g
         for (int i = 0; i < np; ++i) cand[static_cast<size_t>(i)] = theta[static_cast<size_t>(i)] + step[static_cast<size_t>(i)];
         double f1 = llat(cand);
@@ -284,6 +314,7 @@ inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, in
         }
         const double LL2 = evaluate(cand, g2, V2);
         ++it;
+        r.ilog.push_back(LL2);
         if (!std::isfinite(LL2)) { theta = cand; LL = LL2; break; }
         la::matvec(V2.data(), np, g2.data(), step.data());
         double nr = 0.0, pc = 0.0;
@@ -304,6 +335,7 @@ inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, in
     if (!std::isfinite(LL)) return r;
     r.ll = LL;
     r.vcov = V;
+    r.gradient = grad;
     r.beta.assign(theta.begin(), theta.begin() + k);
     r.cuts.assign(theta.begin() + k, theta.end());
     r.se.resize(static_cast<size_t>(k));
@@ -320,11 +352,12 @@ inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, in
 // meat's raw material for vce(robust) / vce(cluster). Parameter order matches
 // r.vcov exactly: slopes, then cutpoints.
 inline std::vector<double> oglm_scores(const double* X, int64_t n, int k, const int* cat, int J,
-                                       OrdLink link, const OglmResult& r) {
+                                       OrdLink link, const OglmResult& r, const double* wt = nullptr,
+                                       const double* off = nullptr) {
     std::vector<double> theta = r.beta;
     theta.insert(theta.end(), r.cuts.begin(), r.cuts.end());
     std::vector<double> S;
-    ogl::ll_grad(X, n, k, cat, J, link, theta, nullptr, &S);
+    ogl::ll_grad(X, n, k, cat, J, link, theta, nullptr, &S, wt, off);
     return S;
 }
 

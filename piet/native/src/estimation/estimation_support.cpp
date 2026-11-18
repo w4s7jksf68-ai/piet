@@ -605,6 +605,23 @@ VcovResult vcovFromOpts(const eval::ParsedCommand& parsed, bool* sawRobustFlag) 
       out.argv = cs.argv;
     } else if (lv == "iid") {
       out.argv = {"--vcov", "iid"};
+    } else if (lowerM4(trimM4(*vceVal)) == "oim" &&
+               (parsed.cmd == "logit" || parsed.cmd == "logistic" || parsed.cmd == "probit" ||
+                parsed.cmd == "cloglog")) {
+      // vce(oim) is these ml fits' default VCE, the observed information (bank
+      // b475b7b5 `logit foreign mpg weight, vce(oim) iterate(50) nolog`: e(vce) oim);
+      // the engine's default, so nothing is forwarded. Under [pweight] the only VCEs
+      // Stata's vce() parser allows are robust and cluster, so vce(oim) there is r(198)
+      // "pweights not allowed with option vce(oim)" (the ml model parser makes the same
+      // check for cloglog).
+      if (parsed.weightType.has_value() &&
+          (lowerM4(*parsed.weightType) == "pw" || lowerM4(*parsed.weightType) == "pweight")) {
+        out.errored = true;
+        out.errorMsg = "pweights not allowed with option vce(oim)";
+        out.rc = 198;
+        return out;
+      }
+      out.argv = {};
     } else if (!unimplementedVceType(*vceVal).empty()) {
       out.errored = true;
       out.errorMsg = "Option `vce(" + unimplementedVceType(*vceVal) +
@@ -896,9 +913,18 @@ EstimationArgvResult buildEstimationArgvM4(const std::string& cobraCmd,
     (void)v;
     if (kEstimationKnownOpts.count(k)) continue;
     if (logitOnlyOk && k == "or") continue;
+    // cloglog's `eform` and logistic's `coef`: the table's metric, consumed in the
+    // dispatcher (bank a16bc26d `cloglog foreign mpg weight, eform`: r(table) eform
+    // 1; 18e88440 `logistic foreign mpg weight, coef`: the coefficients, eform 0).
+    if (cobraCmd == "cloglog" && k == "eform" && v.isBool && v.boolValue) continue;
+    if (parsed.cmd == "logistic" && k == "coef" && v.isBool && v.boolValue) continue;
     if (mlMaxOptOf(k, v) != nullptr) continue;
     if (offsetOk && k == "offset") continue;
     if (asisOk && k == "asis" && v.isBool) continue;
+    // `nolog` / `log`: the iteration-log switch of these ml fits. PIET prints no
+    // iteration log, so the output is that of Stata's `nolog` fit (bank b6682e46
+    // `logit foreign mpg weight, nolog`).
+    if (binaryMl && (k == "nolog" || k == "log") && v.isBool) continue;
     res.errored = true;
     res.errorBlock = engineErrorBlockM4("option `" + k + "` not allowed", "unsupported_option");
     return res;
@@ -1028,6 +1054,44 @@ nlohmann::json runCobraJsonM4(std::vector<std::string> args) {
 
 std::string nextPathM4(const std::string& workdir, const std::string& prefix) {
   return mintScratchPath(workdir, prefix);  // BUG-389: one body, registered at mint
+}
+
+std::optional<std::string> tsVarlistFrameM4(SessionState& session, std::vector<std::string>& vars,
+                                            ojson& err) {
+  static const std::regex kTsTerm(R"(^([LlFfDdSs][0-9]*)+\.[A-Za-z_][A-Za-z0-9_]*$)");
+  std::vector<std::string> gens;
+  std::string exprs;
+  std::vector<std::string> out = vars;
+  for (size_t i = 0; i < vars.size(); ++i) {
+    if (!std::regex_match(vars[i], kTsTerm)) continue;
+    const std::string col = "__piet_tsv" + std::to_string(gens.size()) + "__";
+    gens.push_back(col + "=" + vars[i]);
+    exprs += gens.back() + " ";
+    out[i] = col;
+  }
+  if (gens.empty()) return std::string();
+  if (!session.currentHbin().has_value()) {
+    err = eval::noDataLoaded();
+    return std::nullopt;
+  }
+  if (!session.timevar.has_value() || session.timevar->empty()) {
+    err = ojson(eval::errorBlock("engine_error", "time variable not set, use tsset varname ...",
+                                 std::nullopt, std::nullopt, std::nullopt, "r(111)"));
+    return std::nullopt;
+  }
+  const std::string scratch = nextPathM4(session.workdir(), "ts_varlist");
+  std::vector<std::string> argv = {"eval", "--data", *session.currentHbin()};
+  for (const auto& g : gens) argv.insert(argv.end(), {"--gen", g});
+  argv.insert(argv.end(), {"--out", scratch});
+  try {
+    (void)runCobraJsonM4(translate::injectTsContextForExpr(argv, exprs, session));
+  } catch (const CobraError& ce) {
+    cecon::native_unlink(scratch);
+    err = engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
+    return std::nullopt;
+  }
+  vars = out;
+  return scratch;
 }
 
 // BUG-042: shared if-prefilter for tabstat/correlate/ttest — none of the

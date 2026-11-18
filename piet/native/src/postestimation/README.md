@@ -19,7 +19,7 @@ declared in `piet/handlers/postestimation.h`, `estimation.h` and `results.h`.
 | `suest` stacked sandwich over stored regress fits | `suest_estimation.cpp` |
 | `r(table)` build, post, retire; replacement of stale `r()` after every command | `rtable_rclass_lifecycle.cpp` |
 | Column order and names of `e(b)` (factor base levels, `o.` columns), `eb_stripe` | `coefficient_column_names.cpp` |
-| Default `e(cmdline)`, `e(title)`, `e(predict)`, `e(estat_cmd)`, `e(marginsok)` | `fit_default_e_macros.cpp` |
+| Default `e(cmdline)`, `e(title)`, `e(predict)`, `e(estat_cmd)`, `e(marginsok)`; the rest of an estimator's e() contract (`e(properties)`, margins macros, `ml` settings and scalars, `e(ilog)`/`e(mns)`/`e(Cns)`, xtreg's macros) and the ordered `: e(scalars)`/`: e(macros)` lists of logit/logistic/probit/poisson (`postStataEContract`) | `fit_default_e_macros.cpp` |
 | Declarations shared by the command files above | `postestimation_internal.h` |
 | Declarations shared by the `r(table)` / `e(b)` / default-macro files | `rtable_internal.h` |
 

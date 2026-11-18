@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "session_support.h"
+#include "text_support.h"
+#include <regex>
 #include "options.h"
 #include "handler_declarations.h"
 
@@ -69,4 +71,120 @@ std::string canonicalSetName(const std::string& word) {
       return full;
   return word;
 }
+
+// The settings Stata's `set` knows ([R] set's list, the help files each one
+// points to, and the settings StataBE 19.5 ran in the vs-stata truth bank of
+// 2026-11-10), plus PIET's own `extcompat`. A typed word that is a prefix of
+// any of them is left to the arms (abbreviations are per setting: `set lin`
+// runs); a word that begins none is r(199) "-set X- not allowed; 'X' not
+// recognized" (bank 26736b588799d6eb `set zznotasetting on`, 0a8c18ab3b8fa0a9
+// `set noisily 1`).
+namespace {
+bool settingWordMatches(const std::string& w, bool full);
+bool isStataSettingWord(const std::string& w) { return settingWordMatches(w, false); }
+bool settingWordIsFull(const std::string& w) { return settingWordMatches(w, true); }
+bool settingWordMatches(const std::string& w, bool exact) {
+  static const char* const kSettings[] = {
+      "adosize", "autotabgraphs", "buildfvinfo", "cformat", "charset", "checksum", "clevel",
+      "coeftabresults", "collect_double", "collect_label", "collect_style", "collect_warn",
+      "conren", "copycolor", "ctrlh", "dockable", "dockingguides", "docx_hardbreak",
+      "docx_maxtable", "docx_paramode", "doeditbackup", "dots", "doublebuffer", "dp",
+      "dtable_style", "dtascomplevel", "emptycells", "eolchar", "etable_style", "extcompat",
+      "fastscroll", "floatwindows", "fredkey", "fvbase", "fvlabel", "fvtrack", "fvwrap",
+      "fvwrapon", "graphics", "haverdir", "httpproxy", "httpproxyauth", "httpproxyhost",
+      "httpproxyport", "httpproxypw", "httpproxyuser", "include_bitmap", "insertmode",
+      "iterlog", "java_heapmax", "java_home", "kmp_blocktime", "lapack_mkl", "lapack_mkl_cnr",
+      "lapack_openblas", "level", "linegap", "linesize", "locale_functions", "locale_ui",
+      "locksplitters", "logmsg", "logtype", "lstretch", "matacache", "matafavor", "matalibs",
+      "matalnum", "matamofirst", "mataoptimize", "matasolvetol", "matastrict", "matsize",
+      "maxbezierpath", "maxdb", "maxiter", "max_memory", "max_preservemem", "maxvar", "memory",
+      "min_memory", "more", "niceness", "notifyuser", "obs", "odbcdriver", "odbcmgr", "output",
+      "pagesize", "pdf_maxtable", "persistfv", "persistvtopic", "pformat", "piccomments",
+      "pinnable", "playsnd", "prefix", "printcolor", "processors", "python_exec",
+      "python_userpath", "reshape_favor", "reventries", "revkeyboard", "rmsg", "rng",
+      "rngstate", "rngstream", "scheme", "scrollbufsize", "searchdefault", "seed",
+      "segmentsize", "sformat", "showbaselevels", "showemptycells", "showomitted",
+      "smoothfonts", "smoothsize", "sortmethod", "sortrngstate", "sortseed", "svy_tab_comps",
+      "table_style", "tabulate_comps", "tabulate_style", "taskbargroups", "timeout1",
+      "timeout2", "trace", "tracedepth", "traceexpand", "tracehilite", "traceindent",
+      "tracenumber", "tracesep", "type", "update_interval", "update_prompt", "update_query",
+      "use_atsui_graph", "use_qd_text", "varabbrev", "varkeyboard", "varlabelpos", "virtual",
+      "window"};
+  for (const char* s : kSettings) {
+    const std::string full(s);
+    if (exact ? w == full : (w.size() <= full.size() && full.compare(0, w.size(), w) == 0))
+      return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+bool isFullStataSettingWord(const std::string& w) {
+  static const char* const kExtra[] = {"rmsg", "trace", "matsize"};
+  for (const char* s : kExtra)
+    if (w == s) return true;
+  return isStataSettingWord(w) && !w.empty() && settingWordIsFull(w);
+}
+
+namespace {
+bool isPrefixOfAny(const std::string& w, std::initializer_list<const char*> words) {
+  if (w.empty()) return false;
+  for (const char* s : words) {
+    const std::string full(s);
+    if (w.size() <= full.size() && full.compare(0, w.size(), w) == 0) return true;
+  }
+  return false;
+}
+}  // namespace
+
+std::optional<std::pair<std::string, std::string>> checkedStataSetWord(
+    const eval::ParsedCommand& parsed, bool hasData) {
+  (void)hasData;  // only Stata/BE's `set maxvar` refusal read it (see below)
+  using R = std::optional<std::pair<std::string, std::string>>;
+  if (parsed.varlist.empty()) return std::nullopt;
+  const std::string& typed = parsed.varlist[0];
+  const std::string name = lower(typed);
+  if (!isStataSettingWord(name))
+    return R({"-set " + typed + "- not allowed; '" + typed + "' not recognized", "r(199)"});
+  const std::string arg = parsed.varlist.size() > 1 ? parsed.varlist[1] : std::string();
+  const bool oneArg = parsed.varlist.size() == 2;
+  // The value checks, each a StataBE 19.5 refusal in the bank (the setting typed
+  // in full; an abbreviation keeps the arms' answer).
+  if (name == "cformat" || name == "pformat" || name == "sformat") {
+    // A numeric display format (%9.3f, %8.2gc, ...) or nothing; `set cformat
+    // zz` is r(7) "invalid numeric format" (c450558ca51e5270).
+    static const std::regex reFmt(R"(^%-?0?[0-9]+\.[0-9]+[fge]c?$)");
+    if (oneArg && !std::regex_match(arg, reFmt)) return R({"invalid numeric format", "r(7)"});
+  } else if (name == "dp") {
+    // comma or period; `set dp zz` r(198) "invalid syntax" (0c6beb4b6e4c1bcd).
+    if (oneArg && !isPrefixOfAny(lower(arg), {"comma", "period"}))
+      return R({"invalid syntax", "r(198)"});
+  } else if (name == "logtype") {
+    // text or smcl (7a3db216e53c18a3 `set logtype zz` r(198)).
+    if (oneArg && !isPrefixOfAny(lower(arg), {"text", "smcl"}))
+      return R({"syntax error:  the valid default logtypes are text and smcl", "r(198)"});
+  } else if (name == "output") {
+    // proc, inform or error; any other word is r(101) "<word> not allowed"
+    // (803217bfd7438b99 `set output zz`, c13b1059a920c870 `set output proper`).
+    if (oneArg && !isPrefixOfAny(lower(arg), {"proc", "inform", "error"}))
+      return R({arg + " not allowed", "r(101)"});
+  } else if (name == "showbaselevels") {
+    // on, off or all (7d60d4719ad382b5 `set showbaselevels maybe` r(100)).
+    if (oneArg && arg != "on" && arg != "off" && arg != "all")
+      return R({"on, off, or all required", "r(100)"});
+  } else if (name == "sortseed") {
+    // An integer (c2e1ed90defa00ee `set sortseed abc` r(198) "invalid sortseed").
+    static const std::regex reInt(R"(^[+-]?[0-9]+$)");
+    if (oneArg && !std::regex_match(arg, reInt)) return R({"invalid sortseed", "r(198)"});
+  }
+  // `set maxvar #` is an accepted header line. Stata/BE refuses every one (r(198)
+  // "maxvar not settable in this version of Stata"; r(4) with data in memory: bank
+  // 5ccc22f778772dc5, 0dfc41893ad0f885, 5649416d00862867, c82dc0242371e27e), but it
+  // is the usual first line of do-files written for Stata/SE and MP, which accept it
+  // (tests/eval/piet2 test_131 `set maxvar 10000`). PIET follows Stata/SE and MP
+  // where the editions differ (User ruling 2026-11-12).
+  return std::nullopt;
+}
+
 }  // namespace piet::dispatch_detail

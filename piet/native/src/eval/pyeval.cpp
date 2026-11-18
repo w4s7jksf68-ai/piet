@@ -12,6 +12,7 @@
 
 #include "dispatch/dispatch_profile.h"  // EXPRLAYER: expression-zone attribution (opt-in, stderr)
 
+#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -82,6 +83,57 @@ struct Lexer {
     bool isFloat = false;
     std::string digits;
 
+    // Stata's hexadecimal literal ([U] 12.2.1), `%21x`'s own spelling:
+    // [hex digit][.hex digits]X(+|-)hex exponent, the value mantissa *
+    // 2^exponent (StataBE 19.5, vs-stata bank literals cells: `1.0X+3` is 8,
+    // `-1.0X-1` -.5, `1.0X-3fe` 2.23e-308, `1.0x+3` 8 too).
+    {
+      size_t k = i;
+      double mant = 0.0;
+      bool any = false;
+      const auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+      };
+      if (k < src.size() && hexVal(src[k]) >= 0 && src[k] >= '0' && src[k] <= '9') {
+        mant = hexVal(src[k]);
+        any = true;
+        ++k;
+      }
+      if (k < src.size() && src[k] == '.') {
+        ++k;
+        double scale = 1.0 / 16.0;
+        while (k < src.size() && hexVal(src[k]) >= 0) {
+          mant += hexVal(src[k]) * scale;
+          scale /= 16.0;
+          any = true;
+          ++k;
+        }
+      }
+      if (any && k + 2 < src.size() + 0 && (src[k] == 'X' || src[k] == 'x') &&
+          (src[k + 1] == '+' || src[k + 1] == '-') && hexVal(src[k + 2]) >= 0) {
+        const bool neg = src[k + 1] == '-';
+        k += 2;
+        long ex = 0;
+        while (k < src.size() && hexVal(src[k]) >= 0 && ex < 0x100000) ex = ex * 16 + hexVal(src[k++]);
+        const bool nameFollows =
+            k < src.size() && (std::isalnum(static_cast<unsigned char>(src[k])) || src[k] == '_');
+        // The exponent stays in the normal range, -3fe .. +3ff: `1.0X-3fe` is
+        // read, `1.0X-432` is not a number (r(198) "1.0X invalid name",
+        // vs-stata bank 4244114ebed4f6ff, f70e32c9c9b57f8d).
+        const bool inRange = neg ? ex <= 0x3fe : ex <= 0x3ff;
+        if (!nameFollows && inRange) {
+          i = k;
+          Token t;
+          t.kind = Tok::Float;
+          t.floatVal = std::ldexp(mant, static_cast<int>(neg ? -ex : ex));
+          return t;
+        }
+      }
+    }
+
     auto readDigits = [&]() {
       bool any = false;
       bool prevDigit = false;
@@ -117,6 +169,22 @@ struct Lexer {
       digits.push_back('.');
       ++i;
       readDigits();
+    }
+    // `D` is an exponent letter too (StataBE 19.5: `display 1d3` and `1D3`
+    // are 1000, vs-stata bank e02aa11cd28cce91, 6a66fedff34c1589); only when
+    // digits follow, so nothing else that begins with a `d` is read as one.
+    if (i + 1 < src.size() && (src[i] == 'd' || src[i] == 'D')) {
+      size_t k = i + 1;
+      if (k < src.size() && (src[k] == '+' || src[k] == '-')) ++k;
+      if (k < src.size() && src[k] >= '0' && src[k] <= '9') {
+        size_t e = k;
+        while (e < src.size() && src[e] >= '0' && src[e] <= '9') ++e;
+        if (e >= src.size() || !(std::isalpha(static_cast<unsigned char>(src[e])) || src[e] == '_')) {
+          isFloat = true;
+          digits += "e" + src.substr(i + 1, e - i - 1);
+          i = e;
+        }
+      }
     }
     if (i < src.size() && (src[i] == 'e' || src[i] == 'E')) {
       // Exponent only if followed by digits (optionally signed) — otherwise
@@ -291,6 +359,21 @@ struct Lexer {
       t.kind = Tok::Name;
       t.text = name;
       return t;
+    }
+    // A relational operator's two characters may stand apart: Stata reads `1
+    // < = 2` as `1 <= 2` and `1 ~ = 2`, `1 ! = 2` as `!=` (StataBE 19.5, all 1;
+    // vs-stata bank 48c7ca6b2f6a4aa0, 41d0f554e516ba6e, 5defa41413b0239f).
+    // The blanks between are skipped and the pair read as one token.
+    if (c == '<' || c == '>' || c == '!' || c == '~') {
+      size_t k = i + 1;
+      while (k < src.size() && (src[k] == ' ' || src[k] == '\t')) ++k;
+      if (k > i + 1 && k < src.size() && src[k] == '=' &&
+          !(k + 1 < src.size() && src[k + 1] == '=')) {
+        i = k + 1;
+        if (c == '<') return {Tok::Le, "<=", 0, 0.0};
+        if (c == '>') return {Tok::Ge, ">=", 0, 0.0};
+        return {Tok::Ne, "!=", 0, 0.0};
+      }
     }
     switch (c) {
       case '+': ++i; return {Tok::Plus, "+", 0, 0.0};

@@ -242,6 +242,42 @@ void mirrorIntoEStores(SessionState& session,
     }
     if (!replaced) session.eval.eMatrices.emplace_back(n, std::move(em));
   }
+  // The fit's ordered e() lists (SessionState::ENameContract, published by
+  // estimation/estimation_results.cpp) gain the names in Stata's e() store
+  // order, so `: e(scalars)` keeps answering after an estadd (StataBE: `estadd
+  // scalar myval` lists `... rank myval`, `estadd ysumm` `... rank ysd ymax
+  // ymin ymean`, `estadd local fe` puts `fe` first among the macros, `estadd
+  // matrix Z` lists `b V Z beta`): a new scalar last, a macro first (newest
+  // first; an emptied one is gone), a new matrix right after `b V`.
+  if (session.eNameContract.has_value()) {
+    SessionState::ENameContract& c = *session.eNameContract;
+    auto listed = [](const std::vector<std::string>& v, const std::string& n) {
+      return std::find(v.begin(), v.end(), n) != v.end();
+    };
+    if (c.scalars.has_value()) {
+      for (const auto& [n, v] : scalars) {
+        (void)v;
+        if (!listed(*c.scalars, n)) c.scalars->push_back(n);
+      }
+    }
+    if (c.macros.has_value()) {
+      for (const auto& [n, v] : locals) {
+        std::vector<std::string>& m = *c.macros;
+        m.erase(std::remove(m.begin(), m.end(), n), m.end());
+        if (!v.empty()) m.insert(m.begin(), n);
+      }
+    }
+    if (c.matrices.has_value()) {
+      for (const auto& [n, mj] : matrices) {
+        (void)mj;
+        std::vector<std::string>& x = *c.matrices;
+        if (listed(x, n)) continue;
+        size_t at = 0;
+        while (at < x.size() && (x[at] == "b" || x[at] == "V")) ++at;
+        x.insert(x.begin() + static_cast<long>(at), n);
+      }
+    }
+  }
 }
 
 
@@ -693,6 +729,11 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
   // handle, which is why SessionState grew `estimatesGetMutable`); everything
   // else writes the live bag beside the active e().
   std::vector<ojson*> bags;
+  // estadd.ado: when the active results are stored under one of the target
+  // names, they are restored after the loop (`estimates restore active`), so
+  // the live e() carries the addition as well (StataBE: `estadd local ctrl
+  // "Yes": m2` with m2 active, then e(ctrl) "Yes").
+  bool activeTargeted = false;
   if (!targets.empty()) {
     // W2 esttabnames (BUG-552): `estadd ... : A_*` -- the target list is a
     // namelist too (estadd.ado expands it against the stored names). The
@@ -709,6 +750,7 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
       if (snap == nullptr) {
         return tblError("estadd: no stored estimation result named " + t);
       }
+      if (!session.activeStoredName().empty() && session.activeStoredName() == t) activeTargeted = true;
       if (!snap->contains("added") || !(*snap)["added"].is_object()) {
         (*snap)["added"] = emptyBag();
       }
@@ -752,6 +794,30 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
   }
 
   // ---- collision check across EVERY target, before writing ANY of them -----
+  // estadd refuses a name the live e() already holds (confirm existence of
+  // e(name): any posted scalar or macro, e(N) and e(cmd) included), r(110).
+  // The check reads the live fit, so it applies to the live-bag form only; a
+  // stored estimate is checked against its own added names below.
+  if (!replace && targets.empty()) {
+    auto holds = [&](const std::string& n) {
+      for (const char* kind : {"scalars", "macros"}) {
+        if (const auto names = session.eNameMembersFor(kind)) {
+          for (const auto& m : *names) {
+            if (m == n) return true;
+          }
+        }
+      }
+      return false;
+    };
+    for (const auto& [n, v] : addScalars) {
+      (void)v;
+      if (holds(n)) return tblError("estadd: e(" + n + ") already defined; use replace");
+    }
+    for (const auto& [n, v] : addLocals) {
+      (void)v;
+      if (holds(n)) return tblError("estadd: e(" + n + ") already defined; use replace");
+    }
+  }
   if (!replace) {
     for (ojson* bag : bags) {
       for (const auto& [n, v] : addScalars) {
@@ -786,8 +852,10 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
   // BUG-408/409/421: the live e() gains the same names, so `display e(k)`,
   // `` `e(controls)' `` and `matrix M = e(mean)` can read what the table reads.
   // Only for the LIVE bag: `estadd ... : m1 m2` writes stored estimates, whose
-  // e() is not the active one.
-  if (targets.empty()) mirrorIntoEStores(session, addScalars, addLocals, addMatrices);
+  // e() is not the active one -- unless one of them IS the active one, which
+  // estadd.ado restores after its loop (activeTargeted above).
+  const bool live = targets.empty() || activeTargeted;
+  if (live) mirrorIntoEStores(session, addScalars, addLocals, addMatrices);
   // MIRROR the scalars into e() itself, so `display e(k)` answers 7 rather than
   // `.`. Stata's estadd genuinely ADDS to e() -- the bag is this build's way of
   // carrying the addition to `eststo`, not a substitute for e() being readable,

@@ -569,6 +569,40 @@ bool postestNoConstantUnrefittableM4(const LastModel& lm) {
   return lm.cobraCmd == "poisson" && postestFitLacksConstantM4(lm);
 }
 
+// `poisson ..., iterate(#)` posts ml's iterate there as e(b); every engine refit
+// (lincom/test/nlcom, margins, predict) runs to ml's convergence, so it would answer
+// for other coefficients than e(b)'s. Stata's postestimation reads e(b) and never
+// refits, so these verbs refuse by name after such a fit.
+bool postestPoissonIterateFitM4(const LastModel& lm) {
+  return lm.cobraCmd == "poisson" && lm.result.has_value() && lm.result->is_object() &&
+         lm.result->contains("ml_iterate");
+}
+
+// A maximum-likelihood fit with offset() or exposure() (the engine's reply carries
+// has_offset): every engine refit behind lincom/test/nlcom (postest_fit_glm),
+// margins and predict re-estimates WITHOUT the offset, so it answers for another
+// model. Measured on fatalities: `poisson fatal beertax unemp, exposure(pop)` fits
+// _b[beertax] .237845890670366, and `lincom beertax` answered .0903727136869371 (the
+// no-offset fit), `predict n` differed from exp(xb + ln(pop)) by reldif up to 10;
+// `logit ..., offset(o)` and `probit ..., offset(o)` the same. Stata's
+// postestimation reads e(b)/e(V) and adds the offset, so these verbs refuse by name.
+bool postestOffsetFitM4(const LastModel& lm) {
+  if (postestOlsCmdsM4().count(lm.cobraCmd)) return false;
+  if (!lm.result.has_value() || !lm.result->is_object()) return false;
+  const auto it = lm.result->find("has_offset");
+  return it != lm.result->end() && it->is_boolean() && it->get<bool>();
+}
+
+ojson postestOffsetRejectM4(const std::string& verb, const LastModel& lm) {
+  return engineErrorBlockM4(
+      verb + " after `" + (lm.stataCmd.empty() ? lm.cobraCmd : lm.stataCmd) +
+          " ..., offset()/exposure()` is not supported in this version of PIET -- the "
+          "engine's post-estimation re-fit has no offset input, so it would answer for the "
+          "model without the offset. Refusing rather than reporting a number that is not the "
+          "one asked for.",
+      "unsupported_option");
+}
+
 bool postestRefitMatchesFitM4(const std::string& verb, const LastModel& lm, ojson& reject) {
   // The verbs whose refit is lastModelBaseArgv's (weight + convention flags).
   const bool fullRefit = verb == "lincom" || verb == "test" || verb == "testparm" || verb == "nlcom";
@@ -608,6 +642,18 @@ bool postestRefitMatchesFitM4(const std::string& verb, const LastModel& lm, ojso
   // The Poisson refit still has no constant-free implementation and refuses.
   if (postestNoConstantUnrefittableM4(lm)) {
     reject = postestNoConstantRejectM4(verb, lm);
+    return false;
+  }
+  if (postestPoissonIterateFitM4(lm)) {
+    reject = engineErrorBlockM4(
+        verb + " after `poisson ..., iterate(#)` is not supported in this version of PIET -- the "
+               "engine's post-estimation re-fit runs to convergence, not to the iterate the fit "
+               "posted. Refusing rather than reporting a number for other coefficients.",
+        "unsupported_option");
+    return false;
+  }
+  if (postestOffsetFitM4(lm)) {
+    reject = postestOffsetRejectM4(verb, lm);
     return false;
   }
   if (lm.result.has_value() && lm.result->is_object() && lm.result->contains("svy")) {

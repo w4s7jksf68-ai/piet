@@ -144,9 +144,15 @@ int cmd_durbinalt(const std::vector<std::string>& a) {
                              "[--small] [--robust] [--nomiss0] [--keepif EXPR] [--out f.json]\n");
         return 2;
     }
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    // A regressor under L./F./D. reads the --tsset/--xtset the caller sends;
+    // with an if qualifier the rows are filtered first, so the operators stay
+    // refused there (ts_no_tsset) rather than lag across dropped rows.
+    const std::string keepif = opt(a, "--keepif");
+    const cecon::TsMeta tsm = parse_tsmeta(a);
+    data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
-    GlmInputs g = load_glm(ds, "durbinalt", y, split_csv(xcsv));
+    GlmInputs g = load_glm(ds, "durbinalt", y, split_csv(xcsv), {}, "", cecon::WeightKind::None, "",
+                           keepif.empty() ? &tsm : nullptr);
     if (g.n == 0) { std::fprintf(stderr, "durbinalt: no rows after dropping missing.\n"); return 1; }
     std::vector<double> e;
     if (!ts_ols_residuals(g.X.data(), g.n, g.k, g.y.data(), e)) {
@@ -179,9 +185,15 @@ int cmd_bgodfrey(const std::vector<std::string>& a) {
                              "[--small] [--nomiss0] [--keepif EXPR] [--out f.json]\n");
         return 2;
     }
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    // A regressor under L./F./D. reads the --tsset/--xtset the caller sends;
+    // with an if qualifier the rows are filtered first, so the operators stay
+    // refused there (ts_no_tsset) rather than lag across dropped rows.
+    const std::string keepif = opt(a, "--keepif");
+    const cecon::TsMeta tsm = parse_tsmeta(a);
+    data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
-    GlmInputs g = load_glm(ds, "bgodfrey", y, split_csv(xcsv));
+    GlmInputs g = load_glm(ds, "bgodfrey", y, split_csv(xcsv), {}, "", cecon::WeightKind::None, "",
+                           keepif.empty() ? &tsm : nullptr);
     if (g.n == 0) { std::fprintf(stderr, "bgodfrey: no rows after dropping missing.\n"); return 1; }
     std::vector<double> e;
     if (!ts_ols_residuals(g.X.data(), g.n, g.k, g.y.data(), e)) {
@@ -211,9 +223,15 @@ int cmd_archlm(const std::vector<std::string>& a) {
                              "[--keepif EXPR] [--out f.json]\n");
         return 2;
     }
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    // A regressor under L./F./D. reads the --tsset/--xtset the caller sends;
+    // with an if qualifier the rows are filtered first, so the operators stay
+    // refused there (ts_no_tsset) rather than lag across dropped rows.
+    const std::string keepif = opt(a, "--keepif");
+    const cecon::TsMeta tsm = parse_tsmeta(a);
+    data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
-    GlmInputs g = load_glm(ds, "archlm", y, split_csv(xcsv));
+    GlmInputs g = load_glm(ds, "archlm", y, split_csv(xcsv), {}, "", cecon::WeightKind::None, "",
+                           keepif.empty() ? &tsm : nullptr);
     if (g.n == 0) { std::fprintf(stderr, "archlm: no rows after dropping missing.\n"); return 1; }
     std::vector<double> e;
     if (!ts_ols_residuals(g.X.data(), g.n, g.k, g.y.data(), e)) {

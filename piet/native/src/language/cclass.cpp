@@ -133,6 +133,7 @@ std::optional<double> constantCValue(const std::string& name) {
       {"maxbyte", 100.0},            {"minbyte", -127.0},
       {"maxstrvarlen", 2045.0},      {"maxstrlvarlen", 2000000000.0},
       {"maxvlabellen", 32000.0},     {"stata_version", 19.5},
+      {"macrolen", 264392.0},        {"max_macrolen", 264392.0},  // bank 9bc500e80434223a
   };
   auto it = kConst.find(name);
   if (it == kConst.end()) return std::nullopt;
@@ -148,6 +149,7 @@ std::optional<CValue> ignoredSettingCValue(const std::string& name, SessionState
   static const std::map<std::string, CValue> kDefaults = {
       {"scheme", {true, "stcolor"}},   {"rmsg", {true, "off"}},
       {"trace", {true, "off"}},        {"varabbrev", {true, "on"}},
+      {"fvbase", {true, "on"}},
       {"fredkey", {true, ""}},         {"matsize", {false, "400"}},
       {"maxvar", {false, "2048"}},     {"segmentsize", {false, "33554432"}},
       {"max_memory", {false, "."}},
@@ -160,7 +162,8 @@ std::optional<CValue> ignoredSettingCValue(const std::string& name, SessionState
     // although PIET ignores the setting: 800 after `set matsize 800`, on after
     // `set rm on`.
     if (name == "matsize") return CValue{false, *set};
-    if (name == "rmsg" || name == "trace" || name == "varabbrev") return CValue{true, *set};
+    if (name == "rmsg" || name == "trace" || name == "varabbrev" || name == "fvbase")
+      return CValue{true, *set};
     return std::nullopt;
   }
   return it->second;
@@ -183,6 +186,11 @@ std::optional<std::string> wordListCValue(const std::string& name) {
 }
 
 }  // namespace
+
+bool varAbbreviationOff(SessionState& session) {
+  const std::string* v = session.eval.globals.find(std::string(kSetMarkerPrefix) + "varabbrev");
+  return v != nullptr && *v == "off";
+}
 
 std::optional<CValue> resolveCValue(const std::string& name, SessionState& session) {
   // -- numeric keys ----------------------------------------------------
@@ -272,6 +280,7 @@ std::optional<CValue> resolveCValue(const std::string& name, SessionState& sessi
     return CValue{true, resolveUserPath(session, it->second)};
   }
   if (name == "graphics") return CValue{true, session.graphicsOff ? "off" : "on"};  // BS-047
+  if (auto v = settingCValue(name, session)) return v;  // environment/stata_settings.cpp
   if (auto v = ignoredSettingCValue(name, session)) return v;
 
   // -- string keys -------------------------------------------------------
@@ -285,6 +294,10 @@ std::optional<CValue> resolveCValue(const std::string& name, SessionState& sessi
   }
   if (name == "filename") return CValue{true, session.currentFile()};
   if (name == "edition" || name == "edition_real") return CValue{true, "BE"};  // BUG-1463
+  // The BE flavor's name (vs-stata bank e2fd3d69a716b05d `c(flavor)' IC), and the
+  // byte order of every platform PIET builds for (ec09e9f71c4d4908 lohi).
+  if (name == "flavor") return CValue{true, "IC"};
+  if (name == "byteorder") return CValue{true, "lohi"};
   // BUG-471 T2: c(type), the default storage type `set type` writes
   // (w2e_float_default.log settype_ctype_default :1236 "float",
   // settype_double_ctype :1262 "double").

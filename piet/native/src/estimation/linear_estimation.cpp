@@ -2,6 +2,7 @@
 // Copyright (C) 2026 M.K. Kim
 #include "piet/handlers/estimation.h"
 #include "piet/handlers/vce_types.h"
+#include "piet/handlers/results.h"  // clearEResults (regress with no observations)
 #include "piet/eval/exprfns.h"  // B3(c): exprHasRunningSum
 
 #include <sys/stat.h>
@@ -40,6 +41,7 @@
 #include "piet/translate.h"
 #include "engine/engine_call_internal.h"
 #include "linear_estimation_internal.h"
+#include "estimation_families_internal.h"  // fit_detail::clusteredVRankM4
 
 namespace {
 // W2 estimopts (2026-09-19, BUG-539): reghdfe's `residuals[(newvar)]` and
@@ -366,6 +368,59 @@ namespace {
 bool regressorsCarryTs(const eval::ParsedCommand& parsed) {
   return !parsed.varlist.empty() && translate::hasTsToken(parsed.varlist);
 }
+
+// reghdfe tests its slopes jointly on the V of its STANDARDIZED inputs: the depvar
+// and every regressor column divided by its standard deviation over e(sample)
+// (unweighted, N - 1 divisor, floored at 1e-3), so the block it inverts is
+// S[i][j] * s_i * s_j / s_y^2 and the invsym pivot floor is met on that scale, not
+// on the raw one (`reghdfe tiny mpg weight, absorb(rep78)` with tiny = price*1e-12
+// posts the F of the price fit, 17.37). `S` is the slopes' raw block and `slopes`
+// their e(V) positions in `names`. nullopt when a column cannot be rebuilt (a
+// time-series operator, an unreadable frame).
+std::optional<std::vector<double>> reghdfeStandardizedBlockM4(
+    SessionState& session, const LastModel& lm, const std::string& y, const ojson& names,
+    const std::vector<size_t>& slopes, const std::vector<double>& S) {
+  const auto rows = est_detail::esampleRowsM4(session, lm);
+  if (!rows.has_value() || rows->size() < 2) return std::nullopt;
+  const double N = static_cast<double>(rows->size());
+  const auto stdev = [&](const std::vector<const double*>& cols,
+                         const std::vector<cecon::MarginsAtom>& atoms) {
+    double s1 = 0.0, s2 = 0.0;
+    for (const int64_t i : *rows) {
+      double x = 1.0;
+      for (size_t j = 0; j < atoms.size(); ++j)
+        x *= atoms[j].factor ? (cols[j][i] == atoms[j].level ? 1.0 : 0.0) : cols[j][i];
+      s1 += x;
+      s2 += x * x;
+    }
+    const double v = (s2 - s1 * s1 / N) / (N - 1.0);
+    return std::max(v > 0.0 ? std::sqrt(v) : 0.0, 1e-3);
+  };
+  const double* yv = est_detail::f64ColumnM4(session, y);
+  if (yv == nullptr) return std::nullopt;
+  cecon::MarginsAtom ya;
+  ya.var = y;
+  const double sy = stdev({yv}, {ya});
+  const size_t q = slopes.size();
+  std::vector<double> sd(q);
+  for (size_t i = 0; i < q; ++i) {
+    if (!names[slopes[i]].is_string()) return std::nullopt;
+    bool ok = true;
+    const auto atoms = cecon::margins_parse_column(names[slopes[i]].get<std::string>(), &ok);
+    if (!ok || atoms.empty()) return std::nullopt;
+    std::vector<const double*> cols;
+    for (const auto& a : atoms) {
+      const double* c = est_detail::f64ColumnM4(session, a.var);
+      if (c == nullptr) return std::nullopt;
+      cols.push_back(c);
+    }
+    sd[i] = stdev(cols, atoms);
+  }
+  std::vector<double> out(q * q);
+  for (size_t i = 0; i < q; ++i)
+    for (size_t j = 0; j < q; ++j) out[i * q + j] = S[i * q + j] * sd[i] * sd[j] / (sy * sy);
+  return out;
+}
 }  // namespace
 
 bool tsFitKeepsFullFrame(const eval::ParsedCommand& parsed) {
@@ -435,7 +490,7 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
   bool sawRobustFlag = false;
   std::optional<std::string> clusterOpt;
   bool noConstant = false;
-  std::optional<int> level;
+  std::optional<double> level;
   bool keepSingletons = false;
   // BUG-539: reghdfe's `residuals[(newvar)]`. Bare -> `_reghdfe_resid`
   // (w2_smalls.log reghdfe_bare_resid/residuals/res/residual/resi, all rc 0
@@ -473,7 +528,9 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
       // wins when both are typed. Nothing to push -- no absorb(), no --fe.
     } else if (k == "level" && !v.isBool) {
       try {
-        level = std::stoi(v.strValue);
+        // a non-integer level is Stata's too (bank ca997ce5 `level(99.9)`: r(table)
+        // crit 3.2934, the 99.9% interval); stoi read 99
+        level = std::stod(v.strValue);
       } catch (...) {
       }
     } else if (k == "keepsingletons" && v.isBool && v.boolValue) {
@@ -604,6 +661,53 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
     argv.push_back("--keep-singletons");
   }
 
+  if (vceVal.has_value() && stataCmd == "reghdfe") {
+    // reghdfe parses vce() with its own rules (ftools' VCE parser): the first word
+    // is the vcetype, case-sensitive, with the abbreviations ols* / un* /
+    // conventional = unadjusted, r* = robust, cl* = cluster, dk* = dkraay, empty =
+    // unadjusted; any other type is r(9) "vcetype 'X' not allowed" (bank 6d7d5045
+    // `vce(bootstrap, reps(10))`), and a non-empty suboption list after the comma is
+    // r(9) "VCE options not supported: ...", checked after the type and after the
+    // cluster-variables check. The recognised forms are handed on spelled in full.
+    std::string head = *vceVal, extra;
+    const size_t comma = head.find(',');
+    if (comma != std::string::npos) {
+      extra = strutil::trim(head.substr(comma + 1));
+      head = head.substr(0, comma);
+    }
+    head = strutil::trim(head);
+    std::string vt = head, arg;
+    const size_t sp = head.find_first_of(" \t");
+    if (sp != std::string::npos) {
+      vt = head.substr(0, sp);
+      arg = strutil::trim(head.substr(sp + 1));
+    }
+    if (vt.compare(0, 3, "ols") == 0 || vt.compare(0, 2, "un") == 0 || vt == "conventional")
+      vt = "unadjusted";
+    else if (vt.compare(0, 1, "r") == 0)
+      vt = "robust";
+    else if (vt.compare(0, 2, "cl") == 0)
+      vt = "cluster";
+    else if (vt.compare(0, 2, "dk") == 0)
+      vt = "dkraay";
+    if (vt.empty()) vt = "unadjusted";
+    if (vt != "unadjusted" && vt != "robust" && vt != "cluster" && vt != "dkraay")
+      return ojson(eval::errorBlock("engine_error", "vcetype '" + vt + "' not allowed",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(9)"));
+    // `vce(cluster)` without variables is r(9). Words after a non-cluster type are not
+    // cluster variables: `reghdfe ..., vce(robust x1)` fits robust at rc 0 (StataBE,
+    // w2l_vce_shape.log:4034 reghdfe_vce_robust_x `reghdfe|robust|Robust`).
+    if (vt == "cluster" && arg.empty() && !(clusterOpt.has_value() && !clusterOpt->empty()))
+      return stataRefusalBlock("Can't specify cluster without clustervars (and viceversa)", 9);
+    // Probability weights do not go with the unadjusted VCE (r(9), reghdfe's VCE parser).
+    if (vt == "unadjusted" && parsed.weightType.has_value() &&
+        (lower(*parsed.weightType) == "pw" || lower(*parsed.weightType) == "pweight"))
+      return stataRefusalBlock("pweights do not work with vce(unadjusted)", 9);
+    if (!extra.empty())
+      return ojson(eval::errorBlock("engine_error", "VCE options not supported: " + extra,
+                                    std::nullopt, std::nullopt, std::nullopt, "r(9)"));
+    if (vt != "dkraay") vceVal = arg.empty() ? vt : vt + " " + arg;
+  }
   if (vceVal.has_value()) {
     // W1b: `vce()`'s argument abbreviates -- ONE canonicaliser for all three
     // sites (piet/handlers.h `canonicalVceType`), measured floors: a prefix of
@@ -751,12 +855,14 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
   // `level(...)` usage anywhere in debug_all.do) but is OUT of this phase's
   // 4-mechanism scope to fix; flagged for the operator.
   if (level.has_value()) {
-    if (*level < 1 || *level > 99) {
-      return engineErrorBlock("level(#) must be an integer between 1 and 99.",
+    if (!(*level >= 1 && *level <= 99.99)) {
+      return engineErrorBlock("level(#) must be between 1 and 99.99.",
                               "unsupported_option");
     }
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%.17g", *level);
     argv.push_back("--level");
-    argv.push_back(std::to_string(*level));
+    argv.push_back(buf);
   }
 
   // P3 weights wave: registry.cpp's AllWeights row for regress/reghdfe/feols
@@ -987,6 +1093,12 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
     if (stataCmd == "reghdfe" && ce.code == "no_obs" && std::string(ce.what()) == "no observations")
       return eval::errorBlock("engine_error", "insufficient observations", std::nullopt,
                               std::nullopt, std::nullopt, std::string("r(2001)"));
+    // Stata's built-in regress has already let go of the previous results when it
+    // finds no observations: e() is empty afterwards (bank 046d093c: `regress price
+    // mpg` then `capture regress price if price>1e9` -- rc 2000, e(cmd) "",
+    // `count if e(sample)` 0).
+    if (stataCmd == "regress" && ce.code == "no_obs" && std::string(ce.what()) == "no observations")
+      clearEResults(session);
     return engineErrorBlock(cobraErrorStr(ce), ce.code);
   }
 
@@ -1323,6 +1435,136 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
     // :116 mw_reg_c2_names `...|6|2|180|`), the engine's vcov_rank.
     applyBuiltinMultiwayReplyM4(*lm.result);
   }
+  // e(rank) of regress and areg is the rank of the posted V, _cons included:
+  // rowsof(V) - diag0cnt(invsym(V)) (Stata's post-VCE rank step after areg's
+  // regress call; under areg's alternating-projections path with a cluster VCE
+  // the clustered V's rank r(rankc), the same count on the same V). The engine's
+  // k_vars is the slope count under areg (bank 1f4cdf7f `areg price mpg weight,
+  // absorb(rep78)`: e(rank) 3, e(b) mpg weight _cons) and the column count under
+  // regress, which the V-rank also bounds where invsym drops a pivot: a V whose
+  // entries all lie below invsym's absolute floor counts 0 (bank 513fdb79 perfect
+  // fit, V = 0: rank 0; d8279ad8 `regress v mpg i.foreign`, v = price*1e-15: 0;
+  // 95cd2252 v = price*1e-12: 1; 5efe834e bigx = weight*1e10: 1). The model test
+  // of areg's slopes drops what the V cannot carry: with fewer clusters than slopes
+  // e(df_m) is the rank of the slopes' block of V and e(F) is missing (bank
+  // ac0c9f4b `vce(cluster foreign)`, 2 clusters: rank 1, df_m 1, F .). The
+  // multiway fit already carries the clipped V's rank (applyBuiltinMultiwayReplyM4)
+  // and regress's one-way cluster rule follows below (it owns e(rank) and e(df_m)
+  // there). Cached reply only.
+  // reghdfe's model F is missing when the slopes' block of V is singular to invsym
+  // (diag0cnt of its inverse > 0: too few clusters or a collinear slope), whatever
+  // the VCE (bank 776b4528 `reghdfe fatal beertax unemp, absorb(sid) vce(cluster c2)`,
+  // 2 clusters: e(F) ., where the fit posted 1.8e17; 97575d84 two-way cluster alike).
+  // The block tested is the standardized inputs' (reghdfeStandardizedBlockM4).
+  const bool reghdfeF = stataCmd == "reghdfe";
+  if ((reghdfeF || ((stataCmd == "areg" || stataCmd == "regress") && !postMultiway)) &&
+      lm.result.has_value() &&
+      lm.result->is_object() && lm.result->contains("e_V") && (*lm.result)["e_V"].is_object() &&
+      (*lm.result)["e_V"].contains("matrix") && (*lm.result)["e_V"]["matrix"].is_array() &&
+      (*lm.result)["e_V"].contains("names") && (*lm.result)["e_V"]["names"].is_array()) {
+    ojson& rr = *lm.result;
+    const ojson& m = rr["e_V"]["matrix"];
+    const ojson& nm = rr["e_V"]["names"];
+    const size_t k = m.size();
+    bool ok = k > 0 && nm.size() == k;
+    std::vector<double> V(k * k, 0.0);
+    std::vector<bool> isCons(k, false);
+    for (size_t r = 0; ok && r < k; ++r) {
+      ok = m[r].is_array() && m[r].size() == k && nm[r].is_string();
+      if (!ok) break;
+      const std::string n = nm[r].get<std::string>();
+      isCons[r] = n == "_cons" || n == "(intercept)";
+      for (size_t c = 0; ok && c < k; ++c) {
+        ok = m[r][c].is_number();
+        if (ok) V[r * k + c] = m[r][c].get<double>();
+      }
+    }
+    if (ok && reghdfeF) {
+      std::vector<size_t> slopes;
+      for (size_t j = 0; j < k; ++j)
+        if (!isCons[j] && V[j * k + j] > 0.0) slopes.push_back(j);
+      const size_t q = slopes.size();
+      std::vector<double> S(q * q);
+      for (size_t i = 0; i < q; ++i)
+        for (size_t j = 0; j < q; ++j) S[i * q + j] = V[slopes[i] * k + slopes[j]];
+      const auto Sstd = reghdfeStandardizedBlockM4(session, lm, y, nm, slopes, S);
+      if (q > 0 && static_cast<size_t>(glmVceRank(Sstd.has_value() ? *Sstd : S, q)) < q) {
+        rr["F"] = nullptr;
+        rr["p_F"] = nullptr;
+        block["F"] = nullptr;
+        block["p_F"] = nullptr;
+      }
+    } else if (ok) {
+      const double rank = static_cast<double>(glmVceRank(V, k));
+      if (stataCmd == "areg") {
+        // Under the alternating-projections path (a cluster variable other than the
+        // absorbed one) e(rank) is that solver's r(rankc): the eigenvalues of the
+        // clustered V above 1e-9 of the largest (fit_detail::clusteredVRankM4), which
+        // is scale-dependent (bank 86fb5f1c `areg price mpg weight, absorb(foreign)
+        // vce(cluster c)`: e(rank) 2, rank_mb 3, with e(F) posted on both slopes).
+        bool mapCluster = false;
+        if (lm.vcov == "cluster" && lm.cluster.size() == 1 && lm.fe.size() == 1)
+          mapCluster = lm.cluster[0] != lm.fe[0];
+        const std::optional<double> rankc =
+            mapCluster ? fit_detail::clusteredVRankM4(rr) : std::nullopt;
+        rr["k_vars"] = rankc.has_value() ? std::min(rank, *rankc) : rank;
+        std::vector<size_t> slopes;
+        for (size_t j = 0; j < k; ++j)
+          if (!isCons[j] && V[j * k + j] > 0.0) slopes.push_back(j);
+        if (!slopes.empty() && lm.vcov == "cluster") {
+          const size_t q = slopes.size();
+          std::vector<double> S(q * q);
+          for (size_t i = 0; i < q; ++i)
+            for (size_t j = 0; j < q; ++j) S[i * q + j] = V[slopes[i] * k + slopes[j]];
+          const double rs = static_cast<double>(glmVceRank(S, q));
+          if (rs < static_cast<double>(q)) {
+            rr["df_m"] = rs;
+            rr["F"] = nullptr;
+            rr["p_F"] = nullptr;
+            block["F"] = nullptr;
+            block["p_F"] = nullptr;
+          }
+        }
+      } else if (lm.vcov != "cluster" && rr.contains("k_vars") && rr["k_vars"].is_number() &&
+                 rank < rr["k_vars"].get<double>()) {
+        rr["k_vars"] = rank;
+        // The model test drops what the V cannot carry, judged free of the data's
+        // scale: a V singular on the correlation scale (a robust V with a leverage-1
+        // observation, whose score vanishes) leaves e(df_m) = that rank less the
+        // constant and e(F) missing (bank 22ff8398 `regress price mpg d, vce(hc2)`:
+        // rank 2, df_m 1, F .), where a V that only falls below invsym's absolute
+        // floor keeps both (95cd2252, d8279ad8 above: df_m 2, F posted).
+        std::vector<size_t> pos;
+        for (size_t j = 0; j < k; ++j)
+          if (V[j * k + j] > 0.0) pos.push_back(j);
+        const size_t q = pos.size();
+        std::vector<double> C(q * q);
+        bool consIn = false;
+        for (size_t i = 0; i < q; ++i) {
+          consIn = consIn || isCons[pos[i]];
+          for (size_t j = 0; j < q; ++j)
+            C[i * q + j] = V[pos[i] * k + pos[j]] /
+                           std::sqrt(V[pos[i] * k + pos[i]] * V[pos[j] * k + pos[j]]);
+        }
+        const double rs = static_cast<double>(glmVceRank(C, q));
+        if (q > 0 && rs < static_cast<double>(q)) {
+          rr["df_m"] = std::max(0.0, rs - (consIn ? 1.0 : 0.0));
+          rr["F"] = nullptr;
+          rr["p_F"] = nullptr;
+          block["F"] = nullptr;
+          block["p_F"] = nullptr;
+        }
+      }
+    }
+  }
+  // reghdfe's e(rank) counts the slopes only: under noabsorb the constant is the
+  // absorbed term (e(df_a) 1), so the engine's column count less _cons (bank
+  // dea5cf05 `reghdfe fatal beertax unemp, noabsorb`: e(rank) 2, e(b) beertax
+  // unemp _cons).
+  if (stataCmd == "reghdfe" && lm.fe.empty() && !noConstant && lm.result.has_value() &&
+      lm.result->is_object() && lm.result->contains("k_vars") &&
+      (*lm.result)["k_vars"].is_number() && (*lm.result)["k_vars"].get<double>() >= 1.0)
+    (*lm.result)["k_vars"] = (*lm.result)["k_vars"].get<double>() - 1.0;
   // BUG-1041: areg's MAP path and reghdfe post e(mss) = r(ssr), the model sum of
   // squares about the overall mean (Stata's absorb step, e(r2) =
   // r(ssr)/r(sst)), and e(tss) = r(sst): StataBE areg and reghdfe
@@ -1346,6 +1588,38 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
       (*lm.result)["df_m"].get<double>() == 0.0 &&
       !(lm.result->contains("F") && (*lm.result)["F"].is_number()))
     (*lm.result)["F"] = 0.0;
+  // A dependent variable with no variation about its mean (TSS 0) leaves e(r2) and
+  // e(r2_a) undefined: Stata posts them missing (bank 7317c331 `regress v mpg
+  // i.foreign` with v = -0*price: mss 0, rss 0, r2 ., r2_a .), where 0/0 read 0.
+  if (stataCmd == "regress" && lm.result.has_value() && lm.result->is_object() &&
+      lm.result->contains("mss") && (*lm.result)["mss"].is_number() &&
+      lm.result->contains("rss") && (*lm.result)["rss"].is_number() &&
+      (*lm.result)["mss"].get<double>() + (*lm.result)["rss"].get<double>() == 0.0) {
+    (*lm.result)["r2"] = nullptr;
+    (*lm.result)["adj_r2"] = nullptr;
+  }
+  // A one-way cluster fit with fewer clusters than coefficients (G - 1 < k):
+  // e(rank) is the clustered V's rank G - 1, e(df_m) that rank less the constant,
+  // and the model F is not reported (fit_detail::fewClustersRankM4; bank 5aa7ac2b
+  // 3 clusters: 2, 1, .). Cached reply and block F only.
+  if (stataCmd == "regress" && lm.vcov == "cluster" && lm.cluster.size() == 1 &&
+      lm.cluster[0].find(',') == std::string::npos && lm.result.has_value() &&
+      lm.result->is_object() && lm.result->contains("k_vars") &&
+      (*lm.result)["k_vars"].is_number() && lm.result->contains("n_clusters") &&
+      (*lm.result)["n_clusters"].is_number()) {
+    if (const auto rankc = fit_detail::fewClustersRankM4(
+            *lm.result, (*lm.result)["n_clusters"].get<double>(), (*lm.result)["k_vars"].get<double>())) {
+      ojson& rr = *lm.result;
+      if (*rankc < rr["k_vars"].get<double>()) {
+        rr["k_vars"] = *rankc;
+        rr["df_m"] = std::max(0.0, *rankc - (noConstant ? 0.0 : 1.0));
+        rr["F"] = nullptr;
+        rr["p_F"] = nullptr;
+        block["F"] = nullptr;
+        block["p_F"] = nullptr;
+      }
+    }
+  }
   // reghdfe's e(N_clustervars) and e(N_clust1..k) (w2b_estim.log:1410
   // reghdfe_cluster3 reads e(N_clustervars) 3). Cached reply only, like df_a
   // below: the resolver's key == name fall-through reads them. N_clustervars
@@ -1543,6 +1817,73 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
         rr["diagnostics"]["demean_converged"].is_boolean())
       converged = rr["diagnostics"]["demean_converged"].get<bool>();
     rr["converged"] = converged ? 1.0 : 0.0;
+    // noabsorb absorbs the constant: e(tss) and e(tss_within) are both the centered total
+    // sum of squares rss + mss (bank d4a45140 `reghdfe price mpg weight, noabsorb`: e(tss)
+    // 635065396.12), which the plain OLS reply does not carry under those names.
+    if (lm.fe.empty() && !noConstant && !rr.contains("tss_total") && rr.contains("rss") &&
+        rr["rss"].is_number() && rr.contains("mss") && rr["mss"].is_number()) {
+      const double t = rr["rss"].get<double>() + rr["mss"].get<double>();
+      if (!rr.contains("tss")) rr["tss"] = t;
+      if (!rr.contains("tss_within")) rr["tss_within"] = t;
+    }
+    // reghdfe's e(rmse) and e(r2_a) divide the RSS by its own residual dof,
+    // N - df_m - df_a - df_a_nested: the categories of a variable nested in a cluster
+    // variable are redundant for e(df_a) but still charged here, and they take no
+    // connected-components credit (bank 51bd155c `reghdfe fatal beertax unemp,
+    // absorb(sid year) vce(cluster sid year)`: e(df_a) 0, e(df_a_nested) 55, e(rss)
+    // 2041381.51, e(rmse) 85.538176 = sqrt(rss/279), where the engine's within dof
+    // counted 48 + 7 - 1). e(r2_a) = 1 - (rss/dof) / (tss/(N - 1)). Elsewhere the
+    // count equals the engine's.
+    if (rr.contains("n_obs") && rr["n_obs"].is_number() && rr.contains("rss") &&
+        rr["rss"].is_number() && rr.contains("k_vars") && rr["k_vars"].is_number()) {
+      const double n = rr["n_obs"].get<double>();
+      const double dof = n - rr["k_vars"].get<double>() - (initial - redundant) - nested;
+      const double rss = rr["rss"].get<double>();
+      if (dof > 0) {
+        rr["rmse"] = std::sqrt(rss / dof);
+        if (rr.contains("tss") && rr["tss"].is_number() && rr["tss"].get<double>() > 0 && n > 1)
+          rr["adj_r2"] = 1.0 - (rss / dof) / (rr["tss"].get<double>() / (n - 1.0));
+      }
+      // reghdfe's Gaussian log likelihoods over e(N) and e(rss), the null model's on the
+      // within total sum of squares, -N/2 (1 + ln(2 pi) + ln(SS/N)), and the within
+      // adjusted R2 1 - (rss/dof) / (tss_within/(dof + rank)) on the same residual dof as
+      // e(rmse) (bank f093f1fd `reghdfe price mpg weight, absorb(rep78)`: N 69, rss
+      // 364315235.55, tss_within 568436416.24 -> e(ll) -631.94687, e(ll_0) -647.29489,
+      // e(r2_a_within) .33841793).
+      if (rr.contains("tss_within") && rr["tss_within"].is_number() && n > 0 && rss > 0) {
+        const double tssW = rr["tss_within"].get<double>();
+        const double c = 1.0 + std::log(2.0 * 3.14159265358979323846);
+        rr["ll"] = -0.5 * n * (c + std::log(rss / n));
+        if (tssW > 0) {
+          rr["ll_0"] = -0.5 * n * (c + std::log(tssW / n));
+          if (dof > 0)
+            rr["r2_a_within"] = 1.0 - (rss / dof) / (tssW / (dof + rr["k_vars"].get<double>()));
+        }
+      }
+    }
+    // e(drop_singletons) 0 under keepsingletons, e(report_constant) 0 under noconstant,
+    // e(ic) the absorption's iteration count, 1 for a single absorbed term (solved
+    // directly, the bank's every one-FE and noabsorb fit); with two or more it is the
+    // count of reghdfe's own solver (conjugate gradient on symmetric Kaczmarz sweeps,
+    // tolerance 1e-8), which the engine runs for the count alone (reply key hdfe_ic).
+    rr["drop_singletons"] = keepSingletons ? 0.0 : 1.0;
+    rr["report_constant"] = noConstant ? 0.0 : 1.0;
+    if (hdfeDof->names.size() == 1) rr["ic"] = 1.0;
+    else if (rr.contains("hdfe_ic") && rr["hdfe_ic"].is_number() && rr["hdfe_ic"].get<double>() > 0)
+      rr["ic"] = rr["hdfe_ic"].get<double>();
+    // e(sumweights): e(N) unweighted, else the weight total over e(sample) under every
+    // weight type (bank 8127f003 [aweight=w] 142 with e(N) 69; b7cbf18f [pweight=w] 142).
+    if (lm.fitWeight.empty()) {
+      if (rr.contains("n_obs") && rr["n_obs"].is_number()) rr["sumweights"] = rr["n_obs"].get<double>();
+    } else {
+      const auto rows = est_detail::esampleRowsM4(session, lm);
+      const double* wv = est_detail::f64ColumnM4(session, lm.fitWeight);
+      if (rows.has_value() && wv != nullptr) {
+        double s = 0.0;
+        for (const int64_t i : *rows) s += wv[i];
+        if (std::isfinite(s)) rr["sumweights"] = s;
+      }
+    }
   }
   // e(vce) after a default-VCE `regress` is `ols` (w2_pweight.log R0_unweighted
   // PSTR `120|117|.|ols|||||`, R1_aw_control `...|ols|||aweight|= w|`;
@@ -1607,6 +1948,16 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
                 store.end());
     store.emplace_back("dof_table", std::move(t));
     session.noteEOnFit("dof_table");
+    // reghdfe's fixed macros (bank: every reghdfe fit) and e(title3) under a cluster VCE
+    // (bank 35 of 35 clustered fits "Statistics robust to heteroskedasticity").
+    std::vector<std::pair<std::string, std::string>> fixed = {
+        {"footnote", "reghdfe_footnote"}, {"model", "ols"}, {"properties", "b V"}};
+    if (lm.vcov == "cluster" || lm.vcov == "twoway" || lm.vcov == "multiway")
+      fixed.emplace_back("title3", "Statistics robust to heteroskedasticity");
+    for (const auto& [name, value] : fixed) {
+      session.eval.setEString(name, value);
+      session.noteEOnFit(name);
+    }
   }
   // e(kcluster) and e(cluster1..) after a built-in multiway regress/areg
   // (Stata's multiway-cluster step; w2s_multiway_class.log:133 mw_reg_c2_kclust

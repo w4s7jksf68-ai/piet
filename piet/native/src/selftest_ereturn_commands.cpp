@@ -439,11 +439,12 @@ void testW2dEreturn() {
     erCheck(rc == "0" && objs,
             "W2D ereturn (8) `ereturn clear` with no data in memory is rc 0 (log 211-212) -- got " +
                 rc);
-    // `ereturn list` keeps the answer it had while the command sat behind the
-    // no-data guard.
+    // `ereturn list` with no data (and so no estimates) prints nothing at rc 0,
+    // as StataBE 19.5 does (vs-stata truth bank: `capture noisily ereturn list`
+    // shows no line). It pinned the no_data_loaded r(111) until 2026-11-11.
     const std::string rcList = rcOf(s, "ereturn list");
-    erCheck(rcList == "111",
-            "W2D ereturn (8) `ereturn list` with no data is still no_data_loaded -- got " + rcList);
+    erCheck(rcList == "0",
+            "W2D ereturn (8) `ereturn list` with no data is rc 0 and silent -- got " + rcList);
   }
 
   // (9) A staged `ereturn scalar` of the running eclass program does not come

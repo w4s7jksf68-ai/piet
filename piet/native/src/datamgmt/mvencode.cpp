@@ -104,44 +104,77 @@ ojson runMvencode(const eval::ParsedCommand& parsed, SessionState& session) {
   if (ds == nullptr) return ojson(eval::noDataLoaded());
 
   std::vector<std::string> targets;
+  std::vector<std::string> ignoredStrings;  // the ado names each string variable it skips
   const bool all = parsed.varlist.size() == 1 && lowerOf(parsed.varlist[0]) == "_all";
   if (all) {
-    for (const auto& nm : ds->names())
+    for (const auto& nm : ds->names()) {
       if (ds->dtype(nm) == "f64") targets.push_back(nm);
+      else ignoredStrings.push_back(nm);
+    }
   } else {
     for (const auto& v : parsed.varlist) {
       if (!ds->has(v)) return rsError("variable " + v + " not found");
       // Stata skips string variables rather than failing the command.
       if (ds->dtype(v) == "f64") targets.push_back(v);
+      else ignoredStrings.push_back(v);
     }
   }
-  if (targets.empty())
-    return rsError("mvencode: no numeric variable to encode (string variables are skipped)");
+  // mvencode.ado's r(N) is the result of the last `count` it runs: the sample size
+  // when it only skipped strings, else the missing values of the last numeric variable
+  // (counted just before they are recoded).
+  auto abbrev12 = [](const std::string& name) {
+    return name.size() <= 12 ? name : name.substr(0, 10) + "~" + name.substr(name.size() - 1);
+  };
+  auto countQuietly = [&](const std::string& cond) -> std::optional<ojson> {
+    ojson r = dispatch("quietly count" + (cond.empty() ? std::string() : " if " + cond), session);
+    for (const auto& b : r)
+      if (b.is_object() && b.value("type", std::string()) == "error") return b;
+    return std::nullopt;
+  };
+  if (targets.empty()) {
+    std::string text;
+    if (!allowOverride)
+      for (const auto& v : ignoredStrings)
+        text += std::string(abbrev12(v).size() < 12 ? 12 - abbrev12(v).size() : 0, ' ') +
+                abbrev12(v) + ": string variable ignored\n";
+    if (auto e = countQuietly(ifCond.empty() ? std::string() : "(" + ifCond + ")")) return *e;
+    return text.empty() ? ojson::array() : ojson::array({displayBlock(text)});
+  }
 
   // PRE-SCAN, before any write: encoding into a value the data already holds
   // makes the two indistinguishable afterwards, which is why Stata demands
-  // `override` for it.
-  if (!allowOverride && ifCond.empty()) {
+  // `override` for it. The ado counts the sample's rows holding the value (a
+  // float variable is compared with float(#)), reports each variable that does,
+  // and stops with r(9) after the last one; r(N) keeps that last count.
+  std::string ignoredText;
+  const std::string mvText = strutil::trim(*mvOpt);  // as the user typed it
+  if (!allowOverride) {
+    for (const auto& v : ignoredStrings)
+      ignoredText += std::string(abbrev12(v).size() < 12 ? 12 - abbrev12(v).size() : 0, ' ') +
+                     abbrev12(v) + ": string variable ignored\n";
+    std::string clashText;
     for (const auto& v : targets) {
-      const double* d = ds->col(v).f64();
-      for (int64_t i = 0; i < ds->nRows(); ++i) {
-        if (d[i] == mvValue)
-          return rsError("mvencode: " + v + " already contains " + eval::pythonFloatRepr(mvValue) +
-                         "; specify `override` to encode missing as a value the data already uses.");
+      const bool isFloat = storage::resolveReplaceType(session, v) == "float";
+      const std::string lit = eval::pythonFloatRepr(mvValue);
+      const std::string rhs = isFloat ? "float(" + lit + ")" : lit;
+      if (auto e = countQuietly(v + " == " + rhs + (ifCond.empty() ? "" : " & (" + ifCond + ")")))
+        return *e;
+      const double* nn = session.eval.rValues.find("N");
+      const int64_t hits = nn != nullptr ? static_cast<int64_t>(*nn) : 0;
+      if (hits > 0) {
+        std::string cnt = std::to_string(hits);
+        if (cnt.size() < 4) cnt.insert(0, 4 - cnt.size(), ' ');
+        clashText += std::string(abbrev12(v).size() < 12 ? 12 - abbrev12(v).size() : 0, ' ') +
+                     abbrev12(v) + ": already " + mvText + " in " + cnt +
+                     (hits == 1 ? " observation" : " observations") + "\n";
       }
     }
-  } else if (!allowOverride) {
-    // Within the sample only: count the clashes the way the ado does.
-    for (const auto& v : targets) {
-      ojson r = dispatch("quietly count if " + v + " == " + eval::pythonFloatRepr(mvValue) +
-                             " & (" + ifCond + ")",
-                         session);
-      for (const auto& b : r)
-        if (b.is_object() && b.value("type", std::string()) == "error") return b;
-      const double* n = session.eval.rValues.find("N");
-      if (n != nullptr && *n > 0)
-        return rsError("mvencode: " + v + " already contains " + eval::pythonFloatRepr(mvValue) +
-                       "; specify `override` to encode missing as a value the data already uses.");
+    if (!clashText.empty()) {
+      ojson err = rsErrorRc("no action taken", 9);
+      ojson blocks = ojson::array();
+      blocks.push_back(displayBlock(ignoredText + clashText));
+      blocks.push_back(err);
+      return blocks;
     }
   }
 
@@ -150,6 +183,9 @@ ojson runMvencode(const eval::ParsedCommand& parsed, SessionState& session) {
   // commands already takes (data_generate.cpp's runReplace), which is what makes the
   // resident-frame opt-in safe here: no intermediate is ever read as a file
   // behind the session's back.
+  if (auto e = countQuietly("missing(" + targets.back() + ")" +
+                            (ifCond.empty() ? std::string() : " & (" + ifCond + ")")))
+    return *e;
   SessionState::ResidentEligible resident(session);
   for (const auto& v : targets) {
     const std::string out = nextPath(session.workdir(), "mvencode");
@@ -162,7 +198,9 @@ ojson runMvencode(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   // In-place rewrites: they belong in the rewrittenVars slot (the LAST
   // parameter), not droppedVars (the third) — mutation_result.h's own warning.
-  return mutationResult(session, "gen", {}, {}, targets);
+  ojson mut = mutationResult(session, "gen", {}, {}, targets);
+  if (ignoredText.empty()) return mut;
+  return ojson::array({displayBlock(ignoredText), mut});
 }
 
 }  // namespace piet::handlers

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "piet/handlers/graph.h"
+#include "piet/inrange_filter.h"
 #include "piet/cobra_runner.h"
 #include "piet/dispatcher.h"
 #include "piet/display_hardening.h"
@@ -332,6 +333,22 @@ static ojson normalCurve(double lo, double hi, double mean, double sd, double ar
 }
 
 
+// 300 points of the Student t density with `df` degrees of freedom, located at `mean` and scaled by
+// `sd` (tden((x - mean)/sd)/sd, the curve kdensity's student() option overlays), over [lo, hi].
+static ojson studentCurve(double lo, double hi, double mean, double sd, int df) {
+  constexpr int kPoints = 300;
+  const double v = static_cast<double>(df);
+  const double logNorm = std::lgamma((v + 1.0) / 2.0) - std::lgamma(v / 2.0) - 0.5 * std::log(v * M_PI);
+  ojson pts = ojson::array();
+  for (int i = 0; i < kPoints; ++i) {
+    const double px = lo + (hi - lo) * static_cast<double>(i) / static_cast<double>(kPoints - 1);
+    const double z = (px - mean) / sd;
+    pts.push_back(ojson::array({px, std::exp(logNorm - (v + 1.0) / 2.0 * std::log1p(z * z / v)) / sd}));
+  }
+  return pts;
+}
+
+
 // A value written with 13 significant digits and read back. The drawn bars of
 // `histogram` start at the note's r(min) and use its r(width) at this
 // precision: it is what puts hk_h_discnonint's first serset centre at 5.0e-14
@@ -541,7 +558,13 @@ static std::optional<ojson> addAddplot(SessionState& session, const std::string&
   twoway::ParseResult parsedPlots =
       twoway::parseTwoway(twoway::hasToplevelParens(body) ? body : twoway::expandDoublePipes(body));
   if (parsedPlots.layers.empty()) return std::nullopt;
-  for (auto& layer : parsedPlots.layers) eval::canonicalizeForCommand(layer.opts, "twoway_layer");
+  for (auto& layer : parsedPlots.layers) {
+    for (auto& kv : layer.opts) {
+      const std::string own = plotTypeOwnSpelling(layer.plottype, kv.first);
+      if (!own.empty()) kv.first = own;
+    }
+    eval::canonicalizeForCommand(layer.opts, "twoway_layer");
+  }
   eval::canonicalizeForCommand(parsedPlots.globalOpts, "twoway_layer");
   std::vector<serset::PlotSpec> plots;
   ojson drawn = runTwowayLayers(session.datastore(), session, parsedPlots.layers, parsedPlots.globalOpts,
@@ -806,20 +829,19 @@ ojson runTwowayHistogramGen(const eval::ParsedCommand& parsed, SessionState& ses
     return ojson::array();
   }
 
-  // The sample over the whole frame, `if` applied through a scratch copy.
+  // The sample over the whole frame, `if` and `in` applied through a scratch copy.
   std::string ifCopy;
   std::unique_ptr<Datastore> restricted;
-  if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) {
-    ifCopy = mintScratchPath(session.workdir(), "histgenif");
-    const std::vector<std::string> args = translate::injectTsContextForExpr(
-        {"eval", "--data", full->path(), "--keepif", *parsed.ifExpr, "--out", ifCopy}, *parsed.ifExpr, session);
+  const bool hasIn = parsed.inRange.has_value() && !parsed.inRange->empty();
+  if ((parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) || hasIn) {
     try {
-      runCobraJson(args);
+      InRangeFilterResult fr = applyIfAndInFilter(session, full->path(), parsed.ifExpr, parsed.inRange);
+      if (!fr.ok) return ojson(inRangeRejectError(fr, parsed.inRange.value_or(""), "twoway__histogram_gen"));
+      ifCopy = fr.dataPath == full->path() ? std::string() : fr.dataPath;
+      restricted = std::make_unique<Datastore>(fr.dataPath);
     } catch (const CobraError& ce) {
-      cecon::native_unlink(ifCopy);
       return ojson(eval::engineError(cobraErrorMessage(ce), ce.code));
     }
-    restricted = std::make_unique<Datastore>(ifCopy);
   }
   const GraphSample smp = graphSample(restricted ? *restricted : *full, var, parsed, wtype);
   const int64_t nRows = full->nRows();
@@ -1039,6 +1061,19 @@ ojson runKdensity(SessionState& session, Datastore& ds, const std::vector<std::s
   if (bw.err) return *bw.err;
   if (bw.h < 0.0) return stataRefusal("bandwidth must be positive", 198);
 
+  // student(#): overlay a Student t density with # degrees of freedom (an integer, default 0 = off);
+  // stopts() styles that curve and needs it (kdensity: "option student() is required by option
+  // stopts()", r(198)).
+  int studentDf = 0;
+  if (const auto text = optLast(opts, "student")) {
+    const std::optional<double> d = parseNumberG(*text);
+    if (!d.has_value() || std::floor(*d) != *d) return stataRefusal("option student() incorrectly specified", 198);
+    studentDf = static_cast<int>(*d);
+  }
+  if (hasOpt(opts, "stopts") && studentDf < 1) {
+    return stataRefusal("option student() is required by option stopts()", 198);
+  }
+
   std::vector<std::string> newNames;
   for (const auto& [k, v] : opts) {
     if ((k == "generate" || k == "gen") && !v.isBool) newNames = splitWsG(v.strValue);
@@ -1065,6 +1100,9 @@ ojson runKdensity(SessionState& session, Datastore& ds, const std::vector<std::s
   ks.wtype = wtype;
   const KdensityResult k = kdensityEstimate(smp.v, smp.w, ks, nRows, atText.has_value() ? &atPoints : nullptr);
   if (k.nCapped && pre != nullptr) pre->push_back(displayNoteBlock("(n() set to " + std::to_string(k.n) + ")"));
+  // bank: `kdensity x, nograph generate(kx kd) n(5)` on one observation prints the
+  // n() note and then r(2001) "insufficient observations".
+  if (smp.v.size() < 2) return stataRefusal("insufficient observations", 2001);
 
   const std::string varTitle = varTitleG(session, var);
   ojson graph = ojson::object();
@@ -1116,6 +1154,11 @@ ojson runKdensity(SessionState& session, Datastore& ds, const std::vector<std::s
       graph["normal_mean"] = k.mean;
       graph["normal_sd"] = k.sd;
       if (sersets != nullptr) sersets->push_back(functionSerset(graph["normal_points"]));
+    }
+    if (studentDf > 0 && k.sd > 0 && !drawn.empty()) {
+      graph["student_points"] = studentCurve(xLow, xHigh, k.mean, k.sd, studentDf);
+      graph["student_df"] = studentDf;
+      if (sersets != nullptr) sersets->push_back(functionSerset(graph["student_points"]));
     }
   }
 

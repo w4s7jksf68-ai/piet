@@ -29,7 +29,8 @@ word to its `run*` function is in `dispatch/`.
 | `collapse`, `duplicates`, `recode` | `data_collapse.cpp`, `data_duplicates.cpp`, `data_recode.cpp` |
 | `isid`, `expand`, `fillin`, `cross`, `contract` | `data_observation_expansion.cpp` |
 | `xtile`, `ipolate`, `tssmooth ma`, `mkspline` | `data_quantiles.cpp`, `data_interpolation.cpp`, `data_splines.cpp` |
-| `pctile`, `_pctile`, weighted `xtile`; `cumul`; `bsample`; `sample`, `splitsample`; `drawnorm` | `pctile.cpp`; `cumul.cpp`; `bsample.cpp`; `random_sampling.cpp`, `drawnorm.cpp` |
+| `pctile`, `_pctile`, weighted and `altdef` `xtile`; `cumul`; `bsample`; `sample`, `splitsample`; `drawnorm` | `pctile.cpp`; `cumul.cpp`; `bsample.cpp`; `random_sampling.cpp`, `drawnorm.cpp` |
+| `numlist`, `tsunab`, `fvexpand` (programmer list parsers; their natural home is `language/`, beside `fvunab`) | `list_parsing_commands.cpp` |
 | `split`, `xpose`, `recast`, `insobs`, `stack`, `separate`, `mvencode`, `input` | `string_split.cpp`, `xpose.cpp`, `recast.cpp`, `insobs.cpp`, `dataset_stack.cpp`, `separate_by_level.cpp`, `mvencode.cpp`, `input_data_block.cpp` |
 | `mvdecode`, `integ`, `sencode`, `fillmissing`, `astile` | `mvdecode.cpp`, `integ.cpp`, `sencode.cpp`, `fillmissing.cpp`, `astile.cpp` |
 | `winsor` (Cox); `winsor2` | `winsor.cpp`; `winsor2.cpp` |

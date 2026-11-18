@@ -60,8 +60,6 @@ nlohmann::ordered_json runTabulateGenerate(const std::string& stub,
                                            const std::optional<std::string>& inRange,
                                            bool includeMissing);
 
-DescribeShape describeDatasetShape(SessionState& session);
-
 void captureSummarizeR(const ojson& summBlock, bool meanonly, bool detail,
                               SessionState& session);
 

@@ -99,6 +99,11 @@ bool eoMatrixModel(SessionState& session, const std::string& spec, EoSpec* sp, s
   for (auto& el : sp->cells.elems) {
     if (el.fmt.empty()) el.fmt = {"%9.0g"};
   }
+  // MatrixMode returns the matrix itself as r(coefs) (transposed under
+  // transpose), its own column names kept.
+  sp->matrixMode = true;
+  sp->matrixColNames.clear();
+  for (size_t j = 0; j < nc; ++j) sp->matrixColNames.push_back(transpose ? rowName(j) : colName(j));
   sp->models.push_back(em);
   return true;
 }
@@ -137,6 +142,13 @@ ojson runEstout(const eval::ParsedCommand& parsed, SessionState& session) {
   auto has = [&](const char* k) { return hasFlag(opts, k); };
   auto str = [&](const char* k) { return optStr(opts, k); };
   auto eoFail = [](const EoError& e) { return tblErrorRc(e.msg, e.rc); };
+  if (auto argErr = eoArgumentError(opts, /*esttab=*/false)) return eoFail(*argErr);
+  // label and nolabel are switches: given an argument (`l("+" "-")`) they are r(198).
+  for (const auto& [k, v] : opts) {
+    if (!v.isBool && (k == "label" || k == "nolabel")) {
+      return tblErrorRc("option " + k + "() incorrectly specified", 198);
+    }
+  }
 
   std::vector<std::string> words = parsed.varlist;
   const std::optional<std::string> usingPath = takeUsing(words);
@@ -170,6 +182,13 @@ ojson runEstout(const eval::ParsedCommand& parsed, SessionState& session) {
       return ojson(eval::refusedCommand("estout", "no_" + style + "_writer"));
     }
     return tblErrorRc(style + " style not available (file estout_" + style + ".def not found)", 601);
+  }
+  for (const char* k : {"smcltags", "smclrules", "smclmidrules", "smcleqrules"}) {
+    if (has(k) && style != "smcl") {
+      return ojson(eval::unsupportedOption(
+          k, std::string("estout: ") + k + " outside the smcl style (a `using` file or another "
+                                           "style) is not implemented in this version of PIET"));
+    }
   }
   const bool label = (has("label") || has("labels")) && !has("nolabel");
   bool abbrev = has("abbrev") && !has("noabbrev");
@@ -209,6 +228,32 @@ ojson runEstout(const eval::ParsedCommand& parsed, SessionState& session) {
   sp.abbrev = abbrev;
   sp.wrap = has("wrap") && !has("nowrap");
   sp.lz = !has("nolz");
+  sp.stardetach = has("stardetach");
+  for (const auto& [k, v] : opts) {
+    if (k == "dropped") {
+      sp.dropped = true;
+      if (!v.isBool && !eoTrim(v.strValue).empty()) sp.droppedText = eoStringArg(v.strValue);
+    }
+  }
+  if (style == "smcl" && !usingPath.has_value()) {
+    // estout's smcl style on the screen: rules on, and with smclrules the mid and equation rules (nosmcl* are
+    // not spelled in this build)
+    sp.smclRules = true;
+    sp.smclMidRules = true;
+    sp.smclEqRules = true;
+  }
+  if (!eoParseMargin(opts, &sp, &eerr)) return eoFail(eerr);
+  if (auto v = str("equations")) {
+    sp.equationsSpec = eoTrim(eoStringArg(*v));
+    sp.equationsGiven = true;  // equations("") switches the default main=1 off
+  }
+  if (auto v = str("dmarker")) sp.dmarker = eoStringArg(v);
+  if (auto v = str("msign")) sp.msign = eoStringArg(v);
+  if (auto v = str("stardrop")) sp.starDrop = eoTokens(*v);
+  if (auto v = str("starkeep")) {
+    sp.starKeep = eoTokens(*v);
+    sp.hasStarKeep = true;
+  }
   if (auto ic = str("incelldelimiter")) sp.incelldelimiter = eoStringArg(ic);
   if (auto hl = str("hlinechar")) sp.hlinechar = eoStringArg(hl);
   if (auto v = str("substitute")) {
@@ -361,9 +406,19 @@ ojson runEstout(const eval::ParsedCommand& parsed, SessionState& session) {
 
   // ---- the models ---------------------------------------------------------------------------
   TransformSpec trSpec;
-  if (auto tr = str("transform")) {
+  {
+    std::string trRaw = str("transform").value_or(std::string());
+    if (trRaw.empty()) trRaw = eformTransformRaw(opts);
     std::string trErr;
-    if (!parseTransformOpt(*tr, &trSpec, &trErr)) return tblSyntax(trErr);
+    if (!trRaw.empty() && !parseTransformOpt(trRaw, &trSpec, &trErr)) return tblSyntax(trErr);
+  }
+  if (auto lv = str("level")) {
+    // estout: level(numlist max=1 int >=10 <=99), "level(#) invalid" otherwise.
+    const std::string t = eoTrim(dequote(*lv));
+    char* end = nullptr;
+    const long v = std::strtol(t.c_str(), &end, 10);
+    if (t.empty() || *end != '\0' || v < 10 || v > 99) return tblErrorRc("level(" + t + ") invalid", 198);
+    sp.level = static_cast<int>(v);
   }
   if (matrixOpt.has_value()) {
     std::string merr;
@@ -373,21 +428,36 @@ ojson runEstout(const eval::ParsedCommand& parsed, SessionState& session) {
       sp.models.push_back(eoModelFrom(models[mi], models[mi].name, session,
                                       trSpec.empty() ? nullptr : &trSpec, mi, !sp.omitted,
                                       sp.baselevels));
+      if (sp.level != 95) {
+        if (!trSpec.empty()) {
+          return ojson(eval::unsupportedOption(
+              "level", "estout: level(#) together with transform() is not implemented in this "
+                       "version of PIET (the interval would have to be transformed again)"));
+        }
+        eoApplyLevel(models[mi], sp.models.back(), sp.level, session);
+      }
     }
     for (size_t mi = 0; mi < sp.models.size(); ++mi) sp.models[mi].model = &models[mi];
   }
 
   std::string text;
   int ccols = -1;
-  if (!eoRender(sp, &text, &eerr, &ccols)) return eoFail(eerr);
+  EoRPost rpost;
+  if (!eoRender(sp, &text, &eerr, &ccols, &rpost)) return eoFail(eerr);
+  if (!eoWrapWithFiles(opts, session, &text, &eerr)) return eoFail(eerr);
   ojson result;
   if (!usingPath.has_value()) {
-    result = echoBlock(text);
+    // The table is OUTPUT, a display block: every prefix stage (capture,
+    // noisily, version, eststo:, by) drops `echo` blocks as the echo of its
+    // inner command line, so `capture noisily estout m1` printed nothing.
+    std::string body = text;
+    while (!body.empty() && body.back() == '\n') body.pop_back();
+    result = displayBlock(body);
   } else {
     result = emitTable("estout", session, *usingPath, text, has("replace"), has("append"));
   }
   if (!isErrorBlock(result)) {
-    eoPostR(session, "estout", sp.models, ccols);
+    eoPostR(session, "estout", sp.models, ccols, &rpost);
     session.eval.rClassCmd = "estout";
   }
   return result;

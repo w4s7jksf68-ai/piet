@@ -426,9 +426,28 @@ bool interceptEstimatePrefix(SessionState& session,
         if (!hasError) {
           std::optional<std::string> eststoNameOpt;
           if (!nameToks.empty()) eststoNameOpt = nameToks[0];
-          out.push_back(ojson(handlers::runEststo(eststoNameOpt, storeOpts.title, session,
-                                                  storeOpts.autoPrefix)));
-          pushEstStoreMutation(out.back(), out, session);
+          // addscalars(): the scalars join the fresh e() first; a refusal there stores nothing
+          std::vector<std::pair<std::string, double>> addedSc;
+          if (storeOpts.addscalars.has_value()) {
+            std::vector<ojson> notes;
+            const auto aerr = applyEststoAddscalars(*storeOpts.addscalars, session, &notes, &addedSc);
+            for (auto& nb : notes) out.push_back(std::move(nb));
+            if (aerr.has_value()) {
+              out.push_back(*aerr);
+              hasError = true;
+            }
+          }
+          if (!hasError) {
+            out.push_back(ojson(handlers::runEststo(eststoNameOpt, storeOpts.title, session,
+                                                    storeOpts.autoPrefix)));
+            pushEstStoreMutation(out.back(), out, session);
+            // a scalar that replaced one the fit already had is the stored one
+            for (const auto& [k, v] : addedSc) {
+              if (ojson* sn = session.estimatesGetMutable(session.activeEstimatesName)) {
+                if (sn->contains("escalars") && (*sn)["escalars"].is_object()) (*sn)["escalars"][k] = v;
+              }
+            }
+          }
         }
         { blocks = out; return true; }
       }
@@ -462,6 +481,24 @@ bool interceptVersionPrefix(SessionState& session,
                                            std::regex::icase);
     std::smatch vm;
     std::string trimmedRawV = trimWs(rawCmd);
+    // `version #:` with nothing after the colon runs nothing, rc 0 (StataBE
+    // 19.5 `version 10:`, vs-stata bank cfbd2b2fb7c48475); the number is still
+    // read.
+    {
+      static const std::regex reVersionBare(R"(^version\s+([^\s,:]+)\s*(?:,[^:]*)?:\s*$)",
+                                            std::regex::icase);
+      std::smatch bm;
+      if (trimmedRawV.find(':') != std::string::npos &&
+          std::regex_match(trimmedRawV, bm, reVersionBare) && !eval::hasMacroRefs(bm.str(1))) {
+        double vnum = 0.0;
+        if (auto bad = parseVersionNumber(bm.str(1), &vnum)) {
+          blocks = ojson::array({echo, *bad});
+          return true;
+        }
+        blocks = ojson::array({echo});
+        return true;
+      }
+    }
     // A3: all three colon-prefix forms require a literal ':'.
     if (trimmedRawV.find(':') != std::string::npos &&
         std::regex_search(trimmedRawV, vm, reVersionColon)) {
@@ -544,14 +581,29 @@ bool interceptSurveyPrefix(SessionState& session,
   // order is correct. The design itself lives in SessionState (svyset).
   {
     dprof::Scope __z(dprof::kColonPrefix);
-    static const std::regex reSvyColon(R"(^\s*svy\s*(?:,[^:]*)?:\s*(.+)$)",
+    static const std::regex reSvyColon(R"(^\s*svy\s*(,[^:]*)?:\s*(.+)$)",
                                         std::regex::icase);
     std::smatch sm;
     std::string trimmedRawS = trimWs(rawCmd);
     // A3: all three colon-prefix forms require a literal ':'.
     if (trimmedRawS.find(':') != std::string::npos &&
         std::regex_search(trimmedRawS, sm, reSvyColon)) {
-      blocks.push_back(ojson(handlers::runSvyPrefix(trimWs(sm.str(1)), session)));
+      // `svy, subpop(...) vce(...) ...:` -- the prefix's own options (subpop(), vce(), dof(), ...)
+      // change which observations and which variance the fit uses; this build's prefix takes none.
+      // Two spellings change nothing: an empty option list (`svy , :`) and vce(linearized) (also
+      // spelled vce(linearize) .. vce(linearized), or vce(robust)), the variance this prefix computes.
+      // Whether the design itself asks for another variance is refused by runSvyPrefix.
+      static const std::regex reSvyNoopOpt(R"(^,\s*(?:vce\(\s*(?:linear(?:i(?:z(?:e(?:d)?)?)?)?|r(?:o(?:b(?:u(?:s(?:t)?)?)?)?)?)\s*\))?\s*$)");
+      const std::string svyOpts = trimWs(sm.str(1));
+      if (!svyOpts.empty() && !std::regex_match(svyOpts, reSvyNoopOpt)) {
+        blocks.push_back(ojson(eval::errorBlock(
+            "unsupported_option",
+            "Options on the `svy` prefix (" + svyOpts.substr(1) +
+                ") are valid Stata options that this version of PIET does not yet implement.",
+            std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+      blocks.push_back(ojson(handlers::runSvyPrefix(trimWs(sm.str(2)), session)));
       return true;
     }
   }

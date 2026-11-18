@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -37,6 +38,8 @@
 #include "piet/eval/session.h"  // replaceRClass / declareRPosted
 #include "piet/eval/tokenizer.h"  // scanOneToken / quotedSpanMask
 #include "piet/handlers/variables.h"
+#include "piet/handlers/descriptive.h"
+#include "piet/dispatcher.h"
 #include "piet/inrange_filter.h"
 #include "piet/loops.h"  // expandVarlist -- the ONE varlist wildcard/range expander
 #include "piet/mutation_result.h"
@@ -59,10 +62,10 @@ namespace {
 const piet::eval::OptVocab& kVocabFindname = piet::eval::registerOptVocab(
     {"findname"},
     {{"varlabeltext", "varlabel", "insensitive", "not", "alpha", "local", "cslocal", "indent",
-      "skip", "varwidth"},
-     {"type", "all", "any", "format", "columns", "vallabel", "vallabelname", "vallabeltext",
-      "vallabeltextdef", "vallabeltextuse", "vallabelcountdef", "vallabelcountuse", "char",
-      "charname", "chartext", "placeholder", "detail"}});
+      "skip", "varwidth", "type", "all", "any", "format", "columns", "vallabel", "vallabelname",
+      "vallabeltext", "vallabeltextdef", "vallabeltextuse", "vallabelcountdef",
+      "vallabelcountuse", "char", "charname", "chartext", "placeholder", "detail"},
+     {}});
 
 }  // namespace
 
@@ -172,7 +175,8 @@ ojson runFindname(const eval::ParsedCommand& parsed, SessionState& session) {
   }
 
   const bool insensitive = hasFlag(parsed, "insensitive");
-  if (hasFlag(parsed, "varlabel") || optStr(parsed, "varlabeltext").has_value())
+  if (hasFlag(parsed, "varlabel") || optStr(parsed, "varlabel").has_value() ||
+      optStr(parsed, "varlabeltext").has_value())
     session.syncEvalVarLabels();
   if (hasFlag(parsed, "varlabel")) {
     std::vector<std::string> keep;
@@ -180,7 +184,12 @@ ojson runFindname(const eval::ParsedCommand& parsed, SessionState& session) {
       if (!varLabelOf(session, v).empty()) keep.push_back(v);
     vars = keep;
   }
-  if (auto text = optStr(parsed, "varlabeltext")) {
+  // varlabel(patterns) selects by label text, as varlabeltext() does.
+  std::optional<std::string> labelPatternText = optStr(parsed, "varlabeltext");
+  if (!labelPatternText.has_value())
+    for (const auto& [k, v] : parsed.opts)
+      if (k == "varlabel" && !v.isBool) labelPatternText = v.strValue;  // the bare flag has no patterns
+  if (auto text = labelPatternText) {
     std::vector<std::string> patterns = stataWords(*text);
     // `varlabeltext("")`: one empty pattern, which matches an empty label (FN|emptypat).
     if (patterns.empty() && !strutil::trim(*text).empty()) patterns.emplace_back();
@@ -199,6 +208,271 @@ ojson runFindname(const eval::ParsedCommand& parsed, SessionState& session) {
     }
     vars = keep;
   }
+  // ---- the selectors that read the variables' own metadata and values ----
+  // Each keeps the variables that meet it; all of them together are an intersection (findname's
+  // "and"). vs-stata bank: type(), format(), vallabel*, char*, columns(), all(), any(), detail.
+  std::map<std::string, ojson> meta;
+  auto metaOf = [&](const std::string& v) -> const ojson& {
+    static const ojson kEmpty = ojson::object();
+    auto it = meta.find(v);
+    return it == meta.end() ? kEmpty : it->second;
+  };
+  const bool needMeta = optStr(parsed, "type").has_value() || optStr(parsed, "format").has_value() ||
+                        hasFlag(parsed, "vallabel") || optStr(parsed, "vallabel").has_value() ||
+                        optStr(parsed, "vallabelname").has_value() ||
+                        optStr(parsed, "vallabeltext").has_value() ||
+                        optStr(parsed, "vallabeltextdef").has_value() ||
+                        optStr(parsed, "vallabeltextuse").has_value() ||
+                        optStr(parsed, "vallabelcountdef").has_value() ||
+                        optStr(parsed, "vallabelcountuse").has_value() || hasFlag(parsed, "detail");
+  if (needMeta && !vars.empty()) {
+    ojson d = runDescribe(vars, session);
+    if (d.is_object() && d.contains("variables"))
+      for (const auto& e : d["variables"]) meta[e.value("name", std::string())] = e;
+  }
+  // A selector's patternlist, absent for the bare form (`vallabel`, `char`).
+  auto valuedOpt = [&](const char* key) -> std::optional<std::string> {
+    for (const auto& [k, v] : parsed.opts)
+      if (k == key && !v.isBool) return v.strValue;
+    return std::nullopt;
+  };
+  auto foldCase = [&](std::string t) { return insensitive ? strutil::lower(t) : t; };
+  auto anyPatternMatches = [&](const std::vector<std::string>& patterns, const std::string& text) {
+    for (const auto& p : patterns)
+      if (strutil::globMatch(foldCase(p), foldCase(text))) return true;
+    return false;
+  };
+  auto narrow = [&](const std::function<bool(const std::string&)>& keepIt) {
+    std::vector<std::string> keep;
+    for (const auto& v : vars)
+      if (keepIt(v)) keep.push_back(v);
+    vars = std::move(keep);
+  };
+  auto numlistOf = [&](const std::string& text, std::vector<double>* out, ojson* err) -> bool {
+    std::vector<std::string> toks;
+    if (!piet::loops::expandNumlist(text, &toks)) {
+      *err = rcError("invalid numlist", 121);
+      return false;
+    }
+    for (const auto& t : toks) out->push_back(std::strtod(t.c_str(), nullptr));
+    return true;
+  };
+
+  if (auto text = optStr(parsed, "type")) {
+    // A storage type, str# or a width numlist, string, numeric.
+    std::set<std::string> kinds;
+    std::set<int> widths;
+    {
+      static const std::set<std::string> kTypeWords = {"byte", "int",  "long", "float", "double",
+                                                       "string", "numeric", "str#", "strL"};
+      std::string numRest;
+      for (const auto& w : stataWords(*text)) {
+        if (kTypeWords.count(w)) kinds.insert(w);
+        else numRest += (numRest.empty() ? "" : " ") + w;
+      }
+      if (!numRest.empty()) {
+        ojson nerr;
+        std::vector<double> ws;
+        if (!numlistOf(numRest, &ws, &nerr)) return rcError("invalid variable type(s)", 198);
+        for (double w : ws) {
+          if (w != std::floor(w) || w < 1 || w > 2045) return rcError("invalid type() option", 198);
+          widths.insert(static_cast<int>(w));
+        }
+      }
+      if (kinds.empty() && widths.empty()) return rcError("invalid type() option", 198);
+    }
+    Datastore* tds = session.datastore();
+    narrow([&](const std::string& v) {
+      const bool isString = tds != nullptr && tds->has(v) && tds->dtype(v) == "factor";
+      std::string st = metaOf(v).value("dtype", std::string());
+      if (isString && (st.empty() || st == "str#")) {
+        size_t longest = 1;
+        const cecon::Column& c = tds->col(v);
+        for (const auto& lv : c.levels) longest = std::max(longest, lv.size());
+        st = longest > 2045 ? "strL" : "str" + std::to_string(longest);
+      }
+      if (kinds.count("string") && isString) return true;
+      if (kinds.count("numeric") && !isString) return true;
+      if (kinds.count(st)) return true;
+      if (kinds.count("str#") && isString && st != "strL") return true;
+      if (isString && st.rfind("str", 0) == 0 && st != "strL")
+        for (int w : widths)
+          if (st == "str" + std::to_string(w)) return true;
+      return false;
+    });
+  }
+  if (auto text = optStr(parsed, "format")) {
+    const std::vector<std::string> patterns = stataWords(*text);
+    narrow([&](const std::string& v) {
+      return anyPatternMatches(patterns, metaOf(v).value("format", std::string()));
+    });
+  }
+  if (hasFlag(parsed, "vallabel"))
+    narrow([&](const std::string& v) { return !metaOf(v).value("val_label", std::string()).empty(); });
+  for (const char* key : {"vallabel", "vallabelname"})
+    if (auto text = valuedOpt(key)) {
+      const std::vector<std::string> patterns = stataWords(*text);
+      narrow([&](const std::string& v) {
+        const std::string lab = metaOf(v).value("val_label", std::string());
+        return !lab.empty() && anyPatternMatches(patterns, lab);
+      });
+    }
+  // The labelled values a variable uses: its distinct non-missing values that its value
+  // label names.
+  auto usedLabelled = [&](const std::string& v, std::vector<std::string>* texts) -> int {
+    const std::string lab = metaOf(v).value("val_label", std::string());
+    auto def = session.labelDefs.find(lab);
+    Datastore* uds = session.datastore();
+    if (lab.empty() || def == session.labelDefs.end() || uds == nullptr || !uds->has(v) ||
+        uds->dtype(v) != "f64")
+      return 0;
+    std::set<double> seen;
+    const double* x = uds->col(v).f64();
+    for (int64_t i = 0; i < uds->nRows(); ++i)
+      if (!std::isnan(x[i]) && x[i] == std::floor(x[i])) seen.insert(x[i]);
+    int n = 0;
+    for (double val : seen) {
+      auto t = def->second.find(std::to_string(static_cast<long long>(val)));
+      if (t == def->second.end()) continue;
+      ++n;
+      if (texts != nullptr) texts->push_back(t->second);
+    }
+    return n;
+  };
+  if (auto text = optStr(parsed, "vallabeltext")) {
+    const std::vector<std::string> patterns = stataWords(*text);
+    narrow([&](const std::string& v) {
+      auto def = session.labelDefs.find(metaOf(v).value("val_label", std::string()));
+      if (def == session.labelDefs.end()) return false;
+      for (const auto& kv : def->second)
+        if (anyPatternMatches(patterns, kv.second)) return true;
+      return false;
+    });
+  }
+  if (auto text = optStr(parsed, "vallabeltextdef")) {
+    const std::vector<std::string> patterns = stataWords(*text);
+    narrow([&](const std::string& v) {
+      auto def = session.labelDefs.find(metaOf(v).value("val_label", std::string()));
+      if (def == session.labelDefs.end()) return false;
+      for (const auto& kv : def->second)
+        if (anyPatternMatches(patterns, kv.second)) return true;
+      return false;
+    });
+  }
+  if (auto text = optStr(parsed, "vallabeltextuse")) {
+    const std::vector<std::string> patterns = stataWords(*text);
+    narrow([&](const std::string& v) {
+      std::vector<std::string> used;
+      usedLabelled(v, &used);
+      for (const auto& t : used)
+        if (anyPatternMatches(patterns, t)) return true;
+      return false;
+    });
+  }
+  if (auto text = optStr(parsed, "vallabelcountdef")) {
+    std::vector<double> want;
+    ojson nerr;
+    if (!numlistOf(*text, &want, &nerr)) return nerr;
+    narrow([&](const std::string& v) {
+      auto def = session.labelDefs.find(metaOf(v).value("val_label", std::string()));
+      if (def == session.labelDefs.end()) return false;
+      return std::find(want.begin(), want.end(), static_cast<double>(def->second.size())) != want.end();
+    });
+  }
+  if (auto text = optStr(parsed, "vallabelcountuse")) {
+    std::vector<double> want;
+    ojson nerr;
+    if (!numlistOf(*text, &want, &nerr)) return nerr;
+    narrow([&](const std::string& v) {
+      if (metaOf(v).value("val_label", std::string()).empty()) return false;
+      return std::find(want.begin(), want.end(), static_cast<double>(usedLabelled(v, nullptr))) !=
+             want.end();
+    });
+  }
+  // Characteristics: char / charname select by the variable's characteristic NAMES (any one
+  // when no pattern is given), chartext by their text.
+  if (hasFlag(parsed, "char"))
+    narrow([&](const std::string& v) {
+      for (const auto& c : session.characteristics)
+        if (c.varname == v) return true;
+      return false;
+    });
+  for (const char* key : {"char", "charname"})
+    if (auto text = valuedOpt(key)) {
+      const std::vector<std::string> patterns = stataWords(*text);
+      narrow([&](const std::string& v) {
+        for (const auto& c : session.characteristics)
+          if (c.varname == v && anyPatternMatches(patterns, c.charname)) return true;
+        return false;
+      });
+    }
+  if (auto text = optStr(parsed, "chartext")) {
+    const std::vector<std::string> patterns = stataWords(*text);
+    narrow([&](const std::string& v) {
+      for (const auto& c : session.characteristics)
+        if (c.varname == v && anyPatternMatches(patterns, c.value)) return true;
+      return false;
+    });
+  }
+  if (auto text = optStr(parsed, "columns")) {
+    std::vector<double> want;
+    ojson nerr;
+    if (!numlistOf(*text, &want, &nerr)) return nerr;
+    narrow([&](const std::string& v) {
+      const auto at = std::find(all.begin(), all.end(), v);
+      if (at == all.end()) return false;
+      const double pos = static_cast<double>(at - all.begin()) + 1.0;
+      return std::find(want.begin(), want.end(), pos) != want.end();
+    });
+  }
+  // all() / any(): a condition on each variable's values over the sample, the variable standing
+  // where the placeholder (`@`, or placeholder()) is. A variable the condition cannot be
+  // evaluated for (a string against a number) does not meet it.
+  {
+    const auto allCond = optStr(parsed, "all");
+    const auto anyCond = optStr(parsed, "any");
+    if (allCond.has_value() || anyCond.has_value()) {
+      std::string ph = strutil::trim(optStr(parsed, "placeholder").value_or(std::string()));
+      if (ph.empty()) ph = "@";
+      std::string userIf, userIn;
+      if (parsed.ifExpr.has_value() && !strutil::trim(*parsed.ifExpr).empty())
+        userIf = " & (" + *parsed.ifExpr + ")";
+      if (parsed.inRange.has_value() && !strutil::trim(*parsed.inRange).empty())
+        userIn = " in " + *parsed.inRange;
+      const std::string savedLeaf = session.leafCmdExpanded;
+      auto countOf = [&](const std::string& cond) -> std::optional<double> {
+        ojson b = dispatch("quietly count if (" + cond + ")" + userIf + userIn, session);
+        session.leafCmdExpanded = savedLeaf;
+        if (firstError(b) != nullptr) return std::nullopt;
+        const double* n = session.eval.rValues.find("N");
+        return n != nullptr ? std::optional<double>(*n) : std::nullopt;
+      };
+      auto subst = [&](const std::string& cond, const std::string& v) {
+        std::string out;
+        for (size_t i = 0; i < cond.size();) {
+          if (cond.compare(i, ph.size(), ph) == 0) {
+            out += v;
+            i += ph.size();
+          } else {
+            out += cond[i++];
+          }
+        }
+        return out;
+      };
+      const std::optional<double> nSample = countOf("1");
+      narrow([&](const std::string& v) {
+        if (allCond.has_value()) {
+          const auto n = countOf(subst(*allCond, v));
+          if (!n.has_value() || !nSample.has_value() || *n != *nSample) return false;
+        }
+        if (anyCond.has_value()) {
+          const auto n = countOf(subst(*anyCond, v));
+          if (!n.has_value() || *n <= 0) return false;
+        }
+        return true;
+      });
+    }
+  }
   if (hasFlag(parsed, "not")) {
     std::vector<std::string> comp;
     for (const auto& v : all)
@@ -212,8 +486,34 @@ ojson runFindname(const eval::ParsedCommand& parsed, SessionState& session) {
   shown.reserve(vars.size());
   for (const auto& v : vars) shown.push_back(stataAbbrev(v, static_cast<int>(*varwidth)));
   ojson out = ojson::array();
-  out.push_back(displayBlock(displayInColumns(shown, static_cast<int>(*indent),
-                                              static_cast<int>(*skip))));
+  if (hasFlag(parsed, "detail")) {
+    // detail: describe's table of the variables found.
+    if (meta.empty() || meta.count(vars.front()) == 0) {
+      ojson d = runDescribe(vars, session);
+      if (d.is_object() && d.contains("variables"))
+        for (const auto& e : d["variables"]) meta[e.value("name", std::string())] = e;
+    }
+    auto padR = [](std::string t, size_t w) {
+      if (t.size() < w) t.append(w - t.size(), ' ');
+      return t;
+    };
+    std::string tbl = "Variable      Storage   Display    Value\n"
+                      "    name         type    format    label      Variable label\n" +
+                      std::string(80, '-');
+    for (const auto& v : vars) {
+      const ojson& e = metaOf(v);
+      std::string row = padR(v, 16) + padR(e.value("dtype", std::string()), 8) +
+                        padR(e.value("format", std::string()), 11) +
+                        padR(e.value("val_label", std::string()), 11) +
+                        e.value("label", std::string());
+      while (!row.empty() && row.back() == ' ') row.pop_back();
+      tbl += "\n" + row;
+    }
+    out.push_back(displayBlock(tbl));
+  } else {
+    out.push_back(displayBlock(displayInColumns(shown, static_cast<int>(*indent),
+                                                static_cast<int>(*skip))));
+  }
 
   const std::string joined = joinWords(vars);
   session.eval.rStrings.set("varlist", joined);

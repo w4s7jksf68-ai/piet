@@ -97,16 +97,30 @@ ojson runReturnList(SessionState& session) {
   // OrderedDict/OrderedFloatDict contract is insertion order with
   // assignment-keeps-position, so the tail of items() is the newest key and
   // forward iteration would print Stata's list upside down.
-  out << "\nscalars:\n";
+  //
+  // A section is printed only when it has a row, and an empty r() prints
+  // nothing at all (StataBE 19.5, the vs-stata truth bank: `return list` after
+  // reshape shows `scalars:` and no `macros:` header; after a display-only
+  // cell it shows no line). The headers used to print unconditionally.
+  // A hidden scalar (describe's r(N_max), r(k_max), r(widthmax)) is not
+  // listed, as in Stata (truth bank: `return list` after reshape shows
+  // changed width k N while `: r(scalars)` also names the three limits).
   const auto& scalars = session.eval.rValues.items();
+  bool scalarHeader = false;
   for (auto it = scalars.rbegin(); it != scalars.rend(); ++it) {
+    if (session.eval.isRHidden(it->first)) continue;
+    if (!scalarHeader) out << "\nscalars:\n";
+    scalarHeader = true;
     out << padLabel22("r(" + it->first + ")") << " =  " << fmtRScalar(it->second) << "\n";
   }
 
-  out << "\nmacros:\n";
   const auto& macros = session.eval.rStrings.items();
+  bool macroHeader = false;
   for (auto it = macros.rbegin(); it != macros.rend(); ++it) {
     if (!it->first.empty() && it->first[0] == kReservedKeyLeadByte) continue;
+    if (session.eval.isRMacroHidden(it->first)) continue;
+    if (!macroHeader) out << "\nmacros:\n";
+    macroHeader = true;
     out << padLabel22("r(" + it->first + ")") << " : \"" << it->second << "\"\n";
   }
 
@@ -118,26 +132,62 @@ ojson runReturnList(SessionState& session) {
   // which is exactly the re-pin that hides real drift. So the section appears
   // only when a command actually published an r-matrix, and its absence keeps
   // meaning what it has always meant.
-  if (!session.eval.rMatrices.empty()) {
+  const auto hiddenMatrix = [&session](const std::pair<std::string, eval::EvalMatrix>& m) {
+    for (const auto& [n, g] : session.eval.rHiddenMatrices)
+      if (n == m.first && g == m.second.gen) return true;
+    return false;
+  };
+  bool anyShown = false;
+  for (const auto& m : session.eval.rMatrices) anyShown = anyShown || !hiddenMatrix(m);
+  if (anyShown) {
     out << "\nmatrices:\n";
     const auto& rmats = session.eval.rMatrices;
     for (auto it = rmats.rbegin(); it != rmats.rend(); ++it) {
+      if (hiddenMatrix(*it)) continue;
       const size_t nr = it->second.data.size();
       const size_t nc = nr > 0 ? it->second.data[0].size() : 0;
       out << padLabel22("r(" + it->first + ")") << " :  " << nr << " x " << nc << "\n";
     }
   }
 
-  // Headers with no rows when a store is empty: that is the honest report that
-  // r() has no scalars, and it is what real Stata prints. Suppressing the
-  // header would make "nothing set" indistinguishable from "this build does not
-  // track that half".
+  if (out.str().empty()) return ojson::array();  // nothing in r(): no output
   // "display": output, not the command echo, so `noisily` shows it and `quietly`
   // hides it (BUG-1505, as runEreturnList).
   ojson block;
   block["type"] = "display";
   block["text"] = out.str();
   return block;
+}
+
+// s() lives in rStrings under program.cpp's / macros.cpp's kSClassKeyPrefix.
+namespace {
+const std::string& sClassPrefix() {
+  static const std::string kPrefix = "\x01s:";
+  return kPrefix;
+}
+}  // namespace
+
+ojson runSreturnList(SessionState& session) {
+  std::ostringstream out;
+  const auto& macros = session.eval.rStrings.items();
+  for (auto it = macros.rbegin(); it != macros.rend(); ++it) {
+    if (it->first.compare(0, sClassPrefix().size(), sClassPrefix()) != 0) continue;
+    if (out.tellp() == 0) out << "\nmacros:\n";
+    out << padLabel22("s(" + it->first.substr(sClassPrefix().size()) + ")") << " : \""
+        << it->second << "\"\n";
+  }
+  if (out.str().empty()) return ojson::array();
+  ojson block;
+  block["type"] = "display";
+  block["text"] = out.str();
+  return block;
+}
+
+void clearSreturn(SessionState& session) {
+  std::vector<std::string> keys;
+  for (const auto& kv : session.eval.rStrings.items())
+    if (kv.first.compare(0, sClassPrefix().size(), sClassPrefix()) == 0) keys.push_back(kv.first);
+  for (const auto& k : keys) session.eval.rStrings.erase(k);
 }
 
 }  // namespace piet::handlers

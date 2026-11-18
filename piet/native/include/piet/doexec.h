@@ -75,6 +75,14 @@ struct ExecuteResult {
 // check the cancel flag per top-level item.
 using BlockSink = std::function<void(const ojson&)>;
 
+// Appends block `b` to `blocks`, or joins it onto an open `display ...
+// _continue` line already there. For a loop or program body, whose lines
+// Stata does not echo as it runs them: the echo blocks PIET records between
+// the two displays are passed over (StataBE 19.5 `forvalues i = 1/1 {
+// display "[a" _continue / display "b]" }` is `[ab]`). At the top level of a
+// do-file an echo closes the line instead (executeDoSource's own pushBlock).
+void appendJoiningBodyContinue(nlohmann::ordered_json& blocks, const nlohmann::ordered_json& b);
+
 ExecuteResult executeDoSource(const std::string& source, SessionState& session,
                                const DispatchFn& dispatchFn,
                                const std::vector<std::string>& args = {},

@@ -4,6 +4,7 @@
 // See THIRD_PARTY_NOTICES.
 // table esttab.
 #include "tables_internal.h"
+#include <ctime>
 #include "estout_internal.h"
 namespace piet::handlers::table_detail {
 
@@ -48,7 +49,11 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
     Model m;
     ojson err;
     if (!activeModel(session, "esttab", &m, &err)) return err;
-    if (!names.empty()) m.name = names[0];
+    // The active results, which estout names `.` (r(names) ".", r(coefs)
+    // equation `active`, StataBE `estpost summarize ...` then `esttab`); the
+    // label runEsttab heads the screen column with (the depvar, or `est1`)
+    // is not a model name.
+    m.name = ".";
     models.push_back(m);
   }
 
@@ -77,8 +82,7 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
     // The screen form (esttab `else local mode smcl`): smcl's widths,
     // delimiter and abbreviation are fixed mode's; the text itself is
     // the UI block's, so only the checks and r() matter here.
-    if (mode.empty() || mode == "smcl" || mode == "rtf" || mode == "html" || mode == "html5" ||
-        mode == "md" || mode == "mmd") {
+    if (mode.empty() || mode == "smcl" || mode == "rtf") {
       mode = "fixed";
     }
   } else if (mode.empty()) {
@@ -103,8 +107,9 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
     else if (mode == "mmd") suffix = ".mmd";
     userPath += suffix;
   }
-  if (mode == "smcl" || mode == "rtf" || mode == "html" || mode == "html5" || mode == "md" ||
-      mode == "mmd") {
+  // `md` is mmd under another name -- renamed only once the default suffix has been chosen
+  if (mode == "md") mode = "mmd";
+  if (mode == "smcl" || mode == "rtf") {
     return ojson(eval::unsupportedOption(
         mode, "esttab: the " + mode + " writer is not implemented in this build; fixed, tab, csv, "
               "scsv, tex and booktabs are"));
@@ -134,13 +139,6 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
       return tblErrorRc("level(" + *lv + ") invalid", 198);
     }
     if (level < 10 || level > 99) return tblErrorRc("level(" + *lv + ") invalid", 198);
-    if (level != 95) {
-      // The interval is READ from the estimator (it carries its own level), so
-      // another level cannot be honoured; refused rather than mislabelled.
-      return ojson(eval::unsupportedOption(
-          "level", "esttab reports the confidence interval the estimation stored (95% by "
-                   "default); this build cannot re-derive it at level(" + dequote(*lv) + ")"));
-    }
   }
   std::optional<std::string> bfmtOpt = str("b");
   std::string bfmt = bfmtOpt.has_value() ? eoTrim(dequote(*bfmtOpt)) : std::string();
@@ -160,8 +158,17 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
               bicfmt = str("bic").value_or("");
   bool star = has("star") || str("star").has_value();
   if (star && has("nostar")) return tblErrorRc("options star and nostar not both allowed", 198);
+  // margin: no constant (estout's marginal effects have none) unless `constant` is
+  // asked for, a "Marginal effects" note, and the @discrete legend line.
+  EoSpec marginSpec;
+  {
+    EoError me;
+    if (!eoParseMargin(opts, &marginSpec, &me)) return tblErrorRc(me.msg, me.rc);
+  }
   const bool noconstant = (has("noconstant") || has("nocons") ||
-                           (betaOn && !has("constant")));
+                           (betaOn && !has("constant")) ||
+                           (marginSpec.margin && !has("constant")) ||
+                           (!eformTransformRaw(opts).empty() && !has("constant")));
 
   EtMode md = esttabMode(mode, label, plain, level);
   const std::string mode0 = md.mode0;
@@ -174,6 +181,9 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
     if (modeVarwidth >= 0) modeVarwidth -= label ? 4 : 2;
   }
   EoSpec sp;
+  sp.margin = marginSpec.margin;
+  sp.discrete = marginSpec.discrete;
+  sp.discrete2 = marginSpec.discrete2;
   sp.session = &session;
   sp.level = level;
   if (auto mwo = str("modelwidth")) {
@@ -211,6 +221,11 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
   if (mode0 == "tab" || mode0 == "csv") {
     lines = false;
     eqlines = false;
+  } else if (mode == "html5") {
+    // html5 draws no rules and no gaps: its table sections are <thead> / <tbody> blocks
+    gaps = false;
+    lines = false;
+    eqlines = true;
   }
   const bool legend = notes && !has("nolegend") && nocellsopt && !matrixmode;
   if (plain) {
@@ -247,6 +262,10 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
     }
   } else {
     std::string note1;
+    if (notes && sp.margin) note1 = "Marginal effects";
+    if (notes && !eformTransformRaw(opts).empty()) {
+      note1 += std::string(note1.empty() ? "" : "; ") + "Exponentiated coefficients";
+    }
     auto addElem = [&](EoElem el, int row, bool sideBySide) {
       sp.cells.elems.push_back(el);
       const int idx = static_cast<int>(sp.cells.elems.size()) - 1;
@@ -267,13 +286,13 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
       mainEl.name = "beta";
       mainEl.fmt = {betafmt};
       mainEl.star = bstar;
-      if (notes) note1 = "Standardized beta coefficients";
+      if (notes) note1 += std::string(note1.empty() ? "" : "; ") + "Standardized beta coefficients";
     } else if (auto mo = str("main")) {
       const std::vector<std::string> t = eoTokens(*mo);
       mainEl.name = t.empty() ? std::string("b") : t[0];
       mainEl.fmt = {t.size() > 1 ? t[1] : bfmt};
       mainEl.star = bstar;
-      if (notes) note1 = mainEl.name + " coefficients";
+      if (notes) note1 += std::string(note1.empty() ? "" : "; ") + mainEl.name + " coefficients";
     } else {
       mainEl.name = "b";
       mainEl.fmt = {bfmt};
@@ -281,9 +300,6 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
     }
     addElem(mainEl, 0, false);
     if (!noT || zOn || seOn || pOn || ciOn || str("aux").has_value()) {
-      if (has("onecell")) {
-        return ojson(eval::unsupportedOption("onecell", "esttab: onecell is not implemented in this build"));
-      }
       std::string auxname, auxfmt;
       if (auto ao = str("aux")) {
         const std::vector<std::string> t = eoTokens(*ao);
@@ -346,7 +362,14 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
       auxEl.fmt = {auxfmt};
       auxEl.abs = abs;
       auxEl.star = staraux && star;
-      addElem(auxEl, 1, wide);
+      if (has("onecell") && !sp.cells.rows.empty() && !sp.cells.rows.back().empty()) {
+        // onecell: the statistic goes into the coefficient's own cell (cells(b & t)), after
+        // the in-cell delimiter, instead of a row or column of its own.
+        sp.cells.elems.push_back(auxEl);
+        sp.cells.rows.back().back().push_back(static_cast<int>(sp.cells.elems.size()) - 1);
+      } else {
+        addElem(auxEl, 1, wide);
+      }
     }
     if (!note1.empty()) thenote.push_back(note1);
   }
@@ -485,6 +508,7 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
       for (const auto& t : eoTokens(*an)) thenote.push_back(t);
     }
   }
+  if (legend && sp.margin && !has("nodiscrete")) thenote.push_back("@discrete");
   if (legend && (star || !nocellsopt)) thenote.push_back("@starlegend");
 
   // star levels and the mode strings (esttab)
@@ -508,7 +532,12 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
   if (auto v = str("begin")) sp.begin = eoStringArg(v);
   else if (md.beginSet) sp.begin = md.begin;
   if (auto v = str("delimiter")) sp.delimiter = eoStringArg(v);
-  else if (md.delimiterSet) sp.delimiter = md.delimiter;
+  else if (mode0 == "html") {
+    // </td><td align="..."> when an alignment() is given
+    std::optional<std::string> al = str("alignment");
+    if (!al.has_value()) al = str("align");  // ALIGNment: `align` is its minimum
+    sp.delimiter = al.has_value() ? "</td><td align=\"" + eoStringArg(al) + "\">" : md.delimiter;
+  } else if (md.delimiterSet) sp.delimiter = md.delimiter;
   if (auto v = str("end")) sp.end = eoStringArg(v);
   else if (md.endSet) sp.end = md.end;
   if (auto v = str("substitute")) {
@@ -522,8 +551,32 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
   else if (has("abbrev")) sp.abbrev = true;
   else sp.abbrev = md.abbrev;
   sp.wrap = has("wrap");
+  sp.mmd = mode0 == "mmd";
+  sp.stardetach = stardetach;
+  for (const auto& [k, v] : opts) {
+    if (k == "dropped") {
+      sp.dropped = true;
+      if (!v.isBool && !eoTrim(v.strValue).empty()) sp.droppedText = eoStringArg(v.strValue);
+    }
+  }
   if (auto ic = str("incelldelimiter")) sp.incelldelimiter = eoStringArg(ic);
+  else if (has("onecell") && !md.incelldel.empty()) sp.incelldelimiter = md.incelldel;
   sp.lz = !has("nolz");
+  if (auto v = str("equations")) {
+    sp.equationsSpec = eoTrim(eoStringArg(*v));
+    sp.equationsGiven = true;
+  }
+  if (auto v = str("lastend")) {
+    sp.lastend = eoStringArg(v);
+    sp.lastendSet = true;
+  }
+  if (auto v = str("dmarker")) sp.dmarker = eoStringArg(v);
+  if (auto v = str("msign")) sp.msign = eoStringArg(v);
+  if (auto v = str("stardrop")) sp.starDrop = eoTokens(*v);
+  if (auto v = str("starkeep")) {
+    sp.starKeep = eoTokens(*v);
+    sp.hasStarKeep = true;
+  }
   if (auto hl = str("hlinechar")) sp.hlinechar = eoStringArg(hl);
 
   // estout's own style defaults on top (estout): `style(esttab)` is
@@ -597,12 +650,67 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
       if (floatOn) closing.insert(closing.end(), md.close.begin(), md.close.end());
       else if (star) closing.push_back("}");
     } else {
-      opening.insert(opening.end(), md.open.begin(), md.open.end());
+      const bool htmlPage = mode0 == "html" && has("page");
+      if (htmlPage) {
+        // <html> <head> <title>..</title> page(..) </head> <body>: the title (else the date and time
+        // of the run) names the document; page(string) is added inside <head>.
+        std::string docTitle = sp.title.empty() ? std::string() : "@title";
+        if (docTitle.empty()) {
+          const std::time_t now = std::time(nullptr);
+          char buf[64];
+          std::strftime(buf, sizeof(buf), "%d %b %Y %H:%M:%S", std::localtime(&now));
+          docTitle = buf;
+        }
+        std::vector<std::string> o0 = md.open0;
+        for (auto& ln : o0) {
+          if (ln == "<title>@title</title>") ln = "<title>" + docTitle + "</title>";
+        }
+        if (auto pg = str("page")) {
+          const auto it = std::find(o0.begin(), o0.end(), std::string("</head>"));
+          o0.insert(it, eoStringArg(pg));
+        }
+        opening.insert(opening.end(), o0.begin(), o0.end());
+      }
+      std::vector<std::string> mopen = md.open;
+      if (mode == "html") {
+        const auto widthOpt = str("width");
+        mopen = {"<table border=\"0\" width=\"" + (widthOpt.has_value() ? eoStringArg(widthOpt) : std::string("*")) +
+                 "\">"};
+      } else if (mode == "html5") {
+        const auto attrOpt = str("attributes");
+        mopen = {"<table" + (attrOpt.has_value() ? " " + eoStringArg(attrOpt) : std::string()) + ">"};
+      }
+      opening.insert(opening.end(), mopen.begin(), mopen.end());
       if (!sp.title.empty()) opening.insert(opening.end(), md.caption.begin(), md.caption.end());
-      for (const auto& ch : thenote) {
-        closing.push_back(mode0 == "csv" ? csvlhs + ch + "\"" : ch);
+      if (mode0 == "html") {
+        // the notes: one cell across the table, the chunks separated by <br />
+        std::vector<std::string> chunks;
+        std::string brr;
+        for (const auto& ch : thenote) {
+          chunks.push_back(brr + ch);
+          brr = "<br />";
+        }
+        if (!chunks.empty()) {
+          if (mode == "html5") closing.push_back("<tfoot>");
+          closing.push_back("<tr><td colspan=@span>");
+          closing.insert(closing.end(), chunks.begin(), chunks.end());
+          closing.push_back("</td></tr>");
+          if (mode == "html5") closing.push_back("</tfoot>");
+        }
+      } else if (mode0 == "mmd") {
+        if (!thenote.empty()) {
+          closing.push_back("");
+          for (size_t i = 0; i < thenote.size(); ++i) {
+            closing.push_back(thenote[i] + (i + 1 < thenote.size() ? "<br>" : ""));
+          }
+        }
+      } else {
+        for (const auto& ch : thenote) {
+          closing.push_back(mode0 == "csv" ? csvlhs + ch + "\"" : ch);
+        }
       }
       closing.insert(closing.end(), md.close.begin(), md.close.end());
+      if (htmlPage) closing.insert(closing.end(), md.close0.begin(), md.close0.end());
     }
     toprule = md.toprule;
     bottomrule = md.bottomrule;
@@ -615,6 +723,7 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
   } else {
     if (lines) opening.insert(opening.end(), toprule.begin(), toprule.end());
     else if (gaps) opening.insert(opening.end(), topgap.begin(), topgap.end());
+    else if (mode == "html5") opening.push_back("<thead>");
     sp.prehead = opening;
   }
   if (auto ph = str("posthead")) {
@@ -623,12 +732,15 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
     sp.posthead = midrule;
   } else if (gaps) {
     sp.posthead = midgap;
+  } else if (mode == "html5") {
+    sp.posthead = {"</thead>", "<tbody>"};
   }
   if (auto pf = str("prefoot")) {
     sp.prefoot = eoHookLines(*pf);
   } else if (!sp.stats.empty() && !sp.cells.none) {
     if (lines) sp.prefoot = midrule;
     else if (gaps) sp.prefoot = midgap;
+    else if (mode == "html5") sp.prefoot = {"</tbody>", "<tbody>"};
   }
   if (auto pf = str("postfoot")) {
     sp.postfoot = eoHookLines(*pf);
@@ -636,6 +748,7 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
     std::vector<std::string> c2;
     if (lines) c2 = bottomrule;
     else if (gaps) c2 = bottomgap;
+    else if (mode == "html5") c2 = {"</tbody>"};
     c2.insert(c2.end(), closing.begin(), closing.end());
     sp.postfoot = c2;
   }
@@ -748,15 +861,14 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
       sp.rename.emplace_back(t[i], t[i + 1]);
     }
   }
-  if (str("equations").has_value()) {
-    return ojson(eval::unsupportedOption("equations", "esttab: equations() is not implemented in this build"));
-  }
 
   // ---- the models' rows --------------------------------------------------------------------------------------
   TransformSpec trSpec;
-  if (auto tr = str("transform")) {
+  {
+    std::string trRaw = str("transform").value_or(std::string());
+    if (trRaw.empty()) trRaw = eformTransformRaw(opts);
     std::string trErr;
-    if (!parseTransformOpt(*tr, &trSpec, &trErr)) return tblSyntax("esttab: " + trErr);
+    if (!trRaw.empty() && !parseTransformOpt(trRaw, &trSpec, &trErr)) return tblSyntax("esttab: " + trErr);
   }
   std::vector<std::map<std::string, double>> betas;
   if (betaOn) {
@@ -770,6 +882,14 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
     EoModel em = eoModelFrom(models[mi], models[mi].name, session, trSpec.empty() ? nullptr : &trSpec,
                              mi, !sp.omitted, sp.baselevels);
     if (betaOn) em.beta = betas[mi];
+    if (level != 95) {
+      if (!trSpec.empty()) {
+        return ojson(eval::unsupportedOption(
+            "level", "esttab: level(#) together with transform() is not implemented in this version "
+                     "of PIET (the interval would have to be transformed again)"));
+      }
+      eoApplyLevel(models[mi], em, level, session);
+    }
     sp.models.push_back(em);
   }
   if (!matrixmode) {
@@ -779,16 +899,26 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
 
   std::string text;
   int ccols = -1;
-  if (!eoRender(sp, &text, &eerr, &ccols)) return eoFail(eerr);
+  EoRPost rpost;
+  if (!eoRender(sp, &text, &eerr, &ccols, &rpost)) return eoFail(eerr);
+  if (!eoWrapWithFiles(opts, session, &text, &eerr)) return eoFail(eerr);
   if (!toFile) {
-    eoPostR(session, "estout", sp.models, ccols);
+    eoPostR(session, "estout", sp.models, ccols, &rpost);
     session.eval.rClassCmd = "esttab";
     // BUG-407: a cells()/main()/aux() layout is one the UI's estimates_table
     // block cannot carry, so the screen shows the rendered table itself: smcl's
     // text is fixed mode's (esttab), after the blank line esttab
     // prints first (StataBE 19.5 `esttab m1, cells(b)` and five other layouts
     // match this text line for line).
-    if (cellsGiven || str("main").has_value() || str("aux").has_value()) {
+    // The same holds for what the UI block has no field for: margin, eform, a level
+    // other than 95, and the number/star spellings (dmarker, msign, starkeep, stardrop).
+    const bool writerOnly = mode0 == "html" || mode0 == "mmd" || stardetach || sp.dropped || has("onecell") || sp.margin || !eformTransformRaw(opts).empty() || level != 95 ||
+                            str("dmarker").has_value() || str("msign").has_value() ||
+                            str("starkeep").has_value() || str("stardrop").has_value() ||
+                            str("equations").has_value() || str("lastend").has_value() ||
+                            str("topfile").has_value() ||
+                            str("bottomfile").has_value();
+    if (cellsGiven || str("main").has_value() || str("aux").has_value() || writerOnly) {
       std::string body = text;
       while (!body.empty() && body.back() == '\n') body.pop_back();
       return displayBlock("\n" + body);
@@ -797,13 +927,16 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
   }
   ojson result = emitTable("esttab", session, userPath, text, has("replace"), has("append"));
   if (!isErrorBlock(result)) {
-    eoPostR(session, "estout", sp.models, ccols);
+    eoPostR(session, "estout", sp.models, ccols, &rpost);
     session.eval.rClassCmd = "esttab";
   }
   // Options this build still accepts without honouring: said once, never silent.
   std::vector<std::string> seen;
   for (const char* n : {"page", "longtable", "standalone", "fonttbl", "attributes"}) {
-    if (has(n) || str(n).has_value()) seen.push_back(n);
+    if (!(has(n) || str(n).has_value())) continue;
+    if (std::string(n) == "page" && mode0 == "html") continue;        // applied above
+    if (std::string(n) == "attributes" && mode == "html5") continue;  // applied above
+    seen.push_back(n);
   }
   if (!seen.empty() && !isErrorBlock(result)) {
     ojson arr = ojson::array();

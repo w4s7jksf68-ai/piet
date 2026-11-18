@@ -2435,6 +2435,18 @@ mark.find-hit-current {
   text-align: right;
 }
 .settings-checkbox-wrap { display: flex; align-items: center; }
+/* Table size limits: one line per limit, its caption left and a short number box right. */
+.settings-caption { color: var(--neutral-text); align-self: start; padding-top: 3px; }
+.settings-limits-wrap { display: flex; flex-direction: column; gap: 3px; }
+.settings-limit {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-sm);
+  color: var(--neutral-text);
+}
+.settings-limit > .settings-number { flex: 0 0 104px; width: 104px; }
+.settings-number { text-align: right; font-variant-numeric: tabular-nums; }
 .settings-status {
   margin: var(--s-lg) 0 0;
   min-height: 1.3em;

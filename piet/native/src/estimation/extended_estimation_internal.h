@@ -19,6 +19,8 @@ struct IvParenResult {
   std::vector<std::string> instruments;
   bool errored = false;
   std::string errorMsg;
+  // The block named endogenous regressors but no instrument: `(x = )`.
+  bool noInstruments = false;
 };
 
 std::string joinSpaceM4(const std::vector<std::string>& v);

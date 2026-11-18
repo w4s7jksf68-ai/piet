@@ -11,6 +11,19 @@ ojson runIpolate(const std::vector<std::string>& varlist,
                  const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                  const std::optional<std::string>& ifExpr, SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
+  // ipolate's `varlist(min=2 max=2)`: with every name found, one variable is
+  // r(102) "too few variables specified" and three r(103) (vs-stata bank
+  // `ipolate price, gen(p2)`).
+  if (!varlist.empty() && varlist.size() != 2 && session.datastore() != nullptr) {
+    bool allFound = true;
+    for (const auto& v : varlist) allFound = allFound && session.datastore()->has(v);
+    if (allFound)
+      return eval::errorBlock("syntax_error",
+                              varlist.size() < 2 ? "too few variables specified"
+                                                 : "too many variables specified",
+                              std::nullopt, std::nullopt, std::nullopt,
+                              varlist.size() < 2 ? "r(102)" : "r(103)");
+  }
   if (varlist.size() != 2)
     return engineErrorBlock("ipolate: syntax is `ipolate yvar xvar, generate(newvar)`",
                             "syntax_error");
@@ -162,6 +175,37 @@ ojson runTssmoothMa(const std::string& newvar, const std::string& srcvar,
     return engineErrorBlock(cobraErrorStr(ce), ce.code);
   }
   session.load(outPath);
+  // tssmooth ma stores the window it applied: r(N) observations, r(w0) when the centre
+  // counts, a weight of one for each lag and lead, and the expression and the time
+  // (and panel) variable it ran on.
+  {
+    Datastore* sd = session.datastore();
+    eval::replaceRClass(session.eval);
+    std::vector<std::string> posted;
+    session.eval.rValues.set("N", sd != nullptr ? static_cast<double>(sd->nRows()) : 0.0);
+    posted.push_back("N");
+    if (wc == 1) {
+      session.eval.rValues.set("w0", 1.0);
+      posted.push_back("w0");
+    }
+    for (int i = 1; i <= wl; ++i) {
+      session.eval.rValues.set("wlag" + std::to_string(i), 1.0);
+      posted.push_back("wlag" + std::to_string(i));
+    }
+    for (int i = 1; i <= wf; ++i) {
+      session.eval.rValues.set("wlead" + std::to_string(i), 1.0);
+      posted.push_back("wlead" + std::to_string(i));
+    }
+    session.eval.rStrings.set("exp", srcvar);
+    posted.push_back("exp");
+    if (session.panelvar.has_value() && !session.panelvar->empty()) {
+      session.eval.rStrings.set("panelvar", *session.panelvar);
+      posted.push_back("panelvar");
+    }
+    session.eval.rStrings.set("timevar", *session.timevar);
+    posted.push_back("timevar");
+    eval::declareRPosted(session.eval, "tssmooth", posted);
+  }
   return mutationResult(session, "gen", {newvar});
 }
 }

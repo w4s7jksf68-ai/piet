@@ -7,6 +7,7 @@
 #define PIET_NATIVE_HANDLERS_DESCRIPTIVE_H
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -20,6 +21,25 @@ namespace piet::handlers {
 // `describe` / `desc` — VarInfo table, C++ port of describe.py's run_describe.
 nlohmann::ordered_json runDescribe(const std::optional<std::vector<std::string>>& varlist,
                                     SessionState& session);
+
+// What `describe` leaves in r() for the data in memory (StataBE 19.5, the
+// vs-stata truth bank): r(N), r(k), r(width), r(N_max), r(k_max), r(widthmax),
+// r(changed), and r(datalabel) when the dataset has a label -- posted in that
+// order, so `return list` and `: r(scalars)` list them as Stata does (changed
+// widthmax k_max N_max width k N). r(width) is left unposted (and so refused by
+// name) when a string's width was never recorded. Declares the set for `cmd`:
+// `describe` itself, and the commands whose ado ends in a `describe`
+// (filelist's leftalign, reshape's Report1 `desc, short`), which leave its r().
+void postDescribeResults(SessionState& session, const std::string& cmd = "describe");
+
+// `describe [varlist] using FILE [, short simple varlist]`: FILE's description
+// (read through `cobra import-dta`), the data in memory untouched. Posts the
+// file's r(N), r(k), r(width), the edition limits, r(datalabel) when no varlist
+// was given, and r(varlist)/r(sortlist) under `varlist`; never r(changed).
+// `names` are the variables before `using` (names, patterns, abbreviations).
+nlohmann::ordered_json runDescribeUsing(const std::vector<std::string>& names,
+                                        const std::string& fileTyped, bool shortForm,
+                                        bool simple, bool varlistOpt, SessionState& session);
 
 // `summarize` / `sum [varlist] [if] [, detail]` — routes numeric vars to
 // `cobra eval --summarize`, C++ port of summarize.py's run_summarize.
@@ -76,7 +96,8 @@ nlohmann::ordered_json runAssert(const std::string& expr, SessionState& session,
 // (numeric-only if/in; factor-referencing conditions are OUT of scope).
 nlohmann::ordered_json runList(const std::optional<std::vector<std::string>>& varlist,
                                 const std::optional<std::string>& ifExpr,
-                                const std::optional<std::string>& inRange, SessionState& session);
+                                const std::optional<std::string>& inRange, SessionState& session,
+                                bool noLabel = false);
 
 // `levelsof VAR [, local(NAME) clean]` — distinct sorted values; numeric
 // vertical slice (factor/string levelsof is M3b).
@@ -84,15 +105,41 @@ nlohmann::ordered_json runLevelsof(const std::string& varname,
                                     const std::optional<std::string>& localName, bool clean,
                                     const std::optional<std::string>& ifExpr, SessionState& session);
 
+// `levelsof VAR` / `glevelsof VARLIST` [if] [in] [, local() clean missing
+// separate() colseparate() silent]: the level text and the counts each command's
+// own ado publishes (levels_command.cpp has the rules and their sources).
+struct LevelsofRequest {
+  std::vector<std::string> vars;
+  std::optional<std::string> ifExpr;
+  std::optional<std::string> inRange;
+  std::optional<std::string> localName;
+  bool clean = false;
+  bool missing = false;
+  bool silent = false;
+  bool gtools = false;  // glevelsof
+  std::optional<std::string> separate;
+  std::optional<std::string> colseparate;
+};
+nlohmann::ordered_json runLevelsofCommand(const LevelsofRequest& req, SessionState& session);
+
 // `compare v1 v2` -- display only.
 nlohmann::ordered_json runCompare(const eval::ParsedCommand& parsed, SessionState& session);
 
-nlohmann::ordered_json runInspect(const std::vector<std::string>& varlist, SessionState& session);
+nlohmann::ordered_json runInspect(const std::vector<std::string>& varlist,
+                                  const std::optional<std::string>& ifExpr,
+                                  const std::optional<std::string>& inRange, SessionState& session);
 // BUG-371 — panel summaries. Both PIET-native (no engine verb exists), and both
 // require xtset: the whole content of xtsum is the BETWEEN/WITHIN split, which is
 // meaningless without knowing what a unit is.
-nlohmann::ordered_json runXtsum(const std::vector<std::string>& varlist, SessionState& session);
-nlohmann::ordered_json runXttab(const std::vector<std::string>& varlist, SessionState& session);
+nlohmann::ordered_json runXtsum(const std::vector<std::string>& varlist, SessionState& session,
+                                const std::optional<std::string>& ifExpr = std::nullopt,
+                                const std::optional<std::string>& inRange = std::nullopt,
+                                // i(varname): the panel variable named on the line.
+                                const std::string& idOverride = std::string());
+nlohmann::ordered_json runXttab(const std::vector<std::string>& varlist, SessionState& session,
+                                const std::optional<std::string>& ifExpr = std::nullopt,
+                                const std::optional<std::string>& inRange = std::nullopt,
+                                const std::string& idOverride = std::string());
 
 // `tabulate`/`tab`/`tab1`/`tab2` VARLIST [, chi2 sum(V)|summarize(V)] — C++
 // port of tabulate.py's run_tabulate (oneway/twoway freq, tab1/tab2, the
@@ -121,7 +168,15 @@ nlohmann::ordered_json runTabulate(Datastore& ds, const std::vector<std::string>
                                    const std::optional<std::string>& weightType = std::nullopt,
                                    // BUG-1514: the two-way statistics beyond chi2, a mask of
                                    // the kTab* bits below. 0 keeps every call site byte-identical.
-                                   unsigned twoWayStats = 0);
+                                   unsigned twoWayStats = 0,
+                                   // `exact(#)`: the enumeration workspace (Stata's megabytes,
+                                   // default 1); a larger # allows a larger table.
+                                   double exactWorkspace = 1.0,
+                                   // tab2 `firstonly`: the first variable against each other one.
+                                   bool firstOnly = false,
+                                   // one-way `subpop(varname)`: counts only the rows where the
+                                   // variable is nonzero; the levels are those of the whole sample.
+                                   const std::string& subpopVar = std::string());
 
 // BUG-1514: tabulate_twoway's lrchi2, V, gamma and taub ([R] tabulate twoway,
 // Methods and formulas), the bits of runTabulate's `twoWayStats`.
@@ -129,7 +184,7 @@ constexpr unsigned kTabLrchi2 = 1u;
 constexpr unsigned kTabCramersV = 2u;
 constexpr unsigned kTabGamma = 4u;
 constexpr unsigned kTabTaub = 8u;
-constexpr unsigned kTabExact = 16u;  // Fisher's exact, served on 2 x 2 tables
+constexpr unsigned kTabExact = 16u;  // Fisher's exact (2 x 2 closed form, r x c enumerated)
 
 // `table ROWVAR [COLVAR] [, statistic(STAT VAR)]` — C++ port of table.py's
 // run_table (aggregate statistic by cross-classification).
@@ -137,10 +192,30 @@ constexpr unsigned kTabExact = 16u;  // Fisher's exact, served on 2 x 2 tables
 // spec, so the one-statistic and multi-statistic paths share ONE Total-
 // margin/label-header computation — see runTableMulti's own comment for why
 // both paths were wrong the same way.
+// What `table`'s options decide about the shape of the result: which margins are drawn, and
+// whether the dimension variables' missing values are categories of their own. `presentation`
+// carries the options that only paint the table (title, note, nformat, sformat, showcounts ...)
+// as typed, for the renderer.
+struct TableLayout {
+  bool includeMissing = false;
+  bool showRowTotal = true;  // the Total row (collapses the row variable)
+  bool showColTotal = true;  // the Total column (collapses the column variable)
+  bool zeroCounts = false;  // zerocounts: an empty cell of a count or frequency is 0, not empty
+  // [fw|aw|pw|iw=weightVar]: frequencies and shares are sums of weights, means and sums are
+  // weighted, count / min / max / raw* statistics are not.
+  std::string weightVar;
+  std::string weightType;  // "fw", "aw", "pw" or "iw"
+  // A third dimension (`table a b c`): one table per level of `pageVar`. With `pageLevel` NaN
+  // the call only lists the levels (`page_levels` in the result); with a level it draws that
+  // page. A row must have `pageVar` present to be in the table whichever page is drawn.
+  std::string pageVar;
+  double pageLevel = std::numeric_limits<double>::quiet_NaN();
+};
+
 nlohmann::ordered_json runTable(Datastore& ds, const std::string& rowvar,
                                  const std::optional<std::string>& colvar, const std::string& stat,
                                  const std::optional<std::string>& statvar,
-                                 SessionState* session = nullptr);
+                                 SessionState* session = nullptr, const TableLayout* layout = nullptr);
 
 // BUG-160: `table (row) (col), statistic(A) statistic(B) ...` — ONE
 // `table_result` with every requested statistic nested under each row
@@ -158,7 +233,7 @@ nlohmann::ordered_json runTable(Datastore& ds, const std::string& rowvar,
 nlohmann::ordered_json runTableMulti(
     Datastore& ds, const std::string& rowvar, const std::optional<std::string>& colvar,
     const std::vector<std::pair<std::string, std::optional<std::string>>>& statSpecs,
-    SessionState* session = nullptr);
+    SessionState* session = nullptr, const TableLayout* layout = nullptr);
 
 // `tabstat VARLIST [, by(g) stats(mean sd ...)]` — direct cobra argv (B9/C10
 // translate.py path), estimation-block wrapped. `ifExpr` (BUG-042): tabstat's
@@ -172,7 +247,9 @@ nlohmann::ordered_json runTabstat(const std::vector<std::string>& varlist,
                                    const std::optional<std::string>& statsVal,
                                    SessionState& session,
                                    const std::optional<std::string>& ifExpr = std::nullopt,
-                                   bool wantGroups = false, bool noTotal = false);
+                                   bool wantGroups = false, bool noTotal = false,
+                                   // `in a/b`, composed with `if` (tabstat takes both).
+                                   const std::optional<std::string>& inRange = std::nullopt);
 
 // W:P5 — `by G: tabstat VARLIST, statistics(...)`. The by-prefix driver in
 // dispatcher.cpp has already materialized this group's slice (its rows ANDed
@@ -188,6 +265,14 @@ nlohmann::ordered_json runTabstatOnData(const std::vector<std::string>& varlist,
 // translate.py's build_corr_argv. `ifExpr` (BUG-042): same keepif prefilter
 // as runTabstat above (corr's cobra CLI has no --keepif of its own either).
 // `inRange` (BS-090, BETA Phase G): `in a/b`, composed with `ifExpr` via AND.
+// correlate's means, pwcorr's bonferroni/sidak (adjust 1/2), star(), print() (as
+// fractions, -1 unset) and listwise: runCorrStata's options beyond the core ones.
+struct CorrExtra {
+  bool means = false;
+  int adjust = 0;
+  double star = -1, print = -1;
+  bool listwise = false;
+};
 nlohmann::ordered_json runCorr(const std::vector<std::string>& varlist, bool pairwise, bool sig,
                                 SessionState& session,
                                 const std::optional<std::string>& ifExpr = std::nullopt,

@@ -74,6 +74,20 @@ ojson runScalarList(const std::vector<std::string>& names, SessionState& session
   };
   std::vector<std::string> lines;
   const auto& items = session.eval.scalars.items();
+  // A named scalar that does not exist is r(111) "scalar NAME not found"
+  // (vs-stata bank `scalar list zznotascalar`).
+  for (const auto& nm : names) {
+    if (nm.find_first_of("*?~") != std::string::npos || nm == "_all") continue;
+    bool found = false;
+    for (const auto& [name, val] : items) {
+      (void)val;
+      found = found || name == nm;
+    }
+    found = found || session.eval.stringScalars.count(nm) != 0;
+    if (!found)
+      return ojson(eval::errorBlock("engine_error", "scalar " + nm + " not found", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(111)"));
+  }
   for (const auto& [name, val] : items) {
     if (!names.empty() && std::find(names.begin(), names.end(), name) == names.end()) continue;
     lines.push_back(padRight10(name) + " = " + padRight10(val));
@@ -119,10 +133,12 @@ ojson runEreturnList(SessionState& session) {
   // estpost posting, `ereturn post`, a restored estpost store); its stores are
   // listed like any other (SPEC C, `ereturn list` after estpost).
   if (!lm.has_value() && !session.eval.eLive()) {
-    // Real Stata: `ereturn list` with nothing estimated yet errors ("last
-    // estimates not found", r(301)) rather than printing an empty/
-    // misleading dump.
-    return engineErrorBlockRc("last estimates not found", 301);
+    // StataBE 19.5 prints nothing at rc 0 when e() is empty (the vs-stata
+    // truth bank: every record's `capture noisily ereturn list` after a
+    // command that posts no e() shows no line at all). This was r(301) "last
+    // estimates not found", and that captured error then cleared r() for the
+    // next reader. An empty array = no block.
+    return ojson::array();
   }
   const ojson r = lm.has_value() && lm->result.has_value() ? *lm->result : ojson::object();
 
@@ -159,6 +175,7 @@ ojson runEreturnList(SessionState& session) {
   // byte for byte: for those, eScalars is empty and this loop adds no lines.
   for (const auto& [k, v] : session.eval.eScalars.items()) {
     if (emitted.count(k)) continue;  // the coeftable copy already spoke for it
+    if (session.eval.isEHidden(k, session.eval.eScalars.generationOf(k))) continue;  // `ereturn hidden`
     out << padLabel("e(" + k + ")") << " =  " << fmtScalar(v) << "\n";
   }
 
@@ -179,6 +196,8 @@ ojson runEreturnList(SessionState& session) {
   // Same rule as the scalars: empty for every pre-H command, so their pins hold.
   for (const auto& [k, v] : session.eval.eStrings.items()) {
     if (k == "cmd" || k == "depvar" || k == "vce") continue;  // said above
+    if (k == "_estimates_name") continue;  // hidden (estimates.ado Store): `ereturn list` omits it
+    if (session.eval.isEHidden(k, session.eval.eStrings.generationOf(k))) continue;  // `ereturn hidden`
     out << padLabel("e(" + k + ")") << " : \"" << v << "\"\n";
   }
 
@@ -208,6 +227,7 @@ ojson runEreturnList(SessionState& session) {
     }
     for (const auto& [k, m] : session.eval.eMatrices) {
       if (haveCoefTable && (k == "b" || k == "V")) continue;  // synthesised above
+      if (session.eval.isEHidden(k, m.gen)) continue;  // `ereturn hidden` (margins' e(atdims))
       const size_t nr = m.data.size();
       const size_t nc = nr > 0 ? m.data[0].size() : 0;
       out << padLabel("e(" + k + ")") << " :  " << nr << " x " << nc << "\n";

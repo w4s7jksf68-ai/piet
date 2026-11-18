@@ -61,6 +61,7 @@ enum class SdidDiagnostic {
     PlaceboInsufficientControls,   // vce(placebo) needs more controls than treated units
     UnsupportedVce,                // vce() named a variance estimator this wave does not implement
     BadPanel,                      // no treated units / no controls / non-absorbing treatment / no pre-periods
+    NonBinaryTreatment,            // the treatment takes a value other than 0 and 1 (Stata r(450))
 };
 
 struct SdidConfig {

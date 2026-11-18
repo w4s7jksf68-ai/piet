@@ -36,6 +36,11 @@ std::vector<char> keep_mask(const Dataset& ds, const std::vector<const double*>&
     return keep;
 }
 
+// The if/in sample over the FULL frame (defined with lowess below).
+std::vector<char> smoothing_sample(const std::vector<std::string>& a, const std::string& data,
+                                   const Dataset& ds, const char* cmd,
+                                   const std::vector<const double*>& cols);
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -46,16 +51,21 @@ int cmd_hpfilter(const std::vector<std::string>& a) {
     if (data_missing(data) || yname.empty()) {
         std::fprintf(stderr,
             "usage: cobra hpfilter --data f.hbin --y Y [--lambda L | --tsfmt %%tq]\n"
-            "                      [--panel ID --time T] [--out f.json]\n"
+            "                      [--panel ID --time T] [--keepif EXPR] [--inrange A/B]\n"
+            "                      [--out f.json]\n"
             "  Hodrick-Prescott: tau = (I + lambda*K'K)^-1 y, cycle = y - tau.\n"
             "  --tsfmt supplies the Ravn-Uhlig rescaled default when --lambda is absent\n"
             "  (%%ty 6.25, %%th 100, %%tq 1600, %%tm 129600, %%tw 33177600,\n"
             "   %%td 110930628906.25); anything else defaults to 1600.\n");
         return 2;
     }
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    // if/in (tsfilter.ado's marksample): a row mask over the whole frame, so the
+    // cycle and trend stay row for row and every row outside the sample is
+    // missing. A physically filtered copy (maybe_keepif) would return vectors of
+    // the subsample's length, which the caller cannot place.
     const Dataset& ds = acquire_data(data);
     const double* y = require_num(ds, "hpfilter", yname);
+    const std::vector<char> inSample = smoothing_sample(a, data, ds, "hpfilter", {});
 
     double lambda;
     const std::string lamOpt = opt(a, "--lambda");
@@ -104,7 +114,8 @@ int cmd_hpfilter(const std::vector<std::string>& a) {
         std::vector<std::pair<double, std::vector<int64_t>>> groups;
         std::map<double, std::size_t> at;
         for (int64_t i = 0; i < n; ++i) {
-            if (std::isnan(pid[i]) || std::isnan(y[i])) continue;
+            if (!inSample[static_cast<std::size_t>(i)] || std::isnan(pid[i]) || std::isnan(y[i]))
+                continue;
             auto it = at.find(pid[i]);
             if (it == at.end()) {
                 at.emplace(pid[i], groups.size());
@@ -134,7 +145,7 @@ int cmd_hpfilter(const std::vector<std::string>& a) {
     } else {
         std::vector<int64_t> idx;
         for (int64_t i = 0; i < n; ++i)
-            if (!std::isnan(y[i])) idx.push_back(i);
+            if (inSample[static_cast<std::size_t>(i)] && !std::isnan(y[i])) idx.push_back(i);
         order_by_time(idx);
         // Single series: Stata REFUSES rather than returning a zero cycle, and
         // the two short cases carry different codes.
@@ -413,14 +424,19 @@ int cmd_pca(const std::vector<std::string>& a) {
     if (data_missing(data) || xs.empty()) {
         std::fprintf(stderr,
             "usage: cobra pca --data f.hbin --x V1,V2,... [--covariance] [--comp N]\n"
-            "                 [--mineigen E] [--keepif EXPR] [--out f.json]\n"
+            "                 [--weight W --wtype aw|fw]\n"
+            "                 [--mineigen E] [--keepif EXPR] [--esample-out PATH] [--out f.json]\n"
             "  Principal components on the correlation (default) or covariance matrix.\n");
         return 2;
     }
     if (has(a, "--covariance") && has(a, "--correlation"))
         throw EngineError("bad_input", "pca: options correlation and covariance are exclusive",
                           "r(198)");
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    // e(sample): pca.ado's `ereturn repost, esample(touse)` -- the listwise
+    // sample over every variable named (zero-variance ones included) within if.
+    const EsampleRequest esreq = esample_request(a, "pca");
+    const std::string data0 = data, keepif = opt(a, "--keepif");
+    data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
 
     std::vector<std::string> names = split_csv(xs);
@@ -444,9 +460,41 @@ int cmd_pca(const std::vector<std::string>& a) {
     }
     const std::string mOpt = opt(a, "--mineigen");
     if (!mOpt.empty()) o.mineigen = std::stod(mOpt);
+    // [aweight=] / [fweight=] (pca.ado's `matrix accum ... [aw|fw]`)
+    const std::string wvar = opt(a, "--weight"), wtype = opt(a, "--wtype");
+    if (!wvar.empty()) {
+        if (wtype != "aw" && wtype != "fw")
+            throw EngineError("bad_input", "pca: --wtype must be aw or fw", "r(101)");
+        o.weight = require_num(ds, "pca", wvar);
+        o.fweight = wtype == "fw";
+    }
 
-    const std::vector<char> keep = keep_mask(ds, cols);
+    std::vector<char> keep = keep_mask(ds, cols);
+    if (o.weight != nullptr)
+        for (std::size_t i = 0; i < keep.size(); ++i)
+            if (std::isnan(o.weight[i]) || o.weight[i] == 0.0) keep[i] = 0;
     PcaResult R = pca_fit(names, cols, keep, o);
+    EsampleRows esrows;
+    if (esreq.active()) {
+        esrows.loaded = &ds;
+        for (std::size_t i = 0; i < keep.size(); ++i)
+            if (keep[i]) esrows.keep.push_back(static_cast<int64_t>(i));
+    }
+    // Each analysed variable's minimum and maximum over the sample: with `means`,
+    // pca reports `estat summarize`'s table (mean, sd, min, max), r(stats).
+    std::vector<double> mins, maxs;
+    for (std::size_t j = 0; j < names.size(); ++j) {
+        if (std::find(R.dropped.begin(), R.dropped.end(), names[j]) != R.dropped.end()) continue;
+        double lo = std::numeric_limits<double>::quiet_NaN(), hi = lo;
+        for (std::size_t i = 0; i < keep.size(); ++i) {
+            if (!keep[i]) continue;
+            const double x = cols[j][i];
+            if (std::isnan(lo) || x < lo) lo = x;
+            if (std::isnan(hi) || x > hi) hi = x;
+        }
+        mins.push_back(lo);
+        maxs.push_back(hi);
+    }
 
     // f == 0 posts a deliberately SHORT record: Stata prints "(no components
     // retained)" and posts neither e(L) nor e(Psi) nor trace/lndet/cond.
@@ -460,8 +508,16 @@ int cmd_pca(const std::vector<std::string>& a) {
         {"c", R.c},
         {"means", R.means},
         {"vars", R.vars},
+        {"mins", mins},
+        {"maxs", maxs},
         {"dropped", R.dropped},
     };
+    // the sample's rows (e(sample)'s count); under [fw=] e(N) is the weights' sum
+    {
+        int64_t rows = 0;
+        for (char k : keep) rows += k ? 1 : 0;
+        out["n_rows"] = rows;
+    }
     if (!R.sds.empty()) out["sds"] = R.sds;  // correlation PCA only
     if (R.f > 0) {
         out["loadings"] = R.loadings;
@@ -474,6 +530,7 @@ int cmd_pca(const std::vector<std::string>& a) {
     } else {
         out["rho"] = 0.0;
     }
+    emit_esample(esreq, "pca", data0, keepif, false, esrows, out);
     emit(out, opt(a, "--out"));
     return 0;
 }

@@ -52,6 +52,11 @@ std::string preCommaArgs(const std::string& raw);
 std::vector<std::string> quoteAwareWords(const std::string& s);
 bool splitUsing(const std::vector<std::string>& words, std::vector<std::string>* varlist,
                 std::string* pathArg);
+// `infile spec if COND using f`: the line tokenizer takes everything after `if`
+// as the condition, `using` and the file included. Cut it back to the condition
+// proper (it ends at a blank-delimited `in` or `using`).
+void trimConditionAtUsing(eval::ParsedCommand* parsed);
+
 std::vector<std::string> dropQualifierWords(const std::vector<std::string>& words);
 
 // Files

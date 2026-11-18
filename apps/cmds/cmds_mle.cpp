@@ -4,6 +4,7 @@
 #include "commands.h"
 
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 #include "core/collinear.h"
@@ -95,6 +96,164 @@ int cmd_qreg(const std::vector<std::string>& a) {
     return 0;
 }
 
+// heckman's full maximum likelihood (--ml), Stata's default. --select "S=Z1,Z2", or
+// "Z1,Z2" with no `=`: then a row is selected when y is observed (heckman.ado: the
+// selection indicator of `select(varlist)` is !missing(depvar)). The sample is
+// heckman.ado's: Z and the indicator observed; a selected row also needs y and X
+// (a non-selected row's X is never read). --no-intercept drops the outcome
+// equation's constant; --iterate N, --vce robust and --cluster V as ml takes them.
+static int heckman_ml_cmd(const std::vector<std::string>& a, std::string data, const std::string& y,
+                          const std::string& xcsv, const std::string& selspec, double level, double zc) {
+    const auto eq = selspec.find('=');
+    const bool fromY = eq == std::string::npos;
+    const std::string selvar = fromY ? std::string() : selspec.substr(0, eq);
+    const auto zvars = split_csv(fromY ? selspec : selspec.substr(eq + 1));
+    const auto xvars = split_csv(xcsv);
+    const bool nc = has(a, "--no-intercept");
+    const int maxiter = has(a, "--iterate") ? std::stoi(opt(a, "--iterate")) : -1;
+    const std::string vce = opt(a, "--vce", "oim"), clvar = opt(a, "--cluster");
+    const EsampleRequest esreq = esample_request(a, "heckman");  // e(sample), as cmd_logit
+    const std::string es_data = data, es_keepif = opt(a, "--keepif");
+    data = maybe_keepif(data, opt(a, "--keepif"));
+    const Dataset& ds = acquire_data(data);
+    const int64_t n_raw = ds.n_rows();
+    const double* yr = require_num(ds, "heckman", y);
+    const double* Sr = fromY ? nullptr : require_num(ds, "heckman", selvar);
+    const double* cr = clvar.empty() ? nullptr : require_num(ds, "heckman", clvar);
+    std::vector<const double*> zr, xr;
+    for (auto& v : zvars) zr.push_back(require_num(ds, "heckman", v));
+    for (auto& v : xvars) xr.push_back(require_num(ds, "heckman", v));
+    const int kz = static_cast<int>(zvars.size()) + 1, kx = static_cast<int>(xvars.size()) + (nc ? 0 : 1);
+    std::vector<int64_t> keep;
+    for (int64_t i = 0; i < n_raw; ++i) {
+        bool ok = true;
+        double s = 0;
+        if (fromY) s = std::isnan(yr[i]) ? 0.0 : 1.0;
+        else { s = Sr[i]; if (std::isnan(s)) ok = false; }
+        for (auto* p : zr) if (std::isnan(p[i])) ok = false;
+        if (cr && std::isnan(cr[i])) ok = false;
+        if (ok && s != 0.0) {
+            if (std::isnan(yr[i])) ok = false;
+            for (auto* p : xr) if (std::isnan(p[i])) ok = false;
+        }
+        if (ok) keep.push_back(i);
+    }
+    const int64_t n = static_cast<int64_t>(keep.size());
+    require_sample(n);
+    std::vector<double> S(n), yv(n), Z(static_cast<size_t>(n) * kz), X(static_cast<size_t>(n) * std::max(kx, 1)), cl;
+    std::vector<char> sel(n);
+    for (int64_t j = 0; j < n; ++j) {
+        const int64_t i = keep[static_cast<size_t>(j)];
+        S[j] = fromY ? 1.0 : (Sr[i] != 0.0 ? 1.0 : 0.0);
+        if (fromY) S[j] = std::isnan(yr[i]) ? 0.0 : 1.0;
+        sel[j] = S[j] != 0.0 ? 1 : 0;
+        yv[j] = sel[j] ? yr[i] : std::numeric_limits<double>::quiet_NaN();
+        for (int c = 0; c + 1 < kz; ++c) Z[static_cast<size_t>(c) * n + j] = zr[c][i];
+        Z[static_cast<size_t>(kz - 1) * n + j] = 1.0;
+        for (int c = 0; c < static_cast<int>(xvars.size()); ++c)
+            X[static_cast<size_t>(c) * n + j] = sel[j] ? xr[c][i] : 0.0;
+        if (!nc) X[static_cast<size_t>(kx - 1) * n + j] = 1.0;
+        if (cr) cl.push_back(cr[i]);
+    }
+    int64_t nsel = 0;
+    for (char c : sel) nsel += c;
+    // heckman.ado: never-censored selection is r(498) (the model is OLS)
+    if (nsel == n) throw EngineError("bad_input",
+        "Dependent variable never censored because of selection: model would simplify to OLS regression");
+    const bool robust = vce == "robust" || cr != nullptr;
+    HeckmanMlResult r = heckman_ml(Z.data(), n, kz, S.data(), X.data(), kx, yv.data(), sel, maxiter,
+                                   robust, cr ? cl.data() : nullptr);
+    if (!r.ok) { std::fprintf(stderr, "heckman: estimation failed.\n"); return 1; }
+    const std::string seleq = fromY ? std::string("select") : selvar;
+    std::vector<std::string> names;
+    for (auto& v : xvars) names.push_back(y + ":" + v);
+    if (!nc) names.push_back(y + ":_cons");
+    for (auto& v : zvars) names.push_back(seleq + ":" + v);
+    names.push_back(seleq + ":_cons");
+    names.push_back("/athrho");
+    names.push_back("/lnsigma");
+    const size_t np = names.size();
+    auto row = [&](size_t j, const std::string& nm) {
+        const double b = r.b[j], se = std::sqrt(std::max(0.0, r.V[j * np + j]));
+        json o = {{"name", nm}, {"b", b}, {"se", se}};
+        if (se > 0) {
+            const double z = b / se;
+            o["z"] = z;
+            o["t"] = z;
+            o["p"] = std::erfc(std::fabs(z) / std::sqrt(2.0));
+            o["ci_lo"] = b - zc * se;
+            o["ci_hi"] = b + zc * se;
+        }
+        return o;
+    };
+    json oc = json::array(), sc = json::array(), aux = json::array();
+    for (int c = 0; c < kx; ++c) oc.push_back(row(static_cast<size_t>(c), c < static_cast<int>(xvars.size()) ? xvars[c] : "(intercept)"));
+    for (int c = 0; c < kz; ++c) sc.push_back(row(static_cast<size_t>(kx + c), c + 1 < kz ? zvars[c] : "(intercept)"));
+    aux.push_back(row(np - 2, "/athrho"));
+    aux.push_back(row(np - 1, "/lnsigma"));
+    // rho, sigma, lambda: transforms of (athrho, lnsigma) with delta-method SEs; rho's
+    // and sigma's intervals are the transformed endpoints, lambda's is symmetric
+    const double tau = r.b[np - 2], kap = r.b[np - 1], rho = std::tanh(tau), sigma = std::exp(kap);
+    const double vtt = r.V[(np - 2) * np + (np - 2)], vkk = r.V[(np - 1) * np + (np - 1)],
+                 vtk = r.V[(np - 2) * np + (np - 1)];
+    const double se_t = std::sqrt(std::max(0.0, vtt)), se_k = std::sqrt(std::max(0.0, vkk));
+    const double lambda = rho * sigma;
+    const double dlt = sigma * (1 - rho * rho), dlk = sigma * rho;
+    const double se_lambda = std::sqrt(std::max(0.0, dlt * dlt * vtt + 2 * dlt * dlk * vtk + dlk * dlk * vkk));
+    json dip = json::array();
+    dip.push_back({{"name", "rho"}, {"b", rho}, {"se", (1 - rho * rho) * se_t}, {"t", nullptr}, {"p", nullptr},
+                   {"ci_lo", std::tanh(tau - zc * se_t)}, {"ci_hi", std::tanh(tau + zc * se_t)}});
+    dip.push_back({{"name", "sigma"}, {"b", sigma}, {"se", sigma * se_k}, {"t", nullptr}, {"p", nullptr},
+                   {"ci_lo", std::exp(kap - zc * se_k)}, {"ci_hi", std::exp(kap + zc * se_k)}});
+    dip.push_back({{"name", "lambda"}, {"b", lambda}, {"se", se_lambda}, {"t", nullptr}, {"p", nullptr},
+                   {"ci_lo", lambda - zc * se_lambda}, {"ci_hi", lambda + zc * se_lambda}});
+    // Wald test of the outcome equation's slopes (e(chi2), e(df_m))
+    const int nsl = static_cast<int>(xvars.size());
+    double chi2 = 0;
+    if (nsl > 0) {
+        std::vector<double> Vs(static_cast<size_t>(nsl) * nsl), bs(nsl), t(nsl);
+        for (int i = 0; i < nsl; ++i) {
+            bs[i] = r.b[static_cast<size_t>(i)];
+            for (int j = 0; j < nsl; ++j) Vs[static_cast<size_t>(i) * nsl + j] = r.V[static_cast<size_t>(i) * np + j];
+        }
+        if (la::spd_inverse(Vs.data(), nsl) == 0) {
+            la::matvec(Vs.data(), nsl, bs.data(), t.data());
+            for (int i = 0; i < nsl; ++i) chi2 += bs[i] * t[i];
+        }
+    }
+    // the independence test: LR against probit + regression, Wald on athrho under a sandwich
+    const double chi2_c = robust ? (se_t > 0 ? (tau / se_t) * (tau / se_t) : 0.0)
+                                 : 2.0 * (r.ll - r.regll - r.prbll);
+    json out = {{"estimator", "heckman"}, {"method", "ml"}, {"n_obs", n}, {"n_selected", nsel},
+                {"coefs", oc}, {"select_coefs", sc}, {"aux_coefs", aux}, {"diparm", dip},
+                {"select_eq", seleq}, {"ll", r.ll}, {"iters", r.ic}, {"converged", r.converged},
+                {"ilog", r.ilog}, {"gradient", r.grad}, {"chi2", chi2}, {"df_chi2", nsl},
+                {"p_chi2", nsl > 0 ? chi2_pvalue(chi2, static_cast<double>(nsl)) : 1.0},
+                {"chi2_c", chi2_c}, {"p_c", chi2_pvalue(chi2_c, 1.0)}, {"chi2_ct", robust ? "Wald" : "LR"},
+                {"rho", rho}, {"sigma", sigma}, {"lambda", lambda}, {"se_lambda", se_lambda},
+                {"vce", cr ? "cluster" : (robust ? "robust" : "oim")}};
+    if (cr) {
+        std::set<double> g(cl.begin(), cl.end());
+        out["n_clusters"] = static_cast<int64_t>(g.size());
+        out["clustvar"] = clvar;
+    }
+    out["level"] = level;
+    {
+        EsampleRows esrows;
+        esrows.keep = keep;
+        esrows.loaded = &ds;
+        emit_esample(esreq, "heckman", es_data, es_keepif, false, esrows, out);
+    }
+    add_e_v(out, names, r.V);
+    if (robust) {
+        json tmp;
+        add_e_v(tmp, names, r.Voim);
+        if (tmp.contains("e_V")) out["e_Vmb"] = tmp["e_V"];
+    }
+    emit(out, opt(a, "--out"));
+    return 0;
+}
+
 // heckman — sample-selection model, two-step (Heckit). --select "S=Z1,Z2".
 int cmd_heckman(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), y = opt(a, "--y"), xcsv = opt(a, "--x"), selspec = opt(a, "--select");
@@ -122,32 +281,53 @@ int cmd_heckman(const std::vector<std::string>& a) {
         return 2;
     }
     const double zc = z_critical(level == 95.0 ? 0.05 : 1.0 - level / 100.0);
-    auto eq = selspec.find('=');
-    if (eq == std::string::npos) { std::fprintf(stderr, "heckman: --select must be \"S=Z1,Z2\".\n"); return 2; }
-    std::string selvar = selspec.substr(0, eq);
-    auto zvars = split_csv(selspec.substr(eq + 1));
+    if (has(a, "--ml")) return heckman_ml_cmd(a, data, y, xcsv, selspec, level, zc);
+    // --select "S=Z1,Z2", or "Z1,Z2": then a row is selected when y is observed
+    // (heckman.ado: `gen byte seldep = depvar < .`). The sample is heckman.ado's:
+    // the indicator and Z observed; a selected row (indicator nonzero) also needs y
+    // and X, a non-selected row's y and X are never read.
+    const auto eq = selspec.find('=');
+    const bool fromY = eq == std::string::npos;
+    const std::string selvar = fromY ? std::string() : selspec.substr(0, eq);
+    auto zvars = split_csv(fromY ? selspec : selspec.substr(eq + 1));
     auto xvars = split_csv(xcsv);
+    const EsampleRequest esreq = esample_request(a, "heckman");  // e(sample), as cmd_logit
+    const std::string es_data = data, es_keepif = opt(a, "--keepif");
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     int64_t n_raw = ds.n_rows();
-    const double* Sr = require_num(ds, "heckman", selvar);
+    const double* Sr = fromY ? nullptr : require_num(ds, "heckman", selvar);
     const double* yr = require_num(ds, "heckman", y);
     int kz = static_cast<int>(zvars.size()) + 1, kx = static_cast<int>(xvars.size()) + 1;
-    std::vector<const double*> zr, xr, must = {Sr};
-    for (auto& s : zvars) { zr.push_back(require_num(ds, "heckman", s)); must.push_back(zr.back()); }
-    for (auto& s : xvars) { xr.push_back(require_num(ds, "heckman", s)); must.push_back(xr.back()); }
-    auto keep = listwise_keep(must, n_raw);  // y allowed missing (non-selected)
+    std::vector<const double*> zr, xr;
+    for (auto& s : zvars) zr.push_back(require_num(ds, "heckman", s));
+    for (auto& s : xvars) xr.push_back(require_num(ds, "heckman", s));
+    std::vector<int64_t> keep;
+    for (int64_t i = 0; i < n_raw; ++i) {
+        const double s = fromY ? (std::isnan(yr[i]) ? 0.0 : 1.0) : Sr[i];
+        bool ok = !std::isnan(s);
+        for (auto* p : zr) if (std::isnan(p[i])) ok = false;
+        if (ok && s != 0.0) {
+            if (std::isnan(yr[i])) ok = false;
+            for (auto* p : xr) if (std::isnan(p[i])) ok = false;
+        }
+        if (ok) keep.push_back(i);
+    }
     int64_t n = static_cast<int64_t>(keep.size());
     require_sample(n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
-    auto gv = [&](const double* p) { return gather_rows(p, keep); };
-    std::vector<double> S = gv(Sr), yv = gv(yr);
+    std::vector<double> S(n), yv(n);
     std::vector<double> Z(static_cast<size_t>(n) * kz), X(static_cast<size_t>(n) * kx);
-    for (int c = 0; c + 1 < kz; ++c) { auto col = gv(zr[c]); std::copy(col.begin(), col.end(), Z.data() + static_cast<int64_t>(c) * n); }
-    for (int64_t i = 0; i < n; ++i) Z[static_cast<int64_t>(kz - 1) * n + i] = 1.0;
-    for (int c = 0; c + 1 < kx; ++c) { auto col = gv(xr[c]); std::copy(col.begin(), col.end(), X.data() + static_cast<int64_t>(c) * n); }
-    for (int64_t i = 0; i < n; ++i) X[static_cast<int64_t>(kx - 1) * n + i] = 1.0;
     std::vector<char> sel(n);
-    for (int64_t i = 0; i < n; ++i) sel[i] = (S[i] == 1.0 && !std::isnan(yv[i])) ? 1 : 0;
+    for (int64_t j = 0; j < n; ++j) {
+        const int64_t i = keep[static_cast<size_t>(j)];
+        sel[j] = (fromY ? !std::isnan(yr[i]) : Sr[i] != 0.0) ? 1 : 0;
+        S[j] = sel[j] ? 1.0 : 0.0;
+        yv[j] = sel[j] ? yr[i] : std::numeric_limits<double>::quiet_NaN();
+        for (int c = 0; c + 1 < kz; ++c) Z[static_cast<size_t>(c) * n + j] = zr[c][i];
+        Z[static_cast<size_t>(kz - 1) * n + j] = 1.0;
+        for (int c = 0; c + 1 < kx; ++c) X[static_cast<size_t>(c) * n + j] = sel[j] ? xr[c][i] : 0.0;
+        X[static_cast<size_t>(kx - 1) * n + j] = 1.0;
+    }
 
     HeckmanResult r = heckman_twostep(Z.data(), n, kz, S.data(), X.data(), kx, yv.data(), sel);
     if (!r.ok) { std::fprintf(stderr, "heckman: estimation failed.\n"); return 1; }
@@ -178,6 +358,51 @@ int cmd_heckman(const std::vector<std::string>& a) {
                 {"lambda", r.lambda}, {"se_lambda", r.se_lambda},
                 {"rho", r.rho}, {"sigma", r.sigma}, {"converged", r.converged}};
     out["level"] = level;  // always emitted, like Stata's e(level) (BUG-279)
+    // heckman.ado's Heck2: e(b) = (y:X y:_cons  S:Z S:_cons  /mills:lambda) and e(V)
+    // block-diagonal -- the second step's VCE over [X, lambda] and the probit's, no
+    // covariance between the two equations; e(rho1) the two-step rho before the
+    // rhosigma rule when that rule moved it; the Wald test of the outcome slopes.
+    {
+        const std::string seleq = fromY ? std::string("select") : selvar;
+        out["select_eq"] = seleq;
+        std::vector<std::string> names;
+        for (auto& v : xvars) names.push_back(y + ":" + v);
+        names.push_back(y + ":_cons");
+        for (auto& v : zvars) names.push_back(seleq + ":" + v);
+        names.push_back(seleq + ":_cons");
+        names.push_back("/mills:lambda");
+        const size_t np = names.size(), kw = static_cast<size_t>(kx) + 1;
+        std::vector<double> V(np * np, 0.0);
+        const auto at = [&](size_t i) { return i < static_cast<size_t>(kx) ? i : (i == static_cast<size_t>(kx) ? np - 1 : 0); };
+        for (size_t i = 0; i < kw; ++i)
+            for (size_t j = 0; j < kw; ++j) V[at(i) * np + at(j)] = r.Vreg[i * kw + j];
+        for (int i = 0; i < kz; ++i)
+            for (int j = 0; j < kz; ++j)
+                V[(static_cast<size_t>(kx) + i) * np + static_cast<size_t>(kx) + j] =
+                    r.Vprb[static_cast<size_t>(i) * kz + j];
+        add_e_v(out, names, V);
+        if (r.rho_raw != r.rho) out["rho1"] = r.rho_raw;
+        const int nsl = static_cast<int>(xvars.size());
+        if (nsl > 0) {
+            std::vector<double> Vs(static_cast<size_t>(nsl) * nsl), bs(nsl), t(nsl);
+            for (int i = 0; i < nsl; ++i) {
+                bs[i] = r.beta[static_cast<size_t>(i)];
+                for (int j = 0; j < nsl; ++j) Vs[static_cast<size_t>(i) * nsl + j] = r.Vreg[static_cast<size_t>(i) * kw + j];
+            }
+            if (la::spd_inverse(Vs.data(), nsl) == 0) {
+                la::matvec(Vs.data(), nsl, bs.data(), t.data());
+                double chi2 = 0;
+                for (int i = 0; i < nsl; ++i) chi2 += bs[i] * t[i];
+                out["chi2"] = chi2;
+                out["df_chi2"] = nsl;
+                out["p_chi2"] = chi2_pvalue(chi2, static_cast<double>(nsl));
+            }
+        }
+        EsampleRows esrows;
+        esrows.keep = keep;
+        esrows.loaded = &ds;
+        emit_esample(esreq, "heckman", es_data, es_keepif, false, esrows, out);
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }
@@ -191,17 +416,21 @@ int cmd_tobit(const std::vector<std::string>& a) {
     // when absent) — see below, every new branch is gated on vce=="robust".
     std::string vce = opt(a, "--vce", "iid");
     const std::string weight_var = opt(a, "--weight"), wtype = opt(a, "--wtype");
-    if (data_missing(data) || y.empty() || xcsv.empty() || (lls.empty() && uls.empty())) {
+    if (data_missing(data) || y.empty() || xcsv.empty()) {
         std::fprintf(stderr, "usage: cobra tobit --data f.hbin --y Y --x X1,X2 [--ll L] [--ul U] "
                              "[--vce iid|robust] [--weight W --wtype aw|fw|iw|pw] [--level P] "
                              "[--keepif EXPR] [--out f.json]\n"
-                             "  censored-normal MLE; at least one of --ll/--ul required.\n"
+                             "  censored-normal MLE; neither --ll nor --ul is the normal linear model.\n"
+                             "  --iterate N   Stata's iterate(#): stop ml after N iterations.\n"
                              "  --vce robust  Stata `tobit ..., vce(robust)` sandwich VCE (P5).\n"
                              "  --level P     coeftable ci_lo/ci_hi at P% (t(df_r), matching Stata's\n"
                              "                own tobit table); default 95, matching Stata's default\n"
                              "                table (BUG-202, BUG-279).\n");
         return 2;
     }
+    // --cluster V: vce(cluster V), the scores summed within V's groups, G/(G-1)
+    const std::string clvar = opt(a, "--cluster");
+    if (!clvar.empty()) vce = "robust";
     if (vce != "iid" && vce != "robust") {
         std::fprintf(stderr, "tobit: --vce must be one of iid|robust (got %s).\n", vce.c_str());
         return 2;
@@ -243,7 +472,9 @@ int cmd_tobit(const std::vector<std::string>& a) {
     double ll_lim = has_ll ? std::stod(lls) : 0.0, ul_lim = has_ul ? std::stod(uls) : 0.0;
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
-    GlmInputs g = load_glm(ds, "tobit", y, split_csv(xcsv), {}, weight_var, wkind);
+    GlmInputs g = load_glm(ds, "tobit", y, split_csv(xcsv),
+                           clvar.empty() ? std::vector<std::string>{} : std::vector<std::string>{clvar},
+                           weight_var, wkind);
     require_sample(g.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     // lw: the likelihood weights; sc: an aweight's scale sqrt(w*N/Sum w).
     double sum_w = 0;
@@ -256,9 +487,48 @@ int cmd_tobit(const std::vector<std::string>& a) {
     } else if (wkind != cecon::WeightKind::None) {
         lw = g.weights;
     }
+    // No uncensored observation: Stata's tobit cannot form its starting values and
+    // answers r(1400) "initial values not feasible" (vs-stata bank a55fdfae `gen y=0`
+    // then `tobit y mpg weight, ll(0)`).
+    {
+        int64_t unc = 0;
+        for (int64_t i = 0; i < g.n; ++i) {
+            const double yi = g.y[static_cast<size_t>(i)];
+            if (!(has_ll && yi <= ll_lim) && !(has_ul && yi >= ul_lim)) ++unc;
+        }
+        if (unc == 0) throw EngineError("no_convergence", "tobit: initial values not feasible");
+    }
+    const int maxiter = has(a, "--iterate") ? std::stoi(opt(a, "--iterate")) : -1;
     TobitResult r = tobit_fit(g.X.data(), g.n, g.k, g.y.data(), has_ll, ll_lim, has_ul, ul_lim,
-                              lw.empty() ? nullptr : lw.data(), sc.empty() ? nullptr : sc.data());
+                              lw.empty() ? nullptr : lw.data(), sc.empty() ? nullptr : sc.data(), maxiter);
     if (!r.ok) { std::fprintf(stderr, "tobit: MLE failed.\n"); return 1; }
+    // e(ll_0): the constant-only model's maximum (load_glm's intercept is the last
+    // design column), the base of the LR test and of e(r2_p).
+    TobitResult r0;
+    {
+        const size_t off = static_cast<size_t>(g.k - 1) * static_cast<size_t>(g.n);
+        std::vector<double> ones(g.X.begin() + static_cast<std::ptrdiff_t>(off),
+                                 g.X.begin() + static_cast<std::ptrdiff_t>(off + static_cast<size_t>(g.n)));
+        // iterate(#) caps the comparison fit too (vs-stata bank 04017236
+        // `, iterate(2)`: e(ll_0) -258.67057, that fit's second iterate).
+        r0 = tobit_fit(ones.data(), g.n, 1, g.y.data(), has_ll, ll_lim, has_ul, ul_lim,
+                       lw.empty() ? nullptr : lw.data(), sc.empty() ? nullptr : sc.data(), maxiter);
+    }
+    // An aweight on the uncensored model (no ll(), no ul(): gsem's gaussian regress)
+    // weights each row's log likelihood by its normalized weight, with no log(sc)
+    // Jacobian term: the fit is the same and e(ll), e(ll_0) and the iteration log
+    // are lower by Sum log(sc) (vs-stata bank d26265fb `tobit mpg weight [aw=w]`:
+    // e(ll) -196.16903352606394 against the censored path's -199.667645032141).
+    if (!has_ll && !has_ul && !sc.empty()) {
+        double jac = 0;
+        for (double v : sc) jac += std::log(v);
+        r.ll -= jac;
+        for (double& v : r.ilog) v -= jac;
+        if (r0.ok) {
+            r0.ll -= jac;
+            for (double& v : r0.ilog) v -= jac;
+        }
+    }
     // BUG-280: Stata's tobit residual df is e(N) - e(df_m) — it subtracts ONLY the
     // slope regressors, never the intercept and never sigma. Measured against
     // StataBE 19.5 on seven specs (fatalities inc_cens with ul(): 1/2/4 slopes ->
@@ -275,6 +545,7 @@ int cmd_tobit(const std::vector<std::string>& a) {
     // before, byte-for-byte, so existing pins (freeze corpus `tobit y x1 x2,
     // ll(0)`, tests/unit/test_tobit.cpp) are untouched.
     std::vector<double> Vrobust;
+    int64_t n_clusters = 0;
     const int np = g.k + 1;
     if (vce == "robust") {
         // ML vce(robust) small-sample multiplier: N/(N-1) — the SAME factor Stata
@@ -295,9 +566,30 @@ int cmd_tobit(const std::vector<std::string>& a) {
         } else if (!lw.empty()) {
             mw = lw;
         }
+        std::vector<int64_t> clcodes;
+        if (!clvar.empty()) {
+            if (fw || !sc.empty())
+                throw EngineError("unsupported", "tobit: vce(cluster) with an fweight or aweight is not implemented");
+            int64_t G = 0;
+            clcodes.resize(static_cast<size_t>(g.n));
+            for (int64_t i = 0; i < g.n; ++i) {
+                clcodes[static_cast<size_t>(i)] = static_cast<int64_t>(g.cluster[0].codes[static_cast<size_t>(i)]);
+                G = std::max<int64_t>(G, clcodes[static_cast<size_t>(i)] + 1);
+            }
+            n_clusters = G;
+            // Fewer clusters than the parameters leave a rank-deficient variance, for
+            // which Stata posts its own e(rank) / e(df_m) / e(df_r) conventions
+            // (vs-stata bank 8dcb229c, 2 clusters: rank 2, df_m 1, df_r 74) that are
+            // not identified here: refused rather than reported under other ones.
+            if (G < np)
+                throw EngineError("unsupported",
+                    "tobit: vce(cluster) with fewer clusters than parameters is not implemented");
+            factor = G > 1 ? static_cast<double>(G) / static_cast<double>(G - 1) : 1.0;
+        }
         Vrobust = tobit_robust_vcov(g.X.data(), g.n, g.k, g.y.data(), has_ll, ll_lim, has_ul, ul_lim,
                                     r, factor, mw.empty() ? nullptr : mw.data(),
-                                    sc.empty() ? nullptr : sc.data());
+                                    sc.empty() ? nullptr : sc.data(),
+                                    clcodes.empty() ? nullptr : &clcodes);
         if (Vrobust.empty()) {
             std::fprintf(stderr, "tobit: vce(robust) failed (non-invertible sandwich).\n");
             return 1;
@@ -344,7 +636,53 @@ int cmd_tobit(const std::vector<std::string>& a) {
                 {"ll", r.ll}, {"iters", r.iters}, {"converged", r.converged}, {"coefs", coefs}};
     if (has_ll) out["ll_limit"] = ll_lim;
     if (has_ul) out["ul_limit"] = ul_lim;
+    if (wkind != cecon::WeightKind::None) out["n_rows"] = g.n;  // the e(sample) handshake's rows
+    out["ilog"] = r.ilog;
+    {
+        std::vector<std::string> gn = g.names;
+        gn.push_back("/var(e." + y + ")");
+        out["gradient"] = r.grad_var;
+        out["gradient_names"] = gn;
+    }
+    // The model test: LR against the constant-only fit, or under vce(robust) the
+    // Wald F on the slopes with (df_m, df_r) degrees of freedom.
+    const int df_m = g.k - 1;
+    out["df_m"] = df_m;
+    out["df_r"] = dof;
+    if (r0.ok) {
+        out["ll_0"] = r0.ll;
+        out["r2_pseudo"] = 1.0 - r.ll / r0.ll;
+    }
+    if (vce == "robust") {
+        out["chi2type"] = "Wald";
+        if (df_m > 0) {
+            std::vector<double> Vs(static_cast<size_t>(df_m) * df_m), bs(df_m), tmp(df_m);
+            for (int i = 0; i < df_m; ++i) {
+                bs[i] = r.beta[i];
+                for (int j = 0; j < df_m; ++j) Vs[static_cast<size_t>(i) * df_m + j] = Vrobust[static_cast<size_t>(i) * np + j];
+            }
+            if (la::spd_inverse(Vs.data(), df_m) == 0) {
+                la::matvec(Vs.data(), df_m, bs.data(), tmp.data());
+                double w = 0;
+                for (int i = 0; i < df_m; ++i) w += bs[i] * tmp[i];
+                const double F = w / df_m;
+                out["F"] = F;
+                out["p_F"] = f_pvalue(F, static_cast<double>(df_m), dof);
+            }
+        }
+    } else if (r0.ok) {
+        out["chi2type"] = "LR";
+        const double chi2 = 2.0 * (r.ll - r0.ll);
+        out["chi2"] = chi2;
+        out["df_chi2"] = df_m;
+        if (df_m > 0) out["p_chi2"] = chi2_pvalue(chi2, static_cast<double>(df_m));
+    }
     if (has(a, "--vce")) out["vce"] = vce;  // absent-key on the default path (byte-stable)
+    if (!clvar.empty()) {
+        out["vce"] = "cluster";
+        out["clustvar"] = clvar;
+        out["n_clusters"] = n_clusters;
+    }
     out["level"] = level;  // always emitted, like Stata's e(level) (BUG-279)
     // --emit-v (BUG-1196): Stata's tobit e(V) (gsem underneath) has the residual
     // VARIANCE as its last parameter, `/var(e.y)` (StataBE 19.5: colfullnames
@@ -363,6 +701,23 @@ int cmd_tobit(const std::vector<std::string>& a) {
         std::vector<std::string> names = g.names;
         names.push_back("/var(e." + y + ")");
         add_e_v(out, names, Vs);
+        if (vce == "robust") {
+            // e(V_modelbased): the observed-information variance, in the same metric
+            std::vector<double> Vm(r.vcov);
+            for (int i = 0; i < np; ++i) {
+                Vm[static_cast<size_t>(i) * np + g.k] *= d;
+                Vm[static_cast<size_t>(g.k) * np + i] *= d;
+            }
+            json tmp;
+            add_e_v(tmp, names, Vm);
+            if (tmp.contains("e_V")) out["e_Vmb"] = tmp["e_V"];
+        }
+    }
+    // The variance's interval, as Stata reports a variance: on the log scale,
+    // var * exp(-/+ t se / var) with the table's t(df_r) critical value.
+    if (se_variance > 0 && r.variance > 0) {
+        const double h = tc * se_variance / r.variance;
+        out["variance_ci"] = {r.variance * std::exp(-h), r.variance * std::exp(h)};
     }
     emit(out, opt(a, "--out"));
     return 0;
@@ -743,6 +1098,32 @@ std::vector<double> binary_full_V(const std::vector<double>& V, const BinaryScre
         for (size_t b = 0; b < kf; ++b)
             F[static_cast<size_t>(info.fit_cols[a]) + static_cast<size_t>(info.fit_cols[b]) * K] = V[a + b * kf];
     return F;
+}
+
+// e(gradient): ml's gradient of the log likelihood at the iterate the fit
+// posted, in the full design order with 0 for each column the screen omitted
+// (Stata's e(gradient) carries the omitted and base columns as 0). Sent beside
+// `e_V` under --emit-v, as {names, values}.
+void add_e_gradient(json& out, const std::vector<double>& grad, const BinaryScreenInfo& info) {
+    const size_t K = info.full_names.size(), kf = info.fit_cols.size();
+    if (grad.size() != kf) return;
+    std::vector<double> full(K, 0.0);
+    for (size_t j = 0; j < kf; ++j) full[static_cast<size_t>(info.fit_cols[j])] = grad[j];
+    json names = json::array(), values = json::array();
+    for (size_t c = 0; c < K; ++c) {
+        names.push_back(info.full_names[c]);
+        values.push_back(std::isfinite(full[c]) ? json(full[c]) : json(nullptr));
+    }
+    out["e_gradient"] = {{"names", std::move(names)}, {"values", std::move(values)}};
+}
+
+// e(V_modelbased) of a sandwich fit: the inverse of the negative Hessian the
+// fit stopped at (the default VCE's matrix), on the full design with zero
+// rows/columns for omitted terms, as {names, matrix} beside `e_V` (--emit-v).
+void add_e_vmb(json& out, const std::vector<double>& bread, const BinaryScreenInfo& info) {
+    json tmp;
+    add_e_v(tmp, info.full_names, binary_full_V(bread, info));
+    out["e_Vmb"] = std::move(tmp["e_V"]);
 }
 
 // e(N_cdf) / e(N_cds), e(df_m), e(rank) (`k_vars`), e(chi2type), e(rules) and the
@@ -1212,7 +1593,9 @@ int cmd_logit(const std::vector<std::string>& a) {
         st.count.assign(1, static_cast<double>(g.n));
         g.cluster.push_back(std::move(st));
     }
+    binarize_outcome(g.y);
     if (!check_binary(g.y, "logit", y)) return 2;
+    if (!check_outcome_varies(g.y, "logit")) return 2;
     if (no_intercept) drop_glm_intercept(g, "logit");
     if (vce == "cluster" && (g.cluster.empty() || g.cluster[0].n_levels < 2))
         throw EngineError("bad_input",
@@ -1336,6 +1719,9 @@ int cmd_logit(const std::vector<std::string>& a) {
                 {"n_dropped_missing", g.n_dropped}, {"converged", r.converged},
                 {"iters", r.iters}, {"coefs", binary_full_coefs(coefs, screen)}};
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
+    // e(N) is Sum w under fweight; the rows the fit used are the e(sample)
+    // handshake's count (estimation_sample_install.cpp esampleHandshakeOk).
+    if (wkind == cecon::WeightKind::Frequency) out["n_rows"] = g.n;
     if (wkind != cecon::WeightKind::None) {
         out["weight_var"] = weight_var;
         out["wtype"] = wkind == cecon::WeightKind::Frequency    ? "fw"
@@ -1346,6 +1732,8 @@ int cmd_logit(const std::vector<std::string>& a) {
     echo_ml_max_options(out, a);  // ... and stop where this fit stopped (FU-426)
     // V = the matrix the se above came from, zero rows/columns for omitted terms
     if (has(a, "--emit-v")) add_e_v(out, screen.full_names, binary_full_V(V, screen));
+    if (has(a, "--emit-v")) add_e_gradient(out, r.gradient, screen);
+    if (has(a, "--emit-v") && !svy && (vce == "robust" || vce == "cluster")) add_e_vmb(out, r.bread, screen);
     if (svy) {
         out["vce"] = "svy_linearized";
         out["svy"] = {{"strata_var", strata_var}, {"psu_var", psu_var},
@@ -1379,7 +1767,12 @@ int cmd_logit(const std::vector<std::string>& a) {
     // An fweight or iweight under the default VCE keeps the LR test, on the weighted
     // likelihoods (add_mle_fit_wald's weighted ll_0; post_ml_fit puts the LR chi2
     // in place of its Wald one).
-    bool use_wald = (vce != "iid") || (wkind == cecon::WeightKind::Probability);
+    // An offset() fit has no constant-only comparison model: Stata's header is the
+    // Wald chi2 on the slopes and it posts no e(ll_0) or e(r2_p) (bank 8f1404ce
+    // `logit foreign mpg, offset(o)`: chi2type Wald, chi2 24.814715, no ll_0). The
+    // LR form compared against a constant-only fit WITHOUT the offset (chi2 -5.98).
+    const bool has_offset = offptr != nullptr;
+    bool use_wald = (vce != "iid") || (wkind == cecon::WeightKind::Probability) || has_offset;
     MlModelTest wald;
     if (no_intercept) {
         wald = add_mle_fit_nocons(out, r.p, g.y, wptr, g.n, r.beta, V, g.k);
@@ -1389,6 +1782,10 @@ int cmd_logit(const std::vector<std::string>& a) {
         add_mle_fit(out, r.p, g.y, g.n, g.k - 1);  // ll/ll_0/r2_pseudo/chi2/p_chi2 (since contract A 1.5.0)
     } else {
         wald = add_mle_fit_wald(out, r.p, g.y, wptr, g.n, r.beta, V, g.k);
+    }
+    if (has_offset) {
+        out.erase("ll_0");
+        out.erase("r2_pseudo");
     }
     post_ml_fit(out, r.ll, !no_intercept && !use_wald, r.ic, r.ilog);
     post_binary_extras(out, screen, V, g.k, !no_intercept, (no_intercept || use_wald) ? &wald : nullptr,
@@ -1486,7 +1883,9 @@ int cmd_probit(const std::vector<std::string>& a) {
                            kp.active ? &kp.mask : nullptr);
     if (g.n == 0) throw EngineError("no_obs", "probit: no observations");
     require_sample(g.n);  // BUG-1269: one row is r(2001) "insufficient observations"
+    binarize_outcome(g.y);
     if (!check_binary(g.y, "probit", y)) return 2;
+    if (!check_outcome_varies(g.y, "probit")) return 2;
     // Stata `noconstant` (w2b_estim.log:706/:732, e(k) 2): see drop_glm_intercept.
     const bool no_intercept = has(a, "--no-intercept");
     if (no_intercept) drop_glm_intercept(g, "probit");
@@ -1571,6 +1970,9 @@ int cmd_probit(const std::vector<std::string>& a) {
                 {"n_dropped_missing", g.n_dropped}, {"converged", r.converged},
                 {"iters", r.iters}, {"coefs", binary_full_coefs(coefs, screen)}};
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
+    // e(N) is Sum w under fweight; the rows the fit used are the e(sample)
+    // handshake's count (estimation_sample_install.cpp esampleHandshakeOk).
+    if (wkind == cecon::WeightKind::Frequency) out["n_rows"] = g.n;
     if (wkind != cecon::WeightKind::None) {
         out["weight_var"] = weight_var;
         out["wtype"] = wkind == cecon::WeightKind::Frequency    ? "fw"
@@ -1581,9 +1983,13 @@ int cmd_probit(const std::vector<std::string>& a) {
     echo_ml_max_options(out, a);  // ... and stop where this fit stopped (FU-426)
     // V = the matrix the se above came from, zero rows/columns for omitted terms
     if (has(a, "--emit-v")) add_e_v(out, screen.full_names, binary_full_V(V, screen));
+    if (has(a, "--emit-v")) add_e_gradient(out, r.gradient, screen);
+    if (has(a, "--emit-v") && (vce == "robust" || vce == "cluster")) add_e_vmb(out, bread, screen);
     // FU-463: the header statistic after vce(robust)/vce(cluster) is the Wald
     // chi2 on the slopes (g3_logit_probit_vce.log:153, :207), as in cmd_logit.
-    const bool use_wald = (vce != "iid");
+    // offset(): the Wald chi2, no e(ll_0)/e(r2_p), as in cmd_logit (bank 8f1404ce).
+    const bool has_offset = offptr != nullptr;
+    const bool use_wald = (vce != "iid") || has_offset;
     MlModelTest wald;
     if (no_intercept)
         wald = add_mle_fit_nocons(out, r.p, g.y, wptr, g.n, r.beta, V, g.k);
@@ -1593,6 +1999,10 @@ int cmd_probit(const std::vector<std::string>& a) {
         add_mle_fit(out, r.p, g.y, g.n, g.k - 1);  // ll/ll_0/r2_pseudo/chi2/p_chi2 (since contract A 1.5.0)
     else
         wald = add_mle_fit_wald(out, r.p, g.y, wptr, g.n, r.beta, V, g.k);
+    if (has_offset) {
+        out.erase("ll_0");
+        out.erase("r2_pseudo");
+    }
     post_ml_fit(out, r.ll, !no_intercept && !use_wald, r.ic, r.ilog);
     post_binary_extras(out, screen, V, g.k, !no_intercept, (no_intercept || use_wald) ? &wald : nullptr,
                        r.n_cdf, r.n_cds);
@@ -1697,7 +2107,9 @@ int cmd_cloglog(const std::vector<std::string>& a) {
     GlmInputs g = load_glm(ds, "cloglog", y, xs, cluster_names, weight_var, wkind, "",
                            tsm.timevar.empty() ? nullptr : &tsm, kp.active ? &kp.mask : nullptr);
     if (g.n == 0) throw EngineError("no_obs", "cloglog: no observations");
+    binarize_outcome(g.y);
     if (!check_binary(g.y, "cloglog", y)) return 2;
+    if (!check_outcome_varies(g.y, "cloglog")) return 2;
     const bool no_intercept = has(a, "--no-intercept");
     if (no_intercept) drop_glm_intercept(g, "cloglog");
     if (vce == "cluster" && (g.cluster.empty() || g.cluster[0].n_levels < 2))
@@ -1788,9 +2200,12 @@ int cmd_cloglog(const std::vector<std::string>& a) {
         out["weight_var"] = weight_var;
         out["wtype"] = fw ? "fw" : wkind == cecon::WeightKind::Importance ? "iw" : "pw";
     }
+    if (fw) out["n_rows"] = g.n;  // the e(sample) handshake's row count (e(N) is Sum w)
     if (asis) out["asis"] = true;
     echo_ml_max_options(out, a);
     if (has(a, "--emit-v")) add_e_v(out, info.full_names, binary_full_V(V, info));
+    if (has(a, "--emit-v")) add_e_gradient(out, r.gradient, info);
+    if (has(a, "--emit-v") && (vce == "robust" || vce == "cluster")) add_e_vmb(out, r.bread, info);
 
     // Header test: Wald after a sandwich VCE or noconstant, else LR against lf0.
     const bool use_wald = vce != "iid" || no_intercept;

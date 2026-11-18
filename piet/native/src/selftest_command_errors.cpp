@@ -526,9 +526,9 @@ void testBUG105InQualPrescan() {
           "BUG-105(2): a routed command that ALLOWS `in` still parses it (no regression)");
   }
   {
-    nlohmann::json b = errOf("tabstat wage in 1/5");
+    nlohmann::json b = errOf("tobit wage in 1/5");
     check(b.value("code", std::string()) == "unsupported_option" && says(b, kInGapSig) &&
-              says(b, "tabstat"),
+              says(b, "tobit"),
           "BUG-105(2): a routed command that REJECTS `in` keeps its feature-gap message");
   }
   {
@@ -543,6 +543,57 @@ void testBUG105InQualPrescan() {
     check(b.value("code", std::string()) == "unsupported_option" && says(b, kWeightGapSig),
           "BUG-105(2): a routed command that REJECTS a weight keeps its feature-gap message");
   }
+  // A form Stata's OWN syntax refuses is Stata's refusal, never a PIET gap
+  // (registry.h StataQualifiers / StataLead; StataBE 19.5 truth bank
+  // 2026-11-10): `compress` takes no `in` (r(101)), `sort` needs its varlist
+  // before any option (r(100)), `count` takes no option at all (r(101)).
+  {
+    const struct {
+      const char* line;
+      const char* msg;
+      const char* rc;
+    } kStataSyntax[] = {
+        {"compress in 1/5", "in range not allowed", "r(101)"},
+        {"describe price [aw=weight]", "weights not allowed", "r(101)"},
+        {"tab2 a b [pw=w]", "pweights not allowed", "r(101)"},
+        {"sort , stable", "varlist required", "r(100)"},
+        {"count , detail", "options not allowed", "r(101)"},
+        {"keep price, zz", "options not allowed", "r(101)"},
+    };
+    for (const auto& c : kStataSyntax) {
+      nlohmann::json b = errOf(c.line);
+      check(b.value("message", std::string()) == c.msg && b.value("reason", std::string()) == c.rc,
+            std::string("Stata-syntax step: `") + c.line + "` is Stata's " + c.rc + " `" + c.msg +
+                "`, not a PIET gap -- got: " + b.dump());
+    }
+    // ...while a form Stata ACCEPTS and PIET lacks keeps the honest gap.
+    nlohmann::json g = errOf("tobit wage in 1/5");
+    check(g.value("code", std::string()) == "unsupported_option" && says(g, kInGapSig),
+          "Stata-syntax step: `tobit ... in` (Stata takes `in`) stays a PIET gap");
+    // An operator token is refused only where Stata's varlist refuses it:
+    // `keep i.foreign` is r(101), `summarize i.rep78` is not judged here.
+    nlohmann::json k = errOf("keep i.foreign");
+    check(k.value("reason", std::string()) == "r(101)",
+          "Stata-syntax step: `keep i.foreign` is Stata's r(101) -- got: " + k.dump());
+    check(errOf("summarize i.rep78").empty() && errOf("corr gnp96 L.gnp96").empty(),
+          "Stata-syntax step: commands whose varlist takes operators are not refused");
+  }
+  // A parenthesis glued to `if` is the if qualifier (StataBE 19.5 `summarize price
+  // if(foreign)` rc 0), with or without a following `in`; a name merely starting
+  // with `if` is not one.
+  {
+    piet::eval::ParsedCommand a = piet::eval::tokenize("keep if(price>5000)");
+    check(a.ifExpr && *a.ifExpr == "(price>5000)" && a.varlist.empty(),
+          "glued if(: `keep if(price>5000)` reads the if qualifier");
+    piet::eval::ParsedCommand b = piet::eval::tokenize("summarize price if(foreign) in 1/5");
+    check(b.ifExpr && *b.ifExpr == "(foreign)" && b.inRange && *b.inRange == "1/5" &&
+              b.varlist.size() == 1,
+          "glued if(: `summarize price if(foreign) in 1/5` reads both qualifiers");
+    piet::eval::ParsedCommand c = piet::eval::tokenize("generate w = 1 if iflag");
+    check(c.ifExpr && *c.ifExpr == "iflag",
+          "glued if(: a variable named `iflag` is still an ordinary name");
+  }
+
   // by/bysort: routed WITHOUT a registry row, so the outer token must stay
   // exempt from the unknown-command verdict on every spelling -- and (SUM-BYWEIGHT)
   // a weight there belongs to the sub-command, which the by-driver re-tokenizes:
@@ -927,21 +978,24 @@ void testC2BS031SilentIfDropSweep() {
           "value, oracle-pinned replace-class semantics)");
   }
 
-  // Regression guard: `duplicates drop ... if ...` is now an honest reject
-  // (the recombination this would need wasn't implemented this stint),
-  // not a silent full-dataset dedup.
+  // Regression guard: `duplicates drop ... if ...` de-duplicates only the sample the qualifier
+  // selects and leaves the other rows where they are (vs-stata bank: `duplicates drop foreign if
+  // mpg>20, force` deletes 34 of the 36 selected observations and nothing else). It must never
+  // collapse the WHOLE dataset, which is what it silently did before the C2 sweep.
   freshData();
   {
-    // `force' spelled so the guard reaches the `if' refusal (without it the
-    // varlist drop is r(198) first, as measured on StataBE).
+    // year==1982 selects 48 rows, all alike on `year`: 47 go, the other 288 stay.
     auto dropBlocks = piet::dispatch("duplicates drop year if year==1982, force", session);
     bool sawDropError = false;
+    int64_t rowsAfter = -1;
     for (const auto& b : dropBlocks) {
       if (b.is_object() && b.value("type", std::string()) == "error") sawDropError = true;
+      if (b.is_object() && b.value("type", std::string()) == "data_mutation")
+        rowsAfter = b.value("n_rows_after", int64_t{-1});
     }
-    check(sawDropError,
-          "C2/BS-031 regression guard: `duplicates drop ... if ...` is an honest reject (was "
-          "silently collapsing the WHOLE dataset before this sweep)");
+    check(!sawDropError && rowsAfter == 289,
+          "C2/BS-031 regression guard: `duplicates drop ... if ...` drops duplicates inside the "
+          "selected sample only (336 -> 289 rows; vs-stata bank), never the whole dataset");
   }
 
   fs::remove_all(workdir, ec);

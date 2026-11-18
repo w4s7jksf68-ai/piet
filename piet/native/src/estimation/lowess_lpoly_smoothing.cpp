@@ -683,9 +683,20 @@ ojson runLpoly(const eval::ParsedCommand& parsed, SessionState& session) {
 
   if (smoothOpt(parsed, "by") != nullptr) return aerErrorReason("option by() not allowed", 191);
   const std::vector<std::pair<std::string, size_t>> namedGaps = {{"var", 1}, {"generatevar", 9}, {"generateci", 9}};
-  for (const auto& [gap, atLeast] : namedGaps)
-    if (smoothFirstOpt(parsed, gap, atLeast) != nullptr)
+  for (const auto& [gap, atLeast] : namedGaps) {
+    if (const auto* gapOpt = smoothFirstOpt(parsed, gap, atLeast)) {
+      // var(varname) names a variable that must exist (bank: `lpoly price weight,
+      // nograph generate(gx gs) var(gv)` r(111) "variable gv not found").
+      if (gap == "var") {
+        const std::string vt = strutil::trim(smoothOptText(gapOpt));
+        const bool nameLike = !vt.empty() && (std::isalpha(static_cast<unsigned char>(vt[0])) || vt[0] == '_') &&
+                              std::all_of(vt.begin(), vt.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; });
+        if (nameLike && !resolveVarName(vt, session).has_value())
+          return aerErrorReason("variable " + vt + " not found", 111);
+      }
       return aerErrorReason("lpoly: option " + gap + "() is not implemented in this build", 198);
+    }
+  }
 
   const std::string pilotText = smoothOptText(smoothFirstOpt(parsed, "pwidth", 2));
   const bool pilotGiven = smoothFirstOpt(parsed, "pwidth", 2) != nullptr;

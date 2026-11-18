@@ -642,6 +642,7 @@ MlPath ml_newton_path(MlObjective& obj, std::vector<double> start, const MlMaxOp
     path.ic = search.iterations;
     path.ll = final_point.ll;
     path.ilog = std::move(search.ll_trace);
+    path.gradient = std::move(final_point.grad);
     path.inv_curvature = std::move(final_point.curv.inv);
     path.b = std::move(final_point.beta);
     return path;
@@ -672,6 +673,16 @@ BinaryMlResult binary_ml_fit(BinaryLink link, const double* X, int64_t n, int k,
                 case BinaryLink::Probit: b0 = normal_icdf(n1 / nw); break;
                 case BinaryLink::Cloglog: b0 = std::log(std::log(nw / (nw - n1))); break;
             }
+            // Under offset() the start is that constant less the (weighted) mean
+            // offset: Stata's iteration 0 of `logit foreign mpg weight,
+            // offset(off)` is -51.583492 = ll at logit(ybar) - mean(off) (bank
+            // afb2b4ba; 8f1404ce -65.042862; probit 4ab82d44 -57.490097 and
+            // 2b3d8206 -84.57976 with invnormal(ybar) - mean(off)).
+            if (offset) {
+                double so = 0.0;
+                for (int64_t i = 0; i < n; ++i) so += (weights ? weights[i] : 1.0) * offset[i];
+                b0 -= so / nw;
+            }
         }
         b[K - 1] = b0;
     }
@@ -684,6 +695,7 @@ BinaryMlResult binary_ml_fit(BinaryLink link, const double* X, int64_t n, int k,
     r.ic = path.ic;
     r.ll = path.ll;
     r.ilog = std::move(path.ilog);
+    r.gradient = std::move(path.gradient);
     r.bread.assign(K * K, 0.0);
     for (size_t a = 0; a < K; ++a)
         for (size_t c = 0; c < K; ++c)
@@ -734,6 +746,7 @@ LogitResult logit_fit_ml(const double* X, int64_t n, int k, const double* y, con
     r.ilog = std::move(m.ilog);
     r.n_cdf = m.n_cdf;
     r.n_cds = m.n_cds;
+    r.gradient = std::move(m.gradient);
     return r;
 }
 

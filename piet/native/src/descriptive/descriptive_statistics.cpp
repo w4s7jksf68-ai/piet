@@ -2,6 +2,7 @@
 // Copyright (C) 2026 M.K. Kim
 // Descriptive statistics.
 #include "piet/handlers/descriptive.h"
+#include "piet/eval/result_order.h"  // orderRResults (correlate lists r() as Stata does)
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -111,12 +112,13 @@ ojson runTabstatCore(const std::vector<std::string>& varlist,
 
 ojson runTabstat(const std::vector<std::string>& varlist, const std::optional<std::string>& byVal,
                   const std::optional<std::string>& statsVal, SessionState& session,
-                  const std::optional<std::string>& ifExpr, bool wantGroups, bool noTotal) {
+                  const std::optional<std::string>& ifExpr, bool wantGroups, bool noTotal,
+                  const std::optional<std::string>& inRange) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   if (varlist.empty()) return engineErrorBlockM4("tabstat requires at least one variable");
 
   ojson ifErr;
-  auto dataPathOpt = applyIfFilterM4(session, *session.currentHbin(), ifExpr, ifErr);
+  auto dataPathOpt = applyIfFilterM4(session, *session.currentHbin(), ifExpr, ifErr, inRange);
   if (!dataPathOpt.has_value()) return ifErr;
   return runTabstatCore(varlist, byVal, statsVal, *dataPathOpt, wantGroups, noTotal);
 }
@@ -128,11 +130,12 @@ ojson runTabstatWeighted(const std::vector<std::string>& varlist,
                          const std::optional<std::string>& byVal,
                          const std::optional<std::string>& statsVal, SessionState& session,
                          const std::optional<std::string>& ifExpr, bool wantGroups, bool noTotal,
-                         const std::string& weightFlag, const std::string& weightVar) {
+                         const std::string& weightFlag, const std::string& weightVar,
+                         const std::optional<std::string>& inRange) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   if (varlist.empty()) return engineErrorBlockM4("tabstat requires at least one variable");
   ojson ifErr;
-  auto dataPathOpt = applyIfFilterM4(session, *session.currentHbin(), ifExpr, ifErr);
+  auto dataPathOpt = applyIfFilterM4(session, *session.currentHbin(), ifExpr, ifErr, inRange);
   if (!dataPathOpt.has_value()) return ifErr;
   return runTabstatCore(varlist, byVal, statsVal, *dataPathOpt, wantGroups, noTotal, weightFlag,
                         weightVar);
@@ -172,11 +175,17 @@ ojson runTabstatOnDataWeighted(const std::vector<std::string>& varlist,
 ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, bool sig, bool covar,
                    const std::string& weightFlag, const std::string& weightVar,
                    SessionState& session, const std::optional<std::string>& ifExpr,
-                   const std::optional<std::string>& inRange) {
+                   const std::optional<std::string>& inRange, const CorrExtra& extra) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   std::vector<std::string> varlist;
   if (Datastore* ds = session.datastore()) {
-    for (const auto& v : varlistIn)
+    // No varlist means every variable; the string ones drop out below like any
+    // string variable named (StataBE 19.5, bank bd2efe966c285304: bare
+    // `correlate` on a dataset with one numeric variable is a 1x1 matrix).
+    std::vector<std::string> requested = varlistIn;
+    if (requested.empty())
+      for (const auto& nm : ds->names()) requested.push_back(nm);
+    for (const auto& v : requested)
       if (!(ds->has(v) && ds->dtype(v) == "factor")) varlist.push_back(v);
   } else {
     varlist = varlistIn;
@@ -185,14 +194,35 @@ ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, boo
     return ojson(eval::errorBlock("syntax_error", "too few variables specified", std::nullopt,
                                   std::nullopt, std::nullopt, std::string("r(102)")));
   }
+  // Time-series operators (`cor gnp96 L.gnp96 D.gnp96`, varlist(ts)): each such
+  // term is generated under tsset onto a copy of the frame and read from there;
+  // the matrices and the table keep the names as typed.
+  const std::vector<std::string> shown = varlist;
+  std::string basePath = *session.currentHbin();
+  {
+    ojson tsErr;
+    const auto tsFrame = tsVarlistFrameM4(session, varlist, tsErr);
+    if (!tsFrame.has_value()) return tsErr;
+    if (!tsFrame->empty()) basePath = *tsFrame;
+  }
+  // pwcorr's listwise (casewise): the rows with every variable present
+  // (pwcorr.ado's markout of the varlist), then the same pairwise computation.
+  std::optional<std::string> ifUsed = ifExpr;
+  if (pairwise && extra.listwise) {
+    std::string miss = "!missing(" + joinCommaM4(varlist) + ")";
+    ifUsed = ifExpr.has_value() && !ifExpr->empty() ? "(" + *ifExpr + ") & " + miss : miss;
+  }
   ojson ifErr;
-  auto dataPathOpt = applyIfFilterM4(session, *session.currentHbin(), ifExpr, ifErr, inRange);
+  auto dataPathOpt = applyIfFilterM4(session, basePath, ifUsed, ifErr, inRange);
   if (!dataPathOpt.has_value()) return ifErr;
 
+  // pwcorr's star() and print() read each pair's p-value whether or not `sig` is set.
+  const bool wantP = pairwise && (sig || extra.star > 0 || extra.print > 0 || extra.adjust != 0);
   std::vector<std::string> args = {"corr", "--vars", joinCommaM4(varlist)};
   if (pairwise) args.push_back("--pairwise");
-  if (sig) args.push_back("--sig");
+  if (wantP) args.push_back("--sig");
   if (covar) args.push_back("--cov");
+  if (extra.means && !pairwise) args.push_back("--means");
   if (!weightFlag.empty() && !weightVar.empty()) {
     args.push_back(weightFlag);
     args.push_back(weightVar);
@@ -253,7 +283,46 @@ ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, boo
                                   std::nullopt, std::nullopt, std::nullopt,
                                   std::string(none ? "r(2000)" : "r(2001)")));
   }
+  // pwcorr.ado's multiple-comparison adjustment of each pair's p-value, with nrho =
+  // k(k-1)/2 pairs: bonferroni min(nrho*p, 1) (a p it could not form stays missing);
+  // sidak min(1, 1 - (1-p)^nrho), Stata's min() taking 1 when the power is missing.
+  // print(#) keeps only the p-values at or below # in r(sig) (the others stay missing).
+  if (pairwise && raw.contains("p") && raw["p"].is_array()) {
+    const double k = static_cast<double>(varlist.size());
+    const double nrho = k * (k - 1.0) / 2.0;
+    ojson& P = raw["p"];
+    for (size_t i = 0; i < P.size(); ++i) {
+      if (!P[i].is_array()) continue;
+      for (size_t j = 0; j < P[i].size(); ++j) {
+        if (i == j) continue;
+        const bool have = P[i][j].is_number();
+        const double p0 = have ? P[i][j].get<double>() : std::numeric_limits<double>::quiet_NaN();
+        double p = p0;
+        if (extra.adjust == 1 && have) p = std::min(nrho * p0, 1.0);
+        if (extra.adjust == 2) p = have ? std::min(1.0, 1.0 - std::pow(1.0 - p0, nrho)) : 1.0;
+        P[i][j] = std::isnan(p) ? ojson(nullptr) : ojson(p);
+      }
+    }
+  }
+  ojson rawSig = raw;
+  if (pairwise && extra.print > 0 && rawSig.contains("p") && rawSig["p"].is_array()) {
+    for (auto& row : rawSig["p"])
+      for (auto& c : row)
+        if (!(c.is_number() && c.get<double>() <= extra.print)) c = nullptr;
+  }
+  if (raw.contains("means") && raw["means"].is_array())
+    for (size_t j = 0; j < raw["means"].size() && j < shown.size(); ++j)
+      raw["means"][j]["name"] = shown[j];
   ojson corrBlock = cobraToEstimationM4(raw, "corr");
+  if (shown != varlist) corrBlock["variables"] = shown;
+  if (pairwise) {
+    corrBlock["sig"] = sig;
+    if (wantP && raw.contains("p")) corrBlock["p"] = raw["p"];
+    if (extra.star > 0) corrBlock["star"] = extra.star;
+    if (extra.print > 0) corrBlock["print"] = extra.print;
+  } else if (extra.means && raw.contains("means")) {
+    corrBlock["means"] = raw["means"];
+  }
   auto cell = [](const ojson& m, size_t i, size_t j) {
     if (m.is_array() && i < m.size() && m[i].is_array() && j < m[i].size() && m[i][j].is_number())
       return m[i][j].get<double>();
@@ -261,8 +330,8 @@ ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, boo
   };
   auto toMatrix = [&](const ojson& m) {
     eval::EvalMatrix out;
-    out.rownames = varlist;
-    out.colnames = varlist;
+    out.rownames = shown;
+    out.colnames = shown;
     for (size_t i = 0; i < varlist.size(); ++i) {
       std::vector<double> row;
       for (size_t j = 0; j < varlist.size(); ++j) {
@@ -291,7 +360,7 @@ ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, boo
     post("rho", cell(R, 0, 1));
     postMatrix("C", R);
     postMatrix("Nobs", NB);
-    if (sig && raw.contains("p")) postMatrix("sig", raw["p"]);
+    if (sig && rawSig.contains("p")) postMatrix("sig", rawSig["p"]);
   } else {
     if (raw.contains("n_obs") && raw["n_obs"].is_number()) post("N", raw["n_obs"].get<double>());
     if (covar) {
@@ -310,6 +379,9 @@ ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, boo
     if (weightFlag == "--aweight" && raw.contains("sum_w") && raw["sum_w"].is_number())
       post("sum_w", raw["sum_w"].get<double>());
   }
+  // Stata lists them `sum_w N rho` (`N rho` unweighted, `N cov_12 Var_2 Var_1`
+  // for covariance) -- vs-stata truth bank, `: r(scalars)` after correlate/pwcorr.
+  eval::orderRResults(session.eval, {"sum_w", "N", "rho", "cov_12", "Var_2", "Var_1"});
   eval::declareRPosted(session.eval, pairwise ? "pwcorr" : "correlate", std::move(posted));
   return corrBlock;
 }
@@ -317,7 +389,8 @@ ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, boo
 ojson runCorr(const std::vector<std::string>& varlist, bool pairwise, bool sig,
               SessionState& session, const std::optional<std::string>& ifExpr,
               const std::optional<std::string>& inRange) {
-  return runCorrStata(varlist, pairwise, sig, /*covar=*/false, "", "", session, ifExpr, inRange);
+  return runCorrStata(varlist, pairwise, sig, /*covar=*/false, "", "", session, ifExpr, inRange,
+                      CorrExtra());
 }
 
 ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
@@ -330,14 +403,33 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
 
   std::vector<std::string> levelArgs;
   bool levelExplicit = false;
+  auto refuse198 = [](const std::string& msg) {
+    return ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                  std::string("r(198)")));
+  };
   for (const auto& [k, v] : parsed.opts) {
-    if (k == "level" && !v.isBool) {
+    if (k == "level") {
       levelExplicit = true;
+      // ttest.ado's `Level(cilevel)`: a number from 10 to 99.99 with at most two
+      // decimals, else r(198) -- level(150) ran with missing bounds, level(abc)
+      // silently ran at 95. level(99.5) is a level: the engine reads --level with
+      // stod, so the text goes through whole (truncating it to an int put every CI
+      // at the wrong confidence, r(lb_*) r(ub_*)).
+      const std::string lvs = v.isBool ? std::string() : trimM4(v.strValue);
+      double lv = std::numeric_limits<double>::quiet_NaN();
+      size_t pos = 0;
       try {
-        int lv = std::stoi(v.strValue);
-        levelArgs = {"--level", std::to_string(lv)};
+        lv = std::stod(lvs, &pos);
       } catch (...) {
+        pos = 0;
       }
+      if (lvs.empty() || pos != lvs.size() || std::isnan(lv))
+        return refuse198("option level() incorrectly specified");
+      if (!(lv >= 10.0 && lv <= 99.99))
+        return refuse198("level() must be between 10 and 99.99 inclusive");
+      if (std::fabs(lv * 100.0 - std::round(lv * 100.0)) > 1e-8)
+        return refuse198("level() can have at most two digits after the decimal point");
+      levelArgs = {"--level", lvs};
     }
   }
   // BS-048 (BETA A4): no explicit level() — fall back to the session's `set
@@ -355,12 +447,18 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
 
   std::optional<std::string> byVal;
   bool unequal = false;
+  bool unequalOpt = false;  // `unequal` as typed (unequal is also set by welch)
+  bool welch = false;
   bool paired = false;
   bool reverse = false;
   bool unpaired = false;
   for (const auto& [k, v] : parsed.opts) {
     if (k == "by" && !v.isBool) byVal = v.strValue;
     if ((k == "unequal" || k == "welch") && v.isBool && v.boolValue) unequal = true;
+    if (k == "unequal" && v.isBool && v.boolValue) unequalOpt = true;
+    // welch is Welch's df, not Satterthwaite's (ttesti.ado TwoTest): the engine
+    // must be told which, or every df/p/CI of a welch test is Satterthwaite's.
+    if (k == "welch" && v.isBool && v.boolValue) welch = true;
     if (k == "paired" && v.isBool && v.boolValue) paired = true;
     if (k == "reverse" && v.isBool && v.boolValue) reverse = true;
     if (k == "unpaired" && v.isBool && v.boolValue) unpaired = true;
@@ -390,21 +488,32 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
   // `ttest pre = post if d == 1` ran a one-sample test of pre against 1 and
   // posted its names (sx_ttest_paired_eq).
   std::optional<std::string> eqRhs;
+  std::string lhsVar = varlist[0];
   {
     std::string joined;
     for (const auto& t : varlist) joined += t + " ";
     const size_t eq = joined.find('=');
     if (eq != std::string::npos) {
+      // `ttest rep78==3` arrives as one token: the variable is what precedes the `=`.
+      lhsVar = trimM4(joined.substr(0, eq));
       std::string r = joined.substr(eq + 1);
       while (!r.empty() && (r.front() == '=' || std::isspace(static_cast<unsigned char>(r.front()))))
         r.erase(r.begin());
       eqRhs = trimM4(r);
     }
   }
+  // ttest.ado: with `= exp` and no `unpaired` the test is one-sample or paired,
+  // where unequal and welch mean nothing -- r(198), checked before the right-hand
+  // side is read. They used to be ignored and the paired test ran at rc 0.
+  if (eqRhs.has_value() && !unpaired) {
+    if (unequalOpt) return refuse198("unequal option invalid for one-sample or paired tests");
+    if (welch) return refuse198("welch option invalid for one-sample or paired tests");
+  }
   std::vector<std::string> args;
   if (byVal.has_value() && !byVal->empty()) {
     args = {"ttest", "--var", varlist[0], "--by", *byVal};
     if (unequal) args.push_back("--unequal");
+    if (welch) args.push_back("--welch");
     if (reverse) args.push_back("--reverse");
     for (const auto& a : levelArgs) args.push_back(a);
   } else {
@@ -414,7 +523,7 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
         size_t pos;
         std::stod(rhs, &pos);  // Python's float(rhs) — value unused, only validity matters
         if (pos == rhs.size()) {
-          args = {"ttest", "--var", varlist[0], "--against", rhs};
+          args = {"ttest", "--var", lhsVar, "--against", rhs};
           if (paired) args.push_back("--paired");
           for (const auto& a : levelArgs) args.push_back(a);
         } else {
@@ -422,10 +531,11 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
         }
       } catch (...) {
         // rhs is a variable name -> paired/two-sample.
-        args = {"ttest", "--vars", varlist[0] + "," + rhs};
+        args = {"ttest", "--vars", lhsVar + "," + rhs};
         if (paired) args.push_back("--paired");
         if (unpaired) args.push_back("--unpaired");
         if (unpaired && unequal) args.push_back("--unequal");
+        if (unpaired && welch) args.push_back("--welch");
         if (reverse) args.push_back("--reverse");
         for (const auto& a : levelArgs) args.push_back(a);
       }
@@ -434,6 +544,7 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
       if (paired) args.push_back("--paired");
       if (unpaired) args.push_back("--unpaired");
       if (unpaired && unequal) args.push_back("--unequal");
+      if (unpaired && welch) args.push_back("--welch");
       if (reverse) args.push_back("--reverse");
       for (const auto& a : levelArgs) args.push_back(a);
     } else {
@@ -463,10 +574,21 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
     // by() must name exactly two groups: Stata's r(420) (sx_ttest_ref_by3). The
     // engine's two_groups() says how many it found.
     const std::string msg = cobraErrorStrM4(ce);
+    // ttesti's sample checks carry Stata's rc: r(416) "standard deviation is
+    // missing" (values whose variance overflows), r(2000) for an empty sample.
+    static const std::regex kRc(R"(^r\((\d+)\)$)");
+    if (std::regex_match(ce.detail, kRc))
+      return ojson(eval::errorBlock("engine_error", ce.what(), std::nullopt, std::nullopt,
+                                    std::nullopt, ce.detail));
     static const std::regex kGroups(R"(must define exactly 2 groups \(found (\d+)\))");
     std::smatch gm;
     if (std::regex_search(msg, gm, kGroups)) {
       const int found = std::stoi(gm[1].str());
+      // no row with both the variable and the group: _ttest's by() finds no
+      // observations, r(2000)
+      if (found == 0)
+        return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
+                                      std::nullopt, std::string("r(2000)")));
       return ojson(eval::errorBlock(
           "engine_error",
           found > 2 ? "more than 2 groups found, only 2 allowed"
@@ -496,6 +618,13 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
   std::vector<std::string> posted;
   if (raw2.contains("r") && raw2["r"].is_object()) {
     for (auto it = raw2["r"].begin(); it != raw2["r"].end(); ++it) {
+      // null = a statistic Stata posts as missing (n = 1 has no sd; sd = 0
+      // leaves t and its p-values missing): posted as `.`, not dropped.
+      if (it.value().is_null()) {
+        session.eval.rValues.set(it.key(), std::numeric_limits<double>::quiet_NaN());
+        posted.push_back(it.key());
+        continue;
+      }
       if (!it.value().is_number()) continue;
       session.eval.rValues.set(it.key(), it.value().get<double>());
       posted.push_back(it.key());

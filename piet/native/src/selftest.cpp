@@ -99,6 +99,7 @@ int runSelftestSuite(const std::string& name) {
     // names enabled. Prepare the same process-only prerequisite here instead
     // of inheriting a user's persisted extcompat=false setting.
     piet::settings::setExtcompatEnabled(true);
+    piet::settings::setTableLimits(piet::settings::Settings{});  // Stata's limits, as in the full run
     std::printf("[selftest] suite %s: %zu test functions\n", suite.name, suite.count);
     for (size_t i = 0; i < suite.count; ++i) {
       std::printf("[selftest] RUN %s\n", suite.tests[i].name);
@@ -112,6 +113,9 @@ int runSelftestSuite(const std::string& name) {
 
 int runSelftest() {
   std::printf("[selftest] PIET 2.0 native M0+M1+M4b self-test starting\n");
+  // tabulate's table-size limits are Stata's for the whole run, not whatever the
+  // user's own settings file raised them to.
+  piet::settings::setTableLimits(piet::settings::Settings{});
 
   testBridgeEcho();
   testWindowsFileDropBridgeSeam();
@@ -134,6 +138,7 @@ int runSelftest() {
   testW3FinalFixerBugfixes();
   // 2.2.0 UX/Settings wave (items B/D/E).
   testSettingsPersistence();
+  testTableSizeLimits();
   testMemoryPreflight();
   // P8.1 Wave 2 (contract_B 2.4.0) native lane: file.save / var_detail /
   // ui_state / default_export_dir / live-block streaming / BUG-082.

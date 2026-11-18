@@ -382,6 +382,54 @@ IvShared iv_build_shared(IvModelData& md, Vcov vt, int cluster_index) {
     // The engine has no warning channel on the success path (stderr is discarded
     // there), so the omission is reported as data — S.omitted → IvResult::omitted →
     // the JSON "omitted" array — and NOT as a message.
+    // ivregress (--inst-collin-check, no absorbed effects): Stata's ivregress drops an
+    // excluded instrument collinear with [endog exog constant] or with an earlier
+    // instrument (ivregress_check2collin's _rmcoll2list) and then counts: fewer
+    // instruments than instrumented variables is r(481) (bank 4ba7c02e `ivregress 2sls
+    // price weight (x=length)` with x = 2*length+3). With enough left Stata fits
+    // without the dropped ones, which this fit does not: refused by name.
+    if (md.inst_collin_check && md.fe.empty() && kinst > 0) {
+        const int ka = kendog + kexog;
+        std::vector<double> A(static_cast<size_t>(n) * (ka + kinst));
+        for (int j = 0; j < kendog; ++j)
+            std::copy(md.Xendog.data() + static_cast<int64_t>(j) * n,
+                      md.Xendog.data() + static_cast<int64_t>(j + 1) * n,
+                      A.data() + static_cast<int64_t>(j) * n);
+        for (int j = 0; j < kexog; ++j)
+            std::copy(md.exog(j), md.exog(j) + n, A.data() + static_cast<int64_t>(kendog + j) * n);
+        for (int j = 0; j < kinst; ++j)
+            std::copy(md.inst(j), md.inst(j) + n, A.data() + static_cast<int64_t>(ka + j) * n);
+        // With a constant (exog column 0) the check is made on the columns with the
+        // constant partialled out (centred), as Stata's collinearity check works on
+        // the centred cross-products: the span is unchanged, but the relative
+        // tolerance then measures each column's own variation, so an instrument with
+        // a large offset (length + 1e8) is not mistaken for a collinear one.
+        if (md.has_intercept) {
+            for (int j = 0; j < ka + kinst; ++j) {
+                if (j == kendog) continue;  // the constant itself
+                double* c = A.data() + static_cast<int64_t>(j) * n;
+                for (int pass = 0; pass < 2; ++pass) {
+                    double m = 0;
+                    for (int64_t i = 0; i < n; ++i) m += c[i];
+                    m /= static_cast<double>(n);
+                    for (int64_t i = 0; i < n; ++i) c[i] -= m;
+                }
+            }
+        }
+        const std::vector<char> keepA = collinear_keep_mask(A.data(), n, ka + kinst);
+        bool aFull = true;
+        for (int j = 0; j < ka; ++j) aFull = aFull && keepA[static_cast<size_t>(j)];
+        int kept = 0;
+        for (int j = ka; j < ka + kinst; ++j) kept += keepA[static_cast<size_t>(j)] ? 1 : 0;
+        if (aFull && kept < kinst) {
+            if (kept < kendog)
+                throw EngineError("iv_not_identified",
+                    "equation not identified; must have at least as many instruments not in the "
+                    "regression as there are instrumented variables");
+            throw EngineError("iv_instrument_collinear",
+                "an excluded instrument is collinear with the regressors or another instrument");
+        }
+    }
     if (kinst > 0 && !md.fe.empty()) {
         std::vector<double> Wchk(static_cast<size_t>(n) * kw);
         for (int j = 0; j < kexog; ++j)
@@ -770,6 +818,8 @@ IvResult iv_solve_outcome(const IvShared& S, IvModelData& md, Vcov vt, int clust
     r.se.resize(kx);
     for (int j = 0; j < kx; ++j) r.se[j] = std::sqrt(vc.V[j + j * kx]);
     r.vcov_matrix = std::move(vc.V);
+    if (!gmm && (vt == Vcov::HC1 || vt == Vcov::Cluster) && md.fe.empty())
+        r.vcov_modelbased = S.bread;
 
     // --- Efficient two-step GMM (Stata `ivregress gmm`) ---------------------------
     // Two-step, NOT iterated (Stata default). Step 1 = 2SLS residuals e1 → robust
@@ -783,8 +833,23 @@ IvResult iv_solve_outcome(const IvShared& S, IvModelData& md, Vcov vt, int clust
     // with 2SLS. (Stata default = wmatrix(robust) vce(robust); no finite-sample q.)
     if (gmm) {
         bool clust = (vt == Vcov::Cluster) && S.cl;
+        // ivreg2's gmm2s without robust/cluster is efficient GMM under homoskedasticity:
+        // S1 = sigma^2 Z'Z, sigma^2 = e'e / (N - dofminus) from the 2SLS residuals, so
+        // the estimate is 2SLS and (C'W1 C)^-1 its large-sample variance (bank
+        // ba4d05ae `ivreg2 price weight (mpg = length turn), gmm2s`: mpg 1425.076,
+        // se 1108.632, the 2SLS fit's).
+        const bool homo = md.gmm_efficient_vce && vt == Vcov::IID;
         // S1 from 2SLS residuals e; W1 = S1^-1.
-        std::vector<double> W1 = iv_robust_meat(W, n, kw, e.data(), S.cl, S.G, clust);
+        std::vector<double> W1;
+        if (homo) {
+            W1.assign(static_cast<size_t>(kw) * kw, 0.0);
+            for (int p = 0; p < kw; ++p)
+                la::xtv(W, n, kw, W + static_cast<int64_t>(p) * n, W1.data() + static_cast<int64_t>(p) * kw);
+            const double s2 = la::sumsq(e.data(), n) / static_cast<double>(n - S.dofminus);
+            for (auto& x : W1) x *= s2;
+        } else {
+            W1 = iv_robust_meat(W, n, kw, e.data(), S.cl, S.G, clust);
+        }
         if (la::spd_inverse(W1.data(), kw) != 0)
             throw EngineError("collinear", "GMM step-1 weight matrix (Z'Z meat) not positive-definite");
         // C = Z'X (kw x kx, column-major), d = Z'y.
@@ -852,9 +917,14 @@ IvResult iv_solve_outcome(const IvShared& S, IvModelData& md, Vcov vt, int clust
                 double s = 0; for (int t = 0; t < kx; ++t) s += AM[p + t * kx] * Ainv[t + q * kx];
                 V[p + q * kx] = s;
             }
+        // ivreg2 gmm2s posts the efficient-GMM variance (C'W1 C)^-1 with the same W1
+        // that weighted the estimate (bank 4c6ea412 `ivreg2 price weight (mpg = length
+        // turn), gmm2s robust`: e(V)[1,1] 1912620.80 where the final-residual sandwich
+        // gives 1976178.29; e(b) identical).
+        if (md.gmm_efficient_vce) V = Ainv;
         r.vcov_matrix = V;
         for (int j = 0; j < kx; ++j) r.se[j] = std::sqrt(V[j + j * kx]);
-        r.vcov_type = clust ? "gmm_cluster" : "gmm_robust";
+        r.vcov_type = homo ? "gmm_iid" : clust ? "gmm_cluster" : "gmm_robust";
     }
 
     // --- Hansen J overidentification (kinst > kendog), robust/cluster (ivreg2 e(j)) ---
@@ -1278,9 +1348,12 @@ IvResult iv2sls_fit(IvModelData& md, Vcov vt, int cluster_index, bool gmm, bool 
     DemeanReport d0 = md.fe_absorbed ? DemeanReport{} : demean(md.y.data(), md.n, 1, md.fe);
     // GMM needs the efficient (robust) weight matrix → force the weak-id/meat plumbing
     // on so S.cl/S.G/S.weakid_on are populated even under a nominally-iid vcov request.
-    IvShared S = iv_build_shared(md, gmm ? (vt == Vcov::Cluster ? vt : Vcov::HC1) : vt,
+    // ivreg2 gmm2s under homoskedasticity (--gmm-efficient-vce with an iid VCE) keeps
+    // the iid statistics: its weight matrix is sigma^2 Z'Z (iv_solve_outcome).
+    const bool robustGmm = gmm && !(md.gmm_efficient_vce && vt == Vcov::IID);
+    IvShared S = iv_build_shared(md, robustGmm ? (vt == Vcov::Cluster ? vt : Vcov::HC1) : vt,
                                  cluster_index);  // demeans the X side
-    if (gmm) S.weakid_on = true;
+    if (robustGmm) S.weakid_on = true;
     IvResult r = iv_solve_outcome(S, md, vt, cluster_index, d0.iters, d0.resid, d0.converged,
                                   gmm, small, multiway_subset_factors);
     // The first stage does not involve y, so it is built off the shared X-side algebra

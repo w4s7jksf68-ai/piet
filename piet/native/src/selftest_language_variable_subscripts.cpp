@@ -991,6 +991,46 @@ void nameBindingArms(const std::string& workdir) {
   }
 }
 
+// (5) A subscript on a STRING variable in a generate expression: the row evaluator reads
+// the cell at the observation the index names, whatever row it is on. The index truncates
+// toward zero and an index outside 1.._N is "" (StataBE 19.5: gsort's group number is
+// `generate long g = _n == 1 | k != k[_n-1]` over the keys, string ones included; bank
+// cells of the gsort generate() option). Under a by-prefix a subscript counts within the
+// group, which this evaluator does not know: the line stays refused, never a whole-frame
+// answer.
+void stringSubscriptArms(const std::string& workdir) {
+  piet::SessionState s(workdir);
+  (void)run(s, "clear");
+  (void)run(s, "set obs 4");
+  (void)run(s, "generate str1 s = \"a\"");
+  (void)run(s, "replace s = \"b\" in 2/3");
+  auto cells = [&s](const std::string& v) {
+    std::string out;
+    for (int i = 1; i <= 4; ++i)
+      out += run(s, "display \"[\" " + v + "[" + std::to_string(i) + "] \"]\"").text;
+    return out;
+  };
+  const Reply g = run(s, "generate long g = _n == 1 | s != s[_n-1]");
+  w2check(g.rc == "0" && cells("g") == "[1][1][0][1]",
+          "string subscript: s != s[_n-1] marks where the value changes -- got rc " + g.rc +
+              " `" + cells("g") + "` " + g.msg);
+  const Reply p = run(s, "generate str1 p = s[_n-1]");
+  w2check(p.rc == "0" && cells("p") == "[][a][b][b]",
+          "string subscript: s[_n-1] is the row above, \"\" on the first -- got rc " + p.rc +
+              " `" + cells("p") + "` " + p.msg);
+  const Reply q = run(s, "generate byte q = (s[0] == \"\") + (s[9] == \"\") + (s[1.9] == \"a\")");
+  w2check(q.rc == "0" && cells("q") == "[3][3][3][3]",
+          "string subscript: an index outside 1.._N is \"\" and a fraction truncates toward "
+          "zero -- got rc " + q.rc + " `" + cells("q") + "` " + q.msg);
+  const Reply a = run(s, "generate byte a = s[_n+1] == \"b\" if s != \"\"");
+  w2check(a.rc == "0" && cells("a") == "[1][1][0][0]",
+          "string subscript: s[_n+1] under an if -- got rc " + a.rc + " `" + cells("a") + "` " +
+              a.msg);
+  const Reply b = run(s, "by g: generate byte z = s[_n-1] == \"a\"");
+  w2check(b.rc != "0", "string subscript: under a by-prefix the line is refused, not answered "
+                       "over the whole frame -- got rc " + b.rc);
+}
+
 }  // namespace
 
 void testW2iVarsub() {
@@ -1005,5 +1045,6 @@ void testW2iVarsub() {
   snapshotArms(workdir);
   refusalArms(workdir);
   nameBindingArms(workdir);
+  stringSubscriptArms(workdir);
   fs::remove_all(workdir, ec);
 }

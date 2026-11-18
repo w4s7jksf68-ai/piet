@@ -82,6 +82,7 @@ struct FeolsResult {
     int demean_iters = 0;
     double demean_resid = 0;
     bool demean_converged = true;
+    int hdfe_ic = 0;  // reghdfe's e(ic) with two or more absorbed factors (0 otherwise)
     int64_t n_dropped = 0;
     std::vector<std::string> omitted;  // collinear columns dropped (Stata omits, coef 0)
     std::vector<std::string> full_names;  // pre-drop design-matrix column order (BUG-112(6))

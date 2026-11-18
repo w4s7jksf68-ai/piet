@@ -15,6 +15,7 @@
 #include <sstream>
 #include <unordered_set>
 #include "piet/cobra_runner.h"
+#include "core/distributions.h"  // z_critical (shared with cobra)
 #include "piet/cobra_session.h"
 #include "piet/display_hardening.h"
 #include "piet/eval/errors.h"
@@ -133,6 +134,7 @@ ojson runReg3(const eval::ParsedCommand& parsed, SessionState& session,
           "unsupported_option");
     }
   }
+  std::optional<double> sysLevel;  // level(#)
   for (const auto& [k, v] : parsed.opts) {
     if ((k == "noconstant" || k == "nocons") && v.isBool && v.boolValue) {
       return engineErrorBlockM4(
@@ -141,10 +143,14 @@ ojson runReg3(const eval::ParsedCommand& parsed, SessionState& session,
           "unsupported_option");
     }
     if (k == "level" && !v.isBool) {
-      return engineErrorBlockM4(
-          "Option `level` is a valid Stata option that this version of PIET does not yet "
-          "implement for `" + stataCmd + "`.",
-          "unsupported_option");
+      // level(#): the table's normal interval at that level (set on the block below;
+      // nothing else in the fit depends on it). Stata's cilevel range is 10..99.99.
+      char* end = nullptr;
+      const std::string t = strutil::trim(v.strValue);
+      const double lv = std::strtod(t.c_str(), &end);
+      if (t.empty() || end == nullptr || *end != '\0' || !(lv >= 10.0 && lv <= 99.99))
+        return stataRefusalM4b("level() must be between 10 and 99.99 inclusive", 198);
+      sysLevel = lv;
     }
   }
 
@@ -172,6 +178,50 @@ ojson runReg3(const eval::ParsedCommand& parsed, SessionState& session,
   // options) call actually ran.
   argv.push_back("--method");
   argv.push_back(sawSure ? "sure" : "3sls");
+  // sureg's isure: the FGLS iterated to convergence (reg3.ado's loop: at most
+  // iterate(#) passes, c(maxiter) 300 by default; tolerance(#) on mreldif of e(b),
+  // 1e-6 by default; bank 2b8fedb8 `isure it(2)`: e(ic) 2; 0e1a60d6 `i`: e(ic) 6;
+  // 4b300106 `isure tol(1e-2)`: 2). An iterate(#) other than c(maxiter) (300; `set
+  // maxiter` is fixed at its default in this build) switches the iteration on by
+  // itself, while e(method) still says "isure" only when isure was typed.
+  // tolerance() alone changes nothing.
+  bool isure = false;
+  bool iterated = false;
+  if (isSureg) {
+    std::string iterateOpt, tolOpt;
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "isure" && v.isBool && v.boolValue) isure = true;
+      if (k == "isure" && !v.isBool) return stataRefusalM4b("option isure() not allowed", 198);
+      if (k == "iterate" || k == "tolerance") {
+        char* end = nullptr;
+        const std::string t = v.isBool ? std::string() : strutil::trim(v.strValue);
+        const double x = std::strtod(t.c_str(), &end);
+        const bool okNum = !t.empty() && end != nullptr && *end == '\0';
+        if (k == "iterate") {
+          if (!okNum || x != std::floor(x) || x < 0 || x > 1e9)
+            return stataRefusalM4b("option iterate() incorrectly specified", 198);
+          char ib[32];
+          std::snprintf(ib, sizeof ib, "%.0f", x);  // `1e3` reaches the engine as 1000
+          iterateOpt = ib;
+        } else {
+          if (!okNum || !(x > 0)) return stataRefusalM4b("option tolerance() incorrectly specified", 198);
+          tolOpt = t;
+        }
+      }
+    }
+    iterated = isure || (!iterateOpt.empty() && iterateOpt != "300");
+    if (iterated) {
+      argv.push_back("--isure");
+      if (!iterateOpt.empty()) {
+        argv.push_back("--iterate");
+        argv.push_back(iterateOpt);
+      }
+      if (!tolOpt.empty()) {
+        argv.push_back("--tolerance");
+        argv.push_back(tolOpt);
+      }
+    }
+  }
   if (parsed.ifExpr.has_value()) {
     argv.push_back("--keepif");
     argv.push_back(*parsed.ifExpr);
@@ -181,17 +231,39 @@ ojson runReg3(const eval::ParsedCommand& parsed, SessionState& session,
   argv.push_back("--tidy");
 
   ojson raw;
+  // e(sample): the engine's joint listwise rows (--esample-out, not recorded in
+  // argv), installed before setLastModel below. StataBE: `sureg (...) (...)` then
+  // `estimates store S` adds _est_S, and `count if e(sample)` is e(N).
+  std::string esampleValues;
   try {
     // --emit-v: the stacked system e(V) (y:x1 ... x3:_cons) that e(b)/e(V)
     // and estout's matrix mode read; not part of argv (a refit flag).
     std::vector<std::string> fitArgv = argv;
     fitArgv.push_back("--emit-v");
+    esampleValues = esampleFitArgs(session, fitArgv, std::string(), 0);
     raw = runCobraJsonM4(fitArgv);
   } catch (const CobraError& ce) {
+    if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
     return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
   }
 
   ojson block = cobraToEstimationM4(raw, "reg3", &session);
+  // level(#): each equation's interval b -/+ z(level)*se (reg3/sureg are normal-based;
+  // bank 213ec4a0 `sureg ..., level(90)`).
+  if (sysLevel.has_value() && block.contains("outcomes") && block["outcomes"].is_array()) {
+    const double crit = cecon::z_critical(1.0 - *sysLevel / 100.0);
+    for (auto& eq : block["outcomes"]) {
+      if (!eq.is_object() || !eq.contains("coeftable") || !eq["coeftable"].is_array()) continue;
+      for (auto& row : eq["coeftable"]) {
+        if (!row.is_object() || !row.contains("b") || !row["b"].is_number() || !row.contains("se") ||
+            !row["se"].is_number())
+          continue;
+        const double b = row["b"].get<double>(), se = row["se"].get<double>();
+        row["ci_lo"] = b - crit * se;
+        row["ci_hi"] = b + crit * se;
+      }
+    }
+  }
 
   LastModel lm;
   lm.cobraCmd = "reg3";
@@ -208,9 +280,158 @@ ojson runReg3(const eval::ParsedCommand& parsed, SessionState& session,
   captureFitFilterM4(lm, argv);
   lm.dataPath = *session.currentHbin();
   lm.result = raw;
+  if (!esampleValues.empty() && lm.result->is_object() && lm.result->contains("esample_n"))
+    (void)esampleInstallOnHead(session, esampleValues, *lm.result, lm);
+  else if (!esampleValues.empty())
+    cecon::native_unlink(esampleValues);
   session.setLastModel(lm);
   session.lastEstBlock = block;
+  // The session block names the model's depvar (the first equation's, as
+  // lm.depvar), so `estimates store` pairs block and model and writes _est_NAME
+  // from e(sample). Session copy only: the emitted block is unchanged.
+  if (session.lastEstBlock->is_object() &&
+      session.lastEstBlock->value("depvar", std::string()).empty())
+    (*session.lastEstBlock)["depvar"] = lm.depvar;
   session.attachFitCovariance(raw);  // e(V): the engine's stacked system covariance
+  // sureg's own macros (bank: every `sureg (y1 x..) (y2 x..)` fit): e(depvar) and
+  // e(eqnames) the equations' depvars, e(exog) the regressors in order of first
+  // appearance, e(method) sure, e(corr) unstructured, e(vce) unadjusted, the
+  // margins defaults and e(predict) reg3_p. Plain variable names only. `reg3 ...,
+  // sure` posts the same (bank f11ab0d7 `reg3 (price mpg foreign) (trunk weight
+  // length), su`).
+  if (sawSure) {
+    std::vector<std::string> deps, exog;
+    bool plain = true;
+    for (const auto& g : groups) {
+      const std::vector<std::string> toks = splitTokensM4(g);
+      for (const auto& t : toks)
+        if (t.find_first_of(".#()*?~-") != std::string::npos) plain = false;
+      if (toks.empty()) plain = false;
+      else deps.push_back(toks.front());
+      for (size_t i = 1; i < toks.size(); ++i)
+        if (std::find(exog.begin(), exog.end(), toks[i]) == exog.end()) exog.push_back(toks[i]);
+    }
+    exog.erase(std::remove_if(exog.begin(), exog.end(),
+                              [&deps](const std::string& v) {
+                                return std::find(deps.begin(), deps.end(), v) != deps.end();
+                              }),
+               exog.end());
+    if (plain && session.lastModel().has_value()) {
+      const auto join = [](const std::vector<std::string>& v) {
+        std::string o;
+        for (const auto& x : v) o += (o.empty() ? "" : " ") + x;
+        return o;
+      };
+      std::string mdef;
+      for (const auto& d : deps) mdef += (mdef.empty() ? "" : " ") + ("predict(xb equation(" + d + "))");
+      const std::vector<std::pair<const char*, std::string>> macros = {
+          {"method", isure ? "isure" : "sure"}, {"vce", "unadjusted"}, {"marginsdefault", mdef},
+          {"marginsok", "XB default"}, {"predict", "reg3_p"}, {"corr", "unstructured"},
+          {"exog", join(exog)}, {"depvar", join(deps)}, {"eqnames", join(deps)}};
+      for (const auto& [n, v] : macros) {
+        if (v.empty()) continue;
+        session.eval.setEString(n, v);
+        session.noteEOnFit(n);
+      }
+    }
+  }
+  // reg3's (and sureg's) system results (reg3.ado's posting; bank 77bbda65 `sureg (price
+  // mpg weight) (trunk length weight)`): per equation e(cons_#) 1, e(chi2_#)/e(p_#)/
+  // e(df_m#) the Wald test of its slopes, e(rss_#) from the final coefficients,
+  // e(rmse_#) = sqrt(rss/N), e(mss_#) = TSS - RSS, e(r2_# ) = mss/(mss + rss); then
+  // e(k) the coefficients, e(k_eq) the equations (and the hidden e(k_eform)), e(ic) 0
+  // (not iterated), e(dfk2_adj) = 1/df_adj with df_adj = 1/N kept in a macro at 15
+  // significant digits (bank: N 74 -> 74.00000000000007, N 69 -> 69.00000000000003),
+  // e(ll) the Gaussian system log likelihood on the final residuals (engine), e(rank)
+  // the full column count, the hidden e(k_autoCns) 0, and e(Sigma) the first-step
+  // residual covariance the FGLS used (rows/columns the equations' depvars).
+  if (raw.is_object() && raw.contains("eq_stats") && raw["eq_stats"].is_array() &&
+      raw.contains("n_obs") && raw["n_obs"].is_number() && raw.contains("ll") &&
+      raw["ll"].is_number() && raw.contains("sigma") && raw["sigma"].is_array() &&
+      raw["eq_stats"].size() == groups.size() && raw["sigma"].size() == groups.size()) {
+    const double N = raw["n_obs"].get<double>();
+    auto put = [&session](const std::string& nm, double v) {
+      session.eval.setEScalar(nm, v);
+      session.noteEOnFit(nm);
+    };
+    std::vector<std::string> deps;
+    double K = 0.0;
+    bool ok = N > 0;
+    for (const auto& g : groups) {
+      const std::vector<std::string> toks = splitTokensM4(g);
+      if (toks.empty()) ok = false;
+      else deps.push_back(toks.front());
+      K += static_cast<double>(toks.size());  // its regressors and the constant
+    }
+    for (size_t i = 0; ok && i < groups.size(); ++i) {
+      const ojson& st = raw["eq_stats"][i];
+      for (const char* key : {"rss", "tss", "chi2", "df", "p"})
+        ok = ok && st.contains(key) && st[key].is_number();
+    }
+    for (size_t i = 0; ok && i < deps.size(); ++i)
+      ok = raw["sigma"][i].is_array() && raw["sigma"][i].size() == deps.size();
+    if (ok) {
+      for (size_t i = 0; i < groups.size(); ++i) {
+        const ojson& st = raw["eq_stats"][i];
+        const std::string j = std::to_string(i + 1);
+        const double rss = st["rss"].get<double>(), mss = st["tss"].get<double>() - rss;
+        put("cons_" + j, 1.0);
+        put("chi2_" + j, st["chi2"].get<double>());
+        put("p_" + j, st["p"].get<double>());
+        put("df_m" + j, st["df"].get<double>());
+        put("rss_" + j, rss);
+        put("rmse_" + j, std::sqrt(rss / N));
+        put("mss_" + j, mss);
+        put("r2_" + j, mss / (mss + rss));
+      }
+      const double M = static_cast<double>(groups.size());
+      put("k", K);
+      put("k_eq", M);
+      put("k_eform", M);
+      session.eval.markEHidden("k_eform", session.eval.eScalars.generationOf("k_eform"));
+      put("ic", raw.contains("ic") && raw["ic"].is_number() ? raw["ic"].get<double>() : 0.0);
+      char buf[64];
+      std::snprintf(buf, sizeof buf, "%.15g", 1.0 / N);
+      put("dfk2_adj", 1.0 / std::strtod(buf, nullptr));
+      put("ll", raw["ll"].get<double>());
+      put("rank", K);
+      put("k_autoCns", 0.0);
+      session.eval.markEHidden("k_autoCns", session.eval.eScalars.generationOf("k_autoCns"));
+      eval::EvalMatrix sig;
+      sig.rownames = deps;
+      sig.colnames = deps;
+      for (size_t i = 0; i < deps.size(); ++i) {
+        sig.data.emplace_back();
+        for (size_t c = 0; c < deps.size(); ++c)
+          sig.data.back().push_back(raw["sigma"][i][c].is_number() ? raw["sigma"][i][c].get<double>()
+                                                                  : std::nan(""));
+      }
+      auto& store = session.eval.eMatrices;
+      store.erase(std::remove_if(store.begin(), store.end(),
+                                 [](const auto& p) { return p.first == "Sigma"; }),
+                  store.end());
+      store.emplace_back("Sigma", std::move(sig));
+      session.noteEOnFit("Sigma");
+    }
+  }
+  // sureg, notable: no coefficient table is shown, and r() is left with the sample
+  // count, r(N) (bank 65dfa6f2 `sureg (price mpg weight) (trunk length weight), not`:
+  // r(N) 74, nothing else)
+  if (isSureg && block.is_object() && raw.is_object() && raw.contains("n_obs") &&
+      raw["n_obs"].is_number()) {
+    bool notable = false;
+    for (const auto& kv : parsed.opts) {
+      const std::string k = strutil::lower(kv.first);
+      notable = notable || (k.size() >= 3 && std::string("notable").compare(0, k.size(), k) == 0);
+    }
+    if (notable) {
+      ojson ra;
+      ra["scalars"] = {{"N", raw["n_obs"].get<double>()}};
+      block["r_after_fit"] = ra;
+      if (session.lastEstBlock.has_value() && session.lastEstBlock->is_object())
+        (*session.lastEstBlock)["r_after_fit"] = ra;
+    }
+  }
   return block;
 }
 

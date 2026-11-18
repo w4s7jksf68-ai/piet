@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <functional>
 #include <regex>
+#include <limits>
 #include <set>
 #include <unordered_set>
 #include <vector>
@@ -448,8 +449,14 @@ const EStripeRow kEStripeTable[] = {
     {"reghdfe", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
     // w2g_ebmat.log:594 `symmetric e(V)[3,3]` after `ivregress 2sls y x2 (x1 = id)`
     {"ivregress", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // bank af8d994e `ivreg price weight (mpg = length turn)`: e(b) `mpg weight _cons`,
+    // 3 x 3 e(V) (4b1e00b3 noconstant: `mpg weight`, the block's noconstant mark)
+    {"ivreg", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
     // aer_b4/ivreg2-partial.log:121 `e(b)[1,4]`
     {"ivreg2", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // bank a98fe7be `xtivreg2 frate unemp (beertax = spirits drinkage), fe`: e(b) `beertax
+    // unemp` (row y1), 2 x 2 e(V) -- the within fit, no _cons
+    {"xtivreg2", EStripe::kAsEmitted, ConsRule::kNoCons, nullptr},
     // ivreghdfe.ado (corpus 065) absorb() sets noconstant,
     // `_cons` only `if `cons''; the absorb rule is in resolveEMatrixFor
     {"ivreghdfe", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
@@ -475,6 +482,8 @@ const EStripeRow kEStripeTable[] = {
     // w2g_ebmat.log:723
     {"probit", EStripe::kDepvarEq, ConsRule::kNeedCons, nullptr},
     {"cloglog", EStripe::kDepvarEq, ConsRule::kNeedCons, nullptr},
+    // fracreg: `fr:weight fr:0b.foreign fr:1.foreign fr:_cons` (bank 952f78c4)
+    {"fracreg", EStripe::kDepvarEq, ConsRule::kAnyCons, nullptr},
     // poisson: a depvar's `.` becomes `_` in the equation name
     {"poisson", EStripe::kDepvarEqUnderscore, ConsRule::kNeedCons, nullptr},
     // xtlogit ,fe fits clogit and reposts nothing; the equation is
@@ -519,7 +528,6 @@ const EStripeRow kEStripeTable[] = {
     {"eventstudyinteract", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
     {"sdid", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
     {"stcox", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
-    {"fracreg", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
     {"xtabond", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
     {"mediate", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
     // nl's free parameters are the engine's own row names (`/b0 /b1`), which is
@@ -669,6 +677,10 @@ EvalSession::EMatrixAnswer EvalSession::resolveEMatrixFor(const std::string& nam
       const auto& beta = live->at(key);
       if (!copy.contains("coeftable") || !copy["coeftable"].is_array())
         return fail(111, "matrix e(beta) not found", true);
+      // A column the engine sends as null (an omitted column with no variation
+      // over the sample) is missing in Stata's e(beta); its b stays 0 here so the
+      // e(b) reader names it as it names e(b)'s column, and the value is set after.
+      std::set<std::string> missingSrc;
       for (auto& r : copy["coeftable"]) {
         if (!r.is_object() || !r.contains("name") || !r["name"].is_string())
           return fail(111, "matrix e(beta) not found", true);
@@ -677,6 +689,13 @@ EvalSession::EMatrixAnswer EvalSession::resolveEMatrixFor(const std::string& nam
         const auto it = beta.find(nm);
         if (it != beta.end() && it->is_number()) {
           r["b"] = *it;
+          continue;
+        }
+        if (it != beta.end() && it->is_null()) {
+          // a kept regressor with no variation over the sample (noconstant) has no
+          // standardized coefficient either (bank dec61ebe `regress price mpg one,
+          // noconstant`: e(beta) `-.0107 .`): missing, whatever its b
+          missingSrc.insert(nm);
           continue;
         }
         // A column the fit omitted (b 0): Stata's e(beta) is 0 there too.
@@ -693,6 +712,31 @@ EvalSession::EMatrixAnswer EvalSession::resolveEMatrixFor(const std::string& nam
         return bm;
       }
       if (bm.matrix->data.size() != 1) return fail(111, "matrix e(beta) not found", true);
+      // The engine column behind each e(b) column: the recorded stripe's `src`
+      // (one entry per column, in order) or, without a stripe, the column itself.
+      std::vector<std::string> srcOf(bm.matrix->colnames.size());
+      std::vector<char> noVar(bm.matrix->colnames.size(), 0);
+      {
+        const auto st = copy.find("eb_stripe");
+        const bool aligned = st != copy.end() && st->is_array() &&
+                             st->size() == bm.matrix->colnames.size();
+        for (size_t j = 0; j < srcOf.size(); ++j) {
+          if (aligned) {
+            const auto& e = (*st)[j];
+            srcOf[j] = e.is_object() && e.contains("src") && e["src"].is_string()
+                           ? e["src"].get<std::string>()
+                           : std::string();
+            // a stripe column with no fit row that does not vary over e(sample)
+            // (coefficient_column_names.cpp annotateEbStripe)
+            noVar[j] = e.is_object() && e.contains("novar") && e["novar"].is_boolean() &&
+                       e["novar"].get<bool>();
+          } else {
+            const std::string& c = bm.matrix->colnames[j];
+            const size_t colon = c.find(':');
+            srcOf[j] = colon == std::string::npos ? c : c.substr(colon + 1);
+          }
+        }
+      }
       EvalMatrix out;
       out.rownames = {"r1"};
       out.data.emplace_back();
@@ -702,7 +746,9 @@ EvalSession::EMatrixAnswer EvalSession::resolveEMatrixFor(const std::string& nam
         const std::string bare = colon == std::string::npos ? c : c.substr(colon + 1);
         if (bare == "_cons") continue;
         out.colnames.push_back(c);
-        out.data[0].push_back(bm.matrix->data[0][j]);
+        out.data[0].push_back(missingSrc.count(srcOf[j]) != 0 || noVar[j] != 0
+                                  ? std::numeric_limits<double>::quiet_NaN()
+                                  : bm.matrix->data[0][j]);
       }
       if (out.colnames.empty()) return fail(111, "matrix e(beta) not found", true);
       a.matrix = std::move(out);
@@ -1338,6 +1384,71 @@ std::string substituteMatrixRefs(const std::string& expr, const EvalSession& ses
   pre = regexSubFn(reClsRowsof, pre,
                    [&classDims](const std::smatch& m) { return classDims(m, false); });
 
+  // det(NAME) / trace(NAME) ([FN] Matrix functions) of a stored square
+  // matrix, joining the family for the reason colnumb does. trace is the sum
+  // of the diagonal (vs-stata bank d1745485bfef404d 16); det the product of the
+  // pivots of the LU decomposition inv() uses (implicitly scaled partial
+  // pivoting, the last of a tie), signed by the row exchanges: StataBE 19.5's
+  // det((1,2,3\4,5,6\7,8,10)) is -1.7fffffffffffcX+001 to the bit
+  // (28bf17920359952b), a singular matrix 0. A missing cell gives `.`. A
+  // matrix that is not square is left unsubstituted, for the parser to refuse
+  // (StataBE's answer for it is unmeasured).
+  static const std::regex reDetTrace(
+      R"(\b(det|trace)\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))");
+  pre = regexSubFn(reDetTrace, pre, [&session](const std::smatch& m) -> std::string {
+    // Each multiply and subtract rounded on its own, as StataBE's bits show
+    // (a fused multiply-add gives -1.8000000000002X+001 for the matrix above).
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const EvalMatrix* mat = session.findMatrix(m.str(2));
+    if (mat == nullptr) return m.str(0);
+    const size_t n = mat->data.size();
+    for (const auto& row : mat->data)
+      if (row.size() != n) return m.str(0);
+    if (n == 0) return m.str(0);
+    for (const auto& row : mat->data)
+      for (double v : row)
+        if (std::isnan(v) || std::fabs(v) >= kStataMissingSentinel) return std::string(".");
+    if (m.str(1) == "trace") {
+      double t = 0.0;
+      for (size_t k = 0; k < n; ++k) t += mat->data[k][k];
+      return valueRefText(matrixElementText(t));
+    }
+    std::vector<std::vector<double>> a = mat->data;
+    std::vector<double> weight(n);
+    double sign = 1.0;
+    for (size_t i = 0; i < n; ++i) {
+      double big = 0.0;
+      for (double v : a[i]) big = std::max(big, std::fabs(v));
+      if (big == 0.0) return std::string("0");
+      weight[i] = 1.0 / big;
+    }
+    for (size_t c = 0; c < n; ++c) {
+      size_t piv = c;
+      double best = -1.0;
+      for (size_t r = c; r < n; ++r) {
+        const double d = weight[r] * std::fabs(a[r][c]);
+        if (d >= best) {
+          best = d;
+          piv = r;
+        }
+      }
+      if (a[piv][c] == 0.0) return std::string("0");
+      if (piv != c) {
+        std::swap(a[piv], a[c]);
+        std::swap(weight[piv], weight[c]);
+        sign = -sign;
+      }
+      const double recip = 1.0 / a[c][c];
+      for (size_t r = c + 1; r < n; ++r) a[r][c] *= recip;
+      for (size_t j = c + 1; j < n; ++j)
+        for (size_t r = c + 1; r < n; ++r) a[r][j] -= a[r][c] * a[c][j];
+    }
+    double d = sign;
+    for (size_t k = 0; k < n; ++k) d *= a[k][k];
+    return valueRefText(matrixElementText(d));
+  });
   pre = regexSubFn(reColnumb, pre, [&session](const std::smatch& m) -> std::string {
     const EvalMatrix* mat = nullptr;
     for (const auto& p : session.matrices)

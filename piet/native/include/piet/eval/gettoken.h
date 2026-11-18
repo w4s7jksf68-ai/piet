@@ -10,6 +10,7 @@
 #define PIET_NATIVE_EVAL_GETTOKEN_H
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,13 @@ struct LocalsStore {
 // `locals`), or a one-element vector containing the CommandErrorResult block
 // on a syntax error. Matches run_gettoken()'s `list[dict]` return shape.
 std::vector<nlohmann::json> runGettoken(const std::string& rawLine, LocalsStore& locals);
+
+// `tokenize`'s split of TEXT (its outer quotes already removed) by the same
+// scan gettoken uses, repeated: OPTS is the text after the comma (empty for
+// none) and takes only parse("pchars"). Returns an error block for an option
+// tokenize does not take, else nullopt with the tokens in `out`.
+std::optional<nlohmann::json> tokenizeText(const std::string& text, const std::string& opts,
+                                           std::vector<std::string>& out);
 
 }  // namespace piet::eval
 

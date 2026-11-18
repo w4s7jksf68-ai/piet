@@ -7,7 +7,45 @@
 #include "options.h"
 #include "handler_declarations.h"
 #include "piet/handlers/data_values.h"
+#include "piet/loops.h"
 namespace piet::dispatch_detail {
+std::optional<ojson> generatePlacementRequest(
+    SessionState& session, const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+    std::string& word, std::string& var) {
+  word.clear();
+  var.clear();
+  bool gotBefore = false, gotAfter = false;
+  for (const auto& [k, v] : opts) {
+    if (k == "before" && !v.isBool) gotBefore = true;
+    if (k == "after" && !v.isBool) gotAfter = true;
+  }
+  if (gotBefore && gotAfter)  // vs-stata bank: before() with after() is r(198)
+    return ojson(eval::errorBlock("syntax_error", "before() may not be combined with after()",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+  for (const auto& [k, v] : opts)
+    if ((k == "before" || k == "after") && !v.isBool) {
+      word = k;
+      var = trimWs(v.strValue);
+    }
+  if (word.empty()) return std::nullopt;
+  Datastore* pds = session.hasData() ? session.datastore() : nullptr;
+  if (pds != nullptr && !pds->has(var))
+    return ojson(eval::errorBlock("engine_error", "variable " + var + " not found", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(111)"));
+  return std::nullopt;
+}
+
+void placeGeneratedVariable(SessionState& session, const std::string& name,
+                            const std::string& word, const std::string& var, ojson& blocks) {
+  ojson placed = dispatch("order " + name + ", " + word + "(" + var + ")", session);
+  if (placed.is_array()) {
+    for (const auto& b : placed)
+      if (!(b.is_object() && b.value("type", std::string()) == "echo")) blocks.push_back(b);
+  } else {
+    blocks.push_back(placed);
+  }
+}
+
 bool route_data_generate(std::string& cmd,
     std::string& cmdTyped,
     eval::ParsedCommand& parsed,
@@ -21,6 +59,45 @@ bool route_data_generate(std::string& cmd,
     if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabGenerate.known, kVocabGenerate.unimplemented)) {
       blocks.push_back(ojson(*err));
       return true;
+    }
+    // generate ..., before(varname) | after(varname): the new variable is placed by `order` once it
+    // is made (vs-stata bank: the named variable must exist, r(111), checked first).
+    {
+      std::string placeWord, placeVar;
+      if (auto err = generatePlacementRequest(session, parsed.opts, placeWord, placeVar)) {
+        blocks.push_back(*err);
+        return true;
+      }
+      const long long comma = eval::findUnquotedComma(parsed.raw);
+      if (!placeWord.empty() && comma >= 0) {
+        // The line without its options is the whole generate (type, name, expression, if, in);
+        // the new name is read from it the way the plain arm reads it, whatever the spelling of
+        // the verb (ge, gen, generate) and of the type (str, str5, double ...).
+        const std::string head = trimWs(parsed.raw.substr(0, static_cast<size_t>(comma)));
+        const size_t verbEnd = head.find_first_of(" \t");
+        std::string newName;
+        if (verbEnd != std::string::npos) {
+          std::string body = trimWs(head.substr(verbEnd));
+          StorageTypeInfo hinfo = stripStorageType(body);
+          newName = genTargetName(hinfo.expr);
+        }
+        const std::string savedLeaf = session.leafCmdExpanded;
+        ojson made = dispatch(head, session);
+        bool failed = false;
+        if (made.is_array()) {
+          for (const auto& b : made) {
+            if (b.is_object() && b.value("type", std::string()) == "echo") continue;
+            if (b.is_object() && b.value("type", std::string()) == "error") failed = true;
+            blocks.push_back(b);
+          }
+        } else {
+          failed = made.is_object() && made.value("type", std::string()) == "error";
+          blocks.push_back(made);
+        }
+        if (!failed && !newName.empty()) placeGeneratedVariable(session, newName, placeWord, placeVar, blocks);
+        session.leafCmdExpanded = savedLeaf;
+        return true;
+      }
     }
     std::string raw = genExprText(parsed);
     StorageTypeInfo info = stripStorageType(raw);
@@ -48,6 +125,29 @@ bool route_data_generate(std::string& cmd,
                                               std::nullopt, std::nullopt, std::nullopt,
                                               "r(102)")));
       return true;
+    }
+    // StataBE 19.5 (vs-stata bank 2026-11-10): one name and no `=exp` is r(100)
+    // "=exp required" (`generate x`); two words before `=` are r(103) "too many
+    // variables specified" (`generate zzz x = 1`).
+    {
+      static const std::regex reOneName(R"(^\s*[A-Za-z_][A-Za-z0-9_]*\s*$)");
+      if (info.expr.find('=') == std::string::npos && std::regex_match(info.expr, reOneName)) {
+        // The new name is checked first: an existing one is r(110).
+        if (auto exists = genTargetNameError(session, trimWs(info.expr), strippedTypeWord(raw, info))) {
+          blocks.push_back(*exists);
+          return true;
+        }
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "=exp required", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(100)")));
+        return true;
+      }
+      static const std::regex reTwoNames(R"(^[A-Za-z_][A-Za-z0-9_]*\s+[A-Za-z_][A-Za-z0-9_]*$)");
+      if (std::regex_match(genTargetName(info.expr), reTwoNames)) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "too many variables specified",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(103)")));
+        return true;
+      }
     }
     if (auto genExists =
             genTargetNameError(session, genTargetName(info.expr), strippedTypeWord(raw, info))) {
@@ -245,6 +345,22 @@ bool route_data_generate(std::string& cmd,
       }
     }
     // Est-scalar pre-resolution: done in preResolveGenExpr above (BUG-456).
+    // Stored scalars and matrix elements on the right-hand side, the pass gen
+    // runs (BUG-432): `scalar k = 2` then `replace z = mpg/k` was r(111) "k
+    // not found" where generate took k (StataBE 19.5, vs-stata bank
+    // fb24969a2f54448c). The target is an existing variable, never rewritten.
+    {
+      std::optional<ojson> replExprErr;
+      const size_t eq = info.expr.find('=');
+      if (eq != std::string::npos) {
+        info.expr = info.expr.substr(0, eq + 1) + " " +
+                    substituteRowExprRefs(trimWs(info.expr.substr(eq + 1)), session, &replExprErr);
+      }
+      if (replExprErr.has_value()) {
+        blocks.push_back(*replExprErr);
+        return true;
+      }
+    }
     // Same c(name) pre-resolution as gen (BS-091/BS-101, see gen branch above).
     info.expr = substituteCRefs(info.expr, session);
     if (parsed.ifExpr.has_value()) {
@@ -392,6 +508,37 @@ bool route_data_generate(std::string& cmd,
                                 egenBlk);
       else
         refreshCardFormat(session, egenBlk, egenTarget);  // tag() is byte: %8.0g
+      if (!egenFailed && cmdTyped != "gegen")
+        handlers::egenPublishResidue(session, egenTarget, egenRhs, byVal, parsed.ifExpr,
+                                     parsed.inRange, parsed.opts, info.typeToken);
+      if (!egenFailed && cmdTyped == "gegen" && session.hasData()) {
+        // gtools' gegen reports its groups: the by() variables, else group()/tag()'s
+        // arguments (a missing key leaves the group unless `missing`), else one group.
+        std::vector<std::string> groupVars;
+        bool dropMissingKeys = false;
+        bool readable = true;
+        auto expandInto = [&](const std::string& text) {
+          loops::VarlistExpandResult vx = loops::expandVarlist(trimWs(text), session);
+          if (vx.isError) readable = false;
+          else groupVars = vx.tokens;
+        };
+        if (!trimWs(byVal).empty()) {
+          expandInto(byVal);
+        } else {
+          static const std::regex reGT(R"(^\s*(group|tag)\s*\((.*)\)\s*$)");
+          std::smatch gm;
+          if (std::regex_match(egenRhs, gm, reGT)) {
+            expandInto(gm.str(2));
+            dropMissingKeys = true;
+            for (const auto& kv : parsed.opts)
+              if (lower(kv.first) == "missing" && !(kv.second.isBool && !kv.second.boolValue))
+                dropMissingKeys = false;
+          }
+        }
+        if (readable)
+          handlers::gtoolsPublishGroups(session, groupVars, parsed.ifExpr, parsed.inRange,
+                                        dropMissingKeys);
+      }
     }
     return true;
   }
@@ -402,6 +549,15 @@ bool route_data_generate(std::string& cmd,
     if (strvar.empty()) {
       blocks.push_back(ojson(eval::engineError(
           "encode: syntax error — usage: encode STRVAR, gen(NEWVAR) [label(LBLNAME)]")));
+      return true;
+    }
+    // encode's syntax reads one `varname` before its options: a second word is
+    // r(103) "too many variables specified" (vs-stata bank 920857d4edbd1cd2
+    // `encode make price, gen(m2)`).
+    if (parsed.varlist.size() > 1) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "too many variables specified",
+                                              std::nullopt, std::nullopt, std::nullopt,
+                                              std::string("r(103)"))));
       return true;
     }
     // BS-097: `generate`/`label` are the encode options this arm reads, and
@@ -522,9 +678,40 @@ bool route_data_generate(std::string& cmd,
     // convention the merge/joinby `using "FILE"` arms already use above) so
     // the character SET destring strips from each value is just `,`, not
     // `,` and `"`.
-    if (ignoreChars.has_value() && ignoreChars->size() >= 2 && ignoreChars->front() == '"' &&
-        ignoreChars->back() == '"') {
-      ignoreChars = ignoreChars->substr(1, ignoreChars->size() - 2);
+    // [D] destring: ignore("chars" [, aschars | asbytes | illegal]) -- the
+    // characters are the quoted string, the words after its comma say how to
+    // read them. The whole value used to become the character set, so
+    // ignore("$", illegal) also ignored `,`, ` ` and the letters of `illegal`
+    // (vs-stata bank: `destring ds, gen(d2) ignore("$", illegal)` over "$4099,"
+    // is "contains characters not specified in ignore(); no generate").
+    if (ignoreChars.has_value()) {
+      std::string v = strutil::trim(*ignoreChars);
+      if (!v.empty() && v.front() == '"') {
+        const size_t close = v.find('"', 1);
+        if (close != std::string::npos) {
+          std::string tail = strutil::trim(v.substr(close + 1));
+          ignoreChars = v.substr(1, close - 1);
+          if (!tail.empty()) {
+            if (tail.front() != ',') {
+              blocks.push_back(ojson(eval::errorBlock("syntax_error", "option ignore() invalid",
+                                                      std::nullopt, std::nullopt, std::nullopt,
+                                                      "r(198)")));
+              return true;
+            }
+            std::istringstream subs(tail.substr(1));
+            for (std::string w; subs >> w;) {
+              const std::string lw = strutil::lower(w);
+              if (lw == "illegal") dOpts.illegal = true;
+              else if (lw != "aschars" && lw != "asbytes") {
+                blocks.push_back(ojson(eval::errorBlock(
+                    "syntax_error", "option " + w + " not allowed", std::nullopt, std::nullopt,
+                    std::nullopt, "r(198)")));
+                return true;
+              }
+            }
+          }
+        }
+      }
     }
     // destring's varlist is optional (`syntax [varlist]` = every variable);
     // tostring's is required.

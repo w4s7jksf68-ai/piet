@@ -19,7 +19,7 @@ bool commandNeedsNoData(const std::string& cmd) {
   // to route it to, so this set is intentionally scoped to M3a's surface.
   static const std::set<std::string> kNoDataCommands = {
       "use",       "sysuse", "xtset",     "tsset",   "display", "di",     "cd",
-      "pwd",       "timer",  "label",     "preserve", "restore", "tempfile",
+      "pwd",       "timer",  "label",     "labelbook", "datasignature", "preserve", "restore", "tempfile",
       "tempname",  "scalar",
       // append.ado appends into an empty dataset too: the result is the using
       // data (w2aw_data_combine_family.log dc_a_empty rc 0, N=2);
@@ -49,6 +49,10 @@ bool commandNeedsNoData(const std::string& cmd) {
       // dispatcher.py's own `if ds is None: return no_data_loaded()` INSIDE
       // the "graph" handler body, not at this outer guard).
       "eststo",    "est",    "estimates", "marginsplot", "coefplot", "graph",
+      // `twoway function ...` / `twoway scatteri ...` plot what the command line gives and run
+      // with nothing in memory (vs-stata bank, rc 0, c(N) 0); route_graphics.cpp answers
+      // no_data_loaded itself for every plot type that reads variables.
+      "twoway",
       // Mission 5 (cosmetic no_data_loaded divergence, native-paths
       // investigation): real Stata's `describe`/`desc` with no dataset in
       // memory answers an EMPTY description (0 vars, 0 obs), not an error.
@@ -65,6 +69,11 @@ bool commandNeedsNoData(const std::string& cmd) {
       // its own canonical answers an empty description, i.e. it would be
       // an alias in name only.
       "describe",  "desc",   "d",
+      // `datasignature` of nothing is 0:0(0):0:0 (bank DSIG of every empty cell,
+      // e.g. 832868e6c099d49a after loading a file of zero variables).
+      "datasignature",
+      // bare `notes` over nothing lists nothing, r(0) (bank 832868e6c099d49a)
+      "notes",
       // P1 wave: `import delimited|excel` LOADS a dataset, so it must run with
       // nothing in memory — the same reason `use`/`sysuse` are here. (`export`
       // genuinely needs data and stays on the outer guard.)
@@ -88,7 +97,7 @@ bool commandNeedsNoData(const std::string& cmd) {
       // r()/matrix stores, never the dataset -- `svmat A` on an empty session is
       // how Stata builds a dataset FROM a matrix. `mkmat` is deliberately absent
       // for the mirror reason: it reads variables, so no data is a real error.
-      "return",  "svmat",   "matlist",
+      "return",  "sreturn", "svmat",   "matlist",
       // W2D-T01: `ereturn clear/post/local` act on e(), never the dataset;
       // `ereturn clear` opens the golden do-file's helpers before any data
       // exist (w2d_uncovered.log 211-212). The `list` arm re-checks hasData()
@@ -166,6 +175,12 @@ bool commandNeedsNoData(const std::string& cmd) {
       // T7 L1: `lookfor x` with nothing in memory is rc 0 and silent in StataBE
       // (a bare `lookfor` is still r(198)); the handler owns both answers.
       "lookfor",
+      // vs-stata bank: `numlist` parses its own string argument and `dtaversion`
+      // reads a file's header; neither reads the dataset.
+      "numlist", "dtaversion",
+      // `misstable summarize` with no variable at all is rc 0 (its varlist is
+      // empty); the handler answers that itself.
+      "misstable",
   };
 return kNoDataCommands.count(cmd) != 0;
 }

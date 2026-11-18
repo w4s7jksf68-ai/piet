@@ -54,6 +54,10 @@ namespace cecon {
 
 struct DidImputeConfig {
     std::vector<double> horizons;  // requested post-treatment event times (horizons())
+    // No horizons(): one pooled coefficient `tau`, the average effect over every
+    // treated observation (did_imputation's default), with each treated residual
+    // centred at its (cohort, period) mean. `horizons` is then ignored.
+    bool pooled = false;
     int pretrends = 0;             // number of pre-treatment leads (pretrends())
     bool autosample = false;       // autosample: drop cells whose FEs cannot be imputed
     double level = 95;

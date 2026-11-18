@@ -307,19 +307,30 @@ int cmd_dfuller(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), var = opt(a, "--var"), tvar = opt(a, "--timevar");
     if (data_missing(data) || var.empty() || tvar.empty()) {
         std::fprintf(stderr, "usage: cobra dfuller --data f.hbin --var Y --timevar T [--lags k] "
-                             "[--noconstant|--drift|--trend] [--keepif EXPR] [--out f.json]\n");
+                             "[--noconstant|--drift|--trend] [--keepif EXPR [--panelvar P]] [--out f.json]\n");
         return 2;
     }
     int lags = std::stoi(opt(a, "--lags", "0"));
     int kase = unitroot_case(a, true);
     double delta = std::stod(opt(a, "--delta", "1"));
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    // `if` marks the test's rows on the FULL series; the rows it excludes still
+    // supply lagged values (in_sample, dfuller_fit) -- within the sample's own panel
+    // under xtset data (--panelvar).
+    const std::string keepif = opt(a, "--keepif");
+    std::vector<char> mask;
+    if (!keepif.empty()) data = keepif_own_panels("dfuller", data, keepif, opt(a, "--panelvar"), mask);
     const Dataset& ds = acquire_data(data);
     const double* yr = require_num(ds, "dfuller", var);
     const double* tr = require_num(ds, "dfuller", tvar);
     auto keep = listwise_keep({yr, tr}, ds.n_rows());
     auto y = gather_rows(yr, keep), t = gather_rows(tr, keep);
-    DfullerResult r = dfuller_fit(y, t, static_cast<int64_t>(y.size()), lags, kase, delta);
+    if (!mask.empty() && static_cast<int64_t>(mask.size()) != ds.n_rows())
+        throw EngineError("internal", "dfuller: the if-mask does not match the data's row count");
+    std::vector<char> in_sample;
+    if (!mask.empty())
+        for (const int64_t i : keep) in_sample.push_back(mask[static_cast<size_t>(i)]);
+    DfullerResult r = dfuller_fit(y, t, static_cast<int64_t>(y.size()), lags, kase, delta,
+                                  in_sample.empty() ? nullptr : &in_sample);
     if (!r.ok) {
         if (r.fail == DfullerResult::SINGULAR)
             std::fprintf(stderr, "dfuller: regression is singular (collinear or a degenerate/constant series).\n");
@@ -340,19 +351,30 @@ int cmd_pperron(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), var = opt(a, "--var"), tvar = opt(a, "--timevar");
     if (data_missing(data) || var.empty() || tvar.empty()) {
         std::fprintf(stderr, "usage: cobra pperron --data f.hbin --var Y --timevar T [--lags q] "
-                             "[--noconstant|--trend] [--keepif EXPR] [--out f.json]\n");
+                             "[--noconstant|--trend] [--keepif EXPR [--panelvar P]] [--out f.json]\n");
         return 2;
     }
     int lags = std::stoi(opt(a, "--lags", "-1"));  // -1 => Newey-West default bandwidth
     int kase = unitroot_case(a, false);
     double delta = std::stod(opt(a, "--delta", "1"));
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    // `if` marks the test's rows on the FULL series; the rows it excludes still
+    // supply lagged values (in_sample, pperron_fit) -- within the sample's own panel
+    // under xtset data (--panelvar).
+    const std::string keepif = opt(a, "--keepif");
+    std::vector<char> mask;
+    if (!keepif.empty()) data = keepif_own_panels("pperron", data, keepif, opt(a, "--panelvar"), mask);
     const Dataset& ds = acquire_data(data);
     const double* yr = require_num(ds, "pperron", var);
     const double* tr = require_num(ds, "pperron", tvar);
     auto keep = listwise_keep({yr, tr}, ds.n_rows());
     auto y = gather_rows(yr, keep), t = gather_rows(tr, keep);
-    PperronResult r = pperron_fit(y, t, static_cast<int64_t>(y.size()), lags, kase, delta);
+    if (!mask.empty() && static_cast<int64_t>(mask.size()) != ds.n_rows())
+        throw EngineError("internal", "pperron: the if-mask does not match the data's row count");
+    std::vector<char> in_sample;
+    if (!mask.empty())
+        for (const int64_t i : keep) in_sample.push_back(mask[static_cast<size_t>(i)]);
+    PperronResult r = pperron_fit(y, t, static_cast<int64_t>(y.size()), lags, kase, delta,
+                                  in_sample.empty() ? nullptr : &in_sample);
     if (!r.ok) {
         if (r.fail == PperronResult::SINGULAR)
             std::fprintf(stderr, "pperron: regression is singular (collinear or a degenerate/constant series).\n");
@@ -363,7 +385,8 @@ int cmd_pperron(const std::vector<std::string>& a) {
     const char* cn[] = {"", "noconstant", "constant", "", "trend"};
     json out = {{"test", "pperron"}, {"case", cn[kase]}, {"Zt", r.Ztau}, {"Zrho", r.Zrho},
                 {"newey_west_lags", r.lags}, {"n_obs", r.n},
-                {"cv_1", r.cv1}, {"cv_5", r.cv5}, {"cv_10", r.cv10}, {"p", r.p}};
+                {"cv_1", r.cv1}, {"cv_5", r.cv5}, {"cv_10", r.cv10}, {"p", r.p},
+                {"zrho_cv_1", r.zrho_cv1}, {"zrho_cv_5", r.zrho_cv5}, {"zrho_cv_10", r.zrho_cv10}};
     emit(out, opt(a, "--out"));
     return 0;
 }
@@ -395,17 +418,54 @@ int cmd_tsfill(const std::vector<std::string>& a) {
 int cmd_wntestq(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), var = opt(a, "--var");
     if (data_missing(data) || var.empty()) {
-        std::fprintf(stderr, "usage: cobra wntestq --data f.hbin --var V [--lags P] [--keepif EXPR] [--out f.json]\n"
+        std::fprintf(stderr, "usage: cobra wntestq --data f.hbin --var V [--lags P] [--timevar T [--delta D]]\n"
+                             "                     [--keepif EXPR] [--out f.json]\n"
                              "  Ljung-Box Q white-noise test (rows in time order; interior missings are gaps).\n");
         return 2;
     }
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     const double* raw = require_num(ds, "wntestq", var);
-    const int64_t nrows = ds.n_rows();
+    int64_t nrows = ds.n_rows();
     // Keep the series in time order (do NOT compact) so interior missings act as
     // declared tsset gaps — wntestq() forms lag pairs by time distance and skips
     // any pair touching a gap, matching Stata (a spliced series over-counts lags).
+    // With --timevar the series is laid out on the tsset time grid (step --delta):
+    // a PERIOD with no observation is a gap too (ac.ado's L`i'.x is missing across
+    // it). Without it the rows are taken as consecutive periods.
+    const std::string tvar = opt(a, "--timevar");
+    const double delta = std::stod(opt(a, "--delta", "1"));
+    std::vector<double> grid;
+    if (!tvar.empty()) {
+        const double* t = require_num(ds, "wntestq", tvar);
+        std::vector<std::pair<double, double>> tv;
+        for (int64_t i = 0; i < nrows; ++i)
+            if (!std::isnan(t[i])) tv.emplace_back(t[i], raw[i]);
+        std::sort(tv.begin(), tv.end(),
+                  [](const auto& x, const auto& y) { return x.first < y.first; });
+        if (!tv.empty()) {
+            if (!(delta > 0))
+                throw EngineError("bad_input", "wntestq: --delta must be positive");
+            const double span = (tv.back().first - tv.front().first) / delta;
+            if (!(span < 1e8))
+                throw EngineError("bad_input", "wntestq: the time span is too long");
+            grid.assign(static_cast<std::size_t>(std::llround(span)) + 1,
+                        std::numeric_limits<double>::quiet_NaN());
+            for (const auto& [tt, x] : tv) {
+                const double k = (tt - tv.front().first) / delta;
+                if (std::fabs(k - std::round(k)) > 1e-9)
+                    throw EngineError("bad_input",
+                                      "wntestq: the time variable is not on the tsset delta grid");
+                double& slot = grid[static_cast<std::size_t>(std::llround(k))];
+                if (!std::isnan(slot))
+                    throw EngineError("bad_input", "wntestq: repeated time values in sample",
+                                      "r(451)");
+                slot = x;
+            }
+        }
+        raw = grid.data();
+        nrows = static_cast<int64_t>(grid.size());
+    }
     int64_t nnm = 0;
     for (int64_t i = 0; i < nrows; ++i) if (!std::isnan(raw[i])) ++nnm;
     if (nnm == 0) { std::fprintf(stderr, "wntestq: no rows after dropping missing.\n"); return 1; }

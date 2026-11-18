@@ -58,6 +58,17 @@ using namespace engine_report_detail;
 // `autosample_message` rather than being reconstructed here.
 ojson runDidImputation(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return ojson::array({ojson(eval::noDataLoaded())});
+  // did_imputation.ado: `syntax varlist(min=4 max=4)` -- r(102) / r(103) (vs-stata
+  // bank 5ed9b00e `did_imputation y sid year`).
+  if (parsed.varlist.size() < 4)
+    return ojson::array({ojson(eval::errorBlock("syntax_error", "too few variables specified",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(102)"))});
+  if (parsed.varlist.size() > 4) {
+    return ojson::array({ojson(eval::errorBlock("syntax_error", "too many variables specified",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(103)"))});
+  }
   if (parsed.varlist.size() != 4) {
     return qeErrorBlocks(
         "syntax_error: did_imputation takes four variables positionally — "
@@ -116,6 +127,8 @@ ojson runDidImputation(const eval::ParsedCommand& parsed, SessionState& session)
       }
     }
   }
+  // without horizons() the one coefficient is the pooled `tau` (bank 43d1f644)
+  if (wanted.empty()) wanted.push_back("tau");
   for (int64_t k = 1; k <= inum(r, "pretrends"); ++k) {
     wanted.push_back("pre" + std::to_string(k));
   }

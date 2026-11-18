@@ -31,6 +31,36 @@ namespace piet::handlers {
 // too, so they are unregistered for the same reason and answer a generic
 // r(199), which is what a named refusal would have said anyway.
 
+// `mlabel(varlist)` on any plot: each word must be a variable of `ds`
+// (StataBE 19.5, vs-stata bank: a word that is no name is r(198) "<w> invalid
+// name", a name that is no variable is r(111) "variable <w> not found"). Words
+// with a wildcard or range character are left to the plot. nullopt = fine.
+std::optional<nlohmann::ordered_json> mlabelVarlistRefusal(
+    SessionState& session, Datastore& ds,
+    const std::vector<std::pair<std::string, eval::OptValue>>& opts);
+
+// The options whose value is ONE style word (`msymbol`, `connect`, `pstyle`, `recast`): a
+// comma or a `name(...)` sub-option in the value is r(198) in StataBE 19.5 (vs-stata bank:
+// `scatter price mpg, s(g1sv, replace)` "invalid 'editcopy'", `p(color(white))` "option(s)
+// color(white) not allowed"). nullopt = fine.
+std::optional<nlohmann::ordered_json> graphStyleWordRefusal(
+    const std::vector<std::pair<std::string, eval::OptValue>>& opts);
+
+// A variable name as `set varabbrev on` (Stata's default) reads it: a word that is no variable
+// but the unique prefix of one names that variable (bank: `kdensity pri, nograph`,
+// `twoway scatter pri mpg` on auto run at rc 0). Any other word comes back unchanged.
+std::string unabbreviateGraphVar(SessionState& session, Datastore& ds, const std::string& word);
+
+// True when a twoway plot TYPE does not own the option `key` (horizontal, barwidth,
+// base, range): the option is r(198) "not allowed" on that type.
+bool plotTypeRefusesOption(const std::string& plotType, const std::string& key);
+
+// The full option a one-letter spelling means INSIDE a plot type whose own class syntax reads it
+// before the global graph vocabulary does, or "" when the type has no such reading: `r()` is range()
+// of the fit plots (lfit, qfit, lfitci, qfitci) and `l()` is level() of the two band plots (lfitci,
+// qfitci), where `r` is recast() and `l` is lstyle() everywhere else.
+std::string plotTypeOwnSpelling(const std::string& plotType, const std::string& key);
+
 // `grc1leg2 name1 name2 ..., [legendfrom() rows() cols() title() ...]` --
 // `runGraphCombine` with every panel but one having `legend.off` set, which the
 // frontend already honours.

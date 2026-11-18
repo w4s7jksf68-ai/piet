@@ -181,11 +181,22 @@ void testW2bGlm() {
                 r.text.find("Scale parameter =    .102434") != std::string::npos,
             "w2_glm_lifecycle gam_def log text: the iteration log and the header print Stata's "
             "lines. Got: " + r.text.substr(0, 400));
-    // test/lincom/predict must not refit an OLS behind the glm.
+    // test/lincom/predict must not refit an OLS behind the glm. Since stage-3 lane
+    // s3b_post lincom reads the glm's own posted e(b)/e(V), as Stata's lincom does
+    // (a Wald combination of e(b)/e(V); vs-stata bank 00a38686 / 8c8672d3 for the
+    // same path after nbreg / qreg): `lincom x1` is _b[x1] with the glm's se.
     Reply lc = run(s, "lincom x1");
-    w2check(lc.rc != "0" && lc.msg.find("not supported after `glm`") != std::string::npos,
-            "post-estimation after glm is an honest refusal naming glm, never an OLS refit "
-            "(no oracle arm: the lincom engine has no glm model). Got rc " + lc.rc + " " + lc.msg);
+    {
+      const double* est = s.eval.rValues.find("estimate");
+      const double* se = s.eval.rValues.find("se");
+      const auto eb = s.eval.resolveEMatrixFor("b", piet::eval::EvalSession::EReader::kCopy);
+      const auto eV = s.eval.resolveEMatrixFor("V", piet::eval::EvalSession::EReader::kCopy);
+      w2check(lc.rc == "0" && est != nullptr && se != nullptr && eb.matrix.has_value() && eV.matrix.has_value() &&
+                  close(*est, eb.matrix->data[0][0], 1e-12) &&
+                  close(*se * *se, eV.matrix->data[0][0], 1e-10),
+              "lincom after glm is the glm's own _b[x1] and its e(V) se, never an OLS refit. Got rc " + lc.rc +
+                  " " + lc.msg);
+    }
     // glm POSTS e(V) and its macros; a later model must not read them. Measured
     // on the first build of this lane: `glm` then `regress` then `matrix V =
     // e(V)` returned the glm's V (V[2,1] 9.984e-09) and e(varfunct) was still Gamma.
@@ -364,7 +375,9 @@ void testW2bGlm() {
         {"glm y x1 x2, family(gamma)", "refused:glm_link_reciprocal"},
         {"glm y x1 x2, family(igaussian) link(log)", "refused:glm_family_igaussian"},
         {"glm cnt x1 x2, family(nbinomial ml) link(log)", "refused:glm_family_nbinomial_ml"},
-        {"glm y x1 x2, family(gamma) link(log) vce(robust)", "refused:glm_vce_robust"},
+        // vce(robust) is served since the vs-stata bank pinned it (8aa87f1b: the
+        // per-observation sandwich); opg is a VCE still not implemented.
+        {"glm y x1 x2, family(gamma) link(log) vce(opg)", "refused:glm_vce_opg"},
         {"glm bin x1 x2, family(binomial) link(cloglog)", "refused:glm_link_cloglog"},
     };
     for (const auto& c : cases) {
@@ -434,9 +447,11 @@ void testW2bGlm() {
     w2check(cl.rc == "199" && cl.reason == "refused:glm_collinear_regressors",
             "glm with an exactly collinear regressor refuses by name (refused:glm_collinear_regressors), "
             "never a finite fit from a roundoff-level pivot. Got rc " + cl.rc + " " + cl.reason);
-    Reply o = run(s, "glm y x1 x2, family(gamma) link(log) eform");
-    w2check(o.rc == "198" && o.msg.find("eform") != std::string::npos,
-            "glm option vocabulary: a real glm option this build does not implement (`eform`) is "
+    // `eform` was this arm's example until glm implemented it (the exponentiated
+    // table, vs-stata bank b7486d54); `irls` is a real glm option still refused.
+    Reply o = run(s, "glm y x1 x2, family(gamma) link(log) irls");
+    w2check(o.rc == "198" && o.msg.find("irls") != std::string::npos,
+            "glm option vocabulary: a real glm option this build does not implement (`irls`) is "
             "an r(198) option refusal naming it, not a silent no-op. Got rc " + o.rc + " " + o.msg);
   }
 

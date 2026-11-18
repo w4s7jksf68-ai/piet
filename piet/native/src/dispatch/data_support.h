@@ -32,6 +32,18 @@ std::optional<ojson> replaceNoPromote(
 
 std::string genTargetName(const std::string& exprAfterType);
 
+// generate ..., before(v) | after(v): reads the placement from the options (before() with after()
+// is r(198); a variable that is not in the data is r(111)). On success `word` / `var` hold the
+// placement ("" when none was asked for) and the result is empty.
+std::optional<ojson> generatePlacementRequest(
+    SessionState& session, const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+    std::string& word, std::string& var);
+
+// Moves the variable a generate just made next to `var` (what `order name, word(var)` does) and
+// appends order's own non-echo blocks to `blocks`.
+void placeGeneratedVariable(SessionState& session, const std::string& name,
+                            const std::string& word, const std::string& var, ojson& blocks);
+
 std::string strippedTypeWord(const std::string& raw, const StorageTypeInfo& info);
 
 std::optional<ojson> conditionAsNameError(const std::optional<std::string>& ifExpr);

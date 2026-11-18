@@ -240,6 +240,10 @@ struct ProgramDef {
   bool rclass = false;
   std::vector<std::string> body;
   std::string ado;
+  // True once its `program define` block was reached at its own source position
+  // (doexec's install sentinel), as opposed to the preprocess-time registration.
+  // Reaching another definition of the name while this one stands is r(110).
+  bool installed = false;
 };
 
 // Per-variable editor metadata (session._var_meta[name]): label / format /
@@ -282,6 +286,9 @@ struct PreserveFrame {
   std::map<std::string, std::map<int, std::string>> valueLabels;
   std::string dataLabel;                          // dataset label (Stata `label data`)
   std::vector<DtaCharacteristic> characteristics;  // Stata `char` table
+  // c(changed) at `preserve`: `restore` puts it back (vs-stata bank: sort,
+  // preserve, sort, restore -> describe r(changed) 0).
+  bool changed = false;
   // BUG-922: the preserve level (SessionState::preserveLevel) that ran
   // `preserve`. A frame belongs to that level for its whole life:
   //   I1 only pushPreserveSnapshot writes this field, with the level of the

@@ -54,6 +54,7 @@ const char* sdid_diagnostic_name(SdidDiagnostic d) {
         case SdidDiagnostic::PlaceboInsufficientControls: return "placebo_insufficient_controls";
         case SdidDiagnostic::UnsupportedVce: return "unsupported_vce";
         case SdidDiagnostic::BadPanel: return "bad_panel";
+        case SdidDiagnostic::NonBinaryTreatment: return "nonbinary_treatment";
     }
     return "none";
 }
@@ -295,8 +296,9 @@ SdidResult sdid_run(const double* y, const double* ivar, const double* time,
     R.Y.assign(static_cast<size_t>(R.nu) * R.nt, std::nan(""));
     std::vector<int> first_treated(R.nu, -1), last_untreated(R.nu, -1);
     std::vector<char> seen(static_cast<size_t>(R.nu) * R.nt, 0);
-    int64_t dup_cells = 0;
+    int64_t dup_cells = 0, nonbinary = 0;
     for (int64_t k = 0; k < n_obs; ++k) {
+        if (!std::isnan(treated[k]) && treated[k] != 0.0 && treated[k] != 1.0) ++nonbinary;
         int u = static_cast<int>(std::lower_bound(R.units.begin(), R.units.end(), ivar[k]) -
                                  R.units.begin());
         int t = static_cast<int>(std::lower_bound(R.times.begin(), R.times.end(), time[k]) -
@@ -317,6 +319,12 @@ SdidResult sdid_run(const double* y, const double* ivar, const double* time,
                     "sdid: " + std::to_string(dup_cells) +
                         " duplicate (unit, period) observation(s) — sdid needs one row per "
                         "unit-period cell");
+
+    // the treatment is an indicator: any other value is refused before the adoption
+    // pattern is read (Stata r(450), vs-stata bank 03ecd58c `sdid y sid year beertax`)
+    if (nonbinary > 0)
+        return fail(SdidDiagnostic::NonBinaryTreatment,
+                    "Treatment variable takes values distinct from 0 and 1.");
 
     R.adopt = first_treated;
     int n_tr_units = 0, n_co_units = 0;

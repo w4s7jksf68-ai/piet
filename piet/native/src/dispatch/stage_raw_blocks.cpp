@@ -5,7 +5,57 @@
 #include "options.h"
 #include "handler_declarations.h"
 #include "piet/handlers/io.h"
+#include "piet/eval/tokenizer.h"
 namespace piet::dispatch_detail {
+namespace {
+// True when `line` opens a brace block that it does not close and the open
+// brace has code after it on the same line (a `//` or `/* */` comment is no
+// code). Braces inside "..." or `"..."' are text.
+bool openBraceLeftOpenWithCode(const std::string& line) {
+  int depth = 0, compound = 0;
+  bool simple = false;
+  size_t firstOpen = std::string::npos;
+  for (size_t i = 0; i < line.size(); ++i) {
+    const char c = line[i];
+    if (compound > 0) {
+      if (c == '"' && i + 1 < line.size() && line[i + 1] == '\'') {
+        --compound;
+        ++i;
+      } else if (c == '`' && i + 1 < line.size() && line[i + 1] == '"') {
+        ++compound;
+        ++i;
+      }
+      continue;
+    }
+    if (simple) {
+      if (c == '"') simple = false;
+      continue;
+    }
+    if (c == '`' && i + 1 < line.size() && line[i + 1] == '"') {
+      ++compound;
+      ++i;
+    } else if (c == '"') {
+      simple = true;
+    } else if (c == '{') {
+      if (depth == 0 && firstOpen == std::string::npos) firstOpen = i;
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+    }
+  }
+  if (depth <= 0 || firstOpen == std::string::npos) return false;
+  std::string rest = trimWs(line.substr(firstOpen + 1));
+  for (;;) {
+    if (rest.compare(0, 2, "//") == 0) return false;
+    if (rest.compare(0, 2, "/*") != 0) break;
+    const size_t end = rest.find("*/");
+    if (end == std::string::npos) return false;
+    rest = trimWs(rest.substr(end + 2));
+  }
+  return !rest.empty();
+}
+}  // namespace
+
 bool interceptControlBlocks(SessionState& session,
     ojson& echo,
     ojson& blocks,
@@ -22,6 +72,20 @@ bool interceptControlBlocks(SessionState& session,
   {
     dprof::Scope __z(dprof::kLoopIf);
     std::string strippedForLoop = trimWs(rawCmd);
+    if (loops::opensBraceBlock(strippedForLoop) && openBraceLeftOpenWithCode(strippedForLoop)) {
+      // `forvalues i = 1/2 { display "x"` with the block's `}` on a later line:
+      // StataBE stops at r(198) "program error:  code follows on the same line
+      // as open brace" (vs-stata truth bank, L2 e_forvalues_text_after_brace).
+      // The do-file reader cannot fold such a block, so the line arrived here
+      // alone, and handing it back to executeDoSource re-dispatched the same
+      // line without end: a stack overflow that killed the process.
+      ojson out = ojson::array();
+      out.push_back(echo);
+      out.push_back(ojson(eval::errorBlock(
+          "syntax_error", "program error:  code follows on the same line as open brace",
+          std::string("{"), std::nullopt, strutil::trim(rawCmd), "r(198)")));
+      { blocks = out; return true; }
+    }
     if (loops::opensBraceBlock(strippedForLoop)) {
       doexec::ExecuteResult result = doexec::executeDoSource(strippedForLoop, session, dispatch);
       ojson out = ojson::array();
@@ -142,6 +206,20 @@ bool interceptInputBlock(SessionState& session,
     }
   }
   return false;
+}
+
+
+// `#delimit ;` / `#delimit cr`: the do-file reader (eval::preprocessDo) has
+// already read the lines after it by the new delimiter; the line itself says
+// so, as Stata does ("delimiter now ;", "delimiter now cr").
+bool interceptDelimit(ojson& echo, ojson& blocks, const std::string& rawCmd) {
+  const std::optional<bool> semi = eval::delimitDirective(rawCmd);
+  if (!semi.has_value()) return false;
+  ojson note;
+  note["type"] = "display";
+  note["text"] = *semi ? "delimiter now ;" : "delimiter now cr";
+  blocks = ojson::array({echo, note});
+  return true;
 }
 
 

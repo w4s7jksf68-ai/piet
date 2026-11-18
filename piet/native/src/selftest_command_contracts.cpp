@@ -807,7 +807,9 @@ void testAerAbbrevBundle() {
         {"winsor x, gen(xw)", "neither p() nor h(): winsor.ado has no default tail"},
         {"winsor x, gen(xw) p(.1) h(3)", "p() and h() name two different tails at once"},
         {"winsor x, gen(xw) p(.6)", "p() outside 0 < p < 0.5 crosses the two tails"},
-        {"winsor x, gen(xw) p(.1) highonly lowonly", "both -only flags together clamp nothing"},
+        // (`highonly lowonly` together is not refused: winsor.ado runs it and leaves a copy of the
+        // variable, vs-stata bank 6de2d592b3a9cc46 `winsor price, gen(pw) p(0.1) highonly
+        // lowonly` rc 0 -- asserted below.)
         {"winsor x, p(.1)", "no gen(): there is no replace mode, so the name is required"},
         {"winsor x, gen(xw) p(.1) cuts(1 99)", "cuts() is winsor2's option, not winsor's"},
     };
@@ -824,6 +826,19 @@ void testAerAbbrevBundle() {
       check(!wrote, "WINSOR REFUSE: ...and `" + rf.first +
                         "` wrote NOTHING -- no data_mutation block came back with the refusal");
     }
+  }
+
+  {
+    // The two -only flags together clamp nothing, and Stata runs it (bank 6de2d592b3a9cc46):
+    // the new variable is a copy.
+    piet::SessionState session(workdir);
+    (void)piet::doexec::executeDoSource("clear\nset obs 100\ngen double x = _n\n", session,
+                                        piet::dispatch);
+    auto r = piet::doexec::executeDoSource("winsor x, gen(xw) p(.1) highonly lowonly\n", session,
+                                           piet::dispatch);
+    check(firstOfType(r.blocks, "error").empty(),
+          "WINSOR highonly+lowonly: Stata runs it (bank 6de2d592b3a9cc46) -- it must not be "
+          "refused");
   }
 
   fs::remove_all(workdir, ec);
@@ -1438,16 +1453,16 @@ void testBS096QualifierPolicyTable() {
   // BS-090 (BETA campaign, Phase G): this leg used to name `summarize` —
   // summarize's allowInRange is now TRUE (see testBS090InRangeExpansion
   // below for its own dedicated positive coverage), so this leg was
-  // repointed at `tabstat`, deliberately left OUT of BS-090's flip list
+  // repointed at `tabstat` and, once tabstat took `in` (bank bb041b080), at `tobit`, deliberately left OUT of BS-090's flip list
   // (tabstat/tobit share applyIfFilterM4 with corr/ttest but their call
   // sites still pass no inRange argument — registry.cpp's own comment).
   try {
-    tokenize("tabstat wage in 1/5");
-    check(false, "A3/D7 in: tabstat+in must still throw (freeze-preservation; BS-090 left it "
+    tokenize("tobit wage in 1/5");
+    check(false, "A3/D7 in: tobit+in must still throw (freeze-preservation; BS-090 left it "
                  "out of scope)");
   } catch (const TokenizerError& e) {
     std::string msg = e.block.at("message").get<std::string>();
-    check(msg.find("tabstat") != std::string::npos,
+    check(msg.find("tobit") != std::string::npos,
           "A3/D7 in: reject message NAMES the command (was command-blind pre-A3) — got: " + msg);
   }
   // BS-090: egen's allowInRange is now TRUE (flipped this phase — real
@@ -2571,11 +2586,14 @@ void testBUG105AbbrevArc() {
               fitOf("poisson fatal beertax, off(pop)") == offFull,
           "BUG-231: `offs(pop)`/`off(pop)` give offset()'s fit, not the silently-dropped one");
     const std::string expFull = fitOf("poisson fatal beertax, exposure(pop)");
-    check(expFull.find("ERR:") != std::string::npos,
-          "BUG-231 premise: poisson's exposure() is an honest unimplemented reject");
+    // exposure(pop) is the offset ln(pop) (vs-stata bank e62ba9a9 `poisson fatal
+    // beertax unemp, exposure(pop)` rc 0, e(offset) "ln(pop)").
+    check(!expFull.empty() && expFull.find("ERR:") == std::string::npos && expFull != noOpt &&
+              expFull != offFull,
+          "BUG-231 premise: poisson's exposure() fits with the offset ln(exposure)");
     check(fitOf("poisson fatal beertax, expo(pop)") == expFull &&
               fitOf("poisson fatal beertax, exp(pop)") == expFull,
-          "BUG-231: `expo`/`exp` reach the SAME honest reject, instead of running without it");
+          "BUG-231: `expo`/`exp` give exposure()'s fit, instead of running without it");
 
     // The nine measured minimums (audit §2), each with its intermediate prefixes.
     static const std::vector<std::pair<std::string, std::vector<std::string>>> kMinimums = {
@@ -2803,9 +2821,9 @@ void testBUG105AbbrevArc() {
     check(fitOf("scatter fatal beertax, scheme(s2color)").find("ERR:") == std::string::npos,
           "W4: a cosmetic graph option is ACCEPTED (was r(198) under BUG-336's reject-only rule)");
     // serset-twoway VOC: aspectratio is drawn at rc 0 by Stata (w2al tf_wt_077a,
-    // log:937), so the unimplemented direction is pinned on by(), which the
-    // single-plot arm still does not facet.
-    check(fitOf("scatter fatal beertax, by(state)").find("ERR:unsupported_option") !=
+    // log:937); by() is drawn now too (one panel per group, vs-stata bank), so the unimplemented direction is
+    // pinned on kdensity's addplot() (rc 0 in StataBE, cell 2e8b1d0d89deb5c6, refused by name here).
+    check(fitOf("kdensity beertax, addplot(scatter beertax beertax)").find("ERR:unsupported_option") !=
               std::string::npos,
           "W4: a real Stata graph option PIET does not implement still says so "
           "(unimplemented), rather than being silently dropped");
@@ -2877,8 +2895,11 @@ void testBUG105AbbrevArc() {
           "BUG-333: `summarize, separator(#)` runs");
     check(fitOf("summarize beertax, separator(x)").find("ERR:") != std::string::npos,
           "BUG-333: separator(x) is refused — Stata answers r(198) to a non-numeric argument");
-    check(fitOf("test income, notest").find("ERR:unsupported_option") != std::string::npos,
-          "BUG-333: `test, notest` is an HONEST unimplemented-reject, not a silent drop");
+    // `notest` is served since stage-3 lane s3b_post: the constraints are formed
+    // and listed, nothing is tested (vs-stata bank 37fd4049 `test mpg, notest`,
+    // rc 0, no r()); the block says so and the renderer draws the list alone.
+    check(postestSig("test beertax, notest").find("ERR:") == std::string::npos,
+          "BUG-333: `test, notest` runs as Stata's (constraints listed, nothing tested)");
   }
 
   // A typo must still be a named reject — the sweep is one-sided by
@@ -3026,7 +3047,9 @@ void testBUG233OptNetVocabularySweep() {
     check(sigOf(*setup, line, "").find("ERR|") != std::string::npos,
           "BUG-233: the typo `" + line + "` is still a named reject");
   }
-  check(sigOf(kFatal, "poisson fatal beertax, expo(pop)", "").find("valid Stata option") !=
+  // `expo(pop)` was this leg's example until poisson implemented exposure() (the
+  // offset ln(exposure), vs-stata bank 3337a40b); `nocons` is noconstant's.
+  check(sigOf(kFatal, "poisson fatal beertax, nocons", "").find("valid Stata option") !=
             std::string::npos,
         "BUG-233: an abbreviated unimplemented-but-real option keeps the honest message");
 

@@ -9,7 +9,7 @@ points are declared in `piet/handlers/descriptive.h`, except `runCentile`
 
 | Command or symptom | Owner |
 |---|---|
-| `describe` table (type, format, label, distinct count per variable) | `describe.cpp` |
+| `describe` table (type, format, label, distinct count per variable); `describe ... using FILE`; describe's stored results (`postDescribeResults`, also left by filelist and reshape) | `describe.cpp` |
 | `summarize`, `summarize, detail`, `[aw]`/`[fw]`/`[iw]` weights, `if`/`in` restriction | `summarize.cpp` |
 | `tabstat`, `correlate`/`pwcorr` (`runCorr`), `ttest` | `descriptive_statistics.cpp` |
 | `count [if] [in]` and its native `if` evaluator (also used by `assert`), `list` | `data_listing.cpp` |

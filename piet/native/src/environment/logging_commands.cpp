@@ -80,6 +80,16 @@ ojson runLog(const std::string& raw, SessionState& session) {
   std::string afterLower = lower(after);
   size_t subEnd = afterLower.find_first_of(" \t");
   std::string sub = lower(subEnd == std::string::npos ? after : after.substr(0, subEnd));
+  // The subcommands' documented shortest spellings: c:lose and of:f (`log c`,
+  // `log clo _all`, `log of`); using, on and query are typed in full.
+  {
+    auto spells = [&sub](const char* full, size_t shortest) {
+      const std::string f(full);
+      return sub.size() >= shortest && sub.size() <= f.size() && f.compare(0, sub.size(), sub) == 0;
+    };
+    if (spells("close", 1)) sub = "close";
+    else if (spells("off", 2)) sub = "off";
+  }
 
   if (sub == "using") {
     static const std::regex reUsing(R"re(\busing\s+("([^"]+)"|'([^']+)'|(\S+)))re",
@@ -260,7 +270,22 @@ ojson runLog(const std::string& raw, SessionState& session) {
     return ojson::array();  // Stata: silent when log resumes
   }
 
-  // Unknown subcommand -- silent noop (unchanged from BUG-028's original shim).
+  // `log query [name|_all]` reports; a name that is no open log is r(111) "log
+  // NAME not found" (vs-stata bank `log query Lbzzz`). Any other word is no
+  // subcommand of log: r(198) "WORD invalid" (`log zzzsub`).
+  if (sub == "query") {
+    if (!targetAll && !target.empty()) {
+      bool open = false;
+      for (const auto& n : session.logNames()) open = open || n == target;
+      if (!open)
+        return ojson(eval::errorBlock("engine_error", "log " + target + " not found",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(111)"));
+    }
+    return ojson::array();
+  }
+  if (!sub.empty() && sub[0] != ',')
+    return ojson(eval::errorBlock("syntax_error", sub + " invalid", std::nullopt, std::nullopt,
+                                  std::nullopt, "r(198)"));
   return ojson::array();
 }
 

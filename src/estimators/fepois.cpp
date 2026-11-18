@@ -5,23 +5,217 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
+#include "core/collinear.h"
 #include "core/linalg.h"
+#include "estimators/logit.h"  // MlObjective, ml_newton_path: Stata's ml
 #include "hdfe/demean.h"
 
 namespace cecon {
 
+namespace {
+
+// The Poisson log likelihood Sum w_i (y_i eta_i - exp(eta_i) - ln y_i!), eta = X b
+// + offset, with its gradient X'(w (y - mu)) and A = -H = X' diag(w mu) X.
+class PoissonObjective final : public MlObjective {
+public:
+    PoissonObjective(const double* X, int64_t n, int k, const double* y, const double* w,
+                     const double* off)
+        : X_(X), n_(n), k_(k), y_(y), w_(w), off_(off), eta_(static_cast<size_t>(n)),
+          lgy_(static_cast<size_t>(n)), scaled_(static_cast<size_t>(n) * static_cast<size_t>(k)),
+          resid_(static_cast<size_t>(n)) {
+        for (int64_t i = 0; i < n; ++i) lgy_[static_cast<size_t>(i)] = std::lgamma(y[i] + 1.0);
+    }
+    void index(const std::vector<double>& b) {
+        la::mat_vec(X_, n_, k_, b.data(), eta_.data());
+        if (off_)
+            for (int64_t i = 0; i < n_; ++i) eta_[static_cast<size_t>(i)] += off_[i];
+    }
+    double loglik(const std::vector<double>& b) override {
+        index(b);
+        double s = 0.0, c = 0.0;  // Kahan
+        for (int64_t i = 0; i < n_; ++i) {
+            const size_t ii = static_cast<size_t>(i);
+            const double t = (w_ ? w_[i] : 1.0) * (y_[i] * eta_[ii] - std::exp(eta_[ii]) - lgy_[ii]);
+            const double yk = t - c, tt = s + yk;
+            c = (tt - s) - yk;
+            s = tt;
+        }
+        return s;
+    }
+    double evaluate(const std::vector<double>& b, std::vector<double>& g, std::vector<double>& A) override {
+        const double ll = loglik(b);
+        for (int64_t i = 0; i < n_; ++i) {
+            const size_t ii = static_cast<size_t>(i);
+            const double wi = w_ ? w_[i] : 1.0, mu = std::exp(eta_[ii]);
+            resid_[ii] = wi * (y_[i] - mu);
+            const double root = std::sqrt(std::max(0.0, wi * mu));
+            for (int c2 = 0; c2 < k_; ++c2)
+                scaled_[static_cast<size_t>(c2) * static_cast<size_t>(n_) + ii] =
+                    X_[static_cast<size_t>(c2) * static_cast<size_t>(n_) + ii] * root;
+        }
+        g.assign(static_cast<size_t>(k_), 0.0);
+        A.assign(static_cast<size_t>(k_) * static_cast<size_t>(k_), 0.0);
+        la::xtv(X_, n_, k_, resid_.data(), g.data());
+        la::xtx(scaled_.data(), n_, k_, A.data());
+        return ll;
+    }
+
+private:
+    const double* X_;
+    int64_t n_;
+    int k_;
+    const double *y_, *w_, *off_;
+    std::vector<double> eta_, lgy_, scaled_, resid_;
+};
+
+// Weighted least squares of v on X (row weights a >= 0): false when X'AX does not invert.
+bool wls(const double* X, int64_t n, int k, const double* v, const std::vector<double>& a,
+         std::vector<double>& b) {
+    std::vector<double> Xs(static_cast<size_t>(n) * static_cast<size_t>(k)), vs(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        const double r = std::sqrt(std::max(0.0, a[static_cast<size_t>(i)]));
+        vs[static_cast<size_t>(i)] = v[i] * r;
+        for (int c = 0; c < k; ++c)
+            Xs[static_cast<size_t>(c) * static_cast<size_t>(n) + static_cast<size_t>(i)] =
+                X[static_cast<size_t>(c) * static_cast<size_t>(n) + static_cast<size_t>(i)] * r;
+    }
+    std::vector<double> XtX(static_cast<size_t>(k) * static_cast<size_t>(k)), Xtv(static_cast<size_t>(k));
+    la::xtx(Xs.data(), n, k, XtX.data());
+    if (la::spd_inverse(XtX.data(), k) != 0) return false;
+    la::xtv(Xs.data(), n, k, vs.data(), Xtv.data());
+    b.assign(static_cast<size_t>(k), 0.0);
+    la::matvec(XtX.data(), k, Xtv.data(), b.data());
+    for (double x : b)
+        if (!std::isfinite(x)) return false;
+    return true;
+}
+
+// Stata `poisson`'s starting values: b1 = OLS(y - offset*ybar on X)/ybar (weighted
+// as the fit is); with a constant, c shifts the index so the weighted mean of
+// exp(index) is ybar; then one IRLS step from b1 (+c) gives b2. The one of b1,
+// b1 with c, and b2 with the highest log likelihood starts ml. Empty when none
+// is usable (ml would then search).
+std::vector<double> stata_poisson_start(const double* X, int64_t n, int k, const double* y,
+                                        const double* w, const double* off, int cons) {
+    double sw = 0.0, swy = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        const double wi = w ? w[i] : 1.0;
+        sw += wi;
+        swy += wi * y[i];
+    }
+    if (!(sw > 0.0) || !(swy > 0.0)) return {};
+    const double mean = swy / sw;
+    std::vector<double> a(static_cast<size_t>(n)), v(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        a[static_cast<size_t>(i)] = w ? w[i] : 1.0;
+        v[static_cast<size_t>(i)] = y[i] - (off ? off[i] * mean : 0.0);
+    }
+    std::vector<double> b1;
+    if (!wls(X, n, k, v.data(), a, b1)) return {};
+    for (double& x : b1) x /= mean;
+    PoissonObjective obj(X, n, k, y, w, off);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const auto finiteOr = [nan](double x) { return std::isfinite(x) ? x : nan; };
+    const double lnf1 = finiteOr(obj.loglik(b1));
+    std::vector<double> xb(static_cast<size_t>(n));
+    la::mat_vec(X, n, k, b1.data(), xb.data());
+    double c = nan, lnf1c = nan;
+    if (cons >= 0) {
+        // ln(ybar) - ln(weighted mean of exp(xb + offset)), shifted against overflow
+        double hi = -HUGE_VAL;
+        for (int64_t i = 0; i < n; ++i) hi = std::max(hi, xb[static_cast<size_t>(i)] + (off ? off[i] : 0.0));
+        double se = 0.0;
+        for (int64_t i = 0; i < n; ++i)
+            se += (w ? w[i] : 1.0) * std::exp(xb[static_cast<size_t>(i)] + (off ? off[i] : 0.0) - hi);
+        c = std::log(mean) - (std::log(se / sw) + hi);
+        if (std::isfinite(c)) {
+            std::vector<double> b1c = b1;
+            b1c[static_cast<size_t>(cons)] += c;
+            lnf1c = finiteOr(obj.loglik(b1c));
+        } else {
+            c = nan;
+        }
+    }
+    // one IRLS step: z = y exp(-(xb + off + c)) - 1 + xb + c on X, weights w exp(xb + off + c)
+    const double cc = std::isfinite(c) ? c : 0.0;
+    double lnf2 = nan;
+    std::vector<double> b2;
+    {
+        std::vector<double> z(static_cast<size_t>(n)), a2(static_cast<size_t>(n));
+        bool ok = true;
+        for (int64_t i = 0; i < n && ok; ++i) {
+            const size_t ii = static_cast<size_t>(i);
+            const double e = xb[ii] + (off ? off[i] : 0.0) + cc;
+            z[ii] = y[i] * std::exp(-e) - 1.0 + xb[ii] + cc;
+            a2[ii] = (w ? w[i] : 1.0) * std::exp(e);
+            ok = std::isfinite(z[ii]) && std::isfinite(a2[ii]);
+        }
+        if (ok && wls(X, n, k, z.data(), a2, b2)) lnf2 = finiteOr(obj.loglik(b2));
+    }
+    const auto gt = [](double x, double y2) { return std::isnan(y2) || x > y2; };
+    if (!std::isnan(lnf2) && gt(lnf2, lnf1) && gt(lnf2, lnf1c)) return b2;
+    if (!std::isnan(lnf1) && gt(lnf1, lnf1c) && gt(lnf1, lnf2)) return b1;
+    if (std::isnan(lnf1) && std::isnan(lnf1c) && std::isnan(lnf2)) return {};
+    if (cons >= 0 && std::isfinite(c)) b1[static_cast<size_t>(cons)] += c;
+    return b1;
+}
+
+}  // namespace
+
+bool stata_poisson_ml(const double* X, int64_t n, int k, const double* y, const double* w,
+                      const double* off, int cons, int maxiter, std::vector<double>& b,
+                      double& ll) {
+    std::vector<double> start = stata_poisson_start(X, n, k, y, w, off, cons);
+    if (start.empty()) return false;
+    PoissonObjective obj(X, n, k, y, w, off);
+    MlMaxOptions mo;
+    mo.maxiter = maxiter;
+    MlPath path = ml_newton_path(obj, std::move(start), mo);
+    if (path.failed || !std::isfinite(path.ll)) return false;
+    for (double x : path.b)
+        if (!std::isfinite(x)) return false;
+    b = std::move(path.b);
+    ll = path.ll;
+    return true;
+}
+
 // IRLS for Poisson with HDFE absorption. Each step: weighted within-demean of the
 // working response z and X by w=mu, then a weighted OLS. (For canonical Poisson,
 // IRLS == Newton-Raphson, so this is the shared MLE step the spec calls for.)
+
 FepoisResult fepois_fit(ModelData& md, Vcov vt, int cluster_index,
                         std::vector<double>* fe_sum_out) {
     DesignMatrix& dm = md.dm;
     const int64_t n = dm.n;
-    const int k = dm.k;
     require_sample(n);
+    // Collinear regressors are dropped before the IRLS: Stata's `poisson` runs
+    // _rmcoll over the regressors (the later member of a collinear set goes:
+    // bank cf47e05a `poisson rep78 mpg weight w2` with w2 = weight omits w2), and
+    // ppmlhdfe drops the ones the absorbed effects span (bank d431bcc8 `ppmlhdfe
+    // fatal beertax unemp ti, absorb(sid)` with ti constant within sid: o.ti). The
+    // check runs on the design net of the absorbed effects. Without it a singular
+    // X'WX ended the IRLS on its first pass and every coefficient came back 0.
+    std::vector<std::string> full_names = dm.xnames;
+    std::vector<std::string> omitted;
+    if (dm.k > 0) {
+        std::vector<double> Xc(dm.X.begin(), dm.X.end());
+        if (!md.fe.empty()) demean(Xc.data(), n, dm.k, md.fe, nullptr);
+        std::vector<char> keep = collinear_keep_mask(Xc.data(), n, dm.k, 1e-7);
+        for (int j = 0; j < dm.k; ++j)
+            if (dm.xnames[static_cast<size_t>(j)] == "(intercept)") keep[static_cast<size_t>(j)] = 1;
+        int nkeep = 0;
+        for (char c : keep) nkeep += c;
+        if (nkeep < dm.k) {
+            int kk = dm.k;
+            omitted = compact_columns(dm.X, n, kk, dm.xnames, keep);
+            dm.k = kk;
+        }
+    }
+    const int k = dm.k;
     if (n <= k) throw EngineError("no_obs", "not enough observations");
     const double* off = md.offset.empty() ? nullptr : md.offset.data();
     // P5 pweight: raw (UN-normalized) per-row weight, nullptr = unweighted (every
@@ -36,6 +230,8 @@ FepoisResult fepois_fit(ModelData& md, Vcov vt, int cluster_index,
     r.n = n;
     r.k = k;
     r.names = dm.xnames;
+    r.omitted = std::move(omitted);
+    r.full_names = std::move(full_names);
     r.n_dropped = dm.n_dropped;
     r.has_offset = (off != nullptr);
 
@@ -128,6 +324,46 @@ FepoisResult fepois_fit(ModelData& md, Vcov vt, int cluster_index,
     }
     r.irls_iters = iter;
     r.converged = r.converged && !r.separation;
+    // Stata `poisson` (ModelData::stata_ml): ml's modified Newton-Raphson from
+    // poisson's own starting values, stopping where ml's documented rule stops
+    // (StataBE 19.5 bank dc8fcc88 `poisson fatal beertax unemp`: iterations 0 and 1,
+    // e(ic) 1). The IRLS answer above stands when the ml path cannot run.
+    if (md.stata_ml && md.fe.empty() && k > 0 && !r.separation) {
+        int cons = -1;
+        for (int j = 0; j < k; ++j)
+            if (dm.xnames[static_cast<size_t>(j)] == "(intercept)") cons = j;
+        std::vector<double> start = stata_poisson_start(dm.X.data(), n, k, dm.y.data(), pw, off, cons);
+        if (!start.empty()) {
+            PoissonObjective obj(dm.X.data(), n, k, dm.y.data(), pw, off);
+            MlMaxOptions mo;
+            mo.maxiter = md.ml_maxiter;  // iterate(#) (bank 2ca6271a `poisson ..., iterate(0)`)
+            MlPath path = ml_newton_path(obj, std::move(start), mo);
+            bool finite = !path.failed && std::isfinite(path.ll);
+            for (double x : path.b) finite = finite && std::isfinite(x);
+            if (finite) {
+                beta = path.b;
+                std::vector<double> xbm(static_cast<size_t>(n));
+                la::mat_vec(dm.X.data(), n, k, beta.data(), xbm.data());
+                double devm = 0;
+                for (int64_t i = 0; i < n; ++i) {
+                    eta[i] = xbm[static_cast<size_t>(i)] + (off ? off[i] : 0.0);
+                    double m = std::exp(eta[i]);
+                    if (m < 1e-10) m = 1e-10;
+                    if (m > 1e15) m = 1e15;
+                    mu[i] = m;
+                    const double yi = dm.y[i];
+                    const double di = 2.0 * ((yi > 0 ? yi * std::log(yi / m) : 0.0) - (yi - m));
+                    devm += pw ? pw[i] * di : di;
+                }
+                dev_old = devm;
+                r.converged = path.converged;
+                r.ml_ran = true;
+                r.ic = path.ic;
+                r.ilog = path.ilog;
+                r.gradient = path.gradient;
+            }
+        }
+    }
     r.deviance = dev_old;
     r.demean_iters = dem_iters;
     r.demean_converged = dem_conv;
@@ -262,6 +498,7 @@ FepoisResult fepois_fit(ModelData& md, Vcov vt, int cluster_index,
                 vc.V[static_cast<size_t>(row) + static_cast<size_t>(c) * k] =
                     r.full_vcov_matrix[static_cast<size_t>(row) + static_cast<size_t>(c) * ka];
     } else if (k > 0) {
+        if (vt != Vcov::IID) r.vcov_model = bread;  // e(V_modelbased)
         vc = compute_vcov(vt, Xd, n, k, eP.data(), bread.data(), k_full_vc, 1.0, md.fe,
                           md.cluster, cluster_index, fw ? n_fw : -1.0, ml_cluster);
     } else {
@@ -296,7 +533,7 @@ FepoisResult fepois_fit(ModelData& md, Vcov vt, int cluster_index,
     // cross-check (pinned to ~1e-6 relative by tests/unit/test_fepois_ll.cpp) instead
     // of a tautology. lgamma(y+1) supplies ln(y!) for the non-integer-safe general case.
     {
-        double ll = 0, lg_sum = 0, sy = 0, s_expoff = 0;
+        double ll = 0, lg_sum = 0, sy = 0, s_expoff = 0, sw = 0;
         for (int64_t i = 0; i < n; ++i) {
             const double yi = dm.y[i];
             const double wgt = pw ? pw[i] : 1.0;
@@ -304,6 +541,7 @@ FepoisResult fepois_fit(ModelData& md, Vcov vt, int cluster_index,
             ll += wgt * (yi * std::log(mu[i]) - mu[i] - lgy);
             lg_sum += wgt * lgy;
             sy += wgt * yi;
+            sw += wgt;
             s_expoff += wgt * (off ? std::exp(off[i]) : 1.0);
         }
         r.ll = ll;
@@ -323,6 +561,12 @@ FepoisResult fepois_fit(ModelData& md, Vcov vt, int cluster_index,
             }
             ll0 -= lg_sum;
             r.ll_0 = ll0;
+            r.ll_0_nooffset = ll0;
+            if (off && sw > 0) {
+                // e^α = Σw·y / Σw, the weighted mean: Σ w(y·α − e^α) − Σ w·ln y!.
+                const double a0 = std::log(sy / sw);
+                r.ll_0_nooffset = sy * a0 - sw * std::exp(a0) - lg_sum;
+            }
             r.r2_p = (ll0 != 0.0) ? 1.0 - ll / ll0 : 0.0;
         } else {
             r.ll_valid = false;

@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "io/win_compat.h"  // cecon::to_native_path / native_unlink
+#include "data/missing.h"     // cecon::missing_kind: cellKey keeps . and .a apart
 #include "piet/cobra_runner.h"
 #include "piet/datastore.h"
 #include "piet/dispatcher.h"  // marksample / tsspell cond(): a dispatched `generate`
@@ -467,7 +468,11 @@ bool cellMissing(const ColView& v, int64_t i) {
 // is bit-normalized first, because ±0.0 are the same Stata value and must not
 // key apart (IDIOMS: "±0.0 normalize before hashing/keying").
 uint64_t cellKey(const ColView& v, int64_t i) {
-  if (cellMissing(v, i)) return 0xFFFFFFFFFFFFFFFFull;
+  // Each missing kind is its own value (`.` and `.a` are distinct to Stata's
+  // sort-based counting); a missing string is one value.
+  if (cellMissing(v, i))
+    return v.isFactor ? 0xFFFFFFFFFFFFFFFFull
+                      : 0xFFFFFFFFFFFFFF00ull + static_cast<uint64_t>(cecon::missing_kind(v.d[i]));
   if (v.isFactor) return static_cast<uint64_t>(v.codes[i]);
   double x = v.d[i];
   if (x == 0.0) x = 0.0;  // -0.0 -> +0.0
@@ -535,9 +540,41 @@ std::optional<ojson> resolveVarlist(const Datastore& ds, const std::string& verb
     if (out->empty()) return utilError(verb + ": the dataset has no variables");
     return std::nullopt;
   }
+  const std::vector<std::string> all = ds.names();
+  // `*` and `?` match any run / any one character; a name may not match more than once.
+  auto globMatch = [](const std::string& pat, const std::string& name) {
+    size_t p = 0, t = 0, star = std::string::npos, mark = 0;
+    while (t < name.size()) {
+      if (p < pat.size() && (pat[p] == '?' || pat[p] == name[t])) { ++p; ++t; }
+      else if (p < pat.size() && pat[p] == '*') { star = p++; mark = t; }
+      else if (star != std::string::npos) { p = star + 1; t = ++mark; }
+      else return false;
+    }
+    while (p < pat.size() && pat[p] == '*') ++p;
+    return p == pat.size();
+  };
   for (const auto& nm : asked) {
-    if (!ds.has(nm)) return utilError("variable " + nm + " not found");
-    out->push_back(nm);
+    if (nm == "_all") {
+      for (const auto& a : all) out->push_back(a);
+    } else if (nm.find_first_of("*?") != std::string::npos) {
+      size_t hits = 0;
+      for (const auto& a : all)
+        if (globMatch(nm, a)) { out->push_back(a); ++hits; }
+      if (hits == 0) return utilError("variable " + nm + " not found");
+    } else if (!ds.has(nm) && nm.find('-') != std::string::npos && nm.front() != '-' &&
+               nm.back() != '-') {
+      // a-b: the variables from a to b in dataset order
+      const std::string a = nm.substr(0, nm.find('-')), b = nm.substr(nm.find('-') + 1);
+      auto ia = std::find(all.begin(), all.end(), a), ib = std::find(all.begin(), all.end(), b);
+      if (ia == all.end() || ib == all.end()) return utilError("variable " + (ia == all.end() ? a : b) + " not found");
+      // a range whose first name comes after its last is r(111), never swapped
+      // (bank cell e5564db3c797b7d6: `drop trunk-mpg`)
+      if (ia > ib) return utilErrorRc("variables out of order", 111);
+      for (auto it = ia; it <= ib; ++it) out->push_back(*it);
+    } else {
+      if (!ds.has(nm)) return utilError("variable " + nm + " not found");
+      out->push_back(nm);
+    }
   }
   return std::nullopt;
 }

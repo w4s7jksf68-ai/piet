@@ -121,7 +121,11 @@ ojson runIvreg2(const eval::ParsedCommand& parsed, SessionState& session,
         return aerSyntaxError("option `cluster` requires a variable: cluster(varname)");
       }
       cluster = kv.second.strValue;
-    } else if (k == "gmm2s") {
+    } else if (k == "gmm2s" || (xtTyped && k == "gmm")) {
+      // xtivreg2 hands its legacy `gmm` on to ivreg2 as gmm2s (bank 9927b253 `xtivreg2
+      // ..., fe gmm`: e(model) gmm2s, homoskedastic weight), so the two spellings are
+      // one estimator here: with robust or cluster() it is the two-step efficient GMM,
+      // not 2SLS.
       gmm2s = true;
     } else if (k == "fe") {
       fe = true;
@@ -216,6 +220,24 @@ ojson runIvreg2(const eval::ParsedCommand& parsed, SessionState& session,
         gmm2s ? "gmm2s" : (session.lastModel()->ivEndog.empty() ? "ols" : "iv");
     session.eval.setEString("model", model);
     session.noteEOnFit("model");
+    // e(title) under gmm2s (bank ba4d05ae `ivreg2 ..., gmm2s`, c81bd316 with robust)
+    if (gmm2s) {
+      session.eval.setEString("title", "2-Step GMM estimation");
+      session.noteEOnFit("title");
+    }
+  }
+  // xtivreg2 passes gmm2s (and its legacy gmm, which it runs as gmm2s) to ivreg2: e(model)
+  // gmm2s and its title (bank 6d037f0a `xtivreg2 ..., fe gmm2s`, 9927b253 `fe gmm`)
+  // Reached only by the homoskedastic form (gmm2s with robust or cluster() is refused
+  // as not implemented in runIvRegress), whose two-step estimate is the 2SLS one.
+  if (xtTyped && out.is_object() && out.value("type", std::string()) != "error" &&
+      session.lastModel().has_value()) {
+    if (gmm2s) {
+      session.eval.setEString("model", "gmm2s");
+      session.noteEOnFit("model");
+      session.eval.setEString("title", "2-Step GMM estimation");
+      session.noteEOnFit("title");
+    }
   }
   return out;
 }

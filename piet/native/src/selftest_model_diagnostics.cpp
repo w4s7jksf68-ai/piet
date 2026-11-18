@@ -145,6 +145,11 @@ void testD5BS021Durbinalt() {
   piet::SessionState session(workdir);
 
   (void)piet::dispatch("sysuse fatalities, clear", session);
+  // The oracle's own setup (tests/eval/piet_d45/d45_expected.json d5b_*:
+  // `gen t = _n`, `tsset t`): the serial-correlation tests need a time
+  // variable, without one Stata refuses r(111) "time variable not set".
+  (void)piet::dispatch("gen t = _n", session);
+  (void)piet::dispatch("tsset t", session);
   (void)piet::dispatch("regress income beertax spirits", session);
 
   // D5b bare: chi2=372.934, df=1 (lastModel fallback — no explicit varlist).
@@ -327,12 +332,21 @@ void testD5BS083Hausman() {
   check(session.eval.locals.get("_rc", "") != "0",
         "D5/BS-083: `hausman feM bogusName` (missing store) honestly rejects");
 
-  // Two of the SAME type (both fe) — not a valid fe/re pair.
+  // Two fits of the same kind. Stata's hausman compares ANY two stored fits from
+  // their e(b)/e(V) (vs-stata bank 593d07a6 `hausman iv ols`, b479e666 `hausman
+  // tsls tsls3` after reg3): two identical fe fits leave V_b-V_B = 0, so its
+  // generalized inverse has rank 0 and chi2 is 0 at rc 0 (hausman's MatGinv).
+  // This arm pinned the old fe/re-pair-only refusal.
   (void)piet::dispatch("xtreg income beertax unemp, fe", session);
   (void)piet::dispatch("eststo feM2", session);
   (void)piet::dispatch("capture hausman feM feM2", session);
-  check(session.eval.locals.get("_rc", "") != "0",
-        "D5/BS-083: `hausman feM feM2` (two fe stores, not an fe/re pair) honestly rejects");
+  {
+    const double* rk = session.eval.rValues.find("rank");
+    const double* c2 = session.eval.rValues.find("chi2");
+    check(session.eval.locals.get("_rc", "") == "0" && rk != nullptr && *rk == 0.0 && c2 != nullptr &&
+              *c2 == 0.0,
+          "D5/BS-083: `hausman feM feM2` (two identical fe fits) is Stata's rank-0 test, chi2 0 at rc 0");
+  }
 
   fs::remove_all(workdir, ec);
 }

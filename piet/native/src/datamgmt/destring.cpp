@@ -158,8 +158,33 @@ enum class DestringRead { Number, Missing, Unreadable };
 // One observation's text -> number / missing / unreadable, after ignore(),
 // trimming, the missing tokens and dpcomma ([D] destring, Options and
 // Description). `sawPercent` is set when a `%` was removed.
-DestringRead destringReadCell(const std::string& raw, const std::array<bool, 256>& ignoreSet,
-                              bool anyIgnore, bool dpcomma, double& value, bool& sawPercent) {
+// ignore(..., illegal): the bytes of `s` that are not part of a well-formed
+// UTF-8 sequence are dropped.
+std::string dropIllegalUtf8(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  size_t i = 0;
+  while (i < s.size()) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    size_t len = c < 0x80 ? 1 : (c >= 0xC2 && c <= 0xDF) ? 2 : (c >= 0xE0 && c <= 0xEF) ? 3
+                 : (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+    bool ok = len > 0 && i + len <= s.size();
+    for (size_t k = 1; ok && k < len; ++k)
+      ok = (static_cast<unsigned char>(s[i + k]) & 0xC0) == 0x80;
+    if (!ok) {
+      ++i;
+      continue;
+    }
+    out.append(s, i, len);
+    i += len;
+  }
+  return out;
+}
+
+DestringRead destringReadCell(const std::string& rawIn, const std::array<bool, 256>& ignoreSet,
+                              bool anyIgnore, bool dpcomma, double& value, bool& sawPercent,
+                              bool illegal = false) {
+  const std::string raw = illegal ? dropIllegalUtf8(rawIn) : rawIn;
   std::string t;
   if (anyIgnore) {
     t.reserve(raw.size());
@@ -321,10 +346,12 @@ ojson runDestring(const std::string& varname, bool doReplace,
   const double kMissing = std::numeric_limits<double>::quiet_NaN();
   std::vector<double> values(static_cast<size_t>(n), kMissing);
   bool sawPercent = false;
+  bool anyUnreadable = false;
   for (int64_t r = 0; r < n; ++r) {
     double v = 0;
     DestringRead got =
-        destringReadCell(rowText(r), ignoreSet, anyIgnore, opts.dpcomma, v, sawPercent);
+        destringReadCell(rowText(r), ignoreSet, anyIgnore, opts.dpcomma, v, sawPercent,
+                         opts.illegal);
     if (got == DestringRead::Number && opts.asFloat) {
       const std::optional<double> single = toSingle(v);
       if (single.has_value()) v = *single;
@@ -332,12 +359,26 @@ ojson runDestring(const std::string& varname, bool doReplace,
     }
     if (got == DestringRead::Number) {
       values[static_cast<size_t>(r)] = v;
-    } else if (got == DestringRead::Unreadable && !force) {
-      return destringNoteBlock(varname +
-                               (anyIgnore ? ": contains characters not specified in ignore(); no "
-                                          : ": contains nonnumeric characters; no ") +
-                               op);
+    } else if (got == DestringRead::Unreadable) {
+      anyUnreadable = true;
     }
+  }
+  // destring.ado's last r-class step for a string variable is `count if
+  // missing(NEWVAR)`, converted or refused alike: r(N) is the number of
+  // observations real() leaves missing (vs-stata bank: ignore("$") over
+  // "$4099," -> refused, r(N) 74).
+  {
+    int64_t newMiss = 0;
+    for (double v : values) newMiss += std::isnan(v) ? 1 : 0;
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", static_cast<double>(newMiss));
+    eval::declareRPosted(session.eval, "destring", {"N"});
+  }
+  if (anyUnreadable && !force) {
+    return destringNoteBlock(varname +
+                             (anyIgnore ? ": contains characters not specified in ignore(); no "
+                                        : ": contains nonnumeric characters; no ") +
+                             op);
   }
   if (opts.percent && sawPercent) {
     for (double& v : values) {

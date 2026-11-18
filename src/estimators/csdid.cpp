@@ -689,6 +689,8 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
             ce.ok = true;
             ce.att = cell.att;
             ce.n_cell = cell.n;
+            for (int64_t m = 0; m < n; ++m)
+                if (trtv[static_cast<size_t>(m)] != 0.0) ++ce.n_trt;
 
             // Full-sample influence function: the cell subsample enters the
             // N-unit empirical distribution with selection weight N/n. Also
@@ -1165,7 +1167,10 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
 
     // ---- e(N): union of endpoint rows over all estimated cell samples.
     int64_t nused = 0;
-    for (int64_t r = 0; r < n_obs; ++r) nused += used_row[static_cast<size_t>(r)];
+    for (int64_t r = 0; r < n_obs; ++r) {
+        nused += used_row[static_cast<size_t>(r)];
+        if (used_row[static_cast<size_t>(r)]) R.sample_rows.push_back(r);
+    }
     R.n_obs_est = nused;
 
     return R;

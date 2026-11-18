@@ -5,6 +5,7 @@
 // estout grammar.
 #include "tables_internal.h"
 #include "estout_internal.h"
+#include <set>
 namespace piet::handlers::table_detail {
 
 
@@ -454,5 +455,81 @@ bool eoParseStats(const std::string& raw, const std::string& defaultFmt, EoSpec*
     sp->stats.push_back(r);
   }
   return true;
+}
+
+
+// vs-stata bank 2026-11-10 (StataBE 19.5, estout 3.x): `estout m1 m2 m3,
+// var(mpg "Miles")` and the esttab twin r(121) "varwidth() invalid -- invalid
+// number" (c8c0df3522257b53, 0af0f59c2e4c3dde; `var(30)` runs); `s(* 0.1 **
+// 0.05)`, `st(..)`, `sta(..)` and `scalars(r2) s(%9.4f)` r(7) "* invalid name"
+// (c369a328aab710a2, 9c7a522a41f163ce, c8eadb8f34764c47; `s(N r2)`, `st(mpg)`
+// run); esttab `ma(b 2)` r(198) "margin(b 2) invalid" (a6800b29a2804408);
+// esttab `nocons constant` r(198) "options constant and noconstant not both
+// allowed" (2fac90176decdc9a).
+std::optional<EoError> eoArgumentError(
+    const std::vector<std::pair<std::string, eval::OptValue>>& opts, bool esttab) {
+  // syntax matches each declared option once: an option that takes an argument and is given again
+  // under another spelling (`cells("b se") c("Coef")`) matches nothing the second time and is r(198)
+  // "option c() not allowed" (vs-stata bank 94c113e7, c61a22f8).
+  {
+    std::set<std::string> seen;
+    for (const auto& [k, v] : opts) {
+      if (!v.isBool && !seen.insert(k).second) return EoError{"option " + k + "() not allowed", 198};
+    }
+  }
+  auto lowerOf = [](std::string s) {
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+  // `key` spells `full` when it is a prefix of it at least `minLen` long.
+  auto spells = [](const std::string& key, const std::string& full, size_t minLen) {
+    return key.size() >= minLen && key.size() <= full.size() &&
+           full.compare(0, key.size(), key) == 0;
+  };
+  auto isName = [](const std::string& t) {
+    if (t.empty() || t.size() > 32) return false;
+    const unsigned char c0 = static_cast<unsigned char>(t[0]);
+    if (!(std::isalpha(c0) || c0 == '_')) return false;
+    for (unsigned char c : t)
+      if (!(std::isalnum(c) || c == '_')) return false;
+    return true;
+  };
+  bool neg = false, pos = false;
+  for (const auto& [kRaw, v] : opts) {
+    const std::string k = lowerOf(kRaw);
+    if (esttab) {
+      if (spells(k, "noconstant", 6)) neg = true;
+      if (spells(k, "constant", 4)) pos = true;
+    }
+    if (v.isBool) continue;
+    const std::string arg = eoTrim(v.strValue);
+    if (spells(k, "varwidth", 3)) {
+      const std::vector<std::string> toks = eoTokens(arg);
+      for (const auto& t : toks) {
+        char* end = nullptr;
+        const double d = std::strtod(t.c_str(), &end);
+        if (t.empty() || end == nullptr || *end != '\0')
+          return EoError{"varwidth() invalid -- invalid number", 121};
+        if (d != std::floor(d))
+          return EoError{"varwidth() invalid -- invalid numlist has noninteger elements", 126};
+        if (d < 0)
+          return EoError{"varwidth() invalid -- invalid numlist has elements outside of allowed range",
+                         125};
+      }
+      if (toks.size() > 1)
+        return EoError{"varwidth() invalid -- invalid numlist has too many elements", 123};
+    } else if (spells(k, "stats", 1)) {
+      std::string lhs, rhs;
+      eoSplitComma(arg, &lhs, &rhs);
+      for (const auto& t : eoTokens(lhs))
+        if (!isName(t)) return EoError{t + " invalid name", 7};
+    } else if (spells(k, "margin", 2)) {
+      const std::string m = lowerOf(arg);
+      if (!m.empty() && m != "margin" && m != "u" && m != "c" && m != "p")
+        return EoError{"margin(" + arg + ") invalid", 198};
+    }
+  }
+  if (neg && pos) return EoError{"options constant and noconstant not both allowed", 198};
+  return std::nullopt;
 }
 }

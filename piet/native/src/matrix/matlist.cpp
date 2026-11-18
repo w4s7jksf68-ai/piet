@@ -206,6 +206,7 @@ ojson runMatlist(const eval::ParsedCommand& parsed, SessionState& session) {
   std::string title;
   std::string namesArg = "all";
   bool nonames = false;
+  bool namesGiven = false;
   bool noblank = false;
   int twidth = 12;
   for (const auto& kv : parsed.opts) {
@@ -225,6 +226,13 @@ ojson runMatlist(const eval::ParsedCommand& parsed, SessionState& session) {
         return aerError("matlist: option names() requires all, rows, columns or none");
       }
       namesArg = strutil::lower(strutil::trim(v.strValue));
+      namesGiven = true;
+      // `names(col)` is columns (StataBE 19.5, vs-stata bank 6fa5507cff15aba2).
+      for (const char* full : {"rows", "columns"}) {
+        const std::string f(full);
+        if (namesArg.size() >= 3 && namesArg.size() < f.size() && f.compare(0, namesArg.size(), namesArg) == 0)
+          namesArg = f;
+      }
     } else if (k == "nonames") {
       nonames = true;
     } else if (k == "noblank") {
@@ -234,7 +242,8 @@ ojson runMatlist(const eval::ParsedCommand& parsed, SessionState& session) {
       try {
         twidth = std::stoi(strutil::trim(v.strValue));
       } catch (const std::exception&) {
-        return aerError("matlist: option twidth() requires a number");
+        // StataBE 19.5: r(121) (vs-stata bank 19ece66bccf3f088 `twidth(abc)`).
+        return aerErrorRc("twidth() invalid -- invalid number", 121);
       }
       if (twidth < 1 || twidth > 200) {
         return aerError("matlist: twidth(" + strutil::trim(v.strValue) +
@@ -243,6 +252,11 @@ ojson runMatlist(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
 
+  // `nonames` with `names()` is r(198) (StataBE 19.5, vs-stata bank
+  // 4225e65f6c428e60); a format that is no %format at all is r(120)
+  // `invalid %format zz` (0db4ff4206355e0f).
+  if (nonames && namesGiven) return aerErrorRc("names and names() are exclusive", 198);
+  if (fmtRaw.empty() || fmtRaw[0] != '%') return aerErrorRc("invalid %format " + fmtRaw, 120);
   if (namesArg != "all" && namesArg != "rows" && namesArg != "columns" && namesArg != "none") {
     return aerError("matlist: names(" + namesArg + ") is not one of all, rows, columns, none",
                     "syntax_error");

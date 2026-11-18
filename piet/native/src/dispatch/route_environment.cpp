@@ -43,16 +43,63 @@ bool route_environment(std::string& cmd,
   }
 
   if (cmd == "ado") {
+    // `ado zznotasub` is r(198) "invalid syntax", `ado , zzabbrprobe` r(198)
+    // "option zzabbrprobe not allowed" (vs-stata bank 2b29f652785e52f0,
+    // 4f89a5fa88fbb047); dir, describe, uninstall and update are ado's subcommands.
+    // A bare `ado, option` takes the two options of Stata's syntax line, find(string)
+    // (spelled from `f`) and from(dirname) (from `fr`); any other is refused. The
+    // subcommands take options of their own (`ado dir, find(x)`, `ado update, all`).
+    if (!parsed.opts.empty() && parsed.varlist.empty()) {
+      auto spells = [](const std::string& typed, const char* full, size_t shortest) {
+        const std::string t = lower(typed);
+        return t.size() >= shortest && std::string(full).compare(0, t.size(), t) == 0;
+      };
+      for (const auto& kv : parsed.opts) {
+        if (spells(kv.first, "find", 1) || spells(kv.first, "from", 2)) continue;
+        blocks.push_back(ojson(eval::errorBlock("syntax_error",
+                                                "option " + kv.first + " not allowed",
+                                                std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+    }
+    if (!parsed.varlist.empty()) {
+      const std::string sub = lower(parsed.varlist[0]);
+      bool known = false;
+      for (const char* w : {"dir", "describe", "uninstall", "update"})
+        if (!sub.empty() && std::string(w).compare(0, sub.size(), sub) == 0 && sub.size() >= 1)
+          known = true;
+      if (!known) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+    }
     pushEnvResult(blocks, handlers::runAdo(parsed.raw, parsed.varlist));
     return true;
   }
 
   if (cmd == "adopath") {
+    // adopath takes no option: `adopath , zzabbrprobe` is r(198) "invalid syntax"
+    // (bank 9d1dc5b3233586a0).
+    if (!parsed.opts.empty()) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(198)")));
+      return true;
+    }
     pushEnvResult(blocks, handlers::runAdopath(parsed.raw, parsed.varlist, session));
     return true;
   }
 
   if (cmd == "sysdir") {
+    // sysdir takes no option, and `sysdir list` no argument: `sysdir ,
+    // zzabbrprobe` and `sysdir list BASE` are r(198) "invalid syntax" (vs-stata
+    // bank e85d528cee5691de, 58b576a70d9c2921).
+    if (!parsed.opts.empty() ||
+        (parsed.varlist.size() > 1 && lower(parsed.varlist[0]) == "list")) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(198)")));
+      return true;
+    }
     pushEnvResult(blocks, handlers::runSysdir(parsed.raw, parsed.varlist, session));
     return true;
   }
@@ -84,6 +131,11 @@ bool route_environment(std::string& cmd,
                                               std::nullopt, std::string("r(197)"))));
       return blocks;
     };
+    // `error` takes no qualifier and no option, and its own syntax refusals are
+    // r(197): `error 111 if foreign` "if not allowed", `error 111,
+    // zznotanoption` "options not allowed" (vs-stata bank 2026-11-10).
+    if (parsed.ifExpr.has_value()) { blocks = refuse197("if not allowed"); return true; }
+    if (!parsed.opts.empty()) { blocks = refuse197("options not allowed"); return true; }
     if (arg.empty()) { blocks = refuse197("invalid syntax"); return true; }
     if (arg[0] == '=') {
       std::smatch nm;
@@ -146,6 +198,13 @@ bool route_environment(std::string& cmd,
   }
 
   if (cmd == "gr_edit") {
+    // gr_edit edits a graph in memory: with none, StataBE answers r(111) "graph Graph not found"
+    // (bank: `gr_edit , zzabbrprobe` after no graph command)
+    if (!session.lastGraph.has_value() && session.namedGraphs.empty()) {
+      blocks.push_back(ojson(eval::errorBlock("engine_error", "graph Graph not found", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(111)")));
+      return true;
+    }
     ojson note;
     note["type"] = "display";
     note["text"] = "(gr_edit: graph-editor recording, appearance only -- ignored)";
@@ -193,6 +252,14 @@ bool route_environment(std::string& cmd,
   }
 
   if (cmd == "timer") {
+    // timer takes no qualifier and no option: `timer on 1 if 1` and `timer on
+    // 1, zznotanoption` are r(198) "invalid syntax" (vs-stata bank
+    // 4cbe1c22fce9de02, 3c2ec9ff942b6022), as its `in` and weight forms are.
+    if (parsed.ifExpr.has_value() || !parsed.opts.empty()) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(198)")));
+      return true;
+    }
     // BS-124 (BETA campaign C4): "timer" was already in kNoDataCommands
     // above (correctly — it must work with zero data loaded) but had NO
     // dispatch arm at all, so every call fell through to the bottom

@@ -190,6 +190,41 @@ ojson runAstile(const eval::ParsedCommand& parsed, SessionState& session) {
                                      session)))
       return *e;
   }
+  // astile's last act on r(): the cut points of the last group, as _pctile leaves them
+  // (vs-stata bank: r(r1) ... r(r<nq-1>) after `astile q = price, nq(4)`, the last by() group's
+  // after by()). A by() of several variables leaves nothing here.
+  eval::OrderedFloatDict cutResidue;
+  bool haveResidue = false;
+  {
+    std::string where;
+    bool ok = true;
+    if (byVars.size() == 1) {
+      (void)dispatch("quietly summarize " + byVars[0] + qualifierText(parsed) + ", meanonly",
+                     session);
+      const double* mx = session.eval.rValues.find("max");
+      if (mx != nullptr) where = byVars[0] + " == " + eval::pythonFloatRepr(*mx);
+      else ok = false;
+    } else if (byVars.size() > 1) {
+      ok = false;
+    }
+    if (ok) {
+      std::string src = cutSource;
+      if (!where.empty()) {
+        // _pctile reads every observation, so the last group is cut out into a column that is
+        // missing elsewhere.
+        src = "__piet_t1g_al";
+        dropColumns(session, {src});
+        scratch.add(src);
+        if (auto e = firstError(dispatch("quietly generate double " + src + " = " + cutSource +
+                                             " if " + where,
+                                         session)))
+          return *e;
+      }
+      (void)dispatch("quietly _pctile " + src + ", nq(" + std::to_string(nq) + ")", session);
+      for (const auto& kv : session.eval.rValues.items()) cutResidue.set(kv.first, kv.second);
+      haveResidue = cutResidue.items().size() == static_cast<size_t>(nq - 1);
+    }
+  }
   // One engine call: the nq-1 cut points per group (egen pctile at p = 100*k/nq, the p the
   // engine's xtile uses), then 1 + #(x > cut), then the cut columns go.
   std::vector<std::string> args = {"eval", "--data", *session.currentHbin()};
@@ -230,7 +265,17 @@ ojson runAstile(const eval::ParsedCommand& parsed, SessionState& session) {
       byVars.empty() ? storage::resolveCreateType(session, "") : std::string("double");
   storage::recordCreateType(session, newvar, byVars.empty() ? "" : "double", type);
   session.setVarLabel(newvar, nqText + " quantiles of " + expTyped);
-  return mutationResult(session, "gen", {newvar});
+  ojson made = mutationResult(session, "gen", {newvar});
+  if (haveResidue) {
+    eval::replaceRClass(session.eval);
+    std::vector<std::string> names;
+    for (const auto& kv : cutResidue.items()) {
+      session.eval.rValues.set(kv.first, kv.second);
+      names.push_back(kv.first);
+    }
+    eval::declareRPosted(session.eval, "astile", std::move(names));
+  }
+  return made;
 }
 
 }  // namespace piet::handlers

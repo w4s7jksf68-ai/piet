@@ -6,6 +6,8 @@
 #include "outreg2_internal.h"
 #include "piet/handlers/io.h"
 #include "piet/user_paths.h"
+#include "piet/dispatcher.h"
+#include "piet/eval/macros.h"
 namespace piet::handlers::table_detail {
 
 
@@ -260,22 +262,95 @@ ojson runRegsave(const eval::ParsedCommand& parsed, SessionState& session) {
   // regsave reads e(b): with none it is r(111) "matrix e(b) not found"
   // (w2at wt_r05, log 5348-5358).
   if (!activeModel(session, "regsave", &m, &err)) return tblErrorRc("matrix e(b) not found", 111);
-  if (auto lvErr = rejectForeignLevel(parsed.opts, "regsave")) return *lvErr;
+  // level(#): the interval is coef -/+ t * stderr with t the (1 - level/100)/2
+  // upper-tail critical value of t(e(df_r)), or of the normal when the fit has
+  // no residual degrees of freedom; the range is regsave's own check.
+  double cilevel = 95.0;
+  bool foreignLevel = false;
+  if (const auto lv = optStr(parsed.opts, "level")) {
+    const std::string txt = strutil::trim(dequote(*lv));
+    char* end = nullptr;
+    const double v = std::strtod(txt.c_str(), &end);
+    if (txt.empty() || end == nullptr || *end != '\0') {
+      return tblErrorRc("invalid 'level' option: " + txt, 198);
+    }
+    if (v < 10 || v > 99.99) return tblErrorRc("level() must be between 10 and 99.99 inclusive", 198);
+    cilevel = v;
+    foreignLevel = v != 95.0;
+  }
 
   std::vector<std::string> words = parsed.varlist;
   const std::optional<std::string> usingPath = takeUsing(words);
   std::vector<CoefRowView> rows = coefViews(m.snap);
+  std::vector<size_t> keptIdx(rows.size());
+  for (size_t i = 0; i < keptIdx.size(); ++i) keptIdx[i] = i;
+  // regsave [coeflist]: only the named coefficients are kept, in e(b)'s order.
+  // Every name must be a column of e(b) (equation prefix aside); a wildcard or
+  // range is first expanded against the variables in memory, and kept literally
+  // when it expands to nothing, so it then fails the same check.
+  if (!words.empty()) {
+    std::vector<std::string> wanted;
+    for (const auto& w : words) {
+      if (w.find_first_of("*?~-") != std::string::npos && session.datastore() != nullptr) {
+        auto vr = loops::expandVarlist(w, session);
+        if (!vr.isError && !vr.tokens.empty()) {
+          for (const auto& t : vr.tokens) wanted.push_back(t);
+          continue;
+        }
+      }
+      wanted.push_back(w);
+    }
+    bool eqnames = false;
+    for (const auto& r : rows) {
+      if (r.name.find(':') != std::string::npos) eqnames = true;
+    }
+    auto bare = [](const std::string& n) {
+      const size_t c = n.find(':');
+      return c == std::string::npos ? n : n.substr(c + 1);
+    };
+    std::vector<bool> keep(rows.size(), false);
+    for (const auto& want : wanted) {
+      bool match = false;
+      for (const auto& r : rows) {
+        if (bare(r.name) == want) match = true;
+      }
+      if (!match) return tblErrorRc("No estimation results available for variable " + want, 111);
+      for (size_t i = 0; i < rows.size(); ++i) {
+        if (eqnames ? rows[i].name.find(want) != std::string::npos : rows[i].name == want) keep[i] = true;
+      }
+    }
+    std::vector<CoefRowView> kept;
+    std::vector<size_t> keptNew;
+    for (size_t i = 0; i < rows.size(); ++i) {
+      if (keep[i]) {
+        kept.push_back(rows[i]);
+        keptNew.push_back(i);
+      }
+    }
+    rows = std::move(kept);
+    keptIdx = std::move(keptNew);
+  }
   // regsave builds its table with svmat, i.e. FLOAT columns: b, se and r2
   // are float-rounded, and the interval is float(float(b) -/+ t*float(se))
   // with t the fit's own critical value (w2at wt_r04; regsave.ado's svmat).
-  auto fl = [](double v) { return std::isnan(v) ? v : static_cast<double>(static_cast<float>(v)); };
+  // `double` keeps every table column in double precision instead of float.
+  const bool dbl = hasFlag(parsed.opts, "double");
+  auto fl = [dbl](double v) {
+    return (dbl || std::isnan(v)) ? v : static_cast<double>(static_cast<float>(v));
+  };
   // regsave: t_ci = invttail(e(df_r), .025) exactly (the normal
   // quantile without df); the fit's own (b - lo)/se differs in the last bits
   // and flips the float rounding of a limit (w2at wt_r01_r5c4).
   double tExact = kEoNaN;
+  const double tailProb = (1.0 - cilevel / 100.0) / 2.0;
   if (m.escalars.contains("df_r") && m.escalars["df_r"].is_number()) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "invttail(%.17g, %.17g)", m.escalars["df_r"].get<double>(),
+                  foreignLevel ? tailProb : 0.025);
+    if (auto v = piet::evalScalarExpr(buf, session)) tExact = *v;
+  } else if (foreignLevel) {
     char buf[96];
-    std::snprintf(buf, sizeof(buf), "invttail(%.17g, 0.025)", m.escalars["df_r"].get<double>());
+    std::snprintf(buf, sizeof(buf), "invnormal(%.17g)", 1.0 - tailProb);
     if (auto v = piet::evalScalarExpr(buf, session)) tExact = *v;
   }
   for (auto& r : rows) {
@@ -302,6 +377,10 @@ ojson runRegsave(const eval::ParsedCommand& parsed, SessionState& session) {
     cols.push_back(DsColumn{name, false, {}, {}});
     return cols.back();
   };
+  auto scalar = [&](const std::string& expr) {
+    const auto v = piet::evalScalarExpr(expr, session);
+    return v.has_value() ? *v : std::numeric_limits<double>::quiet_NaN();
+  };
   {
     DsColumn v{"var", true, {}, {}};
     for (const auto& r : rows) v.str.push_back(r.name);
@@ -311,9 +390,37 @@ ojson runRegsave(const eval::ParsedCommand& parsed, SessionState& session) {
     DsColumn& c = addNum("coef");
     for (const auto& r : rows) c.num.push_back(r.b);
   }
-  {
+  if (!hasFlag(parsed.opts, "nose")) {
     DsColumn& c = addNum("stderr");
     for (const auto& r : rows) c.num.push_back(r.se);
+  }
+  // covar(varlist): the covariance of every coefficient with each named one (a column of
+  // e(V)), named covar_<name> with the dots taken out.
+  if (auto cv = optStr(parsed.opts, "covar")) {
+    const std::optional<eval::EvalMatrix> V = session.eval.resolveEMatrix("V");
+    for (const auto& want : splitWs(dequote(*cv))) {
+      int col = -1;
+      if (V.has_value()) {
+        for (size_t j = 0; j < V->colnames.size(); ++j) {
+          const std::string& nm = V->colnames[j];
+          const size_t colon = nm.find(':');
+          const std::string bare = colon == std::string::npos ? nm : nm.substr(colon + 1);
+          if (bare == want) col = static_cast<int>(j);
+        }
+      }
+      if (col < 0) return tblErrorRc(want + " is not a valid regressor", 111);
+      std::string nm;
+      for (char ch : want) {
+        if (ch != '.') nm += ch;
+      }
+      DsColumn& c = addNum("covar_" + nm);
+      for (size_t k : keptIdx) {
+        const double x = (k < V->data.size() && static_cast<size_t>(col) < V->data[k].size())
+                             ? V->data[k][static_cast<size_t>(col)]
+                             : std::numeric_limits<double>::quiet_NaN();
+        c.num.push_back(fl(x));
+      }
+    }
   }
   if (hasFlag(parsed.opts, "tstat")) {
     DsColumn& c = addNum("tstat");
@@ -335,18 +442,13 @@ ojson runRegsave(const eval::ParsedCommand& parsed, SessionState& session) {
                                               : std::numeric_limits<double>::quiet_NaN();
     for (size_t i = 0; i < rows.size(); ++i) c.num.push_back(n);
   }
-  {
+  // r2 only when the estimates carry e(r2): after logit (no e(r2)) the saved
+  // table is var coef stderr ... N (vs-stata bank 7b260327, regsave, pval ci: 7
+  // variables; after regress, 8 with r2).
+  if (m.escalars.contains("r2") && m.escalars["r2"].is_number()) {
     DsColumn& c = addNum("r2");
-    const double r2 = m.escalars.contains("r2") ? m.escalars["r2"].get<double>()
-                                                : std::numeric_limits<double>::quiet_NaN();
+    const double r2 = m.escalars["r2"].get<double>();
     for (size_t i = 0; i < rows.size(); ++i) c.num.push_back(fl(r2));
-  }
-  if (auto al = optStr(parsed.opts, "addlabel")) {
-    for (const auto& [name, val] : parseCommaPairs(*al)) {
-      DsColumn c{name, true, {}, {}};
-      for (size_t i = 0; i < rows.size(); ++i) c.str.push_back(val);
-      cols.push_back(c);
-    }
   }
   if (hasFlag(parsed.opts, "cmdline")) {
     DsColumn c{"cmdline", true, {}, {}};
@@ -355,14 +457,104 @@ ojson runRegsave(const eval::ParsedCommand& parsed, SessionState& session) {
     for (size_t i = 0; i < rows.size(); ++i) c.str.push_back(strutil::trim(cl));
     cols.push_back(c);
   }
+  // detail(scalars|macros|all): every e() scalar / macro as a column of its own, in e()'s
+  // order, skipping a name the table already has (`cap gen` fails there).
+  if (auto dt = optStr(parsed.opts, "detail")) {
+    const std::string which = strutil::lower(strutil::trim(dequote(*dt)));
+    if (which != "all" && which != "scalars" && which != "macros") {
+      return tblErrorRc("The only valid choices for the detail option are \"all\", \"scalars\", or \"macros\"", 198);
+    }
+    auto taken = [&](const std::string& n) {
+      for (const auto& c : cols) {
+        if (c.name == n) return true;
+      }
+      return false;
+    };
+    if (which == "all" || which == "scalars") {
+      const auto names = session.eNameOrderFor("scalars");
+      if (!names.has_value()) {
+        return ojson(eval::unsupportedOption(
+            "detail", "regsave: the list of e() scalars after this estimator is not available in "
+                      "this version of PIET"));
+      }
+      for (const auto& n : *names) {
+        if (taken(n)) continue;
+        DsColumn& c = addNum(n);
+        // An integer in -32767..32740 is stored as it is (an int column); any other scalar goes
+        // into a column of the session's default type -- float, so rounded to float -- unless
+        // the `double' option asked for full precision.
+        double v = scalar("e(" + n + ")");
+        const bool smallInt = !std::isnan(v) && v == std::floor(v) && v >= -32767.0 && v <= 32740.0;
+        if (!smallInt) v = fl(v);
+        for (size_t i = 0; i < rows.size(); ++i) c.num.push_back(v);
+      }
+    }
+    if (which == "all" || which == "macros") {
+      const auto names = session.eNameOrderFor("macros");
+      if (!names.has_value()) {
+        return ojson(eval::unsupportedOption(
+            "detail", "regsave: the list of e() macros after this estimator is not available in "
+                      "this version of PIET"));
+      }
+      for (const auto& n : *names) {
+        if (taken(n)) continue;
+        DsColumn c{n, true, {}, {}};
+        const auto ex = eval::expandMacros("`e(" + n + ")'", session.eval);
+        for (size_t i = 0; i < rows.size(); ++i) c.str.push_back(ex.isError ? std::string() : ex.line);
+        cols.push_back(c);
+      }
+    }
+  }
+  // autoid: a regression-number column _id (1; with `append` the ado renumbers
+  // it against the rows already in the file, which this build does not do).
+  if (hasFlag(parsed.opts, "autoid")) {
+    if (hasFlag(parsed.opts, "append")) {
+      return tblError("regsave: autoid together with append is not implemented in this build");
+    }
+    DsColumn& c = addNum("_id");
+    for (size_t i = 0; i < rows.size(); ++i) c.num.push_back(1.0);
+  }
+  if (auto al = optStr(parsed.opts, "addlabel")) {
+    for (const auto& [name, val] : parseCommaPairs(*al)) {
+      DsColumn c{name, true, {}, {}};
+      for (size_t i = 0; i < rows.size(); ++i) c.str.push_back(val);
+      cols.push_back(c);
+    }
+  }
 
   std::string hbin;
   ojson dsErr;
   if (!materializeDataset(session, "regsave", cols, rows.size(), &hbin, &dsErr)) return dsErr;
   std::vector<std::string> newVars;
   for (const auto& c : cols) newVars.push_back(c.name);
-  return finishDataset(session, "regsave", hbin, usingPath, hasFlag(parsed.opts, "replace"),
-                       hasFlag(parsed.opts, "append"), newVars);
+  ojson done = finishDataset(session, "regsave", hbin, usingPath, hasFlag(parsed.opts, "replace"),
+                             hasFlag(parsed.opts, "append"), newVars);
+  if (!isErrorBlock(done)) {
+    // `return clear` then r(N) = observations and r(k) = variables of the table.
+    // With `append` the table is the one just saved: the rows already in the file
+    // and the new ones, over the union of their variables.
+    double nOut = static_cast<double>(rows.size()), kOut = static_cast<double>(cols.size());
+    if (hasFlag(parsed.opts, "append") && usingPath.has_value()) {
+      const std::string saved = resolveUserPath(session, ensureExt(*usingPath, ".dta"));
+      const std::string back = mintScratchPath(session.workdir(), "regsave_back");
+      const CobraRunResult imp = runCobra({"import-dta", "--data", saved, "--out", back});
+      if (imp.ok && cecon::native_exists(back)) {
+        try {
+          Datastore ds(back);
+          nOut = static_cast<double>(ds.nRows());
+          kOut = 0;
+          for (const auto& n : ds.names()) {
+            if (!isHiddenColumn(n)) kOut += 1;
+          }
+        } catch (const std::exception&) {
+        }
+      }
+    }
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", nOut);
+    session.eval.rValues.set("k", kOut);
+  }
+  return done;
 }
 
 
@@ -371,96 +563,423 @@ ojson runParmest(const eval::ParsedCommand& parsed, SessionState& session) {
                                             kVocabParmest.unimplemented)) {
     return ojson(*err);
   }
+  const auto& opts = parsed.opts;
+  const bool norestore = hasFlag(opts, "norestore") || hasFlag(opts, "fast");
+  const std::optional<std::string> listOpt = optStr(opts, "list");
+  const std::optional<std::string> savingOpt = optStr(opts, "saving");
+  // parmest needs somewhere to put the table: a listing, a file, or the memory.
+  if (!listOpt.has_value() && !savingOpt.has_value() && !norestore) {
+    return tblErrorRc(
+        "You must specify at least one of the five options:\n"
+        "list(), frame(), saving(), norestore, and fast.\n"
+        "If you specify list(), then the output variables specified are listed.\n"
+        "If you specify saving(), then the new data set is output to a disk file.\n"
+        "If you specify norestore and/or fast, then the new data set is created in the current "
+        "data frame,\nand any existing data set in the current data frame is destroyed.",
+        498);
+  }
+  // bmatrix()/vmatrix() name the matrices the table is read from; only the defaults,
+  // e(b) and e(V), are read here, and any other matrix is refused by name.
+  std::string bmatrixTxt = "e(b)", vmatrixTxt = "e(V)";
+  if (auto bm = optStr(opts, "bmatrix")) {
+    bmatrixTxt = strutil::trim(dequote(*bm));
+    if (bmatrixTxt != "e(b)") {
+      return ojson(eval::unsupportedOption("bmatrix", "parmest: bmatrix(" + bmatrixTxt +
+                                           ") is not implemented in this version of PIET; only e(b) is read"));
+    }
+  }
+  if (auto vm = optStr(opts, "vmatrix")) {
+    vmatrixTxt = strutil::trim(dequote(*vm));
+    if (vmatrixTxt != "e(V)") {
+      return ojson(eval::unsupportedOption("vmatrix", "parmest: vmatrix(" + vmatrixTxt +
+                                           ") is not implemented in this version of PIET; only e(V) is read"));
+    }
+  }
   Model m;
   ojson err;
   if (!activeModel(session, "parmest", &m, &err)) return err;
-  if (auto lvErr = rejectForeignLevel(parsed.opts, "parmest")) return *lvErr;
+  {
+    const std::string ecmd = session.eval.eStrings.get("cmd");
+    if (ecmd == "exlogistic" || ecmd == "expoisson") {
+      return tblErrorRc("parmest and parmby cannot work after exlogistic or expoisson", 498);
+    }
+  }
+
+  // level(numlist): every level gets its own min#/max# pair, named by the level
+  // as typed (a `.` becomes `_`), in ascending order.
+  std::vector<std::string> levelTexts;
+  std::vector<double> levels;
+  {
+    std::vector<std::string> toks;
+    if (auto lv = optStr(opts, "level")) {
+      std::string t = dequote(*lv);
+      for (char& c : t) {
+        if (c == ',') c = ' ';
+      }
+      toks = splitWs(t);
+    } else {
+      toks = {"95"};
+    }
+    std::vector<std::pair<double, std::string>> ordered;
+    for (const auto& t : toks) {
+      char* end = nullptr;
+      const double v = std::strtod(t.c_str(), &end);
+      if (t.empty() || *end != '\0' || v < 0 || v >= 100) {
+        return tblErrorRc("invalid level(" + t + ")", 125);
+      }
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%.15g", v);
+      ordered.emplace_back(v, buf);
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& [v, txt] : ordered) {
+      levels.push_back(v);
+      std::string name = txt;
+      for (char& c : name) {
+        if (c == '.') c = '_';
+      }
+      levelTexts.push_back(name);
+    }
+  }
 
   // `saving("f.dta", replace)` -- the replace lives INSIDE the parentheses,
-  // which is parmest's own syntax and not the outer `replace` option.
+  // which is parmest's own syntax and not an outer option.
   std::optional<std::string> savePath;
-  bool saveReplace = hasFlag(parsed.opts, "replace");
-  if (auto sv = optStr(parsed.opts, "saving")) {
-    const std::vector<std::string> parts = splitTopLevel(*sv, ',');
+  bool saveReplace = false;
+  if (savingOpt.has_value()) {
+    const std::vector<std::string> parts = splitTopLevel(*savingOpt, ',');
     if (!parts.empty()) savePath = dequote(strutil::trim(parts[0]));
     for (size_t i = 1; i < parts.size(); ++i) {
       const std::string w = strutil::lower(strutil::trim(parts[i]));
       if (w == "replace" || w == "repl") saveReplace = true;
     }
   }
-
   // parmest checks saving() before it builds anything: an existing file
   // without replace is r(498) with two lines (w2at wt_p07, log 5130-5138).
   if (savePath.has_value() && !saveReplace) {
     const std::string up = ensureExt(*savePath, ".dta");
     if (cecon::native_exists(resolveUserPath(session, up))) {
-      return tblErrorRc("file " + up + " already exists\nsaving(" + *optStr(parsed.opts, "saving") +
-                            ") invalid",
-                        498);
+      return tblErrorRc("file " + up + " already exists\nsaving(" + *savingOpt + ") invalid", 498);
     }
   }
+
+  // The parameters, with the equation each e(b) column sits in: the e(b) stripe
+  // names it (`foreign:mpg` after logit, bare after regress).
   const std::vector<CoefRowView> rows = coefViews(m.snap);
-  const double dfr = m.escalars.contains("df_r") ? m.escalars["df_r"].get<double>()
-                                                 : std::numeric_limits<double>::quiet_NaN();
+  std::vector<std::string> eqs(rows.size()), parms(rows.size());
+  {
+    std::vector<std::string> stripe;
+    if (const std::optional<eval::EvalMatrix> eb = session.eval.resolveEMatrix("b")) stripe = eb->colnames;
+    const bool useStripe = stripe.size() == rows.size();
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const std::string& nm = useStripe ? stripe[i] : rows[i].name;
+      const size_t colon = nm.find(':');
+      eqs[i] = colon == std::string::npos ? std::string("_") : nm.substr(0, colon);
+      parms[i] = colon == std::string::npos ? nm : nm.substr(colon + 1);
+    }
+  }
+  bool anyEq = false;
+  for (const auto& e : eqs) {
+    if (e != "_") anyEq = true;
+  }
+  const bool eform = hasFlag(opts, "eform");
+  const double nullvalue = eform ? 1.0 : 0.0;
+  const double pnull = eform ? std::log(nullvalue) : nullvalue;
+  const bool dofpres = m.escalars.contains("df_r") && m.escalars["df_r"].is_number();
+  const double dfr = dofpres ? m.escalars["df_r"].get<double>() : std::numeric_limits<double>::quiet_NaN();
+  auto scalar = [&](const std::string& expr) {
+    const auto v = piet::evalScalarExpr(expr, session);
+    return v.has_value() ? *v : std::numeric_limits<double>::quiet_NaN();
+  };
+  auto fp = [](const char* f, double a, double b) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), f, a, b);
+    return std::string(buf);
+  };
 
   std::vector<DsColumn> cols;
-  {
-    DsColumn v{"parm", true, {}, {}};
-    for (const auto& r : rows) v.str.push_back(r.name);
-    cols.push_back(v);
-  }
   auto addNum = [&](const std::string& name) -> DsColumn& {
     cols.push_back(DsColumn{name, false, {}, {}});
     return cols.back();
   };
-  { DsColumn& c = addNum("estimate"); for (const auto& r : rows) c.num.push_back(r.b); }
-  { DsColumn& c = addNum("stderr");   for (const auto& r : rows) c.num.push_back(r.se); }
+  if (auto idn = optStr(opts, "idnum")) {
+    DsColumn& c = addNum("idnum");
+    double v = std::numeric_limits<double>::quiet_NaN();
+    const std::string t = strutil::trim(dequote(*idn));
+    char* end = nullptr;
+    const double x = std::strtod(t.c_str(), &end);
+    if (!t.empty() && *end == '\0') v = x;
+    for (size_t i = 0; i < rows.size(); ++i) c.num.push_back(v);
+  }
+  if (auto ids = optStr(opts, "idstr")) {
+    DsColumn c{"idstr", true, {}, {}};
+    for (size_t i = 0; i < rows.size(); ++i) c.str.push_back(dequote(*ids));
+    cols.push_back(c);
+  }
+  // idnum and idstr lead the table, idnum first (parmest `order idstr`, `order idnum`).
+  if (anyEq) {
+    DsColumn c{"eq", true, {}, {}};
+    c.str = eqs;
+    cols.push_back(c);
+  }
   {
+    DsColumn c{"parm", true, {}, {}};
+    c.str = parms;
+    cols.push_back(c);
+  }
+  if (hasFlag(opts, "label")) {
+    session.syncEvalVarLabels();
+    DsColumn c{"label", true, {}, {}};
+    for (size_t i = 0; i < rows.size(); ++i) {
+      std::string lab;
+      const std::string& p = parms[i];
+      if (p == "_cons") {
+        lab = "Constant";
+      } else if (p.find('#') == std::string::npos) {
+        // `2.rep78`, `1b.foreign`, `o.x`: the label of the variable behind it.
+        std::string v = p;
+        const size_t dot = v.find('.');
+        if (dot != std::string::npos) v = v.substr(dot + 1);
+        lab = session.eval.varLabels.get(v);
+      }
+      c.str.push_back(lab);
+    }
+    cols.push_back(c);
+  }
+  std::vector<double> est(rows.size()), se(rows.size());
+  for (size_t i = 0; i < rows.size(); ++i) {
+    est[i] = rows[i].b;
+    se[i] = rows[i].se;
+  }
+  // t/z, p and the limits are computed on the estimate's own scale first; eform
+  // exponentiates the estimate and the limits afterwards, and rescales the
+  // standard error (parmest, parmcip).
+  std::vector<double> stat(rows.size()), pval(rows.size());
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const double z = (se[i] == 0.0 || std::isnan(se[i])) ? std::numeric_limits<double>::quiet_NaN()
+                                                          : (est[i] - pnull) / se[i];
+    stat[i] = z;
+    if (std::isnan(z)) {
+      pval[i] = std::numeric_limits<double>::quiet_NaN();
+    } else if (dofpres) {
+      pval[i] = scalar(fp("2*ttail(%.17g, abs(%.17g))", dfr, z));
+    } else {
+      pval[i] = scalar(fp("2*normal(-abs(%.17g))", z, 0));
+    }
+  }
+  std::vector<std::vector<double>> lo(levels.size(), std::vector<double>(rows.size())),
+      hi(levels.size(), std::vector<double>(rows.size()));
+  for (size_t k = 0; k < levels.size(); ++k) {
+    const double alpha = (100.0 - levels[k]) / 100.0;
+    double crit = dofpres ? scalar(fp("invttail(%.17g, %.17g)", dfr, alpha / 2))
+                          : scalar(fp("invnormal(1-%.17g)", alpha / 2, 0));
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const double hw = se[i] * crit;
+      lo[k][i] = est[i] - hw;
+      hi[k][i] = est[i] + hw;
+    }
+  }
+  if (eform) {
+    for (size_t i = 0; i < rows.size(); ++i) {
+      est[i] = std::exp(est[i]);
+      se[i] = se[i] * est[i];
+      for (size_t k = 0; k < levels.size(); ++k) {
+        lo[k][i] = std::exp(lo[k][i]);
+        hi[k][i] = std::exp(hi[k][i]);
+      }
+    }
+  }
+  { DsColumn& c = addNum("estimate"); c.num = est; }
+  { DsColumn& c = addNum("stderr");   c.num = se; }
+  if (dofpres) {
     DsColumn& c = addNum("dof");
     for (size_t i = 0; i < rows.size(); ++i) c.num.push_back(dfr);
   }
-  if (hasFlag(parsed.opts, "omit")) {
+  if (hasFlag(opts, "omit")) {
     // `omit` ADDS a byte `omit` after dof, 1 on base and omitted parameters
     // (w2at wt_p02_v5); it removes nothing.
     DsColumn& c = addNum("omit");
     for (const auto& r : rows) c.num.push_back((r.b == 0.0 && (r.se == 0.0 || std::isnan(r.se))) ? 1.0 : 0.0);
   }
-  { DsColumn& c = addNum("t");        for (const auto& r : rows) c.num.push_back(r.t); }
-  { DsColumn& c = addNum("p");        for (const auto& r : rows) c.num.push_back(r.p); }
-  // `min95`/`max95` are parmest's names for the fitted 95% limits; a foreign
-  // level() was already refused above, so the names cannot lie about the level.
-  { DsColumn& c = addNum("min95");    for (const auto& r : rows) c.num.push_back(r.lo); }
-  { DsColumn& c = addNum("max95");    for (const auto& r : rows) c.num.push_back(r.hi); }
-  if (hasFlag(parsed.opts, "label")) {
-    DsColumn c{"label", true, {}, {}};
-    for (const auto& r : rows) c.str.push_back(session.eval.varLabels.get(r.name));
-    cols.push_back(c);
-  }
-  if (auto idn = optStr(parsed.opts, "idnum")) {
-    DsColumn& c = addNum("idnum");
-    double v = std::numeric_limits<double>::quiet_NaN();
-    try {
-      size_t pos = 0;
-      v = std::stod(dequote(*idn), &pos);
-      if (pos != dequote(*idn).size()) v = std::numeric_limits<double>::quiet_NaN();
-    } catch (...) {
+  { DsColumn& c = addNum(dofpres ? "t" : "z"); c.num = stat; }
+  { DsColumn& c = addNum("p"); c.num = pval; }
+  if (auto st = optStr(opts, "stars")) {
+    // stars(numlist): one `*` for every threshold the p-value is at or below.
+    std::string t = dequote(*st);
+    for (char& c : t) {
+      if (c == ',') c = ' ';
     }
-    for (size_t i = 0; i < rows.size(); ++i) c.num.push_back(v);
-  }
-  if (auto ids = optStr(parsed.opts, "idstr")) {
-    DsColumn c{"idstr", true, {}, {}};
-    for (size_t i = 0; i < rows.size(); ++i) c.str.push_back(dequote(*ids));
+    std::vector<double> thr;
+    for (const auto& w : splitWs(t)) {
+      char* end = nullptr;
+      const double v = std::strtod(w.c_str(), &end);
+      if (w.empty() || *end != '\0') return tblErrorRc("invalid stars(" + dequote(*st) + ")", 121);
+      thr.push_back(v);
+    }
+    // stars(numlist descending >=0 <=1): thresholds outside [0,1] are r(125); a list that is not
+    // strictly descending (repeats included) is r(124).
+    for (double a : thr) {
+      if (a < 0.0 || a > 1.0) {
+        return tblErrorRc("stars(" + dequote(*st) + ") invalid -- invalid numlist has elements outside allowed range", 125);
+      }
+    }
+    for (size_t k = 1; k < thr.size(); ++k) {
+      if (!(thr[k] < thr[k - 1])) {
+        return tblErrorRc("stars(" + dequote(*st) + ") invalid -- invalid numlist has elements out of order", 124);
+      }
+    }
+    DsColumn c{"stars", true, {}, {}};
+    for (size_t i = 0; i < rows.size(); ++i) {
+      std::string stars;
+      if (!std::isnan(pval[i])) {
+        for (double a : thr) {
+          if (pval[i] <= a) stars += "*";
+        }
+      }
+      c.str.push_back(stars);
+    }
     cols.push_back(c);
   }
-  const size_t nRows = cols.empty() ? 0 : (cols[0].isString ? cols[0].str.size()
-                                                            : cols[0].num.size());
+  for (size_t k = 0; k < levels.size(); ++k) {
+    { DsColumn& c = addNum("min" + levelTexts[k]); c.num = lo[k]; }
+    { DsColumn& c = addNum("max" + levelTexts[k]); c.num = hi[k]; }
+  }
+  if (auto es = optStr(opts, "escal")) {
+    size_t i = 0;
+    for (const auto& name : splitWs(dequote(*es))) {
+      DsColumn& c = addNum("es_" + std::to_string(++i));
+      const double v = scalar("e(" + name + ")");
+      for (size_t r = 0; r < rows.size(); ++r) c.num.push_back(v);
+    }
+  }
+  if (auto em = optStr(opts, "emac")) {
+    size_t i = 0;
+    for (const auto& name : splitWs(dequote(*em))) {
+      DsColumn c{"em_" + std::to_string(++i), true, {}, {}};
+      const auto ex = eval::expandMacros("`e(" + name + ")'", session.eval);
+      for (size_t r = 0; r < rows.size(); ++r) c.str.push_back(ex.isError ? std::string() : ex.line);
+      cols.push_back(c);
+    }
+  }
+  // rename(old new ...): a name that is not a column, or a new name already in
+  // use, is a warning and the pair is skipped.
+  std::vector<std::string> notes;
+  if (auto rn = optStr(opts, "rename")) {
+    std::vector<std::string> t = splitWs(dequote(*rn));
+    if (t.size() % 2) {
+      notes.push_back("Warning: odd number of variable names in rename list - last one ignored");
+      t.pop_back();
+    }
+    for (size_t i = 0; i + 1 < t.size(); i += 2) {
+      const std::string &from = t[i], &to = t[i + 1];
+      auto find = [&](const std::string& n) {
+        for (size_t c = 0; c < cols.size(); ++c) {
+          if (cols[c].name == n) return static_cast<int>(c);
+        }
+        return -1;
+      };
+      const int at = find(from);
+      if (at < 0 || find(to) >= 0 || !strutil::isValidStataIdentifier(to)) {
+        notes.push_back("Warning: it is not possible to rename " + from + " to " + to);
+      } else {
+        cols[static_cast<size_t>(at)].name = to;
+      }
+    }
+  }
+  const size_t nRows = rows.size();
 
   std::string hbin;
   ojson dsErr;
   if (!materializeDataset(session, "parmest", cols, nRows, &hbin, &dsErr)) return dsErr;
   std::vector<std::string> newVars;
   for (const auto& c : cols) newVars.push_back(c.name);
-  return finishDataset(session, "parmest", hbin, savePath, saveReplace, false, newVars);
+
+  ojson out = ojson::array();
+  for (const auto& n : notes) out.push_back(displayBlock(n));
+  auto push = [&](const ojson& b) {
+    if (b.is_array()) {
+      for (const auto& x : b) out.push_back(x);
+    } else if (!b.is_null()) {
+      out.push_back(b);
+    }
+  };
+  // format(varlist %fmt ...): display formats of the new variables, applied in
+  // the table itself so the saved file and the listing carry them.
+  const std::optional<std::string> fmtOpt = optStr(opts, "format");
+  const bool inMemory = fmtOpt.has_value() || listOpt.has_value();
+  auto setR = [&]() {
+    eval::replaceRClass(session.eval);
+    session.eval.rStrings.set("dfmatrix", "");
+    session.eval.rStrings.set("vmatrix", vmatrixTxt);
+    session.eval.rStrings.set("bmatrix", bmatrixTxt);
+    if (eform) session.eval.rStrings.set("eform", "eform");
+    session.eval.rStrings.set("level", strutil::trim(levelTexts.empty() ? std::string("95") : [&] {
+      std::string t = levelTexts[0];
+      for (char& c : t) {
+        if (c == '_') c = '.';
+      }
+      return t;
+    }()));
+    session.eval.rValues.set("nullvalue", nullvalue);
+    session.eval.rValues.set("nparm", static_cast<double>(nRows));
+    session.eval.rValues.set("dof", dofpres ? dfr : 0.0);
+    session.eval.rValues.set("dofpres", dofpres ? 1.0 : 0.0);
+  };
+  if (!inMemory) {
+    // Straight to the file and/or the memory.
+    if (savePath.has_value()) {
+      ojson saved = finishDataset(session, "parmest", hbin, savePath, saveReplace, false, newVars);
+      if (isErrorBlock(saved)) return saved;
+      push(saved);
+      if (norestore) {
+        push(finishDataset(session, "parmest", hbin, std::nullopt, false, false, newVars));
+      }
+    } else {
+      push(finishDataset(session, "parmest", hbin, std::nullopt, false, false, newVars));
+    }
+  } else {
+    // The table goes into the memory for the formats and the listing; unless
+    // norestore it is a loan, and the data set that was there comes back.
+    const bool hadData = session.hasData();
+    if (!norestore && hadData) push(piet::dispatch("preserve", session));
+    ojson loaded = finishDataset(session, "parmest", hbin, std::nullopt, false, false, newVars);
+    if (isErrorBlock(loaded)) return loaded;
+    if (norestore) push(loaded);
+    if (fmtOpt.has_value()) {
+      std::string vl;
+      for (const auto& x : splitWs(dequote(*fmtOpt))) {
+        if (x.empty()) continue;
+        if (x[0] != '%') {
+          vl += " " + x;
+        } else {
+          ojson fr = piet::dispatch("format" + vl + " " + x, session);
+          vl.clear();
+          if (!fr.is_null()) push(fr);
+        }
+      }
+    }
+    if (listOpt.has_value()) push(piet::dispatch("list " + dequote(*listOpt), session));
+    if (savePath.has_value()) {
+      std::string line = "save \"" + *savePath + "\"";
+      if (saveReplace) line += ", replace";
+      ojson sv = piet::dispatch(line, session);
+      push(sv);
+    }
+    if (!norestore && hadData) push(piet::dispatch("restore", session));
+  }
+  if (savePath.has_value() && !inMemory) {
+    // finishDataset already reported the file.
+  }
+  setR();
+  if (const auto fl = optStr(opts, "flist"); fl.has_value() && savePath.has_value()) {
+    const std::string gname = strutil::trim(dequote(*fl));
+    std::string fname = ensureExt(*savePath, ".dta");
+    if (fname.find(' ') != std::string::npos) fname = "\"" + fname + "\"";
+    const std::string cur = session.eval.globals.get(gname);
+    session.eval.globals.set(gname, cur.empty() ? fname : cur + " " + fname);
+  }
+  return out;
 }
 
 
@@ -481,7 +1000,9 @@ ojson runMat2txt(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!saving.has_value()) return tblSyntax("mat2txt: saving(FILENAME) is required");
 
   const eval::EvalMatrix* mat = session.eval.findMatrix(dequote(*matName));
-  if (mat == nullptr) return tblError("matrix " + dequote(*matName) + " not found");
+  // A matrix that does not exist is r(111) "NAME not found" (bank mat2txt cell
+  // fd7b33a486db1640).
+  if (mat == nullptr) return tblErrorRc(dequote(*matName) + " not found", 111);
 
   // W2AK TW-MAT2TXT: mat2txt.ado 1.1.2, derived. The header is a tab and
   // each column name followed by a tab; every row is its name, a tab, then each

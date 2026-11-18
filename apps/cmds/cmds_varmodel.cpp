@@ -5,6 +5,7 @@
 
 #include "core/distributions.h"
 #include "estimators/varmodel.h"
+#include "estimators/posthest.h"  // chi2_pvalue / f_pvalue
 
 // P7 wave — var.
 //
@@ -61,7 +62,8 @@ int cmd_var(const std::vector<std::string>& a) {
     if (data_missing(data) || ycsv.empty() || lagstr.empty() || ts.timevar.empty()) {
         std::fprintf(stderr,
                      "usage: cobra var --data f.hbin --y Y,X1,X2 --lags P --tsset T "
-                     "[--tsdelta D] [--irf-steps N] [--level P] [--keepif EXPR] [--out f.json]\n"
+                     "[--tsdelta D] [--irf-steps N] [--level P] [--keepif EXPR [--panelvar P]]\n"
+                     "       [--esample-out PATH [--esample-index COL --esample-n N]] [--out f.json]\n"
                      "  Vector autoregression: equation-by-equation OLS on lags 1..P of every\n"
                      "  endogenous variable plus a constant. ONE call returns the per-equation\n"
                      "  results (Stata `var`), the Granger-causality Wald block (`vargranger`)\n"
@@ -83,7 +85,16 @@ int cmd_var(const std::vector<std::string>& a) {
         throw EngineError("bad_input", "var: --y needs at least two endogenous variables");
     const int K = static_cast<int>(vars.size());
 
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    const EsampleRequest esreq = esample_request(a, "var");
+    // `if` marks the estimation rows on the FULL series (in_sample below); rows it
+    // excludes still supply lagged values, as Stata's lag operators read them --
+    // within their own panel under xtset data (--panelvar).
+    const std::string keepif = opt(a, "--keepif");
+    const std::string data_all = data;  // the --data frame e(sample) is written against
+    std::vector<char> in_sample;
+    std::vector<int64_t> panel_rows;    // reduced row -> data_all row (empty = not reduced)
+    if (!keepif.empty())
+        data = keepif_own_panels("var", data, keepif, opt(a, "--panelvar"), in_sample, &panel_rows);
     const Dataset& ds = acquire_data(data);
     const double* traw = require_num(ds, "var", ts.timevar);
     const int64_t n = ds.n_rows();
@@ -97,7 +108,10 @@ int cmd_var(const std::vector<std::string>& a) {
         std::copy(col, col + n, Y.data() + static_cast<int64_t>(c) * n);
     }
 
-    VarResult r = var_fit(Y.data(), traw, n, vars, lags, steps, ts.delta);
+    if (!in_sample.empty() && static_cast<int64_t>(in_sample.size()) != n)
+        throw EngineError("internal", "var: the if-mask does not match the data's row count");
+    VarResult r = var_fit(Y.data(), traw, n, vars, lags, steps, ts.delta,
+                          in_sample.empty() ? nullptr : in_sample.data());
     if (!r.ok) {
         switch (r.fail) {
             case VarResult::TOO_FEW:
@@ -135,7 +149,31 @@ int cmd_var(const std::vector<std::string>& a) {
                              {"ci_lo", b - zc * se},
                              {"ci_hi", b + zc * se}});
         }
+        // The equation's own Gaussian log likelihood at its ML variance (Stata's
+        // e(ll_#)): -T/2 (ln 2pi + ln sigma_aa + 1).
+        const size_t a = equations.size();
+        const double saa = r.sigma[a * static_cast<size_t>(K) + a];
+        const double lla = saa > 0 ? -0.5 * static_cast<double>(r.n_obs) *
+                                         (std::log(2.0 * 3.14159265358979323846) + std::log(saa) + 1.0)
+                                   : std::nan("");
+        // The small-sample forms of the equation's Wald test: dfk scales Sigma by
+        // T / (T - m), so the chi2 by (T - m) / T; small reads chi2 / (K p) as
+        // F(K p, T - m) (Stata's `var ..., dfk` / `small`).
+        const double Tm = static_cast<double>(r.n_obs - r.m);
+        const double kp = static_cast<double>(r.K * r.lags);
+        const double chi2_dfk = eq.chi2 * Tm / static_cast<double>(r.n_obs);
         equations.push_back({{"name", eq.name},
+                             {"chi2_dfk", num_or_null(chi2_dfk)},
+                             {"p_chi2_dfk", num_or_null(std::isfinite(chi2_dfk)
+                                                            ? chi2_pvalue(chi2_dfk, kp)
+                                                            : std::nan(""))},
+                             {"p_F", num_or_null(std::isfinite(eq.chi2)
+                                                     ? f_pvalue(eq.chi2 / kp, kp, Tm)
+                                                     : std::nan(""))},
+                             {"p_F_dfk", num_or_null(std::isfinite(chi2_dfk)
+                                                         ? f_pvalue(chi2_dfk / kp, kp, Tm)
+                                                         : std::nan(""))},
+                             {"ll", num_or_null(lla)},
                              {"parms", r.m},
                              {"rmse", eq.rmse},
                              {"r2", eq.r2},
@@ -149,13 +187,32 @@ int cmd_var(const std::vector<std::string>& a) {
                              {"coefs", coefs}});
     }
 
+    // The Granger rows in every form the fit can post: dfk scales the whole
+    // covariance by T / (T - m), so each Wald statistic by (T - m) / T; small
+    // reads a statistic as F = chi2 / df on (df, T - m) degrees of freedom
+    // (Stata's vargranger runs `test` on the posted e(b)/e(V), and `test` is F
+    // after a small-sample fit).
     json granger = json::array();
-    for (const VarGrangerRow& g : r.granger)
-        granger.push_back({{"equation", g.equation},
-                           {"excluded", g.excluded},
-                           {"chi2", num_or_null(g.chi2)},
-                           {"df", g.df},
-                           {"p", num_or_null(g.p)}});
+    {
+        const double Tm = static_cast<double>(r.n_obs - r.m);
+        const double ratio = Tm / static_cast<double>(r.n_obs);
+        for (const VarGrangerRow& g : r.granger) {
+            const double df = static_cast<double>(g.df);
+            const bool ok = std::isfinite(g.chi2) && g.df > 0 && Tm > 0;
+            const double chi2_dfk = ok ? g.chi2 * ratio : std::nan("");
+            granger.push_back(
+                {{"equation", g.equation},
+                 {"excluded", g.excluded},
+                 {"chi2", num_or_null(g.chi2)},
+                 {"df", g.df},
+                 {"p", num_or_null(g.p)},
+                 {"chi2_dfk", num_or_null(chi2_dfk)},
+                 {"p_chi2_dfk", num_or_null(ok ? chi2_pvalue(chi2_dfk, df) : std::nan(""))},
+                 {"df_r", num_or_null(Tm > 0 ? Tm : std::nan(""))},
+                 {"p_F", num_or_null(ok ? f_pvalue(g.chi2 / df, df, Tm) : std::nan(""))},
+                 {"p_F_dfk", num_or_null(ok ? f_pvalue(chi2_dfk / df, df, Tm) : std::nan(""))}});
+        }
+    }
 
     json sigma = json::array();
     for (int i = 0; i < K; ++i) {
@@ -181,6 +238,12 @@ int cmd_var(const std::vector<std::string>& a) {
                 {"hqic", num_or_null(r.hqic)},
                 {"sbic", num_or_null(r.sbic)},
                 {"sigma", sigma},
+                {"n_gaps", r.n_gaps},
+                // The system covariance Sigma_ml (x) (X'X)^-1 and X'X itself,
+                // row-major, equation-major in `regressors` order: e(V) and
+                // e(G) (= X'X / T) are laid out from these by the frontend.
+                {"vcov", r.vcov},
+                {"xtx", r.xtx},
                 {"equations", equations},
                 {"granger", granger}};
 
@@ -224,6 +287,21 @@ int cmd_var(const std::vector<std::string>& a) {
                          "IRF/FEVD columns are undefined and are reported as missing.\n");
     }
 
+    // e(sample): the lag sample's rows (var_fit), every one of them fitted.
+    if (esreq.active()) {
+        EsampleRows rows;
+        if (panel_rows.empty()) {
+            rows.keep = r.sample_rows;
+            rows.loaded = &ds;
+        } else {
+            // the fit loaded only the sample's own panels: put its rows back on the
+            // --data frame's rows (ds is not read after this point)
+            rows.keep.reserve(r.sample_rows.size());
+            for (int64_t k : r.sample_rows) rows.keep.push_back(panel_rows[static_cast<size_t>(k)]);
+            rows.loaded = &acquire_data(data_all);
+        }
+        emit_esample(esreq, "var", data_all, keepif, true, rows, out);
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }

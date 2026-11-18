@@ -141,6 +141,9 @@ bool isStorageTypeWord(const std::string& w, bool* isStr) {
 // block this pass recognises and its rows would reach the dispatcher as
 // commands. Matching prefixed forms belongs in one place for both constructs,
 // not separately here.
+//
+// IDEMPOTENT: the pass runs once per executeDoSource, and a brace body's lines
+// are run through executeDoSource again, so a folded line must pass through.
 std::vector<std::string> captureInputBlocks(const std::vector<std::string>& lines) {
   std::vector<std::string> out;
   size_t i = 0;
@@ -162,7 +165,15 @@ std::vector<std::string> captureInputBlocks(const std::vector<std::string>& line
       continue;
     }
     std::smatch m;
-    if (!std::regex_search(stripped, m, reInputHead())) {
+    // A line that already carries the fold bytes IS a folded block: a brace
+    // body (`capture noisily { input ... end }`, a loop, an `if`) was folded
+    // with the whole file, and runBody hands its lines back through
+    // executeDoSource, which runs this pass again. Re-folding it opened a
+    // second block that hunted for an `end` the first fold had consumed, ate
+    // the rest of the body as data, and answered "block not terminated".
+    const bool alreadyFolded = stripped.find(kInputSep) != std::string::npos ||
+                               stripped.find(kInputUnterminated) != std::string::npos;
+    if (alreadyFolded || !std::regex_search(stripped, m, reInputHead())) {
       out.push_back(lines[i]);
       ++i;
       continue;
@@ -182,6 +193,9 @@ std::vector<std::string> captureInputBlocks(const std::vector<std::string>& line
       folded += kInputSep;
       folded += body;
     }
+    // A block closed by `end` with no data line in it still IS a block: one
+    // empty row part marks it, so `input` / `end` reaches runInput as a block.
+    if (terminated && folded.find(kInputSep) == std::string::npos) folded += kInputSep;
     if (!terminated) folded += kInputUnterminated;
     out.push_back(folded);
   }
@@ -229,6 +243,7 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
   // through the reject net -- `automatic`/`label` come back as "valid Stata
   // option, not yet implemented" rather than as unknown keys.
   std::string varlistText = head;
+  bool labelsFromText = false;  // `automatic` / `label`
   {
     const long long comma = eval::findUnquotedComma(head);
     if (comma >= 0) {
@@ -238,23 +253,55 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
       eval::canonicalizeForCommand(opts, "input");
       if (auto err = eval::rejectUnknownOptions(opts, kVocabInput.known, kVocabInput.unimplemented))
         return ojson(*err);
+      for (const auto& kv : opts)
+        if (kv.first == "automatic" || kv.first == "label") labelsFromText = true;
     }
   }
 
   // varlist, with `str#`/`byte`/... type words binding to the NEXT name only
   // (`input double y x1 x2` types y alone: w2e_float_default.log:2149
-  // input_double_types `double|float`).
+  // input_double_types `double|float`), or to every name of a parenthesised
+  // list right after the word ([U] 11.4.2 "Lists of new variables": `var1
+  // int(var2 var3)` stores both as ints; the truth bank's `input double(x w)`
+  // cells are rc 0 in StataBE 19.5).
   std::vector<std::string> names;
   std::vector<char> declaredStr;
   std::vector<std::string> declaredNumType;  // "" = untyped (c(type) applies)
   std::vector<std::string> declaredStrType;  // the `str#` word as declared, "" otherwise
   {
+    // The parentheses are their own tokens, whether or not blanks surround them.
+    std::string spaced;
+    for (char c : varlistText) {
+      if (c == '(' || c == ')') {
+        spaced += ' ';
+        spaced += c;
+        spaced += ' ';
+      } else {
+        spaced += c;
+      }
+    }
     bool pendingStr = false;
     bool pendingType = false;
     std::string pendingWord;
-    for (const auto& w : splitWs(varlistText)) {
+    bool inGroup = false;  // inside `type(` ... `)`: the type stays bound
+    for (const auto& w : splitWs(spaced)) {
+      if (w == "(") {
+        if (!pendingType || inGroup) return rsSyntax("input: invalid varlist: unexpected `('");
+        inGroup = true;
+        continue;
+      }
+      if (w == ")") {
+        if (!inGroup) return rsSyntax("input: invalid varlist: unexpected `)'");
+        inGroup = false;
+        pendingType = false;
+        pendingStr = false;
+        pendingWord.clear();
+        continue;
+      }
       bool isStr = false;
       if (isStorageTypeWord(w, &isStr)) {
+        if (inGroup) return rsSyntax("input: invalid varlist: a storage type inside `" +
+                                     pendingWord + "(...)'");
         pendingType = true;
         pendingStr = isStr;
         pendingWord = strutil::lower(w);
@@ -267,10 +314,12 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
       declaredStr.push_back(pendingType && pendingStr ? 1 : 0);
       declaredNumType.push_back(pendingType && !pendingStr ? pendingWord : std::string());
       declaredStrType.push_back(pendingType && pendingStr ? pendingWord : std::string());
+      if (inGroup) continue;
       pendingType = false;
       pendingStr = false;
       pendingWord.clear();
     }
+    if (inGroup) return rsSyntax("input: invalid varlist: `(' without its `)'");
     if (pendingType)
       return rsSyntax("input: a storage type must be followed by a variable name");
   }
@@ -284,44 +333,111 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
     }
   }
 
+  // A name typed twice, or one the dataset already has, is r(110) "variable x
+  // already defined" (StataBE 19.5, bank 61fe92aaa9219b1f `input a a`,
+  // 0b64cc4d66434da2 `input price mpg` over the auto data, 4dc0887f243f65a5 a
+  // second `input a b`): a varlist names NEW variables; a bare `input` is what
+  // appends to the existing ones.
+  {
+    std::set<std::string> seen;
+    for (const auto& nm : names) {
+      if (!seen.insert(nm).second || (ds != nullptr && ds->has(nm)))
+        return rsErrorRc("variable " + nm + " already defined", 110);
+    }
+  }
+
   if (ds != nullptr) {
     // With data in memory this build APPENDS to the existing variables, in the
-    // existing order. A different varlist is refused rather than silently
+    // existing order. A varlist of new names is refused rather than silently
     // creating a second, differently shaped dataset.
-    if (!names.empty() && names != ds->names())
+    if (!names.empty())
       return rsError("input: with data in memory this build appends to the existing variables "
-                     "only (`" + joinWith(ds->names(), " ") + "`).");
+                     "only (type `input` alone; new variables are not added by `input " +
+                     joinWith(names, " ") + "`).");
     names = ds->names();
     declaredStr.assign(names.size(), 0);
     declaredNumType.assign(names.size(), std::string());
     for (size_t c = 0; c < names.size(); ++c)
       declaredStr[c] = (ds->dtype(names[c]) == "factor") ? 1 : 0;
   } else if (names.empty()) {
-    return rsSyntax("input: with no data in memory a varlist is required (`input x y`)");
+    return rsErrorRc("nothing to input", 104);
   }
 
   const size_t k = names.size();
   if (k == 0) return rsSyntax("input: no variables to read into");
 
-  // Free format: the rows are one TOKEN STREAM that wraps every k values, which
-  // is what Stata's own reader does -- so a row split across two source lines
-  // reads the same as a row written on one.
-  std::vector<std::string> tokens;
-  std::vector<char> quoted;
+  // One data line is one observation (StataBE 19.5, bank cells 6bdb2488fb3f59c7,
+  // 5a1ec235a5b2164b, d27edf4866751bd1, b6a6a8818c981866): its values are read
+  // free format, a value past the last variable is ignored, and a line that
+  // cannot be read -- too few values, or text for a numeric variable -- is
+  // reported (`'x' cannot be read as a number`, the rest of the line is not
+  // looked at) and its observation is not stored; the lines after it still are.
+  std::vector<std::string> notes;
+  std::vector<std::vector<std::string>> goodRows;
+  std::vector<std::vector<char>> goodQuoted;
   for (size_t r = 1; r < parts.size(); ++r) {
+    std::vector<std::string> lineTokens;
+    std::vector<char> lineQuoted;
     size_t p = 0;
     std::string tok;
     bool wasQuoted = false;
     while (nextDataToken(parts[r], &p, &tok, &wasQuoted)) {
-      tokens.push_back(tok);
-      quoted.push_back(wasQuoted ? 1 : 0);
+      lineTokens.push_back(tok);
+      lineQuoted.push_back(wasQuoted ? 1 : 0);
     }
+    if (lineTokens.empty()) continue;  // the empty-block marker, or a blank line
+    bool readable = true;
+    for (size_t c = 0; c < k && readable; ++c) {
+      const bool isText = declaredStr[c] != 0;
+      if (c >= lineTokens.size()) {
+        if (!isText) {
+          notes.push_back("'' cannot be read as a number");
+          readable = false;
+        }
+        continue;
+      }
+      if (isText || (!lineQuoted[c] && (lineTokens[c] == "." || lineTokens[c].empty()))) continue;
+      const std::string& cell = lineTokens[c];
+      if (cell.size() == 2 && cell[0] == '.' && cell[1] >= 'a' && cell[1] <= 'z') continue;
+      double v = 0.0;
+      if (!parseStrictDouble(cell, &v)) {
+        if (labelsFromText)
+          return rsError("input: `" + cell + "' is text in the numeric variable " + names[c] +
+                         "; building value labels from it (options automatic and label) is not "
+                         "implemented in this build");
+        notes.push_back("'" + cell + "' cannot be read as a number");
+        readable = false;
+      }
+    }
+    if (!readable) continue;
+    lineTokens.resize(k);
+    lineQuoted.resize(k, 0);
+    goodRows.push_back(std::move(lineTokens));
+    goodQuoted.push_back(std::move(lineQuoted));
   }
-  if (tokens.size() % k != 0)
-    return rsSyntax("input: the data ended in the middle of an observation (" +
-                    std::to_string(tokens.size()) + " value(s) for " + std::to_string(k) +
-                    " variable(s))");
-  const size_t nNew = tokens.size() / k;
+  const size_t nNew = goodRows.size();
+  std::vector<std::string> tokens;
+  std::vector<char> quoted;
+  tokens.reserve(nNew * k);
+  quoted.reserve(nNew * k);
+  for (size_t r = 0; r < nNew; ++r)
+    for (size_t c = 0; c < k; ++c) {
+      tokens.push_back(goodRows[r][c]);
+      quoted.push_back(goodQuoted[r][c]);
+    }
+  // Notes go out ahead of the result; nothing read means nothing is created.
+  auto withNotes = [&notes](ojson result) -> ojson {
+    if (notes.empty()) return result;
+    if (result.is_array() && result.empty()) result = ojson();
+    std::string text;
+    for (const auto& n : notes) text += (text.empty() ? "" : "\n") + n;
+    ojson note;
+    note["type"] = "display";
+    note["text"] = text;
+    if (result.is_null()) return note;
+    return ojson::array({note, result});
+  };
+  if (nNew == 0 && ds == nullptr) return withNotes(silent());
 
   // FU-944: the storage type each numeric column takes, and so the value it
   // holds. Untyped is c(type) (float by default: w2e_float_default.log:2120
@@ -343,12 +459,22 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
     t.isFactor.push_back(declaredStr[c]);
   }
   t.rows.reserve(nNew);
+  // Extended missing values `.a`..`.z` typed into a numeric column (StataBE
+  // 19.5 stores them as such: truth bank M2 `n6miss` cells, `. 1` / `.a 2`).
+  // The staging CSV has no spelling for them, so the cell is staged as `.` and
+  // set afterwards (setExtendedMissing below). Per column: (row, letter).
+  std::vector<std::vector<std::pair<size_t, char>>> extMissing(k);
   for (size_t r = 0; r < nNew; ++r) {
     std::vector<std::string> row(k);
     for (size_t c = 0; c < k; ++c) {
       const std::string& tok = tokens[r * k + c];
       const bool wasQuoted = quoted[r * k + c] != 0;
       if (!wasQuoted && (tok == "." || tok.empty())) continue;  // missing stays missing
+      if (!wasQuoted && !t.isFactor[c] && tok.size() == 2 && tok[0] == '.' && tok[1] >= 'a' &&
+          tok[1] <= 'z') {
+        extMissing[c].emplace_back(r, tok[1]);
+        continue;
+      }
       if (!t.isFactor[c]) {
         double v = 0.0;
         if (!parseStrictDouble(tok, &v))
@@ -362,9 +488,65 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
     }
     t.rows.push_back(std::move(row));
   }
+  // Each column holding them gets a helper column in the staging data: the
+  // letter's code (1 = .a ... 26 = .z) on its rows, empty elsewhere. After the
+  // load one `replace ... if helper == code` per distinct letter writes them --
+  // no expression grows with the number of rows (a ~1,000-row cond() chain was
+  // "expression nested too deeply") -- and the helpers are dropped.
+  std::vector<std::string> xmHelper(k);
+  {
+    int seq = 0;
+    for (size_t c = 0; c < k; ++c) {
+      if (extMissing[c].empty()) continue;
+      std::string h;
+      do {
+        h = "__piet_inxm" + std::to_string(++seq);
+      } while (std::find(names.begin(), names.end(), h) != names.end() ||
+               (ds != nullptr && ds->has(h)));
+      xmHelper[c] = h;
+      t.names.push_back(h);
+      t.isFactor.push_back(0);
+      std::vector<std::string> codes(nNew);
+      for (const auto& [r, letter] : extMissing[c])
+        codes[r] = numCell(static_cast<double>(letter - 'a' + 1));
+      for (size_t r = 0; r < nNew; ++r) t.rows[r].push_back(codes[r]);
+    }
+  }
 
   std::string newPath;
   if (auto err = writeAndConvert(session, t, "input", &newPath)) return *err;
+
+  // The extended missing values, written by the expression engine (which reads
+  // `.a`..`.z` literals) once the rows are in place, from the helper columns.
+  auto setExtendedMissing = [&]() -> std::optional<ojson> {
+    std::string helpers;
+    for (size_t c = 0; c < k; ++c) {
+      if (xmHelper[c].empty()) continue;
+      std::vector<char> letters;
+      for (const auto& rl : extMissing[c])
+        if (std::find(letters.begin(), letters.end(), rl.second) == letters.end())
+          letters.push_back(rl.second);
+      std::sort(letters.begin(), letters.end());
+      for (char letter : letters) {
+        const ojson res = dispatch("quietly replace " + names[c] + " = ." + std::string(1, letter) +
+                                       " if " + xmHelper[c] + " == " +
+                                       std::to_string(letter - 'a' + 1),
+                                   session);
+        if (res.is_array()) {
+          for (const auto& b : res)
+            if (b.is_object() && b.value("type", std::string()) == "error") return b;
+        }
+      }
+      helpers += " " + xmHelper[c];
+    }
+    if (helpers.empty()) return std::nullopt;
+    const ojson res = dispatch("quietly drop" + helpers, session);
+    if (res.is_array()) {
+      for (const auto& b : res)
+        if (b.is_object() && b.value("type", std::string()) == "error") return b;
+    }
+    return std::nullopt;
+  };
 
   if (ds == nullptr) {
     session.load(newPath);
@@ -388,11 +570,12 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
         session.varMeta[names[c]].stataType = storeType[c];
       }
     }
+    if (auto bad = setExtendedMissing()) return *bad;
     // NO newVars list here: this is a whole new dataset, not columns ADDED to
     // an existing one, and `newVars` is what steers seedNMissForPureAdd's
     // carry-forward — feeding it every column of a frame that has no
     // predecessor asks it to carry counts from a frame that does not exist.
-    return mutationResult(session, "input");
+    return withNotes(mutationResult(session, "input"));
   }
   const int64_t before = ds->nRows();
   const std::string out = nextPath(session.workdir(), "input_append");
@@ -401,7 +584,8 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
     return *err;
   session.load(out);
   if (auto bad = assertRowCount(session, "input", before + static_cast<int64_t>(nNew))) return *bad;
-  return mutationResult(session, "input");
+  if (auto bad = setExtendedMissing()) return *bad;
+  return withNotes(mutationResult(session, "input"));
 }
 
 }  // namespace piet::handlers

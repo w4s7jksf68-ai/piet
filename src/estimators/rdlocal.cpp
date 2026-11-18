@@ -316,7 +316,14 @@ void nn_sigma2(SideData& s, int J) {
             if (!has_lo && !has_hi) break;
             double dl = has_lo ? std::fabs(val[lo - 1] - val[v]) : 0.0;
             double dr = has_hi ? std::fabs(val[hi + 1] - val[v]) : 0.0;
-            bool take_lo = has_lo && (!has_hi || dl <= dr);
+            // Equidistant neighbours on both sides enter together (rdrobust's
+            // nearest-neighbour residual grows both ends on a distance tie).
+            if (has_lo && has_hi && dl == dr) {
+                --lo; sm += gsum[lo]; ct += gcnt[lo];
+                ++hi; sm += gsum[hi]; ct += gcnt[hi];
+                continue;
+            }
+            bool take_lo = has_lo && (!has_hi || dl < dr);
             if (take_lo) { --lo; sm += gsum[lo]; ct += gcnt[lo]; }
             else { ++hi; sm += gsum[hi]; ct += gcnt[hi]; }
         }
@@ -622,10 +629,38 @@ RdRobustResult rd_robust_run(const double* y, const double* x, int64_t n,
     R.h_left = R.h_right = h;
     R.b_left = R.b_right = b;
     R.rho = h / b;
-    R.n_eff_left = count_within(S.L, h);
-    R.n_eff_right = count_within(S.R, h);
     R.n_unique_left = count_unique(S.L);
     R.n_unique_right = count_unique(S.R);
+    // The estimation sample of each side is the observations with a POSITIVE kernel
+    // weight under the wider of h and b (rdrobust: the w > 0 index sets), and the
+    // nearest-neighbour residuals are matched within that sample, not over the
+    // whole side. Eff. Number of obs counts the positive weights under h, so a
+    // triangular kernel leaves out the points exactly at |x - c| = h (bank e2e101d7
+    // `rdrobust wage x, h(3)`: N_h_l 408 / N_h_r 560 where |x| <= 3 holds 409 / 563).
+    {
+        const double hw = std::max(h, b);
+        auto in_window = [&](const SideData& s) {
+            SideData w;
+            w.n_all = s.n_all;
+            for (size_t i = 0; i < s.x.size(); ++i)
+                if (kern_w(s.x[i] / hw, kk) > 0.0) {
+                    w.x.push_back(s.x[i]);
+                    w.y.push_back(s.y[i]);
+                }
+            nn_sigma2(w, cfg.nnmatch);
+            return w;
+        };
+        S.L = in_window(S.L);
+        S.R = in_window(S.R);
+        auto positive = [&](const SideData& s) {
+            int64_t c = 0;
+            for (double v : s.x)
+                if (kern_w(v / h, kk) > 0.0) ++c;
+            return c;
+        };
+        R.n_eff_left = positive(S.L);
+        R.n_eff_right = positive(S.R);
+    }
 
     // Point estimate, bias estimate and the three variances.  CCT14 Theorem A.1:
     //   tau_bc  = tau_p(h) - h^{p+1} [ beta_{+,q}(b)[p+1] B_+ - beta_{-,q}(b)[p+1] B_- ]

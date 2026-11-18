@@ -275,11 +275,145 @@ std::optional<double> clusteredVRankM4(const ojson& raw) {
   return rank;
 }
 
+// The rank Stata posts for a one-way clustered fit with FEWER clusters than its
+// coefficients need: with G clusters the cluster score sums add to zero (X'e = 0),
+// so the clustered V has rank at most G - 1, and when G - 1 < k Stata posts that
+// rank as e(rank), takes e(df_m) from it and reports no model F / chi2 (bank
+// 5aa7ac2b `regress price mpg weight, vce(cluster c3)`: rank 2, df_m 1, F .;
+// b8ed9d5d `vce(cluster foreign)`: 1, 0, .; 010cde8e 5 clusters, 5 coefficients: 4,
+// 3, .; 03ca3e32 `poisson ..., vce(cluster foreign)`: rank 1, df_m 0, chi2 .).
+// With G - 1 >= k nothing is reduced (bank c8ea9322 `vce(cluster rep78)`, 5
+// clusters, 3 coefficients: rank 3, df_m 2, F 10.09). The rank is counted on the
+// correlation form of V (each row and column divided by its own standard error),
+// so it does not depend on the regressors' scale; it is capped at G - 1.
+// nullopt = no reduction (G - 1 >= k, or no usable G/k).
+std::optional<double> fewClustersRankM4(const ojson& raw, double G, double k) {
+  if (!(G >= 1) || !(k >= 1) || !(G - 1 < k)) return std::nullopt;
+  double rank = G - 1;
+  if (raw.contains("e_V") && raw["e_V"].is_object() && raw["e_V"].contains("matrix") &&
+      raw["e_V"]["matrix"].is_array()) {
+    const ojson& m = raw["e_V"]["matrix"];
+    const size_t n = m.size();
+    std::vector<size_t> live;
+    bool ok = n > 0;
+    for (size_t r = 0; ok && r < n; ++r) {
+      ok = m[r].is_array() && m[r].size() == n && m[r][r].is_number();
+      if (ok && m[r][r].get<double>() > 0) live.push_back(r);
+    }
+    if (ok && !live.empty()) {
+      const size_t q = live.size();
+      std::vector<double> a(q * q);
+      for (size_t i = 0; ok && i < q; ++i)
+        for (size_t j = 0; ok && j < q; ++j) {
+          const ojson& v = m[live[i]][live[j]];
+          ok = v.is_number();
+          if (ok)
+            a[i + j * q] = v.get<double>() / std::sqrt(m[live[i]][live[i]].get<double>() *
+                                                       m[live[j]][live[j]].get<double>());
+        }
+      std::vector<double> w, z;
+      if (ok && piet::lapack::dsyevrVAL(static_cast<int>(q), std::move(a), 0.0, w, z) == 0 && !w.empty()) {
+        const double top = *std::max_element(w.begin(), w.end());
+        double r = 0.0;
+        for (double v : w)
+          if (v > 1e-9 * top) r += 1.0;
+        rank = std::min(rank, r);
+      }
+    }
+  }
+  return rank;
+}
+
 }  // namespace
 
 // ===========================================================================
 // xtreg — fe routes to feols with --fe=panelvar; re routes to cobra xtreg
 // with --ivar=panelvar (no vcov support).
+
+namespace {
+// xtreg, be: the stored results of its regression on the n = N_g panel means (xtreg_be,
+// method identified; bank a833d61d `xtreg frate beertax unemp, be`: e(ll) -32.982318 =
+// -n/2 (1 + ln 2pi + ln(rss/n)) with rss 11.10713, e(ll_0) the same with the centred
+// TSS of the means, e(sum_w) 48, e(beta) b_j sd(xbar_j)/sd(ybar) over the means, row
+// r1), and its title, estat_cmd and marginstok (sic) macros.
+void postBetweenFitResultsM4(SessionState& session) {
+  auto putS = [&session](const std::string& nm, const std::string& v) {
+    session.eval.setEString(nm, v);
+    session.noteEOnFit(nm);
+  };
+  putS("title", "Between regression (regression on group means)");
+  putS("estat_cmd", "xtreg_estat");
+  putS("marginstok", "XB default");
+  const auto& lmo = session.lastModel();
+  if (!lmo.has_value() || !session.panelvar.has_value()) return;
+  const auto rows = est_detail::esampleRowsM4(session, *lmo);
+  const auto ebA = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
+  if (!rows.has_value() || rows->empty() || !ebA.matrix.has_value() ||
+      ebA.matrix->data.size() != 1)
+    return;
+  const std::vector<std::string>& bn = ebA.matrix->colnames;
+  const std::vector<double>& b = ebA.matrix->data[0];
+  if (bn.empty() || bn.back() != "_cons") return;
+  const size_t k = bn.size() - 1;
+  const double* gc = est_detail::f64ColumnM4(session, *session.panelvar);
+  const double* yc = est_detail::f64ColumnM4(session, lmo->depvar);
+  if (gc == nullptr || yc == nullptr) return;
+  std::vector<const double*> xc;
+  for (size_t j = 0; j < k; ++j) {
+    xc.push_back(est_detail::f64ColumnM4(session, bn[j]));
+    if (xc.back() == nullptr) return;
+  }
+  std::map<double, std::vector<double>> sums;  // panel -> (sum y, sum x..., count)
+  for (const int64_t r : *rows) {
+    auto& v = sums[gc[r]];
+    v.resize(k + 2, 0.0);
+    v[0] += yc[r];
+    for (size_t j = 0; j < k; ++j) v[1 + j] += xc[j][r];
+    v[k + 1] += 1.0;
+  }
+  const size_t n = sums.size();
+  if (n < 2) return;
+  std::vector<std::vector<double>> m;  // the means: y, x...
+  for (const auto& [g, v] : sums) {
+    std::vector<double> row(k + 1);
+    for (size_t j = 0; j <= k; ++j) row[j] = v[j] / v[k + 1];
+    m.push_back(std::move(row));
+  }
+  const double nd = static_cast<double>(n);
+  std::vector<double> mean(k + 1, 0.0), ss(k + 1, 0.0);
+  for (const auto& row : m)
+    for (size_t j = 0; j <= k; ++j) mean[j] += row[j] / nd;
+  double rss = 0;
+  for (const auto& row : m) {
+    double fit = b[k];
+    for (size_t j = 0; j < k; ++j) fit += b[j] * row[1 + j];
+    rss += (row[0] - fit) * (row[0] - fit);
+    for (size_t j = 0; j <= k; ++j) ss[j] += (row[j] - mean[j]) * (row[j] - mean[j]);
+  }
+  const double c = 1.0 + std::log(2.0 * M_PI);
+  auto put = [&session](const std::string& nm, double v) {
+    session.eval.setEScalar(nm, v);
+    session.noteEOnFit(nm);
+  };
+  put("ll", -0.5 * nd * (c + std::log(rss / nd)));
+  put("ll_0", -0.5 * nd * (c + std::log(ss[0] / nd)));
+  put("sum_w", nd);
+  if (k == 0 || !(ss[0] > 0)) return;
+  eval::EvalMatrix beta;
+  beta.rownames = {"r1"};
+  beta.data.emplace_back();
+  for (size_t j = 0; j < k; ++j) {
+    beta.colnames.push_back(bn[j]);
+    beta.data[0].push_back(b[j] * std::sqrt(ss[1 + j] / ss[0]));
+  }
+  auto& store = session.eval.eMatrices;
+  store.erase(std::remove_if(store.begin(), store.end(),
+                             [](const auto& p) { return p.first == "beta"; }),
+              store.end());
+  store.emplace_back("beta", std::move(beta));
+  session.noteEOnFit("beta");
+}
+}  // namespace
 
 ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
@@ -369,10 +503,19 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     cobraArgs.push_back(*session.currentHbin());
     cobraArgs.push_back("--tidy");
     ojson raw;
+    // e(sample), as the RE path below.
+    std::string esampleValues;
     try {
-      raw = runCobraJsonM4(cobraArgs);
+      std::vector<std::string> fitArgs = cobraArgs;
+      esampleValues = esampleFitArgs(session, fitArgs, std::string(), 0);
+      raw = runCobraJsonM4(fitArgs);
     } catch (const CobraError& ce) {
+      if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
       return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
+    }
+    if (!raw.is_object() || !raw.contains("esample_n")) {
+      cecon::native_unlink(esampleValues);
+      esampleValues.clear();
     }
     ojson block = cobraToEstimationM4(raw, "xtreg", &session);
     aliasPanelR2M4(raw);
@@ -387,10 +530,11 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
           raw["e_V"]["names"].is_array())
         raw["k_vars"] = raw["e_V"]["names"].size();
     }
-    cacheLastModelM4(session, "xtreg_be", cobraArgs, block, raw, std::string(), "xtreg");
+    cacheLastModelM4(session, "xtreg_be", cobraArgs, block, raw, esampleValues, "xtreg");
     if (session.lastModel().has_value()) {
       putEStringNL(session, "model", "be");
       session.eval.setEString("vce", "conventional");
+      postBetweenFitResultsM4(session);
     }
     return block;
   }
@@ -427,6 +571,16 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
       return ojson(eval::errorBlock("engine_error", "must specify panelvar; use xtset",
                                     std::nullopt, std::nullopt, std::nullopt, "r(459)"));
     }
+    // Stata 19's `xtreg, fe absorb()` (the HDFE fit beside the panel effects) posts
+    // its own statistics -- e(r2_w) = e(r2) = 1 - rss/tss_xt, e(df_m) counting the
+    // absorbed levels, e(tss_w)/e(mss_w)/e(r2_c)/e(df_ax) (bank 466dd621 `xtreg frate
+    // beertax unemp, fe absorb(year)`: r2_w .32626, df_m 55) -- that this version does
+    // not compute; the coefficients alone would leave the rest wrong at rc 0.
+    for (const auto& [k, v] : parsed.opts)
+      if (k == "absorb")
+        return engineErrorBlockM4("Option `absorb()` is a valid Stata option that this version "
+                                  "of PIET does not implement for `xtreg, fe`.",
+                                  "unsupported_option");
     // FU-29: xtreg,fe's `syntax ... [aw fw pw]` -- an iweight is Stata's
     // r(101) "iweights not allowed" (w2_pweight.log X11_iw_fe). The registry
     // row is AllWeights because the RE arm below has a different rule.
@@ -811,10 +965,20 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
   cobraArgs.push_back(*session.currentHbin());
   cobraArgs.push_back("--tidy");
   ojson raw;
+  // e(sample): the engine's listwise rows (--esample-out, not recorded in the
+  // replay argv). StataBE: `xtreg ..., re` then `estimates store re` adds _est_re.
+  std::string esampleValues;
   try {
-    raw = runCobraJsonM4(cobraArgs);
+    std::vector<std::string> fitArgs = cobraArgs;
+    esampleValues = esampleFitArgs(session, fitArgs, std::string(), 0);
+    raw = runCobraJsonM4(fitArgs);
   } catch (const CobraError& ce) {
+    if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
     return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
+  }
+  if (!raw.is_object() || !raw.contains("esample_n")) {
+    cecon::native_unlink(esampleValues);
+    esampleValues.clear();
   }
   ojson block = cobraToEstimationM4(raw, "xtreg", &session);
   aliasPanelR2M4(raw);
@@ -832,7 +996,7 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
         raw["e_V"]["names"].is_array())
       raw["k_vars"] = raw["e_V"]["names"].size();
   }
-  cacheLastModelM4(session, "xtreg", cobraArgs, block, raw);
+  cacheLastModelM4(session, "xtreg", cobraArgs, block, raw, esampleValues);
   if (session.lastModel().has_value()) putEStringNL(session, "model", "re");
   return block;
 }

@@ -49,10 +49,11 @@ namespace {
 // `text` only ever meant anything for a URL transfer (it selects the transfer
 // mode), and a URL source is refused outright below -- so for the local copy
 // this command performs it is honoured by construction, as is `asis`, which
-// names the byte-for-byte copy this does. `public` changes the destination's
-// PERMISSIONS, which this does not do, so it is refused rather than dropped.
+// names the byte-for-byte copy this does. `public` makes the destination
+// readable by everyone (the permission change is made below, on systems that
+// have one).
 const piet::eval::OptVocab& kVocabCopy =
-    piet::eval::registerOptVocab({"copy"}, {{"replace", "text", "asis"}, {"public"}});
+    piet::eval::registerOptVocab({"copy"}, {{"replace", "text", "asis", "public"}, {}});
 
 }  // namespace
 
@@ -70,6 +71,10 @@ using namespace file_command_detail;
 // `copy` that quietly produced nothing (or, worse, an empty file) would be the
 // silent-failure shape.
 ojson runCopy(const eval::ParsedCommand& parsed, SessionState& session) {
+  // `copy , zzabbrprobe`: the comma is taken for the first filename, which is
+  // not there, r(601) (bank d3292585d8956a12).
+  if (preCommaArgs(parsed.raw).empty() && parsed.raw.find(',') != std::string::npos)
+    return ioErrorRc("file , not found", 601);
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabCopy.known,
                                             kVocabCopy.unimplemented)) {
     return ojson(*err);
@@ -134,6 +139,16 @@ ojson runCopy(const eval::ParsedCommand& parsed, SessionState& session) {
       std::filesystem::remove(cecon::to_native_path(tmp), rmEc);
       return ioError("copy: " + srcSpelling + " -> " + dstSpell + ": " + ec.message(), "data_io");
     }
+  }
+  if (hasFlag(parsed.opts, "public")) {
+#ifndef _WIN32
+    std::error_code pec;
+    namespace fs = std::filesystem;
+    fs::permissions(cecon::to_native_path(dst),
+                    fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
+                        fs::perms::others_read,
+                    fs::perm_options::replace, pec);
+#endif
   }
   return silent();  // Stata's copy prints nothing
 }

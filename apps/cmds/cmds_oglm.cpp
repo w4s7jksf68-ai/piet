@@ -31,7 +31,7 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
     if (data_missing(data) || y.empty() || xcsv.empty()) {
         std::fprintf(stderr,
                      "usage: cobra %s --data f.hbin --y Y --x X1,X2 [--vce iid|robust|cluster] "
-                     "[--cluster C] [--level P] [--keepif EXPR] [--out f.json]\n"
+                     "[--cluster C] [--level P] [--iterate N] [--keepif EXPR] [--out f.json]\n"
                      "  ordered %s: outcome recoded 0..J-1 by sorted distinct value;\n"
                      "  reports J-1 cutpoints (/cut1 …) instead of a constant.\n"
                      "  --vce cluster            needs --cluster C.\n",
@@ -56,11 +56,37 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
     // Asymptotic z inference throughout — Stata's ordered models report z, not t.
     const double zc = z_critical(level == 95.0 ? 0.05 : 1.0 - level / 100.0);
 
+    // --weight / --wtype: fweight, iweight or pweight (ologit.ado / oprobit.ado
+    // `[fw iw pw]`), each row's log-likelihood contribution scaled by its weight;
+    // a pweight is fitted with the sandwich, Stata's rule. vs-stata bank aa1bb3ea /
+    // 1198712b / e6cc710e `ologit rep78 mpg weight [fw|iw|pw=w]`: e(ll) -175.42837
+    // under all three, e(N) the weight sum under fw.
+    const std::string weight_var = opt(a, "--weight"), wtype = opt(a, "--wtype");
+    cecon::WeightKind wkind = cecon::WeightKind::None;
+    if (!weight_var.empty() || !wtype.empty()) {
+        if (weight_var.empty()) throw EngineError("bad_input", std::string(cmd) + ": --wtype requires --weight");
+        if (wtype == "fw" || wtype == "fweight") wkind = cecon::WeightKind::Frequency;
+        else if (wtype == "iw" || wtype == "iweight") wkind = cecon::WeightKind::Importance;
+        else if (wtype == "pw" || wtype == "pweight") wkind = cecon::WeightKind::Probability;
+        else throw EngineError("bad_input", std::string(cmd) + ": --wtype must be fw, iw or pw");
+        if (wkind == cecon::WeightKind::Probability && vce == "iid")
+            throw EngineError("bad_input", std::string(cmd) + ": [pweight=] requires vce(robust)");
+        if (wkind != cecon::WeightKind::Probability && vce != "iid")
+            throw EngineError("unsupported", std::string(cmd) + ": fweights and iweights are fitted "
+                                             "with the default VCE only");
+    }
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     std::vector<std::string> cluster_names;
     if (!cluster_var.empty()) cluster_names.push_back(cluster_var);
-    GlmInputs g = load_glm(ds, cmd, y, split_csv(xcsv), cluster_names);
+    // --offset V: Stata's offset(), a term in the linear predictor with its
+    // coefficient fixed at 1; the start is the same cutpoints-only point, the
+    // model test Wald and no e(ll_0) (vs-stata bank 13941585 `ologit rep78 mpg
+    // weight, offset(off)`: iteration 0 -118.81283, Wald chi2(2) 23.28).
+    const std::string offset_var = opt(a, "--offset");
+    GlmInputs g = load_glm(ds, cmd, y, split_csv(xcsv), cluster_names, weight_var, wkind, offset_var);
+    const double* wt = g.weights.empty() ? nullptr : g.weights.data();
+    const double* off = g.offset.empty() ? nullptr : g.offset.data();
     require_sample(g.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     // Drop the trailing intercept (see the file header). Pure truncation: it is the
     // LAST column of the col-major design, so the surviving bytes do not move.
@@ -85,7 +111,21 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
             std::string(cmd) + ": outcome '" + y + "' takes fewer than 2 distinct values.");
     const int np = g.k + J - 1;
 
-    OglmResult r = oglm_fit(g.X.data(), g.n, g.k, cat.data(), J, link);
+    // --iterate N: ml's iterate(#) (Stata default 300; 0 reports the start, the
+    // cutpoints-only fit). The fit stops after N Newton iterations, converged or not.
+    int max_iter = 300;
+    if (has(a, "--iterate")) {
+        const std::string it_s = opt(a, "--iterate");
+        char* end = nullptr;
+        const long v = std::strtol(it_s.c_str(), &end, 10);
+        if (it_s.empty() || end == nullptr || *end != '\0' || v < 0 || v > 16000) {
+            std::fprintf(stderr, "%s: --iterate must be an integer in [0, 16000] (got %s).\n", cmd,
+                         it_s.c_str());
+            return 2;
+        }
+        max_iter = static_cast<int>(v);
+    }
+    OglmResult r = oglm_fit(g.X.data(), g.n, g.k, cat.data(), J, link, max_iter, wt, off);
     if (!r.ok)
         throw EngineError("no_convergence",
             std::string(cmd) + ": MLE failed (singular information matrix or non-convergent fit).");
@@ -107,7 +147,7 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
     std::vector<double> V = r.vcov;
     int n_clusters = 0;
     if (vce == "robust" || vce == "cluster") {
-        std::vector<double> S = oglm_scores(g.X.data(), g.n, g.k, cat.data(), J, link, r);
+        std::vector<double> S = oglm_scores(g.X.data(), g.n, g.k, cat.data(), J, link, r, wt, off);
         int64_t rows = g.n;
         const Factor* fac = nullptr;
         double factor;
@@ -164,15 +204,37 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
                             r.beta[static_cast<size_t>(j)];
     }
 
-    json out = {{"estimator", cmd}, {"n_obs", g.n}, {"n_dropped_missing", g.n_dropped},
+    // The model test Stata reports: with the default (observed-information) VCE it is
+    // the likelihood-ratio statistic 2(ll - ll_0) against the cutpoints-only model
+    // (bank d8de89e3 `ologit rep78 mpg weight`: LR chi2(2) 14.35758750211474 =
+    // 2(-86.513267 + 93.692061)); under vce(robust)/vce(cluster) it is the Wald
+    // statistic above.
+    const bool lr = (vce == "iid") && off == nullptr;
+    if (lr) chi2 = 2.0 * (r.ll - r.ll_0);
+    // e(N): the weight sum under fweights, the row count otherwise.
+    int64_t n_obs = g.n;
+    if (wkind == cecon::WeightKind::Frequency) {
+        double sw = 0.0;
+        for (double w : g.weights) sw += w;
+        n_obs = static_cast<int64_t>(std::llround(sw));
+    }
+    json out = {{"estimator", cmd}, {"n_obs", n_obs}, {"n_dropped_missing", g.n_dropped},
                 {"n_cats", J}, {"cat_values", cat_values}, {"vce", vce},
                 {"coefs", coefs}, {"cuts", cuts},
                 {"ll", r.ll}, {"ll_0", r.ll_0},
                 {"r2_pseudo", (r.ll_0 != 0) ? 1.0 - r.ll / r.ll_0 : 0.0},
                 {"chi2", chi2}, {"df_chi2", g.k}, {"p_chi2", chi2_pvalue(chi2, g.k)},
+                {"chi2type", lr ? "LR" : "Wald"},
                 {"iters", r.iters}, {"converged", r.converged}};
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
     if (level_set) out["level"] = level;
+    if (wkind != cecon::WeightKind::None) out["n_rows"] = g.n;  // the e(sample) handshake's rows
+    // Under offset() there is no constant-only comparison model: no e(ll_0) / e(r2_p).
+    if (off != nullptr) {
+        out.erase("ll_0");
+        out.erase("r2_pseudo");
+        out["offset"] = offset_var;
+    }
     add_warnings(out, g.warnings);
     // --emit-v (BUG-1196): the fit's V, slopes then cutpoints -- Stata's e(V)
     // order and metric (StataBE 19.5 colfullnames e(b) `yo:x1 yo:x2 /cut1 /cut2`).
@@ -180,6 +242,40 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
         std::vector<std::string> names = g.names;
         for (int c = 0; c < J - 1; ++c) names.push_back("/cut" + std::to_string(c + 1));
         add_e_v(out, names, V);
+        // e(V_modelbased): under vce(robust)/vce(cluster) Stata also posts the
+        // observed-information variance the sandwich was built on.
+        if (vce != "iid") {
+            json tmp;
+            add_e_v(tmp, names, r.vcov);
+            out["e_Vmb"] = std::move(tmp["e_V"]);
+        }
+    }
+    // ml's iteration log (iteration 0 is the cutpoints-only start, e(ll_0)) and the
+    // gradient at the reported estimates, slopes then cutpoints (e(ilog), e(gradient)).
+    out["ilog"] = r.ilog;
+    out["gradient"] = r.gradient;
+    // The largest fitted probability of an observation's own outcome at the
+    // estimates: an observation whose outcome the model predicts with certainty is
+    // "completely determined" (e(N_cd)); below 1 - 1e-6 no observation can be.
+    {
+        std::vector<double> theta = r.beta;
+        theta.insert(theta.end(), r.cuts.begin(), r.cuts.end());
+        double pmax = 0.0;
+        for (int64_t i = 0; i < g.n; ++i) {
+            double xb = 0.0;
+            for (int c = 0; c < g.k; ++c)
+                xb += g.X[static_cast<size_t>(c) * static_cast<size_t>(g.n) + static_cast<size_t>(i)] *
+                      r.beta[static_cast<size_t>(c)];
+            if (off) xb += off[static_cast<size_t>(i)];
+            const int j = cat[static_cast<size_t>(i)];
+            const auto F = [&](double t) {
+                return link == OrdLink::Logit ? ogl::lcdf(t) : ogl::ncdf(t);
+            };
+            const double hi = (j == J - 1) ? 1.0 : F(r.cuts[static_cast<size_t>(j)] - xb);
+            const double lo = (j == 0) ? 0.0 : F(r.cuts[static_cast<size_t>(j - 1)] - xb);
+            pmax = std::max(pmax, hi - lo);
+        }
+        out["max_p_own"] = pmax;
     }
     emit(out, opt(a, "--out"));
     return 0;

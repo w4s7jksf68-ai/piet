@@ -899,7 +899,8 @@ public:
     // MISSING (.) on rows where any tag variable is missing (Stata: tagged rows
     // exclude missing-key rows). One-row-per-group dedup marker.
     // No store type: _gtag.ado ignores the requested type ("byte more efficient").
-    void egen_tag(const std::string& out, const std::vector<std::string>& by_cols);
+    void egen_tag(const std::string& out, const std::vector<std::string>& by_cols,
+                  bool missing_as_key = false);
 
     // egen group: `egen out = group(varlist)` — dense integer id 1..K over the SORTED
     // distinct combinations of varlist. Rows with any missing key get MISSING (.)

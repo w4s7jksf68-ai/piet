@@ -557,10 +557,6 @@ ojson bcalCreateVerb(const eval::ParsedCommand& parsed, SessionState& session) {
 
   CalendarTarget target;
   if (auto refusal = splitCalendarTarget(dequote(parsed.varlist[1]), session, &target)) return *refusal;
-  if (hasFlag(parsed.opts, "personal")) {
-    return ojson(eval::unsupportedOption(
-        "personal", "this build has no PERSONAL directory; give the calendar a path instead"));
-  }
   const std::optional<std::string> fromText = optStr(parsed.opts, "from");
   if (!fromText.has_value() || fromText->empty()) return utilErrorRc("option from() required", 198);
   if (!session.hasData()) return utilErrorRc("no dataset in use", 3);
@@ -574,6 +570,11 @@ ojson bcalCreateVerb(const eval::ParsedCommand& parsed, SessionState& session) {
   if (fromVars.tokens.empty()) return utilErrorRc("option from() required", 198);
   const std::string fromVar = fromVars.tokens.front();
   if (head->dtype(fromVar) != "f64") return utilErrorRc(fromVar + " has non-numeric values", 198);
+  // `personal` is read after from(): a missing from() variable is r(111) first (vs-stata bank).
+  if (hasFlag(parsed.opts, "personal")) {
+    return ojson(eval::unsupportedOption(
+        "personal", "this build has no PERSONAL directory; give the calendar a path instead"));
+  }
 
   // generate() is judged here, before anything can be written. A storage-type word
   // as the name is still taken as a name (open BUG-1874).

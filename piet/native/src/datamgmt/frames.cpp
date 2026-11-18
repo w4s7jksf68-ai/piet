@@ -456,6 +456,9 @@ ojson runFrlink(const std::string& linkType, const std::vector<std::string>& key
     total = after->nRows();
     unmatched = after->nMissing(genName);
   }
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("unmatched", static_cast<double>(unmatched));
+  eval::declareRPosted(session.eval, "frlink", {"unmatched"});
   const std::string msg =
       unmatched == 0
           ? "(all observations in frame default matched)"
@@ -478,6 +481,11 @@ ojson runFrget(const std::vector<std::pair<std::string, std::string>>& renames,
   if (renames.empty()) return frameError("frget: variable list required");
   if (fromLink.empty()) return frameError("frget: from(LINKVAR) is required");
 
+  // from() names a variable first: `frget price2, from(nolink)` is r(111)
+  // "variable nolink not found" (vs-stata bank 511f5bc6bc34ee49).
+  if (!master->has(fromLink))
+    return ojson(eval::errorBlock("engine_error", "variable " + fromLink + " not found",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(111)"));
   auto lit = session.frameLinks.find(fromLink);
   if (lit == session.frameLinks.end()) {
     return frameError("frget: " + fromLink +
@@ -590,6 +598,13 @@ nlohmann::ordered_json runFramesReset(SessionState& session) {
     // the opposite of what `frames reset` was asked to do.
     ojson r = runFrameDrop(name, session);
     if (r.is_object() && r.value("type", "") == "error") lastError = r;
+  }
+  if (!lastError.is_object()) {
+    // [D] frames reset: "a single, empty frame named default" -- the default
+    // frame's data go too (vs-stata bank: `frames reset` and `clear frames`
+    // after `use auto` leave N 0, k 0).
+    ojson cleared = runClear("", session);
+    if (cleared.is_object() && cleared.value("type", "") == "error") return cleared;
   }
   return lastError;
 }

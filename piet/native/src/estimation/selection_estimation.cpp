@@ -2,6 +2,7 @@
 // Copyright (C) 2026 M.K. Kim
 // Selection estimation.
 #include "piet/handlers/estimation.h"
+#include "piet/handlers/postestimation.h"  // runHeckmanMillsVar
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -29,6 +30,8 @@
 #include "piet/scratch_seq.h"
 #include "piet/stata_format.h"
 #include "estimation_internal.h"
+#include "estimation_families_internal.h"  // cacheLastModelM4
+#include "estimation_sample_internal.h"  // esampleFitArgs
 #include "estimators/posthest.h"  // cecon::margins_parse_at (header-inline)
 
 #include "extended_estimation_internal.h"
@@ -40,6 +43,284 @@ using namespace est_detail;
 namespace extended_fit_detail {}
 using namespace extended_fit_detail;
 using namespace extended_estimation_vocab;
+
+// heckman's default fit, full maximum likelihood (heckman.ado: ml with heck_d2,
+// started at the two-step estimates, search(off)): the engine's `heckman --ml`
+// (vs-stata bank fdeed49b `heckman lw grade age, select(grade age married south)`:
+// iterations -2409.0108 .. -2404.7667, e(chi2_c) 60.844821). e(b) is `y:x .. y:_cons
+// S:z .. S:_cons /athrho /lnsigma` (S the selection equation's depvar, `select`
+// when select() names none).
+// `twostep`: heckman.ado's Heck2 (engine `heckman` without --ml): e(b) `y:x .. y:_cons
+// S:z .. S:_cons /mills:lambda`, e(V) block-diagonal (vs-stata bank b6e7e050
+// `select(grade age married south) twostep`).
+ojson runHeckmanFit(const eval::ParsedCommand& parsed, SessionState& session, const std::string& y,
+                    const std::vector<std::string>& xs, const std::string& selectRaw,
+                    bool twostep) {
+  static const std::regex rePlain(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
+  if (selectRaw.find(',') != std::string::npos)
+    return engineErrorBlockM4(
+        "Options inside select() (noconstant, offset()) are valid Stata that this version of "
+        "PIET does not implement for `heckman`.",
+        "unsupported_option");
+  const size_t eq = selectRaw.find('=');
+  if (eq != std::string::npos && selectRaw.find('=', eq + 1) != std::string::npos)
+    return engineErrorBlockM4("syntax_error: malformed select(): only one '=' is allowed",
+                              "syntax_error");
+  std::string selDep;
+  std::vector<std::string> selVars;
+  if (eq != std::string::npos) {
+    const auto d = splitTokensM4(selectRaw.substr(0, eq));
+    if (d.size() != 1)
+      return engineErrorBlockM4(
+          "syntax_error: malformed select(): need exactly one selection-equation dependent "
+          "variable",
+          "syntax_error");
+    selDep = d[0];
+    selVars = splitTokensM4(selectRaw.substr(eq + 1));
+  } else {
+    selVars = splitTokensM4(selectRaw);
+  }
+  if (selVars.empty())
+    return engineErrorBlockM4("syntax_error: select() requires at least one variable",
+                              "syntax_error");
+  std::vector<std::string> all(xs);
+  all.insert(all.end(), selVars.begin(), selVars.end());
+  if (!selDep.empty()) all.push_back(selDep);
+  for (const auto& v : all)
+    if (!std::regex_match(v, rePlain))
+      return engineErrorBlockM4(
+          "Factor variables and time-series operators (`" + v + "`) in `heckman`'s maximum-"
+          "likelihood fit are valid Stata that this version of PIET does not implement.",
+          "unsupported_option");
+  if (parsed.weightType.has_value())
+    return engineErrorBlockM4(
+        "Weights in `heckman`'s maximum-likelihood fit are valid Stata that this version of PIET "
+        "does not implement.",
+        "unsupported_option");
+
+  std::vector<std::string> argv = {"heckman", "--y", y, "--x", joinCommaM4(xs),
+                                    "--select",
+                                    selDep.empty() ? joinCommaM4(selVars)
+                                                   : selDep + "=" + joinCommaM4(selVars)};
+  if (!twostep) argv.insert(argv.begin() + 1, "--ml");
+  // the two-step estimator: Stata's conventional VCE and rhosigma rule only
+  if (twostep) {
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "noconstant" || k == "iterate" || k == "vce" || k == "robust")
+        return engineErrorBlockM4("Option `" + k + "` with `heckman, twostep` is valid Stata "
+                                  "that this version of PIET does not implement.",
+                                  "unsupported_option");
+    }
+  }
+  if (parsed.ifExpr.has_value()) {
+    argv.push_back("--keepif");
+    argv.push_back(*parsed.ifExpr);
+  }
+  bool robust = false;
+  std::string clusterVar;
+  for (const auto& [k, v] : parsed.opts) {
+    if (k == "level" && !v.isBool) {
+      argv.push_back("--level");
+      argv.push_back(v.strValue);
+    } else if (k == "noconstant" && !twostep) {
+      argv.push_back("--no-intercept");
+    } else if (k == "iterate" && !twostep) {
+      const std::string val = trimM4(v.isBool ? std::string() : v.strValue);
+      char* end = nullptr;
+      const double d = std::strtod(val.c_str(), &end);
+      if (val.empty() || end == nullptr || *end != '\0' || !(d >= 0 && d <= 16000) ||
+          d != std::floor(d))
+        return engineErrorBlockM4("option iterate() must be an integer from 0 to 16000 in this "
+                                  "build (got `" + val + "`)",
+                                  "unsupported_option");
+      argv.push_back("--iterate");
+      argv.push_back(std::to_string(static_cast<int>(d)));
+    } else if (k == "robust" && !twostep) {
+      robust = true;
+    } else if (k == "vce" && !twostep) {
+      const std::vector<std::string> w = splitTokensM4(v.isBool ? std::string() : v.strValue);
+      const std::string w0 = w.empty() ? std::string() : lowerM4(w[0]);
+      if (w.size() == 1 && std::string("robust").compare(0, w0.size(), w0) == 0 && w0.size() >= 1) {
+        robust = true;
+      } else if (w.size() == 2 && w0.size() >= 2 && std::string("cluster").compare(0, w0.size(), w0) == 0) {
+        clusterVar = w[1];
+      } else if (w.size() == 1 && w0 == "oim") {
+      } else {
+        return engineErrorBlockM4("vce(" + (v.isBool ? std::string() : v.strValue) +
+                                      ") is valid Stata that this version of PIET does not "
+                                      "implement for `heckman`'s maximum-likelihood fit.",
+                                  "unsupported_option");
+      }
+    }
+  }
+  if (!clusterVar.empty()) {
+    argv.push_back("--cluster");
+    argv.push_back(clusterVar);
+  } else if (robust) {
+    argv.push_back("--vce");
+    argv.push_back("robust");
+  }
+  std::unordered_set<std::string> kKnown = kVocabHeckman.known;
+  std::unordered_set<std::string> kUnimpl = kVocabHeckman.unimplemented;
+  // mills(newvar) / nshazard(newvar): the nonselection hazard (nshazard wins when
+  // both are given, heckman.ado); the name must be new (confirm new var, r(110))
+  std::string millsVar;
+  for (const char* key : {"mills", "nshazard"}) {
+    kKnown.insert(key);
+    kUnimpl.erase(key);
+    for (const auto& [k, v] : parsed.opts)
+      if (k == key) {
+        if (v.isBool || trimM4(v.strValue).empty())
+          return stataRefusalM4b("option " + std::string(key) + "() incorrectly specified", 198);
+        millsVar = trimM4(v.strValue);
+      }
+  }
+  if (!millsVar.empty()) {
+    static const std::regex reName(R"(^[A-Za-z_][A-Za-z0-9_]{0,31}$)");
+    if (!std::regex_match(millsVar, reName)) return stataRefusalM4b(millsVar + " invalid name", 198);
+    Datastore* live = session.datastore();
+    if (live != nullptr && live->has(millsVar))
+      return stataRefusalM4b("variable " + millsVar + " already defined", 110);
+  }
+  // rhosigma is the two-step default rule (heckman.ado: rhometh 3); the others are not
+  if (twostep) {
+    kKnown.insert("rhosigma");
+    kUnimpl.erase("rhosigma");
+  }
+  if (auto err = eval::rejectUnknownOptions(parsed.opts, kKnown, kUnimpl)) return *err;
+  argv.push_back("--data");
+  argv.push_back(*session.currentHbin());
+  argv.push_back("--tidy");
+  ojson raw;
+  std::string esampleValues;
+  try {
+    std::vector<std::string> fitArgs = argv;
+    esampleValues = esampleFitArgs(session, fitArgs, std::string(), 0);
+    raw = runCobraJsonM4(fitArgs);
+  } catch (const CobraError& ce) {
+    if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
+    if (std::string(ce.what()).find("never censored") != std::string::npos)
+      return stataRefusalM4b("Dependent variable never censored because of selection: model "
+                             "would simplify to OLS regression", 498);
+    return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
+  }
+  if (!raw.is_object() || !raw.contains("esample_n")) {
+    if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
+    esampleValues.clear();
+  }
+  // Stata's scalar names, from this fit's values.
+  raw["N_selected"] = raw.value("n_selected", 0.0);
+  raw["N_nonselected"] = raw.value("n_obs", 0.0) - raw.value("n_selected", 0.0);
+  raw["selambda"] = raw.value("se_lambda", 0.0);
+
+  if (twostep && raw.contains("converged") && raw["converged"].is_boolean())
+    raw["fconverged"] = raw["converged"].get<bool>() ? 1.0 : 0.0;
+
+  ojson block = cobraToEstimationM4(raw, "heckman", &session);
+  block["depvar"] = y;
+  block["estimator"] = "heckman";
+  // the fit's scalars as the block has always carried them
+  for (const char* k : {"lambda", "se_lambda", "rho", "sigma", "n_selected", "select_coefs"})
+    if (raw.contains(k)) block[k] = raw[k];
+  const std::string seleq = raw.value("select_eq", std::string("select"));
+  const double level = [&] {
+    for (const auto& [k, v] : parsed.opts)
+      if (k == "level" && !v.isBool) return std::strtod(v.strValue.c_str(), nullptr);
+    return 95.0;
+  }();
+  const double zc = cecon::z_critical(level == 95.0 ? 0.05 : 1.0 - level / 100.0);
+  // z, p and the interval of a row from its b and se (the two-step rows carry t only)
+  const auto zrow = [zc](ojson c) {
+    const double b = c.value("b", 0.0), se = c.value("se", 0.0);
+    if (se > 0) {
+      c["z"] = b / se;
+      c["t"] = b / se;
+      c["p"] = std::erfc(std::fabs(b / se) / std::sqrt(2.0));
+      c["ci_lo"] = b - zc * se;
+      c["ci_hi"] = b + zc * se;
+    }
+    return c;
+  };
+  ojson coefs = ojson::array(), selCoefs = ojson::array(), aux = ojson::array();
+  for (const auto& c : raw.value("coefs", ojson::array())) coefs.push_back(twostep ? zrow(c) : c);
+  for (const auto& c : raw.value("select_coefs", ojson::array()))
+    selCoefs.push_back(twostep ? zrow(c) : c);
+  if (twostep) {
+    aux.push_back(zrow(ojson{{"name", "/mills:lambda"}, {"b", raw.value("lambda", 0.0)},
+                             {"se", raw.value("se_lambda", 0.0)}}));
+  } else {
+    aux = raw.value("aux_coefs", ojson::array());
+  }
+  // The table as Stata prints it: the outcome equation, the selection equation,
+  // then /athrho /lnsigma and the transformed rho, sigma and lambda (ML) or
+  // /mills:lambda followed by rho, sigma (two-step).
+  {
+    auto eqOf = [](const std::string& dv, const ojson& rows) {
+      ojson e;
+      e["depvar"] = dv;
+      e["coeftable"] = rows;
+      e["r2"] = nullptr;
+      e["r2_within"] = nullptr;
+      e["dof_resid"] = nullptr;
+      return e;
+    };
+    ojson tail = aux;
+    if (twostep) {
+      for (const char* k : {"rho", "sigma"})
+        tail.push_back(ojson{{"name", k}, {"b", raw.value(k, 0.0)}, {"se", nullptr}, {"t", nullptr},
+                             {"p", nullptr}, {"ci_lo", nullptr}, {"ci_hi", nullptr}});
+    } else {
+      for (const auto& d : raw.value("diparm", ojson::array())) tail.push_back(d);
+    }
+    ojson outcomes = ojson::array();
+    outcomes.push_back(eqOf(y, coefs));
+    outcomes.push_back(eqOf(seleq, selCoefs));
+    outcomes.push_back(eqOf(twostep ? "/mills" : "/athrho /lnsigma", tail));
+    block["outcomes"] = outcomes;
+  }
+  // r(table) laid out as e(b) (normal reference).
+  ojson rcols = ojson::array();
+  std::vector<AncillaryEbColM4> cols;
+  const auto addEq = [&](const ojson& rows, const std::string& eqn) {
+    for (const auto& c : rows) {
+      std::string nm = c.value("name", std::string());
+      std::string full;
+      if (!eqn.empty()) full = eqn + ":" + (nm == "(intercept)" ? std::string("_cons") : nm);
+      else full = nm;
+      ojson rc = c;
+      rc["name"] = full;
+      rcols.push_back(rc);
+      cols.push_back({full, full, c.value("b", 0.0)});
+    }
+  };
+  addEq(coefs, y);
+  addEq(selCoefs, seleq);
+  addEq(aux, std::string());
+  block["rtable_cols"] = rcols;
+  if (!twostep) {
+    ojson dp = ojson::array();
+    for (const auto& d : raw.value("diparm", ojson::array())) {
+      ojson c = d;
+      c["name"] = "_diparm1:" + d.value("name", std::string());
+      dp.push_back(c);
+    }
+    block["rtable_diparm"] = dp;
+  }
+  if (!millsVar.empty()) raw["mills"] = millsVar;
+  fit_detail::cacheLastModelM4(session, twostep ? "heckman" : "heckman_ml", argv, block, raw,
+                               esampleValues, "heckman");
+  session.lastEstBlock = block;
+  // _b[] / _se[] read the live block's coeftable: every e(b) column by its full
+  // name (`lw:grade`, `select:_cons`, `/athrho`, `/mills:lambda`), as the two-step
+  // path always posted it; the returned block keeps the outcome table for display.
+  (*session.lastEstBlock)["coeftable"] = rcols;
+  (void)postAncillaryEbM4(session, raw, cols);
+  if (!millsVar.empty()) {
+    const ojson w = runHeckmanMillsVar(session, millsVar);
+    if (w.value("type", std::string()) == "error") return w;
+  }
+  return block;
+}
 
 ojson runHeckman(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
@@ -61,169 +342,10 @@ ojson runHeckman(const eval::ParsedCommand& parsed, SessionState& session) {
     return engineErrorBlockM4("syntax_error: heckman requires select(depvar = varlist)",
                               "syntax_error");
   }
-  size_t eq = selectRaw->find('=');
-  if (eq == std::string::npos) {
-    return engineErrorBlockM4("syntax_error: malformed select(): missing '='", "syntax_error");
-  }
-  if (selectRaw->find('=', eq + 1) != std::string::npos) {
-    return engineErrorBlockM4("syntax_error: malformed select(): only one '=' is allowed",
-                              "syntax_error");
-  }
-  std::vector<std::string> selDep = splitTokensM4(selectRaw->substr(0, eq));
-  std::vector<std::string> selVars = splitTokensM4(selectRaw->substr(eq + 1));
-  if (selDep.size() != 1 || selVars.empty()) {
-    return engineErrorBlockM4(
-        "syntax_error: malformed select(): need exactly one selection-equation dependent "
-        "variable and at least one identifying variable",
-        "syntax_error");
-  }
-
-  if (!sawTwostep) {
-    return engineErrorBlockM4(
-        "Full maximum-likelihood `heckman` (Stata's default when `twostep` is omitted) is not "
-        "supported by this version of PIET — the engine's heckman estimator only implements the "
-        "two-step Heckit method. Use `heckman ..., select(...) twostep`.",
-        "unsupported_option");
-  }
-
-  std::vector<std::string> argv = {"heckman", "--y", y, "--x", joinCommaM4(xs), "--select",
-                                    selDep[0] + "=" + joinCommaM4(selVars)};
-  // Deliberately no --twostep (see the function-header comment: the flag
-  // itself triggers a cobra CLI masking bug; the engine's bare default
-  // already computes the two-step estimate the oracle pins).
-  if (parsed.ifExpr.has_value()) {
-    argv.push_back("--keepif");
-    argv.push_back(*parsed.ifExpr);
-  }
-
-  // BUG-274: `level()` used to fall through to the generic reject net below
-  // ("option `level` not allowed" — `level` was simply absent from kKnown).
-  // BUG-202 gave cobra's heckman a real `--level` (ci_lo/ci_hi on BOTH the
-  // outcome coeftable and select_coefs, asymptotic z — live-verified on this
-  // tree's engine), so it is now in kKnown and forwards, same idiom as
-  // runTobit/runNbreg. The engine validates the range itself ([10, 99.99]).
-  for (const auto& [k, v] : parsed.opts) {
-    if (k == "level" && !v.isBool) {
-      argv.push_back("--level");
-      argv.push_back(v.strValue);
-      continue;
-    }
-  }
-
-  // BUG-233: the one copy of this vocabulary now lives in the file-scope
-  // registration block (see top of file); this binding keeps every existing
-  // use — including the reject net below — reading the same set.
-  const std::unordered_set<std::string>& kKnown = kVocabHeckman.known;
-  if (auto err = eval::rejectUnknownOptions(parsed.opts, kKnown)) {
-    return *err;
-  }
-
-  argv.push_back("--data");
-  argv.push_back(*session.currentHbin());
-  argv.push_back("--tidy");
-
-  ojson raw;
-  try {
-    raw = runCobraJsonM4(argv);
-  } catch (const CobraError& ce) {
-    return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
-  }
-
-  // Stata's scalar names, from the values this fit actually computed.
-  raw["N_selected"] = raw.at("n_selected");
-  raw["N_nonselected"] = raw.at("n_obs").get<double>() - raw.at("n_selected").get<double>();
-  raw["selambda"] = raw.at("se_lambda");
-  if (raw.contains("converged") && raw["converged"].is_boolean())
-    raw["fconverged"] = raw["converged"].get<bool>() ? 1.0 : 0.0;
-  ojson block = cobraToEstimationM4(raw, "heckman", &session);
-  block["depvar"] = y;  // cobra heckman's raw JSON carries no "depvar" field at all (live-verified)
-  block["estimator"] = "heckman";  // Stata's own display name is "heckman" regardless of twostep
-  static const char* kHeckmanFields[] = {
-      "lambda", "se_lambda", "rho", "sigma", "n_selected", "select_coefs",
-  };
-  for (const char* k : kHeckmanFields) {
-    if (raw.contains(k)) block[k] = raw[k];
-  }
-  // Multi-equation shape (outcome + selection): reuse the SAME
-  // {depvar, coeftable, r2, r2_within, dof_resid}-per-entry "outcomes" array
-  // shape D1's reg3 adapter already established (cobraToEstimationM4's
-  // "equations"->"outcomes" remap above), so any future "iterate
-  // block.outcomes[]" frontend renderer picks up heckman's two equations
-  // for free. cobra's select_coefs rows carry name/b/se/t always, and — since
-  // BUG-202 gave heckman `--level` — ci_lo/ci_hi too WHEN level() was
-  // forwarded (live-verified both ways on this tree's engine: absent without
-  // --level, populated with it). Carry what the engine sent; p is genuinely
-  // never emitted on select rows and stays null, not fabricated (BUG-274
-  // un-staled the old "no p/CI ever" wording here).
-  if (raw.contains("select_coefs") && raw["select_coefs"].is_array()) {
-    ojson selCt = ojson::array();
-    for (const auto& c : raw["select_coefs"]) {
-      ojson r;
-      r["name"] = c.value("name", std::string());
-      r["b"] = c.contains("b") ? c["b"] : ojson(nullptr);
-      r["se"] = c.contains("se") ? c["se"] : ojson(nullptr);
-      r["t"] = c.contains("t") ? c["t"] : ojson(nullptr);
-      r["p"] = ojson(nullptr);
-      r["ci_lo"] = c.contains("ci_lo") ? c["ci_lo"] : ojson(nullptr);
-      r["ci_hi"] = c.contains("ci_hi") ? c["ci_hi"] : ojson(nullptr);
-      selCt.push_back(r);
-    }
-    ojson outcomeEq;
-    outcomeEq["depvar"] = y;
-    outcomeEq["coeftable"] = block.value("coeftable", ojson::array());
-    outcomeEq["r2"] = ojson(nullptr);
-    outcomeEq["r2_within"] = ojson(nullptr);
-    outcomeEq["dof_resid"] = ojson(nullptr);
-    ojson selectEq;
-    selectEq["depvar"] = selDep[0];
-    selectEq["coeftable"] = selCt;
-    selectEq["r2"] = ojson(nullptr);
-    selectEq["r2_within"] = ojson(nullptr);
-    selectEq["dof_resid"] = ojson(nullptr);
-    ojson outcomes = ojson::array();
-    outcomes.push_back(outcomeEq);
-    outcomes.push_back(selectEq);
-    block["outcomes"] = outcomes;
-  }
-
-  LastModel lm;
-  lm.cobraCmd = "heckman";  // added to runMargins's kLinearCmds below — heckman's outcome
-                            // equation is a plain linear fit, so dydx is equally meaningless.
-  lm.y = y;
-  lm.x = xs;
-  lm.depvar = y;
-  captureFitFilterM4(lm, argv);
-  lm.dataPath = *session.currentHbin();
-  lm.result = raw;
-  session.setLastModel(lm);
-  session.lastEstBlock = block;
-  // Both fitted equations and the Mills coefficient are part of e(b), even
-  // though the console presents the equations separately. Preserve their
-  // actual SEs for qualified _se[]; a full cross-equation e(V) is not invented.
-  ojson full = ojson::array();
-  auto appendEq = [&full](const ojson& rows, const std::string& eq) {
-    for (const auto& c : rows) {
-      ojson row = c;
-      std::string name = row.value("name", std::string());
-      if (name == "(intercept)") name = "_cons";
-      row["name"] = eq + ":" + name;
-      full.push_back(std::move(row));
-    }
-  };
-  appendEq(block.value("coeftable", ojson::array()), y);
-  appendEq(raw.value("select_coefs", ojson::array()), selDep[0]);
-  full.push_back(ojson{{"name", "/mills:lambda"}, {"b", raw["lambda"]},
-                       {"se", raw["se_lambda"]}});
-  eval::EvalMatrix eb;
-  eb.rownames = {"y1"};
-  eb.data.emplace_back();
-  for (const auto& row : full) {
-    eb.colnames.push_back(row["name"].get<std::string>());
-    eb.data[0].push_back(row["b"].get<double>());
-  }
-  (*session.lastEstBlock)["coeftable"] = std::move(full);
-  session.eval.eMatrices.emplace_back("b", std::move(eb));
-  return block;
+  // select([depvar =] varlist): without `depvar =` a row is selected when the outcome
+  // is observed (heckman's syntax: depvar_s is optional). Full maximum likelihood by
+  // default, the two-step estimator under twostep.
+  return runHeckmanFit(parsed, session, y, xs, *selectRaw, sawTwostep);
 }
 
 // ===========================================================================

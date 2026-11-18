@@ -85,7 +85,8 @@ nlohmann::ordered_json runXtileStata(const std::string& newvar, const std::strin
                     const std::optional<std::string>& ifExpr,
                     const std::optional<std::string>& inRange,
                     const std::optional<std::string>& weightVar, SessionState& session,
-                    const std::optional<std::string>& weightType);
+                    const std::optional<std::string>& weightType,
+                    bool leavesCountR = true);
 nlohmann::ordered_json runExpandIf(const std::string& countArg, const std::optional<std::string>& genVar,
                   const std::optional<std::string>& ifExpr,
                   const std::optional<std::string>& inRange, SessionState& session);
@@ -129,7 +130,8 @@ JoinbyUsingResult resolveJoinbyUsing(SessionState& session, const std::string& u
 // carries ul list u through ul, StataBE).
 void adoptUsingOwnVars(SessionState& session, const JoinbyUsingResult& ur,
                        const std::map<std::string, UsingVarMeta>& uMeta,
-                       const std::vector<std::string>& usingOnly);
+                       const std::vector<std::string>& usingOnly,
+                       bool copyValueLabels = true);
 inline constexpr int kXtileDefaultNq = 2;
 
 
@@ -442,6 +444,13 @@ struct ImportRequest {
   bool asDouble = false;
   bool asFloat = false;
   std::string encoding;  // "" = work it out from the bytes
+  std::string encodingTyped;  // the spelling the user typed, for r(encoding)
+  // parselocale() / decimalseparator() / groupseparator(): numbers are read with
+  // these separators ("" = the option set none of its own).
+  bool numberLocale = false;
+  std::string decimalSeparator;
+  std::string groupSeparator;
+  std::string parseLocale;
 };
 
 
@@ -462,7 +471,8 @@ std::optional<std::string> decodeToUtf8(const std::string& bytes, const std::str
 
 // The file's text as UTF-8; an error block when it cannot be had.
 std::optional<ojson> loadImportText(const std::string& path, const std::string& shownName,
-                                    const std::string& encoding, std::string* text);
+                                    const std::string& encoding, std::string* text,
+                                    std::string* guessedEncoding = nullptr);
 
 
 // With no varnames(), the first record names the columns when, leaving its

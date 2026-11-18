@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "piet/handlers/utility.h"
+#include "piet/handlers/descriptive.h"  // postDescribeResults: filelist.ado ends in `des`
 #include "piet/user_paths.h"
 
 #include <algorithm>
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "io/win_compat.h"  // cecon::to_native_path / native_unlink
+#include "piet/dispatcher.h"  // save(): the dispatched `save`, `preserve` and `restore`
 #include "piet/eval/tokenizer.h"
 #include "piet/mutation_result.h"
 #include "piet/session_state.h"
@@ -71,10 +73,20 @@ ojson runFilelist(const eval::ParsedCommand& parsed, SessionState& session) {
   const std::string pattern = optStr(parsed.opts, "pattern").value_or(std::string("*"));
   const bool recursive = !hasFlag(parsed.opts, "norecursive");
   const std::string resolved = resolveUserPath(session, typedDir);
+  // save(file): the list goes to disk and the data in memory are left as they
+  // were; `replace` is for that file (filelist.ado: preserve, build, save).
+  const std::string saveTo = optStr(parsed.opts, "save").value_or(std::string());
+  const bool replaceSaved = hasFlag(parsed.opts, "replace");
+  const bool hadData = session.hasData();
+  if (!saveTo.empty() && hadData) {
+    ojson kept = piet::dispatch("preserve", session);
+    if (kept.is_object() && kept.value("type", std::string()) == "error") return kept;
+  }
 
+  // A directory that is not there lists nothing: the answer is the empty list,
+  // not an error (bank 5e8c2a189cc936cd: rc 0, "Number of files found = 0").
   std::error_code ec;
-  if (!std::filesystem::is_directory(cecon::to_native_path(resolved), ec) || ec)
-    return utilErrorRc("filelist: `" + typedDir + "' is not a directory.", 601);
+  const bool dirExists = std::filesystem::is_directory(cecon::to_native_path(resolved), ec) && !ec;
 
   struct FileRow {
     std::string dirname;
@@ -105,7 +117,9 @@ ojson runFilelist(const eval::ParsedCommand& parsed, SessionState& session) {
   };
 
   try {
-    if (recursive) {
+    if (!dirExists) {
+      // nothing to walk
+    } else if (recursive) {
       for (std::filesystem::recursive_directory_iterator
                it(cecon::to_native_path(resolved), std::filesystem::directory_options::skip_permission_denied, ec),
            end;
@@ -132,15 +146,6 @@ ojson runFilelist(const eval::ParsedCommand& parsed, SessionState& session) {
     return a.filename < b.filename;
   });
 
-  if (found.empty()) {
-    // No rows means no dataset: `cobra convert` on a header-only CSV would
-    // produce a zero-observation frame that every later command then treats as
-    // real data. r(2000) ("no observations") says what happened instead.
-    session.eval.rValues.set("N", 0.0);
-    return utilErrorRc("filelist: no files matching `" + pattern + "' found in `" + typedDir + "'.",
-                       2000);
-  }
-
   CsvTable t;
   t.names = {"dirname", "filename", "fsize"};
   t.isFactor = {1, 1, 0};
@@ -158,11 +163,57 @@ ojson runFilelist(const eval::ParsedCommand& parsed, SessionState& session) {
   session.clearMetadata();
   session.invalidateDatastore();
 
-  session.eval.rValues.set("N", static_cast<double>(found.size()));
+  // filelist.ado ends with `qui compress`, `qui leftalign` and `format %15.0fc
+  // fsize`: each string is the str# of its longest value (str1 at least) shown
+  // left-aligned, and fsize the smallest integer type that holds every size
+  // (byte -127..100, int -32767..32740, long -2147483647..2147483620), double
+  // when one does not fit or is unknown. leftalign's last step is `des` on the
+  // realigned strings, so r() is describe's (the vs-stata truth bank: r(N) 4,
+  // r(k) 3, r(width) 11, r(changed) 1 after a four-file filelist).
+  {
+    size_t wDir = 1, wFile = 1;
+    double lo = 0.0, hi = 0.0;
+    bool integral = true;
+    for (const auto& f : found) {
+      wDir = std::max(wDir, f.dirname.size());
+      wFile = std::max(wFile, f.filename.size());
+      if (std::isnan(f.fsize) || f.fsize != std::floor(f.fsize)) integral = false;
+      lo = std::min(lo, f.fsize);
+      hi = std::max(hi, f.fsize);
+    }
+    std::string sizeType = "double";
+    if (integral && !found.empty()) {
+      if (lo >= -127 && hi <= 100) sizeType = "byte";
+      else if (lo >= -32767 && hi <= 32740) sizeType = "int";
+      else if (lo >= -2147483647.0 && hi <= 2147483620.0) sizeType = "long";
+    }
+    auto strMeta = [&](const std::string& name, size_t w) {
+      VarMeta& m = session.varMeta[name];
+      m.stataType = "str" + std::to_string(w);
+      m.format = "%-" + std::to_string(w) + "s";
+    };
+    strMeta("dirname", std::min<size_t>(wDir, 2045));
+    strMeta("filename", std::min<size_t>(wFile, 2045));
+    VarMeta& sm = session.varMeta["fsize"];
+    sm.stataType = sizeType;
+    sm.format = "%15.0fc";
+  }
+  postDescribeResults(session, "filelist");
   ojson out = ojson::array();
   out.push_back(displayBlock("Number of files found = " + intText(
                                  static_cast<int64_t>(found.size())) + "\n"));
-  out.push_back(mutationResult(session, "use"));
+  if (saveTo.empty()) {
+    out.push_back(mutationResult(session, "use"));
+    return out;
+  }
+  ojson saved = piet::dispatch("save \"" + saveTo + "\"" + (replaceSaved ? ", replace" : ""), session);
+  ojson back = hadData ? piet::dispatch("restore", session) : piet::dispatch("clear", session);
+  if (saved.is_array()) {
+    for (const auto& b : saved) out.push_back(b);
+  } else {
+    out.push_back(saved);
+  }
+  if (back.is_object() && back.value("type", std::string()) == "error") out.push_back(back);
   return out;
 }
 

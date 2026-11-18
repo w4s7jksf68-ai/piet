@@ -4,6 +4,7 @@
 #include "data_combine_internal.h"
 #include "piet/handlers/data_combine.h"
 #include "piet/handlers/observations.h"
+#include "piet/handlers/descriptive.h"  // postDescribeResults (reshape.ado Report1)
 namespace piet::handlers::data_mutation_detail {
 const piet::eval::OptVocab& kVocabReshape = piet::eval::registerOptVocab(
     {"reshape"}, {{"i", "j"},
@@ -17,8 +18,8 @@ namespace piet::handlers::data_combine_detail {
 // reshape.ado's syntax line: I() J() ATwl() String favor(); `string` is read
 // by runReshape (s/str/string, and j(t, string)).
 const piet::eval::OptVocab& kVocabReshape = piet::eval::registerOptVocab(
-    {"reshape"}, {{"i", "j", "string"},
-     {"atwl", "favor"}});
+    {"reshape"}, {{"i", "j", "string", "favor"},
+     {"atwl"}});
 
 
 // _parse_ivar_jvar: opts["i"]/["j"] are space-separated token strings
@@ -59,8 +60,16 @@ using namespace data_combine_detail;
 ojson runReshape(const std::vector<std::string>& stubsIn,
                  const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                  SessionState& session) {
+  // reshape.ado's syntax refusals are r(198): no subcommand, an unknown one, a
+  // `long`/`wide` line without i() or j() (vs-stata bank c1e7072f2f52abf8
+  // `reshape , zzabbrprobe`, 45b6defc42b71608 `reshape wide bp, j(when)`,
+  // 97e39d21f5c20765 `reshape wide bp, i(patient)`).
+  auto syntax198 = [](const std::string& msg) {
+    return ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(198)"));
+  };
   if (stubsIn.empty()) {
-    return engineErrorBlock("reshape: specify direction: `reshape long ...' or `reshape wide ...'");
+    return syntax198("reshape: specify direction: `reshape long ...' or `reshape wide ...'");
   }
   std::string direction = lower(stubsIn[0]);
   std::vector<std::string> stubs(stubsIn.begin() + 1, stubsIn.end());
@@ -84,6 +93,14 @@ ojson runReshape(const std::vector<std::string>& stubsIn,
   if (auto err = eval::rejectUnknownOptions(optsC, kKnownReshapeOpts, kVocabReshape.unimplemented)) {
     return *err;
   }
+  // favor(speed | memory | space): the same reshape by a different route in Stata; the answer
+  // does not depend on it, so it is read and checked and changes nothing here.
+  for (const auto& kv : optsC) {
+    if (kv.first != "favor") continue;
+    const std::string fv = kv.second.isBool ? std::string() : lower(trim(kv.second.strValue));
+    if (!fv.empty() && fv != "memory" && fv != "speed" && fv != "space")
+      return syntax198("invalid favor method; option favor() requires argument speed or memory");
+  }
   // j(t, string): the J() option's own `string` (reshape).
   for (auto& kv : optsC) {
     if (kv.first != "j" || kv.second.isBool) continue;
@@ -96,15 +113,31 @@ ojson runReshape(const std::vector<std::string>& stubsIn,
   }
 
   auto [iVars, jVar] = parseIvarJvar(optsC);
+  // A stub is a name, with `@` marking where j goes; `*` / `?` make none
+  // (vs-stata bank df0234924a8a2e6d `reshape long bp_*, ...` r(198)).
+  for (const auto& st : stubs)
+    if (st.find_first_of("*?") != std::string::npos) return syntax198(st + " invalid name");
+  const bool knownDirection = direction == "long" || direction == "wide";
   if (iVars.empty()) {
-    return engineErrorBlock(
-        "reshape: i() option required — e.g. `reshape long inc, i(id) j(year)'");
+    return knownDirection && !stubs.empty()
+               ? syntax198("reshape: i() option required — e.g. `reshape long inc, i(id) j(year)'")
+               : engineErrorBlock(
+                     "reshape: i() option required — e.g. `reshape long inc, i(id) j(year)'");
+  }
+  // Without j() the j variable is `_j`: `long` creates it, `wide` reads it, and
+  // only a `wide` line with no `_j` in the data is r(198) "option j()
+  // required" (reshape's own default; vs-stata bank 97e39d21f5c20765 `reshape
+  // wide bp, i(patient)`).
+  bool jDefaulted = false;
+  if (!jVar.has_value() && knownDirection && !stubs.empty()) {
+    jVar = std::string("_j");
+    jDefaulted = true;
   }
   if (!jVar.has_value()) {
     return engineErrorBlock(
         "reshape: j() option required — e.g. `reshape long inc, i(id) j(year)'");
   }
-  if (direction != "long" && direction != "wide") {
+  if (!knownDirection) {
     return engineErrorBlock("reshape: unknown direction `" + direction +
                             "'. Use `reshape long ...' or `reshape wide ...'.");
   }
@@ -121,12 +154,20 @@ ojson runReshape(const std::vector<std::string>& stubsIn,
       if (!hasName(v)) return engineErrorBlock("reshape long: id variable `" + v + "' not found");
     }
     if (stubs.empty()) return engineErrorBlock("reshape long: no stub variables specified");
+    // The j variable is new under `long`: an existing one is r(110) "variable
+    // <j> already exists" / "Data are already long." (vs-stata bank
+    // 4c8f43ae854bdb03, 8c94c200753276ed).
+    if (hasName(*jVar))
+      return ojson(eval::errorBlock("engine_error",
+                                    "variable " + *jVar + " already exists\n    Data are already long.",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(110)"));
   } else {
     if (stubs.empty()) return engineErrorBlock("reshape wide: no stub variables specified");
     for (const auto& v : iVars) {
       if (!hasName(v)) return engineErrorBlock("reshape wide: id variable `" + v + "' not found");
     }
     if (!hasName(*jVar)) {
+      if (jDefaulted) return syntax198("option j() required");
       return engineErrorBlock("reshape wide: j variable `" + *jVar + "' not found");
     }
     for (const auto& s : stubs) {
@@ -168,6 +209,38 @@ ojson runReshape(const std::vector<std::string>& stubsIn,
             (best == stubs.size() || stubs[si].size() > stubs[best].size()))
           best = si;
       if (best != stubs.size()) stubComponents[stubs[best]].push_back(nm);
+    }
+  }
+  // Under `long` every variable of one stub must be all string or all numeric:
+  // `input id str2 s1 s2` then `reshape long s, i(id) j(t)` is r(198) "variable
+  // s2 type mismatch with other s variables" (vs-stata bank 3b1378a3d80c14b9).
+  // With a numeric j only the stub's digit-suffixed variables are its own.
+  if (direction == "long") {
+    for (const auto& st : stubs) {
+      auto it = stubComponents.find(st);
+      if (it == stubComponents.end()) continue;
+      std::optional<bool> firstIsStr;
+      for (const auto& nm : it->second) {
+        const std::string suf = nm.substr(st.size());
+        if (!jString && suf.find_first_not_of("0123456789") != std::string::npos) continue;
+        const bool isStr = ds->dtype(nm) == "factor";
+        if (!firstIsStr.has_value()) {
+          firstIsStr = isStr;
+        } else if (*firstIsStr != isStr) {
+          return syntax198("variable " + nm + " type mismatch with other " + st + " variables");
+        }
+      }
+    }
+  }
+  // Under `wide` a numeric j names the new variables, so its values must be
+  // non-negative integers: j = -1 and 1.5 is r(198) "invalid syntax" (vs-stata
+  // bank 2e6d49c4fe70f679).
+  if (direction == "wide" && !jString && ds->dtype(*jVar) == "f64") {
+    const double* d = ds->col(*jVar).f64();
+    const int64_t cnt = ds->col(*jVar).nbytes / static_cast<int64_t>(sizeof(double));
+    for (int64_t r = 0; r < cnt; ++r) {
+      if (std::isnan(d[r]) || d[r] >= 8.98846567431158e307) continue;
+      if (d[r] < 0 || d[r] != std::floor(d[r])) return syntax198("invalid syntax");
     }
   }
   struct WideStubMeta {
@@ -329,6 +402,11 @@ ojson runReshape(const std::vector<std::string>& stubsIn,
         session.varMeta[*jVar].stataType = t;
       }
     } else {
+      // The long stubs go first, all of them: a stub can share its name with
+      // another stub's new column (`reshape wide bp bp2, j(when)` makes bp2
+      // from bp), and forgetting `bp2` after bp's columns were typed dropped
+      // the int it had just been given (r(width) 18 where StataBE has 16).
+      for (const auto& st : stubs) session.forgetVarPlanes(st);
       for (const auto& st : stubs) {
         const WideStubMeta& wm = wideStubMeta[st];
         for (const auto& jv : jValues) {
@@ -339,13 +417,34 @@ ojson runReshape(const std::vector<std::string>& stubsIn,
           if (!wm.format.empty()) vm.format = wm.format;
           vm.label = jv + " " + st;
         }
-        session.forgetVarPlanes(st);
       }
       session.forgetVarPlanes(*jVar);
     }
   }
-  // reshape leaves r(N) = the result's _N (dc_r_long_r 6, dc_r_wide_r 3).
-  session.eval.rValues.set("N", static_cast<double>(nAfterRows));
+  // reshape leaves r(N) = the result's _N (dc_r_long_r 6, dc_r_wide_r 3): its
+  // report (reshape.ado Report1) runs `quietly desc, short` on the reshaped
+  // data, so r() is describe's whole set (the vs-stata truth bank: r(N) 48,
+  // r(k) 15, r(width) 44, r(changed) 1 and the edition limits after `reshape
+  // wide fatal beertax, i(state) j(year)`).
+  // The ado rebuilds the data through a saved file, which carries only the value labels some
+  // variable still uses: a set whose last variable went away (the j variable of a wide
+  // reshape) is gone from `label list` too.
+  {
+    std::set<std::string> present, used;
+    if (outDs != nullptr)
+      for (const auto& nm : outDs->names()) present.insert(nm);
+    for (const auto& [var, lbl] : session.varLblname)
+      if (present.count(var)) used.insert(lbl);
+    for (auto it = session.labelDefs.begin(); it != session.labelDefs.end();) {
+      if (used.count(it->first)) {
+        ++it;
+        continue;
+      }
+      session.labelSeq.erase(it->first);
+      it = session.labelDefs.erase(it);
+    }
+  }
+  postDescribeResults(session, "reshape");
   ojson result = mutationResult(session, "reshape");
   result["direction"] = direction;
   result["n_wide"] = nWide;

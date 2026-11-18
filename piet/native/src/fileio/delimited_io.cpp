@@ -157,6 +157,11 @@ std::vector<std::vector<std::string>> parse(const std::string& text, const ReadS
     // it read (log:3185 `ab"cd,7\n`).
     endField();
     if (!(spec.skipEmptyLines && isBlankRecord(rec))) out.push_back(rec);
+  } else if (!spec.skipEmptyLines && n > 0 && (text[n - 1] == '\n' || text[n - 1] == '\r')) {
+    // emptylines(include) reads the empty line after the last line end as one
+    // more (empty) observation (vs-stata bank: `id,v` / `1,2` / `` / `3,4` and a
+    // final line end are 4 observations, the 2nd and 4th missing).
+    out.push_back(std::vector<std::string>{std::string()});
   }
   return out;
 }
@@ -261,6 +266,25 @@ char detectDelimiter(const std::string& text) {
   for (int k = 1; k < 4; ++k)
     if (counts[k] > counts[best]) best = k;
   return counts[best] == 0 ? ',' : kCand[best];
+}
+
+bool firstRecordNamesColumns(const std::vector<std::vector<std::string>>& records) {
+  // A file with no record after the first has no column to tell by: the
+  // caller's own first-record test decides alone (unmeasured either way).
+  if (records.size() < 2) return true;
+  const std::vector<std::string>& first = records.front();
+  for (size_t c = 0; c < first.size(); ++c) {
+    double v = 0.0;
+    if (isMissingToken(first[c]) || parseNumber(first[c], &v)) continue;  // not a word
+    bool numeric = true;
+    for (size_t r = 1; r < records.size() && numeric; ++r) {
+      if (c >= records[r].size()) continue;
+      const std::string& cell = records[r][c];
+      if (!isMissingToken(cell) && !parseNumber(cell, &v)) numeric = false;
+    }
+    if (numeric) return true;
+  }
+  return false;
 }
 
 bool isMissingToken(const std::string& field) {
@@ -515,7 +539,7 @@ ColumnType typeColumn(const std::vector<const std::string*>& cells, bool forceSt
     return t;
   };
   if (forceString) return asString();
-  bool allNum = true, anyNum = false, allInt = true, floatLoses = false;
+  bool allNum = true, anyNum = false, allInt = true, floatLoses = false, zeroLed = false;
   double lo = 0.0, hi = 0.0;
   for (const std::string* s : cells) {
     if (isMissingToken(*s)) continue;
@@ -523,6 +547,12 @@ ColumnType typeColumn(const std::vector<const std::string*>& cells, bool forceSt
     if (!parseNumber(*s, &v)) {
       allNum = false;
       continue;
+    }
+    {  // a number written with a leading zero ("007")
+      size_t at = s->find_first_not_of(" \t+-");
+      if (at != std::string::npos && (*s)[at] == '0' && at + 1 < s->size() &&
+          std::isdigit(static_cast<unsigned char>((*s)[at + 1])))
+        zeroLed = true;
     }
     if (!floatLoses && v != std::floor(v)) {
       // Does float storage keep every digit the TEXT gives? Compare v and
@@ -559,8 +589,15 @@ ColumnType typeColumn(const std::vector<const std::string*>& cells, bool forceSt
   }
   if (!allNum) {
     if (!forceNumeric) return asString();
-    t.stataType = asDouble ? "double" : "float";
-    return t;
+    // numericcols() over text: the text reads as missing and the type is the
+    // one the numbers left give (bank cells 74263dbf4fd2df3c, d1d2609acd38f603:
+    // a column of "x" and "3" is byte, one of "x" and "y" is byte); a column
+    // whose numbers carry leading zeros ("007") is float (aer_w2
+    // dx_imd_024_numericcols).
+    if (zeroLed) {
+      t.stataType = asDouble ? "double" : "float";
+      return t;
+    }
   }
   if (!anyNum) { t.stataType = "byte"; return t; }
   if (allInt) {
@@ -574,10 +611,14 @@ ColumnType typeColumn(const std::vector<const std::string*>& cells, bool forceSt
   // (2^24) is double whatever asfloat says (aer_w2 w2e_float_default
   // import_default_types `0.1,2.7,1e10` -> double, also under asfloat,
   // w2e_float_default.log:1979/:2089); smaller ones are float (log:3340).
-  if (precisionToDouble && (std::max(std::fabs(lo), std::fabs(hi)) > 16777216.0 || floatLoses)) {
-    // ...and so is one whose text carries more digits than float keeps
-    // (internal probe BUG-406: -77.551724137931034 stays
-    // exact).
+  // vs-stata bank (StataBE 19.5, 2026-11-10) moved both halves of this rule: a
+  // column of 0.5 and 100000000 is float, and so are 1.2345678 over 1 and
+  // 0.30000000000000004 over 3 -- the digits a text carries do not make it
+  // double, and the magnitude that does lies between 1e8 (float here) and 1e10
+  // (double, w2e_float_default above). The bound used is long's range, the
+  // first one past every measured float column.
+  (void)floatLoses;
+  if (precisionToDouble && std::max(std::fabs(lo), std::fabs(hi)) > 2147483620.0) {
     t.stataType = "double";
     return t;
   }
@@ -604,11 +645,13 @@ std::optional<ojson> stageAndAdopt(SessionState& session, const Table& t, const 
     char buf[64];
     for (const auto& row : t.rows) {
       line.clear();
+      bool allMissing = true;
       for (size_t c = 0; c < k; ++c) {
         if (c) line += ',';
         const std::string empty;
         const std::string& cell = c < row.size() ? row[c] : empty;
         if (t.types[c].isString) {
+          allMissing = false;
           // Always quoted: cobra convert trims an unquoted field, and the
           // blanks of `  pad  ` are data (log:2574).
           line += '"';
@@ -624,7 +667,12 @@ std::optional<ojson> stageAndAdopt(SessionState& session, const Table& t, const 
         if (t.types[c].stataType == "float") v = static_cast<double>(static_cast<float>(v));
         std::snprintf(buf, sizeof(buf), "%.17g", v);
         line += buf;
+        allMissing = false;
       }
+      // A row of missing values only would be a blank line, which the CSV
+      // reader skips (BUG-1078's shape): a quoted empty first field keeps it
+      // (vs-stata bank: `a` over `.a`, `.z`, `1` is 3 observations).
+      if (allMissing) line = "\"\"" + line;
       line += '\n';
       f.write(line.data(), static_cast<std::streamsize>(line.size()));
     }
@@ -656,7 +704,12 @@ std::optional<ojson> stageAndAdopt(SessionState& session, const Table& t, const 
   }
   session.load(hbin, SessionState::LoadIntent::FreshRead);
   session.clearMetadata();
-  session.setCurrentFile(sourceResolved);
+  // A text importer leaves no file name behind: c(filename) is empty after
+  // import delimited / insheet / import excel (every `describe` after one in the
+  // bank prints no "from FILE"), so a name-less `save, replace` is r(198) and
+  // can never overwrite the text source with a .dta.
+  (void)sourceResolved;
+  session.setCurrentFile(std::string());
   // setCurrentFile clears c(changed), as `use` does; data read by an importer
   // have not been saved, so it is 1 (StataBE 19.5, BUG-1478: c(changed) 1 after
   // import delimited, insheet, import excel, infix, infile with a dictionary and

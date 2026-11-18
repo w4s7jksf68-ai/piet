@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "piet/handlers/graph.h"
+#include "piet/strutil.h"
 #include "piet/user_paths.h"
 #include "piet/eval/errors.h"
 #include "io/win_compat.h"
@@ -32,6 +33,17 @@ using ojson = nlohmann::ordered_json;
 
 
 static bool fileExistsG(const std::string& path) { return cecon::native_exists(path); }
+
+// A graph file's name without its directory and suffix, as a Stata name (every other character becomes _).
+static std::string gphBaseName(const std::string& fp) {
+  const size_t slash = fp.find_last_of('/');
+  std::string base = slash == std::string::npos ? fp : fp.substr(slash + 1);
+  const size_t dot = base.find_last_of('.');
+  if (dot != std::string::npos) base = base.substr(0, dot);
+  for (char& c : base)
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) c = '_';
+  return base;
+}
 
 
 // BS-007 (D3): the on-disk read-back half of runGraphSave's (below)
@@ -126,13 +138,20 @@ ojson runGraphSave(const std::optional<std::string>& name, const std::optional<s
   ojson doc;
   doc["_magic"] = "PIETGPH1";
   doc["block"] = *blk;
+  // `graph use` loads the graph under the name it was saved with; the default "Graph" is saved under the file's
+  // base name (bank: `graph save g1 g1file.gph` (g1 a named graph) then `graph use g1file.gph` leaves g1 in
+  // `graph dir`; `scatter ...; graph save g1; graph drop _all; graph use g1` leaves g1)
+  doc["name"] = (gname.empty() || gname == "Graph") ? gphBaseName(fp) : gname;
   {
     // serset-twoway GST: the graph's sersets travel with it.
     const std::vector<serset::Serset> sets = serset::ownedBy(session, gname);
     if (!sets.empty()) doc["sersets"] = serset::toJson(sets);
     // graph-family AI-4: and so does its describe record.
     auto mt = session.graphMeta.find(gname);
-    if (mt != session.graphMeta.end()) doc["meta"] = mt->second;
+    if (mt != session.graphMeta.end()) {
+      doc["meta"] = mt->second;
+      if (doc["meta"].is_object()) doc["meta"].erase("displayed");  // session-only marker
+    }
   }
   std::ofstream f(cecon::to_native_path(fp), std::ios::binary);
   if (!f) return stataRefusal("file " + fp + " could not be opened", 603);
@@ -194,11 +213,15 @@ ojson saveGraphOption(const ojson& block, const std::string& savingText, Session
   ojson doc;
   doc["_magic"] = "PIETGPH1";
   doc["block"] = block;
+  doc["name"] = (session.currentGraph.empty() || session.currentGraph == "Graph") ? gphBaseName(fp) : session.currentGraph;
   if (sersets != nullptr && !sersets->empty()) doc["sersets"] = serset::toJson(*sersets);
   // graph-family AI-4: the describe record of the graph just registered.
   {
     auto mt = session.graphMeta.find(session.currentGraph);
-    if (mt != session.graphMeta.end()) doc["meta"] = mt->second;
+    if (mt != session.graphMeta.end()) {
+      doc["meta"] = mt->second;
+      if (doc["meta"].is_object()) doc["meta"].erase("displayed");  // session-only marker
+    }
   }
   std::ofstream f(cecon::to_native_path(fp), std::ios::binary);
   if (!f) {
@@ -244,10 +267,14 @@ ojson runGraphUse(const std::string& fileArg,
     out.push_back(stataRefusal("file " + fp + " is not a Stata .gph file", 610));
     return out;
   }
-  // name(): as given, else the file's base name.
+  // name(): as given, else the name the graph had when it was saved (bank: `graph save g1 g1file.gph` then
+  // `graph use g1file.gph` leaves one memory graph, g1, in `graph dir`), else the file's base name.
   std::string nameOpt;
   for (const auto& [k, v] : opts) {
     if (k == "name" && !v.isBool) nameOpt = v.strValue;
+  }
+  if (nameOpt.empty() && doc.contains("name") && doc["name"].is_string() && !doc["name"].get<std::string>().empty()) {
+    nameOpt = doc["name"].get<std::string>() + ", replace";
   }
   if (nameOpt.empty()) {
     const size_t slash = fp.find_last_of('/');
@@ -266,8 +293,12 @@ ojson runGraphUse(const std::string& fileArg,
   std::vector<serset::Serset> sets = serset::fromJson(doc.value("sersets", ojson::array()));
   // graph-family AI-8: the graph keeps the command it was drawn with (w2ai
   // gf_use_059_d, log:1506-1527).
-  const ojson meta = doc.contains("meta") && doc["meta"].is_object() ? doc["meta"]
-                                                                       : serset::makeGraphMeta("twoway", "", "");
+  ojson meta = doc.contains("meta") && doc["meta"].is_object() ? doc["meta"]
+                                                                 : serset::makeGraphMeta("twoway", "", "");
+  // graph use draws the loaded graph into a Graph window unless `nodraw` is given
+  // (the saved command's own nodraw says nothing about this window): the marker
+  // `graph export, name()` needs.
+  if (meta.is_object() && !hasOpt(opts, "nodraw")) meta["displayed"] = true;
   serset::registerGraph(session, block, nameOpt, std::move(sets), &meta);
   decimateGraphBlockForView(block);
   out.push_back(block);
@@ -421,6 +452,23 @@ ojson runGraphExport(const std::string& filepathArg,
       auto it = session.namedGraphs.find(want);
       if (it == session.namedGraphs.end()) {
         return engineErrorBlockG("graph export: could not find Graph window " + want);
+      }
+      // A graph drawn with `nodraw` has no Graph window until `graph display` puts
+      // it in one, and `graph export, name()` reads the window: bank `twoway
+      // scatter price mpg, name(g1, replace) nodraw` + `graph export g1.svg,
+      // name(g1) replace` is r(693) "could not find Graph window".
+      auto mt = session.graphMeta.find(want);
+      if (mt != session.graphMeta.end() && mt->second.is_object() && !mt->second.contains("displayed")) {
+        std::string cmdText = strutil::lower(mt->second.value("command", std::string()));
+        const size_t comma = cmdText.find(',');
+        if (comma != std::string::npos) {
+          std::istringstream words(cmdText.substr(comma + 1));
+          for (std::string w; words >> w;) {
+            if (w == "nodraw") {
+              return engineErrorBlockG("graph export: could not find Graph window " + want);
+            }
+          }
+        }
       }
       blk = &it->second;
     }

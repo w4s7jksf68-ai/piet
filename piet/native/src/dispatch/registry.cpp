@@ -304,7 +304,8 @@ const std::vector<CommandSpec>& commandRegistry() {
       // the depvar's own observed min/max). ----
       // BUG-1544: tobit takes aweights, fweights, iweights and pweights (tobit.sthlp;
       // the engine fits them all).
-      {"tobit", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
+      // TOBit (vs-stata bank fd1f148d `tob , zzabbrprobe` r(301): the replay, not r(199))
+      {"tobit", {"tob", "tobi"}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runTobit (forwards parsed)"},
 
       {"var", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
@@ -327,10 +328,10 @@ const std::vector<CommandSpec>& commandRegistry() {
       {"mixed", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runMixed (forwards parsed)"},
 
-      // svyset carries the design's [pweight=], so its weight policy must admit
-      // one; without that the tokenizer rejects the weight before the handler
-      // ever sees it. `svy` is the PREFIX row (intercepted ahead of tokenize).
-      {"svyset", {}, Family::Meta, false, false, WeightPolicy::PweightOnly, false, {},
+      // svyset carries the design's [pweight=] or [iweight=], so its weight policy must
+      // admit them; without that the tokenizer rejects the weight before the handler
+      // ever sees it (the handler refuses [aweight=] and [fweight=] itself, r(101)). `svy` is the PREFIX row (intercepted ahead of tokenize).
+      {"svyset", {}, Family::Meta, false, false, WeightPolicy::AllWeights, false, {},
        "runSvyset (forwards parsed)"},
       // `svy` itself is deliberately NOT a row: it is a PREFIX, intercepted
       // ahead of tokenize, and this codebase's convention is that prefixes carry
@@ -358,12 +359,14 @@ const std::vector<CommandSpec>& commandRegistry() {
       // ---- P7 wave (dispatcher.cpp): ordered / multinomial / zero-inflated /
       // fractional MLE. Each carries the ML-family vce set its engine verb
       // actually implements; anything else honest-rejects in the handler. ----
-      {"ologit", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
-       "runOrdered (forwards parsed)"},
-      {"oprobit", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
-       "runOrdered (forwards parsed)"},
-      {"mlogit", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
-       "runMlogit (forwards parsed)"},
+      // OLOgit, OPRobit, MLOGit (vs-stata bank 563ee6e0 `olo`, 11f3d58f `opr`, dd4aca9d
+      // `mlog` r(301), the replay; `ol`, `op`, `mlo` are r(199))
+      {"ologit", {"olo", "olog", "ologi"}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
+       "runOrdered (forwards parsed; fw/iw/pw, aw is Stata's r(101))"},
+      {"oprobit", {"opr", "opro", "oprob", "oprobi"}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
+       "runOrdered (forwards parsed; fw/iw/pw, aw is Stata's r(101))"},
+      {"mlogit", {"mlog", "mlogi"}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
+       "runMlogit (forwards parsed; fw/iw/pw, aw is Stata's r(101))"},
       {"zip", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runZeroInflated (forwards parsed)"},
       {"zinb", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
@@ -494,7 +497,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       {"sort", {"so", "sor"}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runSort"},
 
       // ---- dispatcher.cpp:1365 `gsort` ----
-      {"gsort", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runGsort"},
+      {"gsort", {}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {}, "runGsort"},
 
       // ---- dispatcher.cpp:1370 `order` ----
       {"order", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runOrder"},
@@ -561,7 +564,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       {"expand", {}, Family::DataMgmt, false, true, WeightPolicy::None, false, {}, "runExpand"},
       {"fillin", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runFillin"},
       {"cross", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runCross"},
-      {"contract", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runContract"},
+      {"contract", {}, Family::DataMgmt, true, true, WeightPolicy::FweightOnly, false, {}, "runContract"},
       // `export delimited|excel` / `import delimited|excel` — two-word verbs;
       // the dispatcher routes on the sub-verb. Registered under the first word
       // so the command table recognizes the line at all.
@@ -608,7 +611,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // persisted into hbin (post-beta P1/hbin-v2). Real Stata's `format`
       // has no if/in/by/weight and no options of its own beyond the
       // trailing %fmt token. ----
-      {"format", {}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runFormat"},
+      {"format", {}, Family::Meta, false, true, WeightPolicy::None, false, {}, "runFormat"},
 
       // ---- dispatcher.cpp:1542 `scalar list`/`scalar dir` — this row ONLY
       // covers that display sub-arm. Plain `scalar NAME = value` DEFINITIONS
@@ -669,7 +672,8 @@ const std::vector<CommandSpec>& commandRegistry() {
       // ---- dispatcher.cpp:1634 `levelsof` ----
       // byIllegalInStata=true (A3/BS-096): audit G3, CONFIRMED live —
       // `levelsof may not be combined with by`, r(190).
-      {"levelsof", {"levels"}, Family::DataMgmt, true, false, WeightPolicy::None, false, {}, "runLevelsof",
+      // allowInRange: runLevelsofCommand filters if AND in (applyIfAndInFilter).
+      {"levelsof", {"levels"}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runLevelsof",
        true},
 
       // ---- dispatcher.cpp:1653 `winsor2` (community-package name; no abbrev) ----
@@ -691,7 +695,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // The weights are xtile's "aweight fweight pweight": the
       // qualifier wave (f8413c27) served [pw=] as well, and the integration of the
       // two branches keeps it; [iw=] is Stata's r(101), refused first by the
-      // tokenizer's kStataLegalWeights row, so AllWeights here admits exactly aw/fw/pw.
+      // registry's kStataQualifiers row, so AllWeights here admits exactly aw/fw/pw.
       {"xtile", {}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {},
        "runXtileStata (nquantiles/cutpoints; if/in, aw/fw/pw)"},
       {"ipolate", {}, Family::DataMgmt, true, false, WeightPolicy::None, true, {},
@@ -707,7 +711,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // wildcard expander `foreach ... of varlist` uses (piet::loops::
       // expandVarlist), so `x*` cannot mean two different things. ----
       {"decode", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runDecode"},
-      {"inspect", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runInspect"},
+      {"inspect", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runInspect"},
       {"ds", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
        "dispatcher arm (sets r(varlist))"},
       {"unab", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
@@ -717,8 +721,8 @@ const std::vector<CommandSpec>& commandRegistry() {
       // (T7 L1 probe), not the r(199) a by-prefix on an unknown name gives.
       {"lookfor", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
        "runLookfor (describes matches, sets r(varlist))", true},
-      {"xtsum", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runXtsum"},
-      {"xttab", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runXttab"},
+      {"xtsum", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runXtsum"},
+      {"xttab", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runXttab"},
 
       // ---- dispatcher.cpp:1697 `tabulate`/`tab`/`tab1`/`tab2` — tab1/tab2
       // are real Stata's distinct one-way/two-way BATCH tabulation commands
@@ -731,7 +735,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // now composes if/in via piet::handlers::applyIfAndInFilter.
       // tabulate/tab1 serve [fw=], [aw=] and [iw=] (tabulate.cpp TabWeight;
       // w2aj_qualifiers qf_tb_aw_sp, qf_tb_iw_sp). AllWeights is the policy
-      // that admits all three; the tokenizer's kStataLegalWeights row answers
+      // that admits all three; the registry's kStataQualifiers row answers
       // Stata's r(101) for the pweight it refuses, before this policy is read.
       {"tabulate", {"tab", "ta", "tabu", "tabul", "tabula", "tabulat"}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {}, "runTabulate"},
       {"tab1", {}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {},
@@ -743,13 +747,13 @@ const std::vector<CommandSpec>& commandRegistry() {
       // byIllegalInStata=true (A3/BS-096): audit G3, CONFIRMED live —
       // `prefix by: not allowed since Stata 17; see help table for updated
       // syntax`, r(190).
-      {"table", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {}, "runTable",
+      {"table", {}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {}, "runTable",
        true},
 
       // ---- dispatcher.cpp:1796 `tabstat` (M4a item2 "estimation surface") ----
       // BUG-1014: [aw=]/[fw=] flipped on -- tabstat.ado takes `[aw fw]` and hands
       // them to summarize per group (w2as sx_tabstat_aw, sx_tabstat_fw).
-      {"tabstat", {}, Family::Estimation, true, false, WeightPolicy::AweightFweight, false, {}, "runTabstat"},
+      {"tabstat", {}, Family::Estimation, true, true, WeightPolicy::AweightFweight, false, {}, "runTabstat"},
 
       // ---- dispatcher.cpp:1810 `corr`/`pwcorr`/`correlate` — ONE arm;
       // `correlate` is a genuine Stata alias of `corr`; `pwcorr` is a
@@ -784,7 +788,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // the engine serves pw and aw and refuses fw/iw by name.
       {"mean", {}, Family::Estimation, true, true, WeightPolicy::AllWeights, false, {}, "runMean (forwards parsed)"},
       // BUG-1541: proportion takes fweights and iweights too (the engine fits
-      // them); its aweight is Stata's r(101), the tokenizer's kStataLegalWeights row.
+      // them); its aweight is Stata's r(101), the registry's kStataQualifiers row.
       {"proportion", {}, Family::Estimation, true, true, WeightPolicy::AllWeights, false, {},
        "runProportion (forwards parsed)"},
 
@@ -852,7 +856,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // reghdfe precedent above. ----
       // BUG-1538/1539: poisson takes fweights, iweights and pweights, ppmlhdfe
       // fweights and pweights (the engine's fepois fits them all); the rest are
-      // Stata's own r(101), answered by the tokenizer's kStataLegalWeights rows.
+      // Stata's own r(101), answered by the registry's kStataQualifiers rows.
       {"poisson", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runPoisson (forwards parsed; absorb() honest-rejects here)"},
       {"ppmlhdfe", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
@@ -867,7 +871,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // wiring is complete and correct; the gap is engine-side, out of this
       // batch's edit scope. ----
       // BUG-1537: fweights, iweights and pweights (the engine fits them); the
-      // aweight is Stata's r(101), the tokenizer's kStataLegalWeights row.
+      // aweight is Stata's r(101), the registry's kStataQualifiers row.
       {"nbreg", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runNbreg (forwards parsed)"},
 
@@ -876,7 +880,8 @@ const std::vector<CommandSpec>& commandRegistry() {
       // form of either — Stata's own default for both IS random-effects, so
       // the bare/`,re`/`,pa` forms honest-reject naming `,fe` as the only
       // supported form). Distinct real Stata commands, own rows. ----
-      {"xtpoisson", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // xtpois: xtpois.ado is `xtpoisson `0'' (vs-stata bank 2126d6c2 r(301), the replay)
+      {"xtpoisson", {"xtpois"}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runXtPoisson (forwards parsed; ,fe only)"},
       {"xtlogit", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runXtLogitFe (forwards parsed; ,fe only)"},
@@ -913,7 +918,8 @@ const std::vector<CommandSpec>& commandRegistry() {
       {"binscatter", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "runBinscatter (forwards parsed)", false, {"binscatter"}},
       // [aw=]/[pw=]: the engine's weighted IW estimator (BUG-1283).
-      {"eventstudyinteract", {}, Family::Estimation, true, false, WeightPolicy::AweightPweight, false, {},
+      // AllWeights: the arm answers [iw] with Stata's r(101) and refuses [fw] itself.
+      {"eventstudyinteract", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runEventstudyinteract (forwards parsed)", false, {"eventstudyinteract"}},
       {"did_imputation", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runDidImputation (forwards parsed)", false, {"did_imputation"}},
@@ -928,11 +934,11 @@ const std::vector<CommandSpec>& commandRegistry() {
        "runNewey (forwards parsed; lag() required)"},
       {"prais", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runPrais (forwards parsed)"},
-      {"dfuller", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      {"dfuller", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
        "runDfullerPperron (forwards parsed)"},
-      {"pperron", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      {"pperron", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
        "runDfullerPperron (forwards parsed; no drift() form)"},
-      {"wntestq", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      {"wntestq", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
        "runWntestq (forwards parsed)"},
 
       // ---- dispatcher.cpp `tsfill` (BETA D4, BS-081): data-mutation verb
@@ -949,7 +955,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // estimates, not the live dataset directly) — allowIf=false. chow is
       // a PIET-ONLY convenience command (real Stata has no `chow` at all —
       // see runChow's header comment, postestimation/model_comparison.cpp). ----
-      {"sdtest", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      {"sdtest", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
        "runSdtest (by()/= # exactly one required)"},
       {"hausman", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
        "runHausman (eststo/estimates-store fe/re pair)"},
@@ -962,7 +968,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // `if` is honest-rejected too (forwarded by the dispatcher arm, then
       // rejected inside the handler — see the SAME header comment for the
       // --keepif row-drop finding). ----
-      {"mkspline", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
+      {"mkspline", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
        "runMkspline (cubic only; if honest-rejected)"},
 
       // ---- dispatcher.cpp:1842 `test` ----
@@ -1045,15 +1051,15 @@ const std::vector<CommandSpec>& commandRegistry() {
       // handler, which keeps Stata's own legal set and refuses the rest with
       // r(101) (histogram: fweights; kdensity: fweights, aweights, iweights;
       // w2aq_histogram_family hk_r_h_pw/_aw, hk_r_kd_pw).
-      {"histogram", {"hist"}, Family::Graph, true, false, WeightPolicy::AllWeights, false, {},
+      {"histogram", {"hist"}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "runHistogram"},
-      {"kdensity", {}, Family::Graph, true, false, WeightPolicy::AllWeights, false, {}, "runKdensity"},
+      {"kdensity", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {}, "runKdensity"},
       // serset-twoway WT/IN (2026-10-21): scatter/line/tsline/twoway/graph take
       // `in` and forward every weight clause; the twoway layer renderer keeps
       // each plot type's own legal set (r(101) `iweights not allowed`, w2al
       // tf_r_iw) and `[w=]` is aweight (tf_tw_072, log:305-307).
       {"line", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {}, "runGraphLine"},
-      {"xtline", {}, Family::Graph, true, false, WeightPolicy::None, false, {}, "runXtline"},
+      {"xtline", {}, Family::Graph, true, true, WeightPolicy::None, false, {}, "runXtline"},
       {"tsline", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {}, "runTsline"},
       {"twoway", {"tw"}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "twoway_dispatch (runTwowayLayers for parenthesised/`||` multi-layer; else plot-type strip, "
@@ -1074,7 +1080,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // serset-twoway SS (2026-10-21): the graph-owned serset store (serset.sthlp):
       // `serset`, `serset [set] #`, `serset use [, clear]`, `serset clear`,
       // `serset drop`, `serset dir` (w2al_twoway_family.log:177-188, :5418-5440).
-      {"serset", {}, Family::Graph, false, false, WeightPolicy::None, false, {},
+      {"serset", {}, Family::Graph, true, true, WeightPolicy::None, false, {},
        "serset::runSerset (bare/set #/use/clear/drop/dir)"},
 
       // ---- AER-SCOPE1 bundle C (GTOOLS, 2026-09-03) -----------------------
@@ -1099,7 +1105,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // up (dispatcher.cpp's gtoolsCanonicalName call), so this row's own flag
       // is never read. Setting it would only widen the audited four-stem set
       // that selftest pins, with a stem nobody measured against real Stata.
-      {"glevelsof", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
+      {"glevelsof", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
        "runLevelsof via gtools shim", false, {"glevelsof"}},
       {"gisid", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
        "runIsid via gtools shim", false, {"gisid"}},
@@ -1107,7 +1113,7 @@ const std::vector<CommandSpec>& commandRegistry() {
        "runReshape via gtools shim", false, {"greshape"}},
       {"fmerge", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
        "runMerge via ftools shim", false, {"fmerge"}},
-      {"gquantiles", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
+      {"gquantiles", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
        "runXtile (xtile form) / runGQuantilesPctile (_pctile|pctile forms)", false,
        {"gquantiles"}},
       {"gstats", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
@@ -1120,6 +1126,10 @@ const std::vector<CommandSpec>& commandRegistry() {
       // them `return list`.
       {"return", {}, Family::Macro, false, false, WeightPolicy::None, false, {},
        "runReturnList (list|clear|add) + program::handleReturnStmt (scalar|local)"},
+      // `sreturn list|clear` at any level; `sreturn local` in an sclass program
+      // is intercepted before tokenizing (program.cpp), as `return local` is.
+      {"sreturn", {}, Family::Macro, false, false, WeightPolicy::None, false, {},
+       "runSreturnList (list) + clearSreturn (clear) + program::handleReturnStmt (local)"},
       // The matrix<->dataset round trip. Neither direction existed.
       {"svmat", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runSvmat"},
       // ml-getmata T4. `mata` is a raw-line arm (mata_subset.h): `mata: stmt`
@@ -1146,7 +1156,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // h observations with the (h+1)-th ORDER STATISTIC. At N=100, p=.01 those
       // are different numbers, so an alias would be a silent wrong answer --
       // the one outcome this campaign exists to prevent. Eight packages.
-      {"winsor", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+      {"winsor", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
        "runWinsorCox (order-statistic replacement; NOT winsor2)", false, {"winsor"}},
 
       // ---- AER-SCOPE1 bundle D (ENV, 2026-09-03) --------------------------
@@ -1223,7 +1233,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // twoway__histogram_gen takes fweights, if and in: AllWeights forwards the
       // clause and the handler refuses every type but fweight with r(101)
       // (hk_r_thg_pw); `in` stays unimplemented.
-      {"twoway__histogram_gen", {}, Family::Graph, true, false, WeightPolicy::AllWeights, false, {},
+      {"twoway__histogram_gen", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "runTwowayHistogramGen"},
       // `frames` is Stata's plural spelling of `frame`; `reset` is the one
       // sub-command that only exists in the plural form.
@@ -1250,7 +1260,7 @@ const std::vector<CommandSpec>& commandRegistry() {
        "runEstadd (local|scalar|matrix|ysumm sub-verbs)", false, {"estadd"}},
       // allowIf: estpost reads the dataset, so `estpost summarize x if y > 0`
       // is a real filter rather than a silently dropped qualifier.
-      {"estpost", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      {"estpost", {}, Family::Estimation, true, true, WeightPolicy::AllWeights, false, {},
        "runEstpost (summarize|tabstat sub-verbs)", false, {"estpost"}},
       {"estout", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
        "runEstout", false, {"estout"}},
@@ -1288,16 +1298,16 @@ const std::vector<CommandSpec>& commandRegistry() {
       // not touch a single cell.
       {"recast", {}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runRecast"},
       {"insobs", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runInsobs"},
-      {"stack", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runStack"},
-      {"separate", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+      {"stack", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runStack"},
+      {"separate", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
        "runSeparate"},
       // allowIf: mvencode.ado marks an `if` sample (007's Wave 2 cleaning uses it).
       {"mvencode", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
        "runMvencode"},
       // The three sampling verbs. Philox keyed on session.seed -- `set seed 7`
       // then the same command twice gives the same rows.
-      {"sample", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runSample"},
-      {"splitsample", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+      {"sample", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runSample"},
+      {"splitsample", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
        "runSplitsample"},
       {"bsample", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runBsample"},
       {"drawnorm", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
@@ -1308,14 +1318,15 @@ const std::vector<CommandSpec>& commandRegistry() {
        "runInput (raw pre-pass; block folded at preprocess time)"},
       // `note` is Stata's own documented synonym ([D] notes), not an invented
       // alias -- the same split-row shape as erase/rm and dir/ls.
-      {"notes", {"note"}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runNotes"},
-      {"compare", {}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runCompare"},
+      {"notes", {"note"}, Family::Meta, false, true, WeightPolicy::None, false, {}, "runNotes"},
+      {"char", {"characteristic"}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runChar"},
+      {"compare", {}, Family::Meta, true, true, WeightPolicy::None, false, {}, "runCompare"},
       // BUG-1015: cumul.ado takes `[fw aw/] [if] [in]` and is byable(onecall):
       // if/in, both weights and the by: prefix flipped on (w2as sx_cumul_if,
       // sx_cumul_aw_equal, sx_cumul_fw, sx_cumul_by).
       {"cumul", {}, Family::DataMgmt, true, true, WeightPolicy::AweightFweight, true, {}, "runCumul"},
       // pctile/_pctile take [aw=]/[fw=]/[pw=] (the weighted percentile rule in
-      // datamgmt/pctile.cpp); the tokenizer's kStataLegalWeights row
+      // datamgmt/pctile.cpp); the registry's kStataQualifiers row
       // answers Stata's r(101) for iweight before this policy is read.
       {"pctile", {}, Family::DataMgmt, false, false, WeightPolicy::AllWeights, false, {}, "runPctile"},
       {"_pctile", {}, Family::DataMgmt, false, false, WeightPolicy::AllWeights, false, {},
@@ -1335,10 +1346,13 @@ const std::vector<CommandSpec>& commandRegistry() {
       // dx_outs_if log:838).
       {"outsheet", {}, Family::IO, true, true, WeightPolicy::None, false, {},
        "runOutsheet -> writeDelimitedFile (tab default)"},
-      {"infile", {}, Family::IO, false, false, WeightPolicy::None, false, {}, "runInfile"},
+      // allowIf/allowInRange TRUE: runInfile keeps the observations the qualifier
+      // selects (StataBE 19.5, bank 26988b7fdda8f5c6 `infile a b using in.raw if
+      // a>1, clear`, 1258423a4c81b569 `in 2/3`).
+      {"infile", {}, Family::IO, true, true, WeightPolicy::None, false, {}, "runInfile"},
       // allowInRange TRUE: runInfix keeps the records `in` names (w2ar dx_rb
       // `infix ... using f in 1`, log:2376).
-      {"infix", {}, Family::IO, false, true, WeightPolicy::None, false, {}, "runInfix"},
+      {"infix", {}, Family::IO, true, true, WeightPolicy::None, false, {}, "runInfix"},
       // allowIf/allowInRange TRUE: runOutfile writes the rows the qualifier
       // selects (w2ar dx_outf_if `outfile s g if year == 2001 using f`, log:4990).
       {"outfile", {}, Family::IO, true, true, WeightPolicy::None, false, {}, "runOutfile"},
@@ -1379,6 +1393,18 @@ const std::vector<CommandSpec>& commandRegistry() {
        "runLrtest (two stored fits, or one and the current)"},
       {"fvunab", {}, Family::Macro, false, false, WeightPolicy::None, false, {},
        "runFvunab (ts/fv operator prefixes kept)"},
+      // vs-stata bank (2026-11-11): the programmer list parsers and the .dta
+      // format probe. StataCorp's own, so no community tag.
+      {"numlist", {}, Family::Macro, false, false, WeightPolicy::None, false, {},
+       "runNumlist (sets r(numlist))"},
+      {"tsunab", {}, Family::Macro, false, false, WeightPolicy::None, false, {},
+       "runTsunab (fvunab restricted to ts operators; sets a local)"},
+      {"fvexpand", {}, Family::Macro, true, true, WeightPolicy::None, false, {},
+       "runFvexpand (sets r(varlist) r(fvops) r(tsops))"},
+      {"dtaversion", {}, Family::IO, false, false, WeightPolicy::None, false, {},
+       "runDtaversion (sets r(version))"},
+      {"misstable", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
+       "runMisstable (summarize; patterns/tree/nested refused)"},
       {"integ", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
        "runInteg (trapezoid/cubic, sets r(integral))"},
       {"numlabel", {}, Family::Meta, false, false, WeightPolicy::None, false, {},
@@ -1451,11 +1477,11 @@ const std::vector<CommandSpec>& commandRegistry() {
        "runMissings (report|dropvars|dropobs|tag)", false, {"missings"}},
       {"mdesc", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runMdesc",
        false, {"mdesc"}},
-      {"labmask", {}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runLabmask",
+      {"labmask", {}, Family::Meta, false, true, WeightPolicy::None, false, {}, "runLabmask",
        false, {"labmask"}},
       {"renvarlab", {}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runRenvarlab",
        false, {"renvarlab"}},
-      {"splitvallabels", {}, Family::Meta, false, false, WeightPolicy::None, false, {},
+      {"splitvallabels", {}, Family::Meta, true, true, WeightPolicy::None, false, {},
        "runSplitvallabels", false, {"splitvallabels"}},
       // Stata's own, and program-internal: no community tag.
       {"marksample", {}, Family::Macro, false, false, WeightPolicy::None, false, {},
@@ -1480,9 +1506,9 @@ const std::vector<CommandSpec>& commandRegistry() {
       // refuses both qualifiers in every form, and the row now says so.
       // (`unique`, `distinct` and `missings` keep true: their arms genuinely
       // read the qualifier in at least one form.)
-      {"rangestat", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+      {"rangestat", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
        "runRangestat", false, {"rangestat"}},
-      {"tsspell", {}, Family::DataMgmt, false, false, WeightPolicy::None, true, {}, "runTsspell",
+      {"tsspell", {}, Family::DataMgmt, true, true, WeightPolicy::None, true, {}, "runTsspell",
        false, {"tsspell"}},
 
       // ---- AER-SCOPE1 bundle J (GRAPH-X, 2026-09-04) ----------------------
@@ -1508,7 +1534,7 @@ const std::vector<CommandSpec>& commandRegistry() {
        false, {"geodist"}},
       {"geonear", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runGeonear",
        false, {"geonear"}},
-      {"cdfplot", {}, Family::Graph, true, true, WeightPolicy::None, false, {}, "runCdfplot",
+      {"cdfplot", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {}, "runCdfplot",
        false, {"cdfplot"}},
       {"event_plot", {}, Family::Graph, false, false, WeightPolicy::None, false, {},
        "runEventPlot -> runCoefplot", false, {"event_plot"}},
@@ -1598,7 +1624,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // column pair and honour both qualifiers.
       {"spearman", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
        "runSpearman (rank correlation + 4-parameter beta exact p)"},
-      {"sktest", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
+      {"sktest", {}, Family::Estimation, true, true, WeightPolicy::AweightFweight, false, {},
        "runSktest (D'Agostino-Belanger-D'Agostino + Royston adjustment)"},
       {"signrank", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
        "runSignrank (Wilcoxon matched-pairs, normal + exact p)"},
@@ -1618,20 +1644,23 @@ const std::vector<CommandSpec>& commandRegistry() {
       // allowed" (lpl_pw); lowess.ado declares no weights at all, so every
       // weight is r(101) "weights not allowed" (lpl_lw_aw). The tokenizer's own
       // weight gate would answer r(198) for both.
-      {"tsfilter", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
+      // tsfilter hp honours `in` (runTsfilterHp passes the rows to the engine's
+      // full-frame sample mask, as lowess/lpoly do).
+      {"tsfilter", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
        "runTsfilterHp (subcommand `hp` only; others -> kUnknownSubcommand)"},
       {"lpoly", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "runLpoly (local polynomial smooth + ROT bandwidth)"},
       {"lowess", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "runLowess (tricube LOWESS, no robustness iterations)"},
-      {"pca", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      {"pca", {}, Family::Estimation, true, true, WeightPolicy::AweightFweight, false, {},
        "runPca (correlation/covariance principal components)"},
 
       // X2-GLM: `glm` left E3. Fitted in-process (estimation_glm.cpp over the
-      // engine's cecon::glm_fit). `if` is read; `in` has no oracle arm and stays
-      // off. AweightFweight lets [aw=] through (w2_glm_lifecycle pois_aw_cl_*);
+      // engine's cecon::glm_fit). `if` and `in` are read (runGlm's frame filter;
+      // vs-stata bank cc7bc9b0 `glm ... in 1/60, family(poisson)` rc 0).
+      // AweightFweight lets [aw=] through (w2_glm_lifecycle pois_aw_cl_*);
       // an [fw=] that gets past the tokenizer is refused by name in runGlm.
-      {"glm", {}, Family::Estimation, true, false, WeightPolicy::AweightFweight, false, {},
+      {"glm", {}, Family::Estimation, true, true, WeightPolicy::AweightFweight, false, {},
        "runGlm (in-process, estimation_glm.cpp)"},
 
       // xi is BOTH a command (`xi i.region`) and a prefix (`xi: regress ...`);
@@ -1719,7 +1748,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // -- qreg's LP vertex under version 11 (e(f_r) as _qreg measures it), the
       // Machado-Parente-Santos Silva sandwich, the MSS/PSS tests. FweightOnly is
       // qreg2 `[fweight]` (aw/pw/iw r(101) via the tokenizer's
-      // kStataLegalWeights row); if/in are its marksample.
+      // kStataQualifiers row); if/in are its marksample.
       {"qreg2", {}, Family::Estimation, true, true, WeightPolicy::FweightOnly, false, {},
        "runQreg2 (qreg2.ado: qreg vertex, kernel sandwich V (robust/cluster), MSS/PSS tests)"},
 
@@ -1769,7 +1798,10 @@ const std::vector<CommandSpec>& commandRegistry() {
   static const std::set<std::string> kPlainVarlist = {
       "drop",     "keep",   "order",    "summarize", "tabstat", "list",
       "codebook", "describe", "format", "destring", "recode",  "tostring",
-      "compress", "isid",   "labelbook",
+      "compress", "isid",
+      // `labelbook` is absent on purpose: its words are value-label names, not
+      // variables (`labelbook *lbl` is r(198) "* invalid name" in Stata, not a
+      // variable pattern that expands to nothing).
       // BUG-525 (W2 labelglued): `corr` and `levelsof` take a varlist and
       // nothing else in that position, and the plain-varlist site is now also
       // where a parenthesised varlist is unwrapped -- oracle
@@ -1789,13 +1821,28 @@ const std::vector<CommandSpec>& commandRegistry() {
       // tab2 take a varlist and nothing else in that position, so the shared
       // wildcard/range/abbreviation rule applies (StataBE ec.do, ab3.do).
       "tabulate", "tab1", "tab2",
+      // vs-stata bank (s3b_est_other): pwcorr, mean, proportion and pca take a
+      // varlist in that position, so Stata's wildcard and range rule applies
+      // (f7f455df `pwcorr m* p* t*`, 0f5e5609 `mean price-weight`, 0c8d7547 `pca
+      // price-weight, components(2)`).
+      "pwcorr", "mean", "proportion", "pca",
   };
   // BUG-1422: StataBE 19.5 `tsfill in 1/3`, `marginsplot in 1/3`, `tsset t in 1/3`,
   // `xtset g t in 1/3` -> "in range not allowed" r(101); the same with [fw=w] or
   // [aw=w] -> "weights not allowed" r(101); `marginsplot x1 in 1/3` -> "varlist
   // not allowed" r(101).
+  // `sort` answers its own qualifiers too, in Stata's order: the varlist first
+  // (`so if price>5000 in 1/10`, `so in 5`, `so [fw=rep78]`, `so = price*2`,
+  // `so using "f"` are all r(100) "varlist required" in StataBE 19.5, truth bank
+  // syntaxopt), then `if` r(101), weights r(101); its `in` is Stata syntax this
+  // build does not implement and is refused by name in the arm.
+  // `reshape` takes no qualifier at all: reshape.ado reads `if`, `in` and `[`
+  // as words of its stub list (`reshape wide bp if sex==0, ...` and `... bp in
+  // 1/20, ...` are r(111) "variable if/in not found", `... bp [aw=bp], ...`
+  // r(198) "[ invalid name"; vs-stata bank 21a1700cb323d079, c64de4384b383b64,
+  // d3847b0b1ac554dd), so its arm answers them.
   static const std::set<std::string> kQualifiersRefusedByArm = {"tsfill", "marginsplot", "tsset",
-                                                                "xtset"};
+                                                                "xtset", "sort", "reshape"};
   static const bool kMarked = [] {
     for (auto& row : kRegistry) {
       if (kPlainVarlist.count(row.canonical) != 0) row.varlistIsPlain = true;
@@ -1899,6 +1946,455 @@ std::string resolveCanonical(const std::string& lowerName) {
     if (cn == lowerName) return lowerName;
   }
   return spec->canonical;
+}
+
+bool isStataCommandAbbreviation(const std::string& typed) {
+  // Compared as typed: Stata's command words are case-sensitive, so a program
+  // named `G` is not `g` (generate) and still runs.
+  if (typed.empty()) return false;
+  // Spellings that are NOT abbreviations inside Stata but ado-files of their
+  // own in StataNow's ado/base (r/reg.ado, d/desc.ado, l/levels.ado ...: shims
+  // that call the full command). Stata looks for a program already in memory
+  // before it searches the ado path, so `program define reg` then `reg price
+  // mpg` runs the user's program. Listed from this registry's abbreviation
+  // spellings that have a <spelling>.ado under ado/base (StataNow 19.5);
+  // `so`, `sa`, `g`, `su` ... have none and stay built-in abbreviations.
+  static const std::set<std::string> kAdoShims = {
+      "desc",  "d",       "de",     "des",    "descr", "descri", "describ", "ren",
+      "rena",  "renam",   "reg",    "regr",   "regre", "regres", "ap",      "app",
+      "appe",  "appen",   "la",     "lab",    "labe",  "levels", "logi",    "prob",
+      "probi", "te",      "tes",    "est",    "esti",  "estim",  "estima",  "estimat",
+      "estimate", "hist", "tw",     "gr",     "note",  "xtdes"};
+  if (kAdoShims.count(typed) != 0) return false;
+  for (const auto& spec : commandRegistry()) {
+    if (spec.canonical == typed) return false;
+    for (const auto& ab : spec.abbrev) {
+      if (ab != typed) continue;
+      for (const auto& cn : spec.communityNames)
+        if (cn == typed) return false;
+      return spec.canonical.size() > typed.size() &&
+             spec.canonical.compare(0, typed.size(), typed) == 0;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Stata's own syntax (registry.h StataQualifiers / StataLead). Every row cites
+// its source: the command's shipped ado `syntax` statement (read for WHAT the
+// syntax admits, never copied) and/or the StataBE 19.5 answer recorded in the
+// truth bank of 2026-11-10 ("StataBE ... r(101)").
+namespace {
+constexpr StataQualifiers kStataQualifiers[] = {
+    // ---- legal weight sets carried over from the tokenizer's former
+    // kStataQualifiers (each command takes `if` and `in`) ----------------
+    // summarize: its help ("aweights, fweights, and iweights are allowed");
+    // oracle tests/eval/golden/aer_w2/w2_pweight.log:764-768 (`pweights not
+    // allowed`, r(101)) and aer_b4/esttab-beta.log:338 (W_su_pweight_refused).
+    {"summarize", true, true, "aweight fweight iweight"},
+    // qreg: its help ("allows fweights, iweights, and pweights"); oracle
+    // w2p_estim_ev.log:418-419 (`qreg ... [aw=w]` -> r(101), A_qreg_aw_q50).
+    // ...under `version 12` and earlier its ado parses `[fw aw]` (qreg.ado `vc <= 12`).
+    {"qreg", true, true, "fweight iweight pweight", 13, "aweight fweight"},
+    // qreg2 (SSC): `syntax ... [fweight]`; oracle w2j_e3_qreg2.log:1996-2018.
+    {"qreg2", true, true, "fweight"},
+    // tabulate/tab1: "fweights, aweights, and iweights are allowed"; tab2:
+    // "fweights are allowed by tab2". Oracle w2aj_qualifiers qf_tb_aw_sp/_iw_sp.
+    {"tabulate", true, true, "aweight fweight iweight"},
+    {"tab1", true, true, "aweight fweight iweight"},
+    {"tab2", true, true, "fweight"},
+    // pctile/xtile: aweights, fweights and pweights (pctile's help); _pctile
+    // also iweights (StataBE `_pctile x [iw=wf]` rc 0, BUG-1444).
+    {"pctile", true, true, "aweight fweight pweight"},
+    {"_pctile", true, true, "aweight fweight iweight pweight"},
+    {"xtile", true, true, "aweight fweight pweight"},
+    // BUG-1444 (StataBE 19.5, 2026-10-29): pweights and iweights are r(101) on
+    // correlate, pwcorr, tabstat (tabstat.ado `[aw fw]`, BUG-1151) and cumul;
+    // aweights on probit and poisson.
+    {"corr", true, true, "aweight fweight"},
+    {"pwcorr", true, true, "aweight fweight"},
+    {"tabstat", true, true, "aweight fweight"},
+    {"cumul", true, true, "aweight fweight"},
+    {"probit", true, true, "fweight iweight pweight"},
+    {"poisson", true, true, "fweight iweight pweight", 7, "aweight fweight iweight pweight"},
+    // BUG-1539/1537/1541 (StataBE 19.5, scratch-laneA2/agents/wml/x1.log).
+    {"ppmlhdfe", true, true, "fweight pweight"},
+    {"nbreg", true, true, "fweight iweight pweight", 7, "aweight fweight iweight pweight"},
+    {"proportion", true, true, "fweight iweight pweight"},
+    // ---- 2026-11-11 (vs-stata bank) --------------------------------------
+    {"_dots", false, false, ""},  // _dots.ado `syntax [anything] [, ...]`; StataBE if/in/aw r(101)
+    {"acreg", true, true, "fweight pweight"},  // acreg.ado `[fweight pweight]`; StataBE aw r(101)
+    {"areg", true, true, "aweight fweight pweight"},  // areg.ado `[aw fw pw]`; StataBE iw r(101)
+    {"assert", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"cdfplot", true, true, "aweight fweight iweight pweight"},  // cdfplot.ado `[aweight fweight iweight pweight]`; bank rc 0 for all four
+    {"binscatter", true, true, "aweight fweight"},  // binscatter.ado `[aweight fweight]`; StataBE iw/pw r(101)
+    {"centile", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"cf", false, false, ""},  // cf.ado `syntax varlist using/ [, ...]`; StataBE if/in r(101)
+    {"clear", false, false, ""},  // clear.ado `syntax [anything]`; StataBE if r(101)
+    {"cloglog", true, true, "fweight iweight pweight"},  // cloglog.ado `[fw iw pw]`; StataBE aw r(101)
+    {"clonevar", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"codebook", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"compare", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"compress", false, false, ""},  // built-in; StataBE if/in/aw r(101)
+    {"contract", true, true, "fweight"},  // contract.ado `[fw]`; StataBE aw/pw r(101)
+    {"count", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"cross", false, false, ""},  // cross.ado `syntax using/`; StataBE if r(101)
+    {"csdid", true, true, "iweight"},  // csdid.ado `[iw]`; StataBE aw/fw/pw r(101)
+    {"describe", false, false, ""},  // describe.ado `syntax [anything] [using] [, ...]`; StataBE if/in/aw r(101)
+    {"destring", false, false, ""},  // destring.ado `syntax [varlist], ...`; StataBE if/in r(101)
+    {"dfuller", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"did_imputation", true, true, "aweight"},  // StataBE fw/iw/pw r(101), aw rc 0
+    {"drawnorm", false, false, ""},  // drawnorm.ado `syntax newvarlist [, ...]`; StataBE if r(101)
+    {"drdid", true, true, "iweight"},  // drdid.ado `[iw]`; StataBE aw/fw/pw r(101)
+    {"drop", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"ds", false, false, ""},  // built-in `ds [varlist] [, options]`; StataBE if r(101)
+    {"duplicates", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"egen", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    // StataBE `error 111 in 1/5` / `[aw=weight]`: r(197) "in range not allowed" /
+    // "weights not allowed" (48fd40e7455e6945, 68563bac22df7952); `if` unmeasured.
+    {"error", true, false, "", 0, nullptr, 197},
+    {"estout", false, false, ""},  // estout.ado `syntax [anything] [using] [, ...]`; StataBE if/in r(101)
+    {"esttab", false, false, ""},  // esttab.ado `syntax [anything] [using] [, ...]`; StataBE if/in r(101)
+    {"fillin", false, false, ""},  // fillin.ado `syntax varlist(min=2)`; StataBE if r(101)
+    {"fmerge", false, false, ""},  // fmerge.ado `syntax [varlist(default=none)] using/ [, ...]`; StataBE if r(101)
+    {"format", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"fracreg", true, true, "fweight iweight pweight"},  // StataBE aw r(101); fw/iw/pw rc 0
+    {"frget", false, false, ""},  // frget.ado `syntax anything(equalok), ...`; StataBE if/in r(101)
+    {"frlink", false, false, ""},  // built-in `frlink 1:1|m:1 varlist, frame()`; StataBE if r(101)
+    {"frmttable", false, false, ""},  // frmttable.ado `syntax [using/], [...]`; StataBE if r(101)
+    {"gduplicates", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"generate", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"getmata", false, false, ""},  // getmata.ado `syntax [anything] [, ...]`; StataBE if r(101)
+    {"gisid", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"gquantiles", true, true, "aweight fweight pweight"},  // StataBE iw r(101); aw/fw/pw rc 0
+    {"graph", true, true, "aweight fweight pweight"},  // StataBE `graph twoway ... [iw=]` r(101); aw/fw/pw rc 0
+    {"greshape", false, false, ""},  // greshape.ado `syntax anything, ...`; StataBE if r(101)
+    {"grstyle", false, false, nullptr},  // StataBE if/in r(101) (its `[aw=]` is read as a name, r(198))
+    {"heckman", true, true, "fweight iweight pweight"},  // heckman.ado `[pw fw iw]`; StataBE aw r(101) (vs-stata bank aedc499f)
+    {"histogram", true, true, "fweight"},  // histogram.ado `[fw]`; StataBE aw/iw/pw r(101)
+    {"insobs", false, false, ""},  // insobs.ado `syntax anything [, ...]`; StataBE if/in r(101)
+    {"inspect", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"integ", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"ipolate", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"isid", false, false, ""},  // isid.ado `syntax varlist [, Sort Missok]`; StataBE if/in/aw r(101)
+    {"ivprobit", true, true, "fweight iweight pweight"},  // ivprobit.ado `[fw pw iw/]`; StataBE aw r(101)
+    {"ivreghdfe", true, true, "aweight fweight pweight"},  // StataBE iw r(101) "iweights not allowed" (bank 83ecde87)
+    {"ivtobit", true, true, "fweight iweight pweight"},  // ivtobit.ado `[fw pw iw/]`; StataBE aw r(101)
+    {"joinby", false, false, ""},  // joinby.ado `syntax [varlist(default=none)] using/ [, ...]`; StataBE if/in/aw r(101)
+    {"kdensity", true, true, "aweight fweight iweight"},  // StataBE pw r(101); aw/fw/iw rc 0
+    {"keep", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"label", true, false, nullptr},  // StataBE `label ... in` r(101) (`if`/weights: r(198) invalid syntax)
+    {"labelbook", false, false, ""},  // labelbook.ado `syntax [anything] [using/] [, ...]`; StataBE if/in/aw r(101)
+    {"labmask", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"labvars", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"leebounds", true, true, "fweight iweight pweight"},  // leebounds.ado `[pweight fweight iweight/]`; StataBE aw r(101)
+    {"levelsof", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"line", true, true, "aweight fweight pweight"},  // StataBE iw r(101); aw/fw/pw rc 0
+    {"list", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"logistic", true, true, "fweight iweight pweight"},  // StataBE aw r(101); fw/iw/pw rc 0
+    {"logit", true, true, "fweight iweight pweight"},  // StataBE aw r(101); fw/iw/pw rc 0
+    {"lowess", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"lpoly", true, true, "aweight fweight"},  // StataBE iw/pw r(101); aw/fw rc 0
+    {"markout", false, false, ""},  // built-in; StataBE if/in/aw r(101)
+    {"matlist", false, false, ""},  // matlist.ado `syntax anything [, *]`; StataBE if/in/aw r(101)
+    {"matselrc", false, false, nullptr},  // StataBE if/in r(101)
+    {"mdesc", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"mediate", true, true, "fweight iweight pweight"},  // mediate.ado `[pw iw fw]`; StataBE aw r(101)
+    {"merge", false, false, ""},  // merge.ado `syntax [varlist(default=none)] using/ [, ...]`; StataBE if/in/aw r(101)
+    {"missings", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"mixed", true, true, "fweight pweight"},  // StataBE aw/iw r(101); fw/pw rc 0
+    {"mkmat", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"mkspline", true, true, "fweight"},  // mkspline.ado `[fweight]`; StataBE aw/pw r(101)
+    {"mlogit", true, true, "fweight iweight pweight", 18, "aweight fweight iweight pweight"},  // StataBE aw r(101); fw/iw/pw rc 0; mlogit.ado allows aw when _caller() < 18
+    {"move", false, false, ""},  // built-in `move varname1 varname2`; StataBE if r(101)
+    {"mvdecode", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"mvencode", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"newey", true, true, "aweight"},  // newey.ado `[aw/]`; StataBE fw/iw/pw r(101)
+    {"notes", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"char", false, false, ""},  // built-in `char`; StataBE if/in/weights r(101)
+    {"numlabel", false, false, ""},  // numlabel.ado `syntax [anything] [, ...]`; StataBE in/aw r(101)
+    {"ologit", true, true, "fweight iweight pweight", 19, "aweight fweight iweight pweight"},  // StataBE aw r(101); fw/iw/pw rc 0; ologit.ado allows aw when _caller() < 19
+    {"oprobit", true, true, "fweight iweight pweight", 19, "aweight fweight iweight pweight"},  // StataBE aw r(101); fw/iw/pw rc 0; oprobit.ado allows aw when _caller() < 19
+    {"order", false, false, ""},  // order.ado `syntax varlist [, ...]`; StataBE if r(101)
+    {"pca", true, true, "aweight fweight"},  // StataBE iw/pw r(101); aw/fw rc 0
+    {"pperron", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"prais", true, true, ""},  // StataBE weights r(101) "weights not allowed" (bank 89ef3eaf [aw=t])
+    {"preserve", false, false, ""},  // built-in; StataBE if/in/aw r(101)
+    {"rangestat", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"rddensity", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"rdplot", true, false, ""},  // rdplot.ado `syntax anything [if] [, ...]`; StataBE in/aw/fw/iw/pw r(101)
+    {"rdrobust", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"recast", false, false, ""},  // recast.ado `syntax varlist [, FORCE DRYRUN]`; StataBE if/in/aw r(101)
+    {"recode", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"reghdfe", true, true, "aweight fweight pweight"},  // StataBE iw r(101); aw/fw/pw rc 0
+    {"reg3", true, true, "aweight fweight"},  // reg3.ado `[aw fw]`; StataBE iw/pw r(101)
+    {"regsave", false, false, ""},  // regsave.ado `syntax [anything] [using/] [, ...]`; StataBE if r(101)
+    {"renvarlab", false, false, ""},  // renvarlab.ado `syntax newvarlist [, ...]`; StataBE if/in/aw r(101)
+    {"renvars", false, false, ""},  // renvars.ado `syntax newvarlist [, ...]`; StataBE if/in/aw r(101)
+    {"replace", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"require", false, false, ""},  // require.ado `syntax anything, [...]`; StataBE if/in/aw r(101)
+    {"restore", false, false, ""},  // built-in; StataBE if/in/aw r(101)
+    {"sample", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"save", false, false, ""},  // built-in `save [filename] [, options]`; StataBE if r(101)
+    {"scalar", false, true, ""},  // StataBE `scalar x = 5 if foreign` / `[aw=]` r(101); `in` rc 0
+    {"scatter", true, true, "aweight fweight pweight"},  // StataBE iw r(101); aw/fw/pw rc 0
+    {"sctorezone", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"sdid", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"sdtest", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"sencode", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"separate", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"signrank", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"sktest", true, true, "aweight fweight"},  // sktest.ado `[aw fw]`; StataBE pw r(101)
+    {"sort", false, true, ""},  // built-in `sort varlist [in] [, stable]`; StataBE if/aw r(101)
+    {"spearman", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"split", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"splitsample", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"splitvallabels", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"stack", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"stcox", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"streg", true, true, ""},  // StataBE `streg ... [pweight=]` r(101) "weights must be stset" (vs-stata bank 850cc61d)
+    {"strdist", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"stset", true, false, "fweight pweight iweight"},  // stset.ado `syntax varlist [if/] [fw pw iw/]`; StataBE in/aw r(101)
+    {"sureg", true, true, "aweight fweight"},  // sureg.ado `[aw fw]`; StataBE iw/pw r(101)
+    {"svyset", false, false, "pweight iweight"},  // svyset.ado `[pweight iweight/]`; StataBE if/in/aw/fw r(101)
+    {"tabout", true, true, "aweight fweight iweight"},  // tabout.ado `[fweight aweight iweight]`; StataBE pw r(101)
+    {"teffects", true, true, "fweight iweight pweight"},  // StataBE aw r(101); fw/iw/pw rc 0
+    {"tolower", false, false, ""},  // StataBE if/in/aw r(101)
+    {"tostring", false, false, ""},  // tostring.ado `syntax varlist, [...]`; StataBE if/in/aw r(101)
+    {"tset", false, false, ""},  // StataBE if/in/aw r(101)
+    {"tsline", true, true, "aweight fweight pweight"},  // StataBE iw r(101); aw/fw/pw rc 0
+    {"tssmooth", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"tsspell", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"ttest", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"twoway", true, true, "aweight fweight pweight"},  // StataBE iw r(101); aw/fw/pw rc 0
+    {"twoway__histogram_gen", true, true, "fweight"},  // twoway__histogram_gen.ado `[fw]`; StataBE aw/iw/pw r(101)
+    {"unab", false, false, ""},  // unab.ado `syntax [varlist(...)]`; StataBE if r(101)
+    {"unique", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"var", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"winsor", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"winsor2", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"wntestq", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"xi", false, false, ""},  // xi.ado `syntax [anything] [, PREfix() NOOMIT]`; StataBE if/in/aw r(101)
+    {"xtabond", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"xtdescribe", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"xtline", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"xtlogit", true, true, "fweight iweight pweight"},  // xtlogit.ado `[iweight fweight pweight]`; StataBE aw r(101)
+    {"xtpoisson", true, true, "fweight iweight pweight"},  // xtpoisson.ado `[iweight fweight pweight]`; StataBE aw r(101)
+    {"xtsum", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"xttab", true, true, ""},  // StataBE weights r(101) "weights not allowed"
+    {"zinb", true, true, "fweight iweight pweight", 7, "aweight fweight iweight pweight"},  // zinb.ado; StataBE aw r(101); aw when _caller() < 7
+    {"zip", true, true, "fweight iweight pweight", 7, "aweight fweight iweight pweight"},  // zip.ado; StataBE aw r(101); aw when _caller() < 7
+};
+
+// {canonical, bare, bareRc, withOptions, withOptionsRc, replay, noOptions,
+//  qualifiersAreLead}. Source of every row: StataBE 19.5 truth bank 2026-11-10,
+// the cells `<cmd>` and `<cmd> , <unknown option>` (and `<cmd> <lead>,
+// <unknown option>` for noOptions) with a dataset loaded and no estimates in
+// memory; cross-checked against the ado `syntax` statement where one ships
+// (a required `varlist`/`using/`/`=/exp`, or a replay branch `if replay()`).
+constexpr StataLead kStataLead[] = {
+    {"_pctile", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"append", "using required", 100, "using required", 100, false, false, false},
+    {"areg", nullptr, 0, nullptr, 0, true, false, false},
+    {"astile", "namelist required", 100, "namelist required", 100, false, false, false},
+    {"binscatter", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"carryforward", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"cdfplot", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"cf", "varlist required", 100, "varlist required", 100, false, false, false},
+    // clear.ado `syntax [anything]`: `clear, zz` r(101) (vs-stata bank d3045496a568112c).
+    {"clear", nullptr, 0, "options not allowed", 101, false, false, false},
+    {"cloglog", nullptr, 0, nullptr, 0, true, false, false},
+    // clonevar takes no options: `clonevar p2 = price, zznotanoption` r(101)
+    // (vs-stata bank e7f86976681cfa70); with nothing before the comma its own
+    // usage refusal, r(198) (`clonevar , zzabbrprobe`, 8e5794e8f72d9d5b).
+    {"clonevar", nullptr, 0, "syntax is clonevar newvar = varname ...", 198, false, true, false},
+    {"compare", "varlist required", 100, "varlist required", 100, false, true, false},
+    {"contract", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"count", nullptr, 0, "options not allowed", 101, false, true, false},
+    {"cross", "using required", 100, "options not allowed", 101, false, true, false},
+    {"csdid", nullptr, 0, nullptr, 0, true, false, false},
+    {"decode", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"dfuller", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"did_imputation", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"drawnorm", "varlist required", 100, "varlist not allowed", 101, false, false, false},
+    {"drdid", nullptr, 0, nullptr, 0, true, false, false},
+    {"drop", "varlist, if exp, or in range required", 100, "options not allowed", 101, false, true, true},
+    {"encode", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"erase", "invalid file specification", 198, nullptr, 0, false, true, false},
+    {"estadd", "subcommand required", 100, "subcommand required", 100, false, false, false},
+    {"estpost", nullptr, 0, nullptr, 0, true, false, false},
+    {"eventstudyinteract", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"expand", "=exp required", 100, "=exp required", 100, false, false, false},
+    {"fillin", "varlist required", 100, "varlist required", 100, false, true, false},
+    {"fillmissing", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"findfile", "file \"\" not found", 601, "varlist not allowed", 101, false, false, false},
+    {"format", nullptr, 0, "options not allowed", 101, false, false, false},
+    {"fracreg", nullptr, 0, nullptr, 0, true, false, false},
+    {"frget", "something required", 100, "something required", 100, false, false, false},
+    {"gegen", "something required", 100, "something required", 100, false, false, false},
+    {"generate", "=exp required", 100, "=exp required", 100, false, false, true},
+    {"geodist", "something required", 100, "something required", 100, false, false, false},
+    {"geonear", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"gisid", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"glevelsof", "something required", 100, "something required", 100, false, false, false},
+    {"glm", nullptr, 0, nullptr, 0, true, false, false},
+    {"gmm", nullptr, 0, nullptr, 0, true, false, false},
+    {"graph", nullptr, 0, "varlist not allowed", 101, false, false, false},
+    {"gsort", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"gunique", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"heckman", nullptr, 0, nullptr, 0, true, false, false},
+    {"insheet", "using required", 100, nullptr, 0, false, false, false},
+    {"insobs", "number of inserted observations required", 100, "number of inserted observations required", 100, false, false, false},
+    {"inspect", nullptr, 0, "options not allowed", 101, false, true, false},
+    {"integ", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"ipolate", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"isid", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"ivprobit", nullptr, 0, nullptr, 0, true, false, false},
+    {"ivreg", nullptr, 0, nullptr, 0, true, false, false},
+    {"ivregress", nullptr, 0, nullptr, 0, true, false, false},
+    {"ivtobit", nullptr, 0, nullptr, 0, true, false, false},
+    {"joinby", "using required", 100, "using required", 100, false, false, false},
+    {"kdensity", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"keep", "varlist, if exp, or in range required", 100, "options not allowed", 101, false, true, true},
+    {"labmask", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"lasso", nullptr, 0, nullptr, 0, true, false, false},
+    {"leebounds", nullptr, 0, nullptr, 0, true, false, false},
+    {"levelsof", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"line", nullptr, 0, "varlist required", 100, false, false, false},
+    {"logistic", nullptr, 0, nullptr, 0, true, false, false},
+    {"logit", nullptr, 0, nullptr, 0, true, false, false},
+    {"lowess", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"lpoly", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"markout", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"matlist", "matrix name or matrix expression required", 100, "matrix name or matrix expression required", 100, false, false, false},
+    {"mean", nullptr, 0, nullptr, 0, true, false, false},
+    {"mediate", nullptr, 0, nullptr, 0, true, false, false},
+    {"mixed", nullptr, 0, nullptr, 0, true, false, false},
+    {"mkdir", "invalid syntax", 198, "varlist not allowed", 101, false, false, false},
+    {"mkmat", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"ml", nullptr, 0, nullptr, 0, true, false, false},
+    {"mlogit", nullptr, 0, nullptr, 0, true, false, false},
+    {"move", "varlist required", 100, "varlist required", 100, false, true, false},
+    {"mvdecode", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"mvencode", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"nbreg", nullptr, 0, nullptr, 0, true, false, false},
+    {"newey", nullptr, 0, nullptr, 0, true, false, false},
+    {"nl", nullptr, 0, nullptr, 0, true, false, false},
+    {"nlcom", nullptr, 0, nullptr, 0, true, false, false},
+    {"notes", nullptr, 0, "varlist required", 100, false, false, false},
+    {"char", nullptr, 0, nullptr, 0, false, false, false},
+    {"ologit", nullptr, 0, nullptr, 0, true, false, false},
+    {"oprobit", nullptr, 0, nullptr, 0, true, false, false},
+    {"order", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"outfile", "using required", 100, "using required", 100, false, false, false},
+    {"outsheet", "using required", 100, "using required", 100, false, false, false},
+    {"pca", nullptr, 0, nullptr, 0, true, false, false},
+    {"pctile", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"poisson", nullptr, 0, nullptr, 0, true, false, false},
+    {"pperron", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"ppmlhdfe", nullptr, 0, nullptr, 0, true, false, false},
+    {"prais", nullptr, 0, nullptr, 0, true, false, false},
+    {"probit", nullptr, 0, nullptr, 0, true, false, false},
+    {"proportion", nullptr, 0, nullptr, 0, true, false, false},
+    {"qreg", nullptr, 0, nullptr, 0, true, false, false},
+    {"rangestat", "slist required", 100, "slist required", 100, false, false, false},
+    {"rddensity", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"rdplot", "something required", 100, "something required", 100, false, false, false},
+    {"rdrobust", "something required", 100, "something required", 100, false, false, false},
+    {"recode", "varlist (rule).. required", 100, "varlist (rule).. required", 100, false, false, false},
+    {"reg3", nullptr, 0, nullptr, 0, true, false, false},
+    {"renpfix", nullptr, 0, "varlist required", 100, false, false, false},
+    {"replace", "varlist required", 100, "varlist required", 100, false, false, false},
+    // `require, list` runs (require.ado `cap syntax [using], list [*]`), so only the
+    // bare command is a refusal.
+    {"require", "something required", 100, nullptr, 0, false, false, false},
+    {"rm", "invalid file specification", 198, nullptr, 0, false, true, false},
+    {"scatter", nullptr, 0, "varlist required", 100, false, false, false},
+    {"sctorezone", "time zone shift or starttime variable required", 100, "time zone shift or starttime variable required", 100, false, false, false},
+    {"sdid", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"sdtest", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"sencode", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"separate", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"signrank", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"sktest", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"sort", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"split", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"splitvallabels", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"stack", "varlist required", 100, "varlist required", 100, false, false, false},
+    // st estimation commands replay: `stcox , zzabbrprobe` with no results is r(301)
+    // "last estimates not found" (vs-stata bank d00dde22, 9bb917af).
+    {"stcox", nullptr, 0, nullptr, 0, true, false, false},
+    {"streg", nullptr, 0, nullptr, 0, true, false, false},
+    {"strdist", "something required", 100, "something required", 100, false, false, false},
+    {"sureg", nullptr, 0, nullptr, 0, true, false, false},
+    {"tab1", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"tab2", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"tabstat", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"tabulate", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"test", nullptr, 0, nullptr, 0, true, false, false},
+    {"testparm", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"texsave", "using required", 100, "using required", 100, false, false, false},
+    {"tobit", nullptr, 0, nullptr, 0, true, false, false},
+    {"tolower", nullptr, 0, "options not allowed", 101, false, true, false},
+    {"tostring", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"tsline", nullptr, 0, "varlist required", 100, false, false, false},
+    {"ttest", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"unique", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"unzipfile", "zipfile required", 100, "zipfile required", 100, false, false, false},
+    {"var", nullptr, 0, nullptr, 0, true, false, false},
+    {"winsor", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"winsor2", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"wntestq", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"xtabond", nullptr, 0, nullptr, 0, true, false, false},
+    {"xtile", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"xtline", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"xtlogit", nullptr, 0, nullptr, 0, true, false, false},
+    {"xtpoisson", nullptr, 0, nullptr, 0, true, false, false},
+    {"xtreg", nullptr, 0, nullptr, 0, true, false, false},
+    {"xttab", "varlist required", 100, "varlist required", 100, false, false, false},
+    {"zinb", nullptr, 0, nullptr, 0, true, false, false},
+    {"zip", nullptr, 0, nullptr, 0, true, false, false},
+    {"zipfile", "files or directories required", 100, "files or directories required", 100, false, false, false},
+};
+}  // namespace
+
+const StataQualifiers* findStataQualifiers(const std::string& canonical) {
+  for (const auto& row : kStataQualifiers)
+    if (canonical == row.canonical) return &row;
+  return nullptr;
+}
+
+const StataLead* findStataLead(const std::string& canonical) {
+  for (const auto& row : kStataLead)
+    if (canonical == row.canonical) return &row;
+  return nullptr;
+}
+
+namespace {
+// {canonical, refusesFactor, refusesTimeSeries}. Source of every row: the
+// StataBE 19.5 refusal in the truth bank of 2026-11-10 -- "factor-variable and
+// time-series operators not allowed" (both) for `keep i.foreign`, `sort
+// i.foreign`, `tab i.foreign`, `tabstat D.gnp96 L.gnp96`, `ttest D.gnp96 == 0`,
+// `xttab L.jl`, `format price 9.2f`, ...; "factor-variable operators not
+// allowed" (time-series taken) for `cor price i.foreign` (and `cor gnp96
+// L.gnp96` runs), `scatter price i.foreign`, `xtsum i.dry`.
+constexpr StataOperators kStataOperators[] = {
+    {"corr", true, false},      {"format", true, true},   {"histogram", true, true},
+    {"keep", true, true},       {"mdesc", true, true},    {"pca", true, true},
+    {"recode", true, true},     {"scatter", true, false}, {"sort", true, true},
+    {"tab1", true, true},       {"tab2", true, true},     {"tabstat", true, true},
+    {"tabulate", true, true},   {"ttest", true, true},    {"twoway", true, false},
+    {"unab", true, true},       {"xtsum", true, false},   {"xttab", true, true},
+    // xtivreg2's varlist(ts): "factor-variable operators not allowed" (bank d5505dc3
+    // `xtivreg2 frate unemp i.year (beertax = spirits drinkage), fe cluster(sid)`)
+    {"xtivreg2", true, false},
+};
+}  // namespace
+
+const StataOperators* findStataOperators(const std::string& canonical) {
+  for (const auto& row : kStataOperators)
+    if (canonical == row.canonical) return &row;
+  return nullptr;
 }
 
 // ---------------------------------------------------------------------------

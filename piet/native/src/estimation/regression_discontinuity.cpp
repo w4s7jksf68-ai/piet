@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -159,6 +160,23 @@ ojson runRdrobust(const eval::ParsedCommand& parsed, SessionState& session) {
     return ojson::array({ojson(*err)});
   }
 
+  // h(# #) / b(# #) set the left and right bandwidths separately; the engine fits one
+  // bandwidth for both sides and read only the first number (bank 2cdfec1e
+  // `rdrobust wage x, h(3 5) b(6 8)`: e(N_h_r) 926 against the fit's 560).
+  for (const char* side : {"h", "b"}) {
+    for (const auto& [k, v] : parsed.opts) {
+      if (k != side || v.isBool) continue;
+      std::istringstream in(v.strValue);
+      std::string a, b2;
+      if (in >> a >> b2)
+        return qeErrorBlocks(
+            std::string("Option `") + side +
+                "()` with separate left and right bandwidths is a valid Stata option that this "
+                "version of PIET does not implement for `rdrobust` (one bandwidth for both sides "
+                "is).",
+            "unsupported_option");
+    }
+  }
   std::vector<std::string> argv = {"rdrobust", "--y", parsed.varlist[0], "--x", parsed.varlist[1]};
   for (const auto& [opt, flag] : {std::pair<const char*, const char*>{"c", "--c"},
                                    {"p", "--p"},
@@ -290,6 +308,16 @@ ojson runRdrobust(const eval::ParsedCommand& parsed, SessionState& session) {
 // running variable — there is no depvar.
 ojson runRddensity(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return ojson::array({ojson(eval::noDataLoaded())});
+  // rddensity's `varlist(max=1)`: a second variable is r(103) "too many
+  // variables specified" (vs-stata bank `rddensity x wage`).
+  if (parsed.varlist.size() > 1 && session.datastore() != nullptr) {
+    bool allFound = true;
+    for (const auto& v : parsed.varlist) allFound = allFound && session.datastore()->has(v);
+    if (allFound)
+      return ojson::array({ojson(eval::errorBlock("syntax_error", "too many variables specified",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(103)"))});
+  }
   if (parsed.varlist.size() != 1) {
     return qeErrorBlocks(
         "syntax_error: rddensity takes exactly one variable (the running variable) — "
@@ -491,6 +519,26 @@ ojson runRdplot(const eval::ParsedCommand& parsed, SessionState& session) {
     return ojson::array({ojson(*err)});
   }
 
+  // A string variable is r(109) "type mismatch" and a negative p() r(411) before the
+  // engine runs (vs-stata bank: `rdplot price make, c(20)`, `rdplot price mpg, c(20) p(-1)`).
+  if (Datastore* rds = session.datastore()) {
+    for (const auto& v : parsed.varlist) {
+      if (rds->has(v) && rds->dtype(v) == "factor") {
+        return ojson::array({ojson(eval::errorBlock("engine_error", "type mismatch", std::nullopt,
+                                                    std::nullopt, std::nullopt, "r(109)"))});
+      }
+    }
+  }
+  if (auto pt = optStr(parsed, "p"); pt.has_value()) {
+    char* endp = nullptr;
+    const double pv = std::strtod(pt->c_str(), &endp);
+    if (endp != pt->c_str() && pv < 0.0) {
+      return ojson::array({ojson(eval::errorBlock("engine_error",
+                                                  "p() and nbins() should be a positive integers",
+                                                  std::nullopt, std::nullopt, std::nullopt, "r(411)"))});
+    }
+  }
+
   std::vector<std::string> argv = {"rdplot", "--y", parsed.varlist[0], "--x", parsed.varlist[1]};
   for (const auto& [opt, flag] : {std::pair<const char*, const char*>{"c", "--c"},
                                    {"p", "--p"},
@@ -510,6 +558,13 @@ ojson runRdplot(const eval::ParsedCommand& parsed, SessionState& session) {
   EngineCall call = callEngine(argv);
   if (!call.ok) return ojson::array({call.error});
   const ojson& r = call.raw;
+  // A cutoff that leaves one side empty lies outside the running variable's range
+  // (bank: `rdplot price mpg, c(1000)`, `rdplot price mpg if mpg>20, c(20)` r(125)).
+  if (inum(r, "n_left") == 0 || inum(r, "n_right") == 0) {
+    return ojson::array({ojson(eval::errorBlock("engine_error",
+                                                "c() should be set within the range of " + parsed.varlist[1],
+                                                std::nullopt, std::nullopt, std::nullopt, "r(125)"))});
+  }
 
   Printer say;
   if (str(r, "masspoints") == "adjust") {

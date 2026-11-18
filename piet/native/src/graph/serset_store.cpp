@@ -153,6 +153,17 @@ void Store::drop(int id) {
   if (id == current_) current_ = -1;
 }
 
+bool Store::resetId(int from, int to) {
+  auto it = sets_.find(from);
+  if (it == sets_.end() || to < 0 || to > kMaxSersetId) return false;
+  if (from == to) return true;
+  if (sets_.count(to) != 0) return false;
+  sets_[to] = std::move(it->second);
+  sets_.erase(from);
+  if (current_ == from) current_ = to;
+  return true;
+}
+
 void Store::dropOwner(const std::string& owner) {
   for (auto it = sets_.begin(); it != sets_.end();) {
     if (it->second.owner == owner) {

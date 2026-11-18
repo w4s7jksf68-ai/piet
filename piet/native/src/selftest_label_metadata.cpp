@@ -289,11 +289,13 @@ void testAerUtilRenameLabel() {
     check(rel != "<unset>" && !rel.empty(),
           "AER-UTIL/renlab (viii): r(relabel) is published at all -- this command's ENTIRE answer "
           "is that macro, so an empty one is the command not having run. Got `" + rel + "`");
-    check(has(rel, "1 \"one two\" \"three\""),
+    // r(relabel) is Stata's relabel() string, `code `" `"line"' ... "'` per value (vs-stata bank
+    // cells 595e82ba5b687cf5, 7aadb3615f9082e0).
+    check(has(rel, "1 `\" `\"one two\"' `\"three\"' \"'"),
           "AER-UTIL/renlab (viii): ...code 1 splits at the WORD boundary: \"one two\" then "
           "\"three\". A character split at 8 yields \"one two \" (trailing space) and no split at "
           "all yields \"one two three\". Got `" + rel + "`");
-    check(has(rel, "2 \"four\" \"five\""),
+    check(has(rel, "2 `\" `\"four\"' `\"five\"' \"'"),
           "AER-UTIL/renlab (viii): ...and code 2, whose text is 9 characters, splits into two "
           "pieces rather than staying whole -- the length() bound is applied per PIECE. Got `" +
               rel + "`");

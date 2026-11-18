@@ -29,6 +29,7 @@
 // values -- which is every fixture this bundle freezes -- so no gate in the
 // tree can tell them apart today.
 #include "piet/handlers/data_values.h"
+#include "dataset_shape_support.h"
 
 #include <algorithm>
 #include <cmath>
@@ -38,6 +39,7 @@
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -48,6 +50,7 @@
 #include "piet/column_fetch.h"
 #include "piet/datastore.h"
 #include "piet/eval/errors.h"
+#include "piet/eval/session.h"
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
@@ -71,6 +74,11 @@ const eval::OptVocab& kWinsorCoxVocab = eval::registerOptVocab(
 
 ojson wcError(const std::string& message, const std::string& code = "engine_error") {
   return ojson(eval::engineError(message, code));
+}
+
+ojson wcErrorRc(const std::string& message, int rc) {
+  return ojson(eval::errorBlock("syntax_error", message, std::nullopt, std::nullopt, std::nullopt,
+                                "r(" + std::to_string(rc) + ")"));
 }
 
 // Shortest round-tripping decimal, for echoing the user's own p()/h() back in a
@@ -170,7 +178,9 @@ ojson runWinsorCox(const eval::ParsedCommand& parsed, SessionState& session) {
   if (parsed.varlist.size() > 1) {
     // winsor.ado's syntax is `varname`, singular. Winsorizing only the first of a
     // list and dropping the rest would be a silent partial answer.
-    return wcError("winsor: only one variable allowed; winsor takes a single varname");
+    // r(103) "too many variables specified" (vs-stata bank `winsor price mpg,
+    // gen(pw) p(0.1)`).
+    return wcErrorRc("too many variables specified", 103);
   }
   const std::string varname = parsed.varlist[0];
 
@@ -211,24 +221,26 @@ ojson runWinsorCox(const eval::ParsedCommand& parsed, SessionState& session) {
   // way to name the output -- it is the only one.
   if (genName.empty()) return wcError("winsor: option gen() required");
   if (haveP && haveH) {
-    return wcError("winsor: options p() and h() may not be combined");
+    return wcErrorRc("use either h() option or p() option", 198);  // vs-stata bank: r(198)
   }
   if (!haveP && !haveH) {
-    return wcError("winsor: one of p() or h() is required");
+    return wcErrorRc("h() or p() option required, h( ) or p() > 0", 198);  // vs-stata bank: r(198)
   }
-  if (highOnly && lowOnly) {
-    // Both together clamp NOTHING, i.e. a copy of the input under a name that
-    // claims to be winsorized. Refusing is the only non-silent reading.
-    return wcError("winsor: options highonly and lowonly may not be combined");
-  }
-  if (haveP && !(pOpt > 0.0 && pOpt < 0.5)) {
-    return wcError("winsor: p(" + fmtNum(pOpt) + ") invalid -- p() must satisfy 0 < p < 0.5");
-  }
+  // highonly with lowonly: each one switches off the other tail, so nothing is
+  // clamped and the new variable is a copy (winsor.ado takes the pair without
+  // complaint; its label says "low only").
+  if ((haveP && pOpt < 0.0) || (haveH && hOpt < 0.0)) return wcErrorRc("invalid negative value", 198);
+  if (haveP && pOpt >= 0.5) return wcErrorRc("p() too high", 198);
   if (haveH && (hOpt != std::floor(hOpt))) {
     return wcError("winsor: h(" + fmtNum(hOpt) + ") is not an integer value");
   }
 
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
+
+  // The if/in sample, evaluated before any column is read (the evaluation reloads
+  // the head, which would leave a datastore pointer taken earlier dangling).
+  std::vector<char> inSample;
+  if (auto e = dataset_shape_detail::ifInMask(session, parsed, &inSample)) return *e;
 
   // Reading ONE column (plus, when it exists, the gen() target) instead of
   // materializing the head. `genName` rides in as an EXPRESSION rather than via
@@ -272,13 +284,17 @@ ojson runWinsorCox(const eval::ParsedCommand& parsed, SessionState& session) {
     return wcError("winsor: could not read " + varname + " as a full-length numeric column");
   }
 
+  // marksample: the sample is the if/in rows where the variable is not missing.
   std::vector<double> sorted;
   sorted.reserve(static_cast<size_t>(count));
   for (int64_t i = 0; i < count; ++i) {
-    if (!std::isnan(data[i])) sorted.push_back(data[i]);
+    if (!std::isnan(data[i]) && inSample[static_cast<size_t>(i)]) sorted.push_back(data[i]);
   }
   if (sorted.empty()) {
-    return wcError("winsor: " + varname + " has no non-missing observations");
+    eval::replaceRClass(session.eval);  // `qui count if touse` ran: r(N) = 0
+    session.eval.rValues.set("N", 0.0);
+    eval::declareRPosted(session.eval, "winsor", {"N"});
+    return wcErrorRc("no observations", 2000);
   }
   std::sort(sorted.begin(), sorted.end());
   const int64_t n = static_cast<int64_t>(sorted.size());
@@ -295,16 +311,18 @@ ojson runWinsorCox(const eval::ParsedCommand& parsed, SessionState& session) {
   const int64_t hFromP = static_cast<int64_t>(std::floor(pOpt * static_cast<double>(n)));
   const int64_t h = haveH ? static_cast<int64_t>(hOpt) : hFromP;
   if (h <= 0) {
-    if (haveH) return wcError("winsor: h(" + fmtNum(hOpt) + ") invalid -- h() must be > 0");
-    return wcError("winsor: p(" + fmtNum(pOpt) + ") gives a tail count of 0 with N = " +
-                   std::to_string(n) + " non-missing observations; raise p() or use h()");
+    // h() and p() both zero was refused above; a p() whose share of the sample
+    // rounds down to no observation is the ado's "0 values to be Winsorized".
+    return wcErrorRc("0 values to be Winsorized", 198);
   }
   if (h * 2 >= n) {
     // The two tails must not meet: at h == n/2 every observation is a tail
     // observation and lo would exceed hi, i.e. an empty clamp interval.
-    return wcError("winsor: tail count " + std::to_string(h) +
-                   " is too large for N = " + std::to_string(n) +
-                   " non-missing observations; winsor needs h < N/2");
+    // StataBE: r(198) "50 values to be Winsorized, 74 in data" (vs-stata bank
+    // `winsor price, gen(pw) h(50)`).
+    return wcErrorRc(std::to_string(h) + " values to be Winsorized, " + std::to_string(n) +
+                         " in data",
+                     198);
   }
 
   // ORDER STATISTICS: the (h+1)-th smallest and the (h+1)-th largest OBSERVED
@@ -321,8 +339,9 @@ ojson runWinsorCox(const eval::ParsedCommand& parsed, SessionState& session) {
   out.reserve(static_cast<size_t>(count));
   for (int64_t i = 0; i < count; ++i) {
     const double v = data[i];
-    if (std::isnan(v)) {
-      out.push_back(v);  // missing stays missing; it was never in the sort either
+    if (std::isnan(v) || !inSample[static_cast<size_t>(i)]) {
+      // missing stays missing; a row outside if/in is not generated at all
+      out.push_back(std::numeric_limits<double>::quiet_NaN());
       continue;
     }
     double clamped = v;
@@ -360,6 +379,26 @@ ojson runWinsorCox(const eval::ParsedCommand& parsed, SessionState& session) {
   }
 
   session.load(outPath);
+  {
+    // label var `generate' "`varlist', `which'" -- the ado's own wording
+    auto shortNum = [](double x) {
+      char b[64];
+      std::snprintf(b, sizeof(b), "%.15g", x);
+      std::string t = b;
+      if (t.rfind("0.", 0) == 0) t.erase(0, 1);
+      return t;
+    };
+    std::string which = haveP ? "Winsorized fraction " + shortNum(pOpt)
+                              : "Winsorized extreme " + std::to_string(h);
+    if (lowOnly) which += ", low only";
+    else if (highOnly) which += ", high only";
+    session.varMeta[genName].label = varname + ", " + which;
+  }
+  // winsor.ado's last r-class command is `qui count if touse`: r(N) is the number of
+  // observations it winsorized over.
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("N", static_cast<double>(n));
+  eval::declareRPosted(session.eval, "winsor", {"N"});
   // "gen" and not "winsor": the mutation this performed IS a pure add of one new
   // column, which is the branch seedNMissForPureAdd must take for the untouched
   // columns to carry their missing-counts forward.

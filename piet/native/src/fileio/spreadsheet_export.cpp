@@ -277,6 +277,15 @@ ojson runExportExcel(const std::vector<std::string>& varlist, const std::string&
         oc.strings[i] = col.levels[static_cast<size_t>(code)];
       } else {
         double v = col.f64()[r];
+        if (std::isnan(v) && labels != nullptr && cecon::missing_kind(v) >= 1) {
+          // An extended missing value that carries a label is written as that
+          // label, as for any other labeled value (bank 4df91fe08f82080a: .a
+          // labeled "ext miss" comes back as the 8-character string).
+          const std::string key =
+              std::string(".") + static_cast<char>('a' + cecon::missing_kind(v) - 1);
+          auto it = labels->find(key);
+          if (it != labels->end()) { oc.strings[i] = it->second; continue; }
+        }
         if (std::isnan(v)) {
           // Excel has no missing sentinel; Stata writes the cell EMPTY. The
           // extended code is not representable here — a named limitation, not

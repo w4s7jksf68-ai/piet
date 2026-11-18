@@ -207,6 +207,20 @@ void testD4BS080Wntestq() {
 
   (void)piet::dispatch("sysuse fatalities, clear", session);
 
+  // wntestq is a time-series command: without tsset Stata answers r(111) "time
+  // variable not set, use tsset varname ..." (vs-stata bank 38db1194e1501f76
+  // `wntestq price`); PIET used to run it on the row order.
+  {
+    auto blocks = piet::dispatch("wntestq income", session);
+    const nlohmann::ordered_json* err = firstBlockOfTypeD1(blocks, "error");
+    check(firstBlockOfTypeD1(blocks, "estimation") == nullptr && err != nullptr &&
+              err->value("reason", std::string()) == "r(111)",
+          "D4e: `wntestq income` before tsset is r(111) time variable not set, not a test on the "
+          "row order");
+  }
+  (void)piet::dispatch("gen t = _n", session);
+  (void)piet::dispatch("tsset t", session);
+
   // D4e bare: Q=839.9262, df=40 (real Stata's default lag rule,
   // min(n/2-2,40), reproduced automatically by the engine — PIET forwards
   // no --lags at all here).

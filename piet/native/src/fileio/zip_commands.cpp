@@ -53,7 +53,9 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <regex>
 #include <set>
@@ -77,15 +79,15 @@
 namespace {
 
 // zipfile's `syntax` line: SAVING(string asis) [COMPLevel(numlist integer >=0 <10 max=1)].
-// complevel() is READ: it is validated, and the entries it would compress are written stored
-// all the same -- each `adding:` line says `(stored 0%)`, which is the truth about the bytes.
+// complevel() is the deflate level of the entries (0 stored blocks ... 9; default 6), as zlib
+// reads it.
 const piet::eval::OptVocab& kVocabZipfile =
     piet::eval::registerOptVocab({"zipfile"}, {{"saving", "complevel"}, {}});
 
 // unzipfile: replace, plus ifilter()/efilter(), which select entries by a java.util.regex
 // pattern -- a dialect this build does not evaluate, so both are refused by name.
 const piet::eval::OptVocab& kVocabUnzipfile =
-    piet::eval::registerOptVocab({"unzipfile"}, {{"replace"}, {"ifilter", "efilter"}});
+    piet::eval::registerOptVocab({"unzipfile"}, {{"replace", "ifilter", "efilter"}, {}});
 
 // zipsave: `[, replace *]` -- every other option is save's, and save judges it.
 const piet::eval::OptVocab& kVocabZipsave =
@@ -507,8 +509,10 @@ nlohmann::ordered_json runZipfile(const eval::ParsedCommand& parsed, SessionStat
   if (items.empty()) return zipError("files or directories required", 100);
   const std::optional<std::string> saving = optString(parsed, "saving");
   if (!saving.has_value()) return zipError("option saving() required", 198);
+  int level = 6;
   if (auto cl = optString(parsed, "complevel")) {
     if (auto e = checkComplevel(*cl)) return *e;
+    level = static_cast<int>(std::strtol(cl->c_str(), nullptr, 10));
   }
 
   // saving(): a filename, then optionally `, replace` (zipfile's own sub-parser).
@@ -566,6 +570,7 @@ nlohmann::ordered_json runZipfile(const eval::ParsedCommand& parsed, SessionStat
   }
 
   std::vector<zipio::Entry> entries;
+  std::vector<size_t> lineAt;  // where each entry's `adding:` line stands in `lines`
   std::string lines;
   size_t skipped = 0;
   for (const ToZip& t : todo) {
@@ -587,13 +592,51 @@ nlohmann::ordered_json runZipfile(const eval::ParsedCommand& parsed, SessionStat
       if (!bytes.has_value()) return zipError("file " + t.entry + " could not be opened", 603);
       e.data = std::move(*bytes);
     }
-    lines += "    adding: " + t.entry + " (stored 0%)\n";
+    lineAt.push_back(lines.size());
+    lines += "    adding: " + t.entry + "\n";
     entries.push_back(std::move(e));
   }
+  size_t compressedBytes = 0;
+  std::vector<size_t> perEntry;
   try {
-    zipio::commit(targetPath, zipio::build(entries));
+    zipio::commit(targetPath, zipio::build(entries, level, &compressedBytes, &perEntry));
   } catch (const std::exception& ex) {
     return zipError("file " + target + " could not be opened: " + ex.what(), 603);
+  }
+  // The `adding:` lines carry what each entry came to: stored 0% when the deflate
+  // stream is no smaller than the file, else deflated N% (bank cells print stored
+  // 0% for files a few bytes long; the spelling for a smaller stream is the zip
+  // tools' own).
+  for (size_t i = entries.size(); i-- > 0;) {
+    const size_t u = entries[i].data.size();
+    const size_t c = i < perEntry.size() ? perEntry[i] : u;
+    std::string note = " (stored 0%)";
+    if (u > 0 && c < u)
+      note = " (deflated " + std::to_string(static_cast<int>(100.0 * (1.0 - static_cast<double>(c) / u) + 0.5)) + "%)";
+    const size_t eol = lines.find('\n', lineAt[i]);
+    lines.insert(eol, note);
+  }
+  // r(): the files seen, skipped and archived, the bytes of the archived ones,
+  // the bytes of their deflate streams and the ratio of the two (bank zipfile
+  // cells, e.g. 53e7e4cff7abf738: total 2, skipped 0, archived 2, processed_size
+  // 17, compressed_size 21, compression_ratio 21/17).
+  {
+    double processedBytes = 0.0;
+    for (const zipio::Entry& e : entries) processedBytes += static_cast<double>(e.data.size());
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("total", static_cast<double>(entries.size() + skipped));
+    session.eval.rValues.set("skipped", static_cast<double>(skipped));
+    session.eval.rValues.set("archived", static_cast<double>(entries.size()));
+    session.eval.rValues.set("processed_size", processedBytes);
+    session.eval.rValues.set("compressed_size", static_cast<double>(compressedBytes));
+    std::vector<std::string> posted = {"total", "skipped", "archived", "processed_size",
+                                       "compressed_size"};
+    if (processedBytes > 0.0) {
+      session.eval.rValues.set("compression_ratio",
+                               static_cast<double>(compressedBytes) / processedBytes);
+      posted.push_back("compression_ratio");
+    }
+    eval::declareRPosted(session.eval, "zipfile", posted);
   }
   return displayText(lines + "\n" +
                      countLines(entries.size() + skipped, skipped, "       archived:  ",
@@ -638,6 +681,25 @@ nlohmann::ordered_json runUnzipfile(const eval::ParsedCommand& parsed, SessionSt
                       198);
   }
   const bool replace = hasOpt(parsed, "replace");
+  // ifilter() keeps the entries whose whole name matches the regular expression,
+  // efilter() drops the ones that match (bank unzipfile cells d1f5365dad970204,
+  // cd472b5d89f63084, b399765304656142: `ifilter("^a")` ignores `a.txt`, the
+  // pattern has to match the entire name). The two counts are then posted too.
+  std::optional<std::string> ifilterText = optString(parsed, "ifilter");
+  std::optional<std::string> efilterText = optString(parsed, "efilter");
+  if (ifilterText.has_value()) ifilterText = stripQuotes(*ifilterText);
+  if (efilterText.has_value()) efilterText = stripQuotes(*efilterText);
+  const bool filtered = ifilterText.has_value() || efilterText.has_value();
+  std::optional<std::regex> includeRe, excludeRe;
+  try {
+    if (ifilterText.has_value()) includeRe.emplace(*ifilterText, std::regex::ECMAScript);
+    if (efilterText.has_value()) excludeRe.emplace(*efilterText, std::regex::ECMAScript);
+  } catch (const std::regex_error&) {
+    return zipError("option ifilter() or efilter(): this build's regular-expression engine does not "
+                    "read that pattern",
+                    198);
+  }
+  size_t ignored = 0;
   const std::string root = resolveUserPath(session, ".");
   std::string lines;
   size_t processed = 0, skipped = 0, extracted = 0;
@@ -654,6 +716,11 @@ nlohmann::ordered_json runUnzipfile(const eval::ParsedCommand& parsed, SessionSt
       continue;
     }
     ++processed;
+    if ((includeRe.has_value() && !std::regex_match(rel, *includeRe)) ||
+        (excludeRe.has_value() && std::regex_match(rel, *excludeRe))) {
+      ++ignored;
+      continue;
+    }
     {
       const fs::path parent = fs::path(cecon::to_native_path(dest)).parent_path();
       std::error_code ec;
@@ -674,8 +741,21 @@ nlohmann::ordered_json runUnzipfile(const eval::ParsedCommand& parsed, SessionSt
     lines += "    inflating: " + rel + "\n";
     ++extracted;
   }
-  return displayText(lines + "\nsuccessfully unzipped " + name + " to current directory\n" +
-                     countLines(processed, skipped, "      extracted:  ", extracted));
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("total", static_cast<double>(processed));
+  session.eval.rValues.set("skipped", static_cast<double>(skipped));
+  session.eval.rValues.set("extracted", static_cast<double>(extracted));
+  std::vector<std::string> postedNames = {"total", "skipped", "extracted"};
+  std::string counts = countLines(processed, skipped, "      extracted:  ", extracted);
+  if (filtered) {
+    session.eval.rValues.set("ignored", static_cast<double>(ignored));
+    postedNames = {"total", "skipped", "ignored", "extracted"};
+    counts = "total processed:  " + std::to_string(processed) + "\n        skipped:  " +
+             std::to_string(skipped) + "\n        ignored:  " + std::to_string(ignored) +
+             "\n      extracted:  " + std::to_string(extracted);
+  }
+  eval::declareRPosted(session.eval, "unzipfile", postedNames);
+  return displayText(lines + "\nsuccessfully unzipped " + name + " to current directory\n" + counts);
 }
 
 // `zipsave [name] [, replace save_options]`.
@@ -719,14 +799,31 @@ nlohmann::ordered_json runZipsave(const eval::ParsedCommand& parsed, SessionStat
   std::string entryName = baseName(file);
   if (entryName.size() > 4 && entryName.compare(entryName.size() - 4, 4, ".zip") == 0)
     entryName.resize(entryName.size() - 4);
+  const size_t dataBytes = bytes->size();
+  size_t compressedBytes = 0;
   try {
-    zipio::commit(target, zipio::build({zipio::Entry{entryName, std::move(*bytes)}}));
+    zipio::commit(target, zipio::build({zipio::Entry{entryName, std::move(*bytes)}}, 6,
+                                       &compressedBytes));
   } catch (const std::exception& ex) {
     return zipError("file " + file + " could not be opened: " + ex.what(), 603);
   }
+  // r(): the one entry archived and the size of its deflate stream (the sizes
+  // follow the saved .dta's bytes, which carry the save's own time stamp).
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("total", 1.0);
+  session.eval.rValues.set("skipped", 0.0);
+  session.eval.rValues.set("archived", 1.0);
+  session.eval.rValues.set("processed_size", static_cast<double>(dataBytes));
+  session.eval.rValues.set("compressed_size", static_cast<double>(compressedBytes));
+  if (dataBytes > 0)
+    session.eval.rValues.set("compression_ratio",
+                             static_cast<double>(compressedBytes) / static_cast<double>(dataBytes));
+  eval::declareRPosted(session.eval, "zipsave",
+                       {"total", "skipped", "archived", "processed_size", "compressed_size",
+                        "compression_ratio"});
   // The archive is now the dataset's file, as Stata's $S_FN: c(filename) names it, c(changed)
   // is 0, and a later name-less `zipsave` writes there (review st_zu zs1/zs_noname).
-  session.setCurrentFile(target);
+  session.setCurrentFile(target, /*saveTarget=*/false);
   return displayText("data compressed with zip and saved in file " + file);
 }
 
@@ -855,7 +952,7 @@ nlohmann::ordered_json runZipuse(const eval::ParsedCommand& parsed, SessionState
     }
   }
   // c(filename) is the archive, as Stata's $S_FN after zipuse (zp1 zu_nolabel).
-  session.setCurrentFile(zipPath);
+  session.setCurrentFile(zipPath, /*saveTarget=*/false);
   return ojson::array();
 }
 

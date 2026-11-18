@@ -26,6 +26,7 @@
 #include "estimation/estimation_internal.h"  // e(sample) T2's mask writer (esampleRewriteHeadMask)
 #include "io/win_compat.h"     // cecon::native_exists / to_native_path
 #include "results/stored_estimates_internal.h"
+#include "estout_internal.h"  // eoArgumentError: estout's argument refusals
 
 // ---------------------------------------------------------------------------
 // BUG-233 / FIX:OPTNET-ABBREV-SWEEP — this file's option vocabularies.
@@ -166,7 +167,8 @@ const piet::eval::OptVocab& kVocabEsttab = piet::eval::registerOptVocab(
       "noeqlines", "eqlines", "float", "nofloat", "note", "begin", "delimiter", "end",
       "incelldelimiter", "abbrev", "legend", "stardetach", "interaction", "hlinechar",
       "nolz", "lz", "noisily", "outfilenoteoff", "nooutfilenoteoff", "notype", "omitted",
-      "baselevels", "longtable", "standalone", "fonttbl", "attributes", "onecell"},
+      "baselevels", "longtable", "standalone", "fonttbl", "attributes", "onecell", "dmarker",
+      "msign", "stardrop", "starkeep", "margin", "nomargin", "discrete", "nodiscrete", "eform", "noeform", "equations", "lastend", "topfile", "bottomfile", "smcl", "html", "html5", "md", "mmd", "dropped"},
      // UNIMPLEMENTED, and `cells`/`p` are here deliberately. This handler reads
      // nostar/b/se/t/star and nothing else from the cell layer, so listing
      // either as KNOWN would accept it and silently ignore it -- the class
@@ -179,9 +181,17 @@ const piet::eval::OptVocab& kVocabEsttab = piet::eval::registerOptVocab(
      // already did. `cells` stays -- runEsttab still does not read a cells()
      // spec, and accepting one would silently render the default layout under a
      // different request (BUG-407).
-     {"rtf", "html", "html5", "md", "mmd", "smcl", "equations", "eform", "margin",
-      "discrete", "dropped", "lastend", "dmarker", "msign", "stardrop", "starkeep",
-      "topfile", "bottomfile"}});
+     {"rtf"},
+     // estout's NOMargin is `nom`; esttab's own nomtitles needs `nomt` or more (vs-stata bank
+     // ed20497540ebef56: `esttab m1 m2 m3, nom` runs, with the mtitles row kept).
+     // Likewise the capitals of esttab's and estout's syntax lines: ABbrev (`abs` is lower case, so
+     // `ab` is abbrev), Fragment (`f`), Margin (`m`; `md` is lower case) -- bank 4db4f81f59689e99,
+     // 63f958a0d197292b, ca4e4028e48a40b7.
+     {{"nom", "nomargin"}, {"ab", "abbrev"}, {"f", "fragment"}, {"m", "margin"},
+      // Noisily (capital N) and Cells (capital C) are the only options of esttab's own
+      // and estout's syntax lines that start with these letters, so the single letter and
+      // `no` are theirs (vs-stata bank 7c08d4c3, 27c26585, a5618132, 8fcacf18).
+      {"n", "noisily"}, {"no", "noisily"}, {"c", "cells"}}});
 }  // namespace
 
 namespace piet::handlers {
@@ -270,6 +280,14 @@ std::string fmtB(const ojson& val, const std::string& fmt) {
 ojson runEsttab(const std::vector<std::string>& modelNamesIn,
                 const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                 SessionState& session) {
+  // An option esttab does not have is r(198) before anything else is looked at,
+  // with or without active estimates (vs-stata bank 20df9714).
+  if (auto err = eval::rejectUnknownOptions(opts, kVocabEsttab.known, kVocabEsttab.unimplemented))
+    return *err;
+  // estout's argument refusals (varwidth(), stats() names, margin(),
+  // constant/noconstant) answer before any model is looked up.
+  if (auto argErr = table_detail::eoArgumentError(opts, /*esttab=*/true))
+    return table_detail::tblErrorRc(argErr->msg, argErr->rc);
   // W2 esttabnames (BUG-552): a written namelist is EXPANDED (namelist
   // semantics: `A_*`, `A_?`, `*`, `_all`, `.`), in store order, before any
   // lookup -- w2_smalls.log section G. Every name the expansion returns is
@@ -299,6 +317,7 @@ ojson runEsttab(const std::vector<std::string>& modelNamesIn,
   auto liveSnapshot = [&session]() {
     ojson snap = makeSnapshot(*session.lastEstBlock);
     snap["escalars"] = escalarsFrom(*session.lastEstBlock);
+    mergeLiveEScalars(snap["escalars"], session);
     const std::string fp = SessionState::estAddFingerprint(*session.lastEstBlock);
     snap["added"] = (!session.estAddedFp.empty() && session.estAddedFp == fp)
                         ? session.estAdded
@@ -398,6 +417,7 @@ ojson runEsttab(const std::vector<std::string>& modelNamesIn,
     for (const auto& [k, v] : opts) {
       if (k == "transform" && !v.isBool) trRaw = v.strValue;
     }
+    if (trRaw.empty()) trRaw = table_detail::eformTransformRaw(opts);
     if (!trRaw.empty() && !parseTransformOpt(trRaw, &trSpec, &trErr)) {
       // r(198): estout answers `invalid pattern in transform(,pattern()) or
       // eform()` there (w1b_transform2.log tr_pat_two), and `engine_error`

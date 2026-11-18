@@ -57,14 +57,27 @@ namespace {
 const piet::eval::OptVocab& kVocabBinscatter = piet::eval::registerOptVocab(
     {"binscatter"},
     {{"by", "nquantiles", "genxq", "discrete", "medians", "controls", "absorb", "noaddmean",
-      "linetype", "reportreg", "colors", "mcolors", "lcolors", "msymbols", "savedata", "replace"},
-     {"xq", "rd", "savegraph", "nofastxtile", "randvar", "randcut", "randn", "nbins",
-      "create_xq", "x_q", "symbols", "method", "unique"},
+      "linetype", "reportreg", "colors", "mcolors", "lcolors", "msymbols", "savedata", "replace",
+      // the legacy spellings (renamed with a NOTE) and nofastxtile (xtile in place of fastxtile: the
+      // same bins) are read in runBinscatter
+      "nbins", "create_xq", "symbols", "method", "unique", "nofastxtile"},
+     {"xq", "rd", "savegraph", "randvar", "randcut", "randn", "x_q"},
      {{"n", "nquantiles"}, {"nq", "nquantiles"}, {"med", "medians"}, {"median", "medians"},
       {"control", "controls"}, {"noa", "noaddmean"}, {"line", "linetype"}, {"col", "colors"},
       {"color", "colors"}, {"mc", "mcolors"}, {"mcolor", "mcolors"}, {"lc", "lcolors"},
       {"lcolor", "lcolors"}, {"m", "msymbols"}, {"ms", "msymbols"}, {"msymbol", "msymbols"},
       {"gen", "genxq"}}});
+
+// binscatter hands the options it does not own to the twoway call as GLOBAL options,
+// so the plot-level ones are r(198) "option X() not allowed" there. This is the set
+// StataBE 19.5 refused in the vs-stata bank (2026-11-10, every one a bank cell with
+// that message); color/lcolor/mc/mcolor/ms/msymbol are binscatter's own and run.
+const std::unordered_set<std::string> kBsRefusedPlotOptions = {
+    "acolor", "afcolor", "alcolor", "alpattern", "alwidth", "barwidth", "base", "bcolor",
+    "bfcolor", "blcolor", "blwidth", "clcolor", "clpattern", "clwidth", "cmissing", "connect",
+    "dropline", "fcolor", "fintensity", "horizontal", "jitter", "lp", "lpattern", "lstyle",
+    "lw", "lwidth", "mfcolor", "mlabel", "mlalign", "mlcolor", "mlwidth", "msangle", "msi",
+    "msize", "mz", "pstyle", "range", "recast", "sort", "xaxis", "yaxis", "xcommon", "ycommon"};
 }  // namespace
 
 namespace piet {
@@ -242,6 +255,12 @@ ojson runBinscatter(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   // varlist(min=2 numeric), ado: several y, then x (ado).
   if (parsed.varlist.size() < 2) return ojson::array({bsRcError("too few variables specified", 102, "syntax_error")});
+  for (const auto& kv : parsed.opts) {
+    if (kBsRefusedPlotOptions.count(kv.first) != 0) {
+      return ojson::array({bsRcError("option " + kv.first + (kv.second.isBool ? "" : "()") + " not allowed", 198,
+                                     "syntax_error")});
+    }
+  }
   // [aweight fweight] (ado): any other weight is Stata's r(101).
   std::string wtype;
   if (parsed.weightType.has_value()) {
@@ -258,11 +277,18 @@ ojson runBinscatter(const eval::ParsedCommand& parsed, SessionState& session) {
 
   // ---- the options, read as Stata's `syntax` reads them (ado)
   std::map<std::string, RawOpt> own;
+  std::map<std::string, RawOpt> legacy;
   std::vector<std::string> passThrough;  // `options' (the catch-all), as typed
   for (auto& o : bsRawOptions(parsed.raw)) {
     const std::string full = bsMatch(o.name);
     if (full.empty()) {
       passThrough.push_back(o.text);
+      continue;
+    }
+    // the legacy spellings and the two options that change nothing the engine computes
+    if (full == "nbins" || full == "create_xq" || full == "x_q" || full == "symbols" || full == "method" ||
+        full == "unique" || full == "nofastxtile") {
+      legacy[full] = o;
       continue;
     }
     if (kBsServed.count(full) == 0) {
@@ -271,6 +297,75 @@ ojson runBinscatter(const eval::ParsedCommand& parsed, SessionState& session) {
                 "build does not implement it; it is refused rather than ignored."))});
     }
     own[full] = o;
+  }
+  // ---- legacy option compatibility (ado): each renamed option is read as its new name after a
+  // NOTE; a conflict with the new name is an error printed at rc 0, nothing computed
+  std::vector<std::string> legacyNotes;
+  {
+    auto legacyArg = [&](const char* k) {
+      auto it = legacy.find(k);
+      return it == legacy.end() || !it->second.arg.has_value() ? std::string() : strutil::trim(*it->second.arg);
+    };
+    auto conflict = [&](const char* oldName, const char* newName) {
+      return ojson::array({bsText(std::string("Cannot specify both ") + newName + "() and " + oldName +
+                                  "(): both are the same option, " + oldName +
+                                  "() is supported only for backward compatibility.")});
+    };
+    if (legacy.count("nbins") != 0) {
+      const std::string t = legacyArg("nbins");
+      char* end = nullptr;
+      const long v = std::strtol(t.c_str(), &end, 10);
+      if (t.empty() || end == t.c_str() || *end != '\0')
+        return ojson::array({bsRcError("option nbins() incorrectly specified", 198, "syntax_error")});
+      if (v != 20) {
+        if (own.count("nquantiles") != 0) {
+          const std::string nt = strutil::trim(own["nquantiles"].arg.value_or(""));
+          if (std::strtol(nt.c_str(), nullptr, 10) != 20)
+            return ojson::array({bsText("Cannot specify both nquantiles() and nbins(): both are the same option, "
+                                        "nbins is supported only for backward compatibility.")});
+        }
+        legacyNotes.push_back("NOTE: legacy option nbins() has been renamed nquantiles(), and is supported only for "
+                              "backward compatibility.");
+        RawOpt r;
+        r.name = "nquantiles";
+        r.arg = t;
+        own["nquantiles"] = r;
+      }
+    }
+    if (legacy.count("create_xq") != 0) {
+      if (own.count("genxq") != 0) {
+        return ojson::array({bsText("Cannot specify both genxq() and create_xq: both are the same option, "
+                                    "create_xq is supported only for backward compatibility.")});
+      }
+      legacyNotes.push_back("NOTE: legacy option create_xq has been renamed genxq(), and is supported only for "
+                            "backward compatibility.");
+      RawOpt r;
+      r.name = "genxq";
+      r.arg = "q_" + parsed.varlist.back();
+      own["genxq"] = r;
+    }
+    if (legacy.count("x_q") != 0) {
+      return ojson::array({ojson(eval::unsupportedOption(
+          "x_q", "x_q() is the legacy spelling of xq(), which supplies the bins and is not implemented in this "
+                 "build; it is refused rather than ignored."))});
+    }
+    if (legacy.count("symbols") != 0) {
+      if (own.count("msymbols") != 0) return conflict("symbols", "msymbols");
+      legacyNotes.push_back("NOTE: legacy option symbols() has been renamed msymbols(), and is supported only for "
+                            "backward compatibility.");
+      RawOpt r;
+      r.name = "msymbols";
+      r.arg = legacyArg("symbols");
+      own["msymbols"] = r;
+    }
+    if (legacy.count("method") != 0) {
+      legacyNotes.push_back("NOTE: method() is no longer a recognized option, and will be ignored. binscatter now "
+                            "always uses the fastest method without a need for two instances");
+    }
+    if (legacy.count("unique") != 0) {
+      legacyNotes.push_back("NOTE: unique() is no longer a recognized option, and will be ignored. binscatter now "
+                            "considers the x-variable discrete if it has fewer unique values than nquantiles()");
+    }
   }
   auto has = [&](const char* k) { return own.count(k) != 0; };
   auto arg = [&](const char* k) -> std::string {
@@ -302,6 +397,7 @@ ojson runBinscatter(const eval::ParsedCommand& parsed, SessionState& session) {
   const bool replace = has("replace");
   const std::string savedata = has("savedata") ? bsDequote(arg("savedata")) : std::string();
   ojson blocks = ojson::array();
+  for (const auto& note : legacyNotes) blocks.push_back(bsText(note));
 
   // ---- the checks before anything is computed (ado)
   if (linetype == "noline") {

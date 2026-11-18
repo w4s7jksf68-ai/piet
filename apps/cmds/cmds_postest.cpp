@@ -195,6 +195,7 @@ bool binary_refit_screen(const std::string& model, GlmInputs& g, bool asis, cons
     for (int c = 0; c < g.k; ++c) fit_cols.push_back(c);
     screen = BinaryPerfectScreen{};
     if (model != "logit" && model != "probit" && model != "cloglog") return true;
+    binarize_outcome(g.y);
     if (!check_binary(g.y, who, y)) return false;
     const std::vector<BinaryBaseLevel> bases =
         asis ? std::vector<BinaryBaseLevel>() : binary_base_levels(ds, xs, g);
@@ -317,14 +318,16 @@ bool postest_fit_glm(const std::string& model, const Dataset& ds, const std::str
     if (!binary_refit_screen(model, g, asis, y, "post-estimation", screen, fit_cols, ds, xs, !no_intercept))
         return false;
     if (model == "logit") {
-        if (!check_binary(g.y, "lincom/nlcom/test(logit)", y)) return false;
+        binarize_outcome(g.y);
+    if (!check_binary(g.y, "lincom/nlcom/test(logit)", y)) return false;
         // A separated fit was posted at rc 0 with every row determined (cmd_logit;
         // BUG-1233 without asis too), so its refit answers from that fit.
         LogitResult lr = refit_logit(g, mo);
         out.beta = lr.beta;
         out.vcov_matrix = lr.bread;  // (X'WX)^{-1} — the OIM asymptotic covariance
     } else if (model == "probit") {
-        if (!check_binary(g.y, "lincom/nlcom/test(probit)", y)) return false;
+        binarize_outcome(g.y);
+    if (!check_binary(g.y, "lincom/nlcom/test(probit)", y)) return false;
         ProbitResult pr = refit_probit(g, mo);  // separated: as logit above
         out.beta = pr.beta;
         // BUG-140's boundary, and the ONE place this refit cannot take the fitter's
@@ -352,7 +355,8 @@ bool postest_fit_glm(const std::string& model, const Dataset& ds, const std::str
     } else if (model == "cloglog") {
         // cmd_cloglog's own fit and OIM V (StataBE `lincom x` after `cloglog yb x z d`:
         // .50786860699644709, se .076212489114577064, eng-ml/x21.log LCd)
-        if (!check_binary(g.y, "lincom/nlcom/test(cloglog)", y)) return false;
+        binarize_outcome(g.y);
+    if (!check_binary(g.y, "lincom/nlcom/test(cloglog)", y)) return false;
         const BinaryMlResult cr = cloglog_ml(g, !no_intercept, z0, mo);
         out.beta = cr.beta;
         out.vcov_matrix = cr.bread;
@@ -368,6 +372,10 @@ bool postest_fit_glm(const std::string& model, const Dataset& ds, const std::str
         md.has_intercept = true;
         md.dm.n = g.n; md.dm.k = g.k;
         md.dm.X = g.X; md.dm.y = g.y; md.dm.xnames = g.names; md.keep = g.keep;
+        // The refit is of a Stata `poisson` fit (the only caller of --model poisson
+        // here), which posts ml's iterate (ModelData::stata_ml): the refit must
+        // reproduce that e(b)/e(V), not the IRLS optimum next to it.
+        md.stata_ml = true;
         FepoisResult pf = fepois_fit(md, Vcov::IID);
         out.beta = pf.beta;
         out.vcov_matrix = pf.vcov_matrix;
@@ -762,6 +770,46 @@ int build_restrictions(const std::vector<std::string>& names,
         throw EngineError("coef_not_found", nm + " not found", nm);
     };
     for (const auto& [is_joint, text] : items) {
+        // `[eq]` alone: every coefficient of that equation but its constant (test.ado's
+        // `test [eq]`; vs-stata bank 2e1903225 `test [3]` after mlogit: age grade wage)
+        if (is_joint && text.size() > 2 && text.front() == '[' && text.back() == ']' &&
+            text.find(']') == text.size() - 1) {
+            const std::string en = postest::resolve_equation(names, postest::trim_ws(text.substr(1, text.size() - 2)));
+            if (en.empty()) not_found(text);
+            for (int c = 0; c < k; ++c) {
+                if (names[static_cast<size_t>(c)].compare(0, en.size() + 1, en + ":") != 0) continue;
+                if (names[static_cast<size_t>(c)] == en + ":_cons") continue;
+                std::vector<double> row(static_cast<size_t>(k), 0.0);
+                row[static_cast<size_t>(c)] = 1.0;
+                rows.push_back(std::move(row));
+                qs.push_back(0.0);
+            }
+            continue;
+        }
+        // A plain name in a coefficient list of a multi-equation e(b) is that variable in
+        // every equation that has it, equation by equation (vs-stata bank f0592086
+        // `test grade age` after heckman: [lw]grade [select]grade [lw]age [select]age).
+        if (is_joint && postest::name_index(names, postest::trim_ws(text)) < 0) {
+            const std::string t = postest::trim_ws(text);
+            const bool plain = !t.empty() && t.find_first_of(":[]") == std::string::npos &&
+                               t.compare(0, 3, "_b[") != 0;
+            if (plain && !postest::equations_of(names).empty()) {
+                std::vector<int> hits;
+                for (const auto& e : postest::equations_of(names)) {
+                    const int j = postest::name_index(names, e + ":" + (t == "cons" ? std::string("_cons") : t));
+                    if (j >= 0) hits.push_back(j);
+                }
+                if (!hits.empty()) {
+                    for (int j : hits) {
+                        std::vector<double> row(static_cast<size_t>(k), 0.0);
+                        row[static_cast<size_t>(j)] = 1.0;
+                        rows.push_back(std::move(row));
+                        qs.push_back(0.0);
+                    }
+                    continue;
+                }
+            }
+        }
         if (is_joint) {
             const postest::CoefRef r = postest::resolve_coef(names, text, levels);
             if (r.kind == postest::CoefKind::NeedsSample) {
@@ -1453,8 +1501,10 @@ struct MlMarginsFit {
 // cmd_probit), so margins answers from it too, as postest_fit_glm's refit does
 // (BUG-1242: StataBE `logit y x1 xs, asis` with xs separating y completely, then
 // `margins, dydx(x1)` 2.7e-14 and `margins, at(x1=1)` .535 = mean(y), rc 0).
+// `stata_ml`: the poisson fit is a Stata `poisson` one, so its e(b)/e(V) are ml's
+// iterate (ModelData::stata_ml), not the IRLS optimum (the --emit-v replay).
 MlMarginsFit ml_margins_fit(const std::string& model, const GlmInputs& g, const std::string& vce, bool asis,
-                            const double* wptr, const MlMaxOptions& mo) {
+                            const double* wptr, const MlMaxOptions& mo, bool stata_ml = false) {
     MlMarginsFit f;
     if (model == "logit") {
         f.link = GlmLink::Logit;
@@ -1585,6 +1635,7 @@ MlMarginsFit ml_margins_fit(const std::string& model, const GlmInputs& g, const 
         Vcov vt = Vcov::IID;
         if (vce == "cluster") { md.cluster = g.cluster; vt = Vcov::Cluster; }
         else if (vce == "robust") { vt = Vcov::HC1; }
+        md.stata_ml = stata_ml;
         FepoisResult r = fepois_fit(md, vt);
         f.beta = r.beta;
         f.V = r.vcov_matrix;
@@ -1978,7 +2029,7 @@ int cmd_margins(const std::vector<std::string>& a) {
         if (g.n == 0) { std::fprintf(stderr, "margins: no rows after dropping missing.\n"); return 1; }
         for (double vv : g.y) if (vv < 0) { std::fprintf(stderr, "margins(poisson): y has negatives.\n"); return 2; }
         at_clusters_ok(g);
-        const MlMarginsFit fit = ml_margins_fit(model, g, vce, asis, nullptr, ml_opts);
+        const MlMarginsFit fit = ml_margins_fit(model, g, vce, asis, nullptr, ml_opts, true);
         const int k = g.k;
         if (fit.beta.size() != static_cast<size_t>(k) || fit.V.size() != static_cast<size_t>(k) * k)
             throw EngineError("internal", "margins --emit-v: the fit returned no covariance matrix");
@@ -2022,7 +2073,8 @@ int cmd_margins(const std::vector<std::string>& a) {
         at_clusters_ok(g);
 
         if (model == "logit" || model == "probit" || model == "cloglog") {
-            if (!check_binary(g.y, ("margins(" + model + ")").c_str(), y)) return 2;
+            binarize_outcome(g.y);
+    if (!check_binary(g.y, ("margins(" + model + ")").c_str(), y)) return 2;
         } else {
             for (double vv : g.y) if (vv < 0) { std::fprintf(stderr, "margins(poisson): y has negatives.\n"); return 2; }
         }
@@ -2098,6 +2150,7 @@ int cmd_margins(const std::vector<std::string>& a) {
                 rows.push_back({{"name", row.name},
                                 {"b", row.dydx},
                                 {"dydx", row.dydx},
+                                {"J", row.J},
                                 {"se", row.se},
                                 {"t", t},
                                 {"p", row.se > 0 ? z_twosided_pvalue(t) : 1.0},
@@ -2112,7 +2165,7 @@ int cmd_margins(const std::vector<std::string>& a) {
         }
         json out = {{"estimator", "margins"}, {"model", model}, {"n_obs", g.n},
                     {"vce", vce_out}, {"n_at", at_index}, {"equations", at_groups},
-                    {"V", margins_cross_v(jac, V, g.k)}};
+                    {"V", margins_cross_v(jac, V, g.k)}, {"J_names", g.names}};
         if (fit.n_clusters > 0) out["n_clusters"] = fit.n_clusters;
         emit(out, opt(a, "--out"));
         return 0;
@@ -2140,7 +2193,8 @@ int cmd_margins(const std::vector<std::string>& a) {
             return 2;
         at_clusters_ok(g);
         if (model == "logit" || model == "probit" || model == "cloglog") {
-            if (!check_binary(g.y, ("margins(" + model + ")").c_str(), y)) return 2;
+            binarize_outcome(g.y);
+    if (!check_binary(g.y, ("margins(" + model + ")").c_str(), y)) return 2;
         } else {
             for (double vv : g.y) if (vv < 0) { std::fprintf(stderr, "margins(poisson): y has negatives.\n"); return 2; }
         }
@@ -2210,14 +2264,15 @@ int cmd_margins(const std::vector<std::string>& a) {
             // p-value shares tc's reference distribution (BUG-194): normal, not t(dof).
             arr.push_back({{"at", spec}, {"margin", mg}, {"se", se}, {"t", t}, {"df", dof},
                            {"p", se > 0 ? z_twosided_pvalue(t) : 1.0},
-                           {"ci_lo", mg - tc * se}, {"ci_hi", mg + tc * se}, {"model", model}});
+                           {"ci_lo", mg - tc * se}, {"ci_hi", mg + tc * se}, {"model", model},
+                           {"J", J}});
         }
         // The full delta-method covariance across points (Stata's r(V): `margins,
         // at(c1=(1(1)3))` after logit, el(r(V),2,1) .0012759229767275 at
         // w2v_margins_siblings.log:2984-3012 F_range_numlist_lg_v).
         json out = {{"estimator", "margins"}, {"type", "predictive"}, {"model", model},
                     {"n_obs", g.n}, {"df", dof}, {"margins", arr}, {"vce", vce_out},
-                    {"V", margins_cross_v(jac, V, k)}};
+                    {"V", margins_cross_v(jac, V, k)}, {"J_names", g.names}};
         if (fit.n_clusters > 0) out["n_clusters"] = fit.n_clusters;
         emit(out, opt(a, "--out"));
         return 0;
@@ -2297,11 +2352,13 @@ int cmd_margins(const std::vector<std::string>& a) {
     if (!use_general) {
         MarginsResult m;
         if (model == "logit") {
-            if (!check_binary(g.y, "margins(logit)", y)) return 2;
+            binarize_outcome(g.y);
+    if (!check_binary(g.y, "margins(logit)", y)) return 2;
             LogitResult r = refit_logit(g, ml_opts);
             m = margins_logit(g.X.data(), g.n, g.k, r.beta.data(), r.bread.data());
         } else if (model == "probit") {
-            if (!check_binary(g.y, "margins(probit)", y)) return 2;
+            binarize_outcome(g.y);
+    if (!check_binary(g.y, "margins(probit)", y)) return 2;
             ProbitResult r = refit_probit(g, ml_opts);
             // BUG-210, second iid site: this "exact old per-column path" passed the
             // FISHER bread r.V too, so plain `margins --model probit` (no --dydx) was
@@ -2322,12 +2379,14 @@ int cmd_margins(const std::vector<std::string>& a) {
             if (g.names[static_cast<size_t>(c)] == "(intercept)") continue;  // no AME for the constant
             double se = m.se[static_cast<size_t>(c)];
             coefs.push_back({{"name", g.names[static_cast<size_t>(c)]}, {"dydx", m.dydx[static_cast<size_t>(c)]},
-                             {"se", se}, {"t", tstat(m.dydx[static_cast<size_t>(c)], se)}});
+                             {"se", se}, {"t", tstat(m.dydx[static_cast<size_t>(c)], se)},
+                             {"J", m.J[static_cast<size_t>(c)]}});
         }
     } else {
         const double* wptr = g.weights.empty() ? nullptr : g.weights.data();
         if (model == "logit" || model == "probit" || model == "cloglog") {
-            if (!check_binary(g.y, ("margins(" + model + ")").c_str(), y)) return 2;
+            binarize_outcome(g.y);
+    if (!check_binary(g.y, ("margins(" + model + ")").c_str(), y)) return 2;
         } else {
             for (double v : g.y) if (v < 0) { std::fprintf(stderr, "margins(poisson): y has negatives.\n"); return 2; }
         }
@@ -2347,9 +2406,12 @@ int cmd_margins(const std::vector<std::string>& a) {
                                   wptr, request_vars);
         if (!m.ok) { std::fprintf(stderr, "%s\n", m.error.c_str()); return 2; }
         for (const auto& row : m.rows)
-            coefs.push_back({{"name", row.name}, {"dydx", row.dydx}, {"se", row.se}, {"t", tstat(row.dydx, row.se)}});
+            coefs.push_back({{"name", row.name}, {"dydx", row.dydx}, {"se", row.se}, {"t", tstat(row.dydx, row.se)},
+                             {"J", row.J}});
     }
-    json out = {{"estimator", "margins"}, {"model", model}, {"n_obs", g.n}, {"coefs", coefs}};
+    // J_names: the design columns each row's J (d(effect)/d(beta)) runs over.
+    json out = {{"estimator", "margins"}, {"model", model}, {"n_obs", g.n}, {"coefs", coefs},
+                {"J_names", g.names}};
     if (use_general) {
         out["vce"] = vce;
         if (wkind != cecon::WeightKind::None) { out["weight_var"] = weight_var; out["wtype"] = "pw"; }

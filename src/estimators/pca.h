@@ -15,6 +15,11 @@ struct PcaOpts {
     bool covariance = false;   // default is the correlation matrix
     int components = -1;       // <0 = all p
     double mineigen = 1e-5;    // [MV] pca: the default is 1e-5
+    // [aweight=] / [fweight=]: the weight column (nullptr = unweighted). aweights are
+    // rescaled to sum to the observation count, as `matrix accum` does; fweights count
+    // replicates (e(N) their sum).
+    const double* weight = nullptr;
+    bool fweight = false;
 };
 
 struct PcaResult {

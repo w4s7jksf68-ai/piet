@@ -347,8 +347,13 @@ ojson runPost(const eval::ParsedCommand& parsed, SessionState& session) {
 
   // Copies BEFORE the clear: b and V live in session.eval.matrices, which the
   // clear does not touch, but nothing below may depend on that.
-  const std::optional<eval::EvalMatrix> bCopy =
+  std::optional<eval::EvalMatrix> bCopy =
       b != nullptr ? std::optional<eval::EvalMatrix>(*b) : std::nullopt;
+  // e(b)'s one row is Stata's own `y1`, whatever the posted matrix called it
+  // and with or without depname() (vs-stata truth bank: `matrix b = (1,2,3)`
+  // then `ereturn post b V, obs(74)` or `..., depname(price)` leaves e(b) row
+  // `y1`, not b's `r1`).
+  if (bCopy.has_value()) bCopy->rownames.assign(1, "y1");
   const std::optional<eval::EvalMatrix> VCopy =
       V != nullptr ? std::optional<eval::EvalMatrix>(*V) : std::nullopt;
 
@@ -365,7 +370,14 @@ ojson runPost(const eval::ParsedCommand& parsed, SessionState& session) {
   // regress had N = 55).
   clearEResults(session);
 
-  if (bCopy.has_value()) session.eval.eMatrices.emplace_back("b", *bCopy);
+  if (bCopy.has_value()) {
+    // e(b)'s row is `y1` once posted, whatever depname() says, when b carries
+    // the default row name (StataBE 19.5, truth bank programs eclass_post
+    // `depname(yy)`, ereturn_post_esample, ereturn: XRN|e|b|1 = y1, not r1).
+    eval::EvalMatrix posted = *bCopy;
+    if (posted.rownames.size() == 1 && posted.rownames[0] == "r1") posted.rownames[0] = "y1";
+    session.eval.eMatrices.emplace_back("b", std::move(posted));
+  }
   if (VCopy.has_value()) session.eval.eMatrices.emplace_back("V", *VCopy);
   if (obs.has_value()) session.eval.setEScalar("N", *obs);
   if (dof.has_value()) session.eval.setEScalar("df_r", *dof);
@@ -423,6 +435,14 @@ bool inEclassProgram(const SessionState& session) {
 // never stores e() from a non-eclass context. The text is the raw rest of the
 // line after NAME, as `local` takes it: a comma in it is text, not an option
 // list (`ereturn local note a, b` stores `a, b`).
+// After `ereturn local|matrix|scalar` on top of a fit (eclass program), the fit's
+// ordered e() lists gain the name as estadd's (table_estadd.cpp): a macro first
+// (an emptied one leaves), a matrix right after `b V`, a scalar last.
+void noteEOnFitContract(SessionState& session, const std::string& name, char kind) {
+  if (session.ePostedLive) return;
+  noteEContractName(session, name, kind);
+}
+
 ojson runLocal(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!inEclassProgram(session)) {
     return rcError("non e-class program may not set e()", 152);
@@ -441,6 +461,30 @@ ojson runLocal(const eval::ParsedCommand& parsed, SessionState& session) {
     return rcError("ereturn local: " + name + " is not a valid name", 198, "syntax_error");
   }
   std::string value = strutil::trim(rest.substr(nameEnd));
+  // `ereturn local NAME : extended_fcn` stores the function's result, as
+  // `local NAME : ...` does, computed by local's own definition path through a
+  // scratch local (`ereturn local n : word count a b c` is 3).
+  if (!value.empty() && value.front() == ':') {
+    static const std::string kScratch = "__piet_eretlocal_fn";
+    eval::MacroFnError fe;
+    const bool consumed =
+        eval::tryCaptureDefinition("local " + kScratch + " " + value, session.eval, &fe);
+    const std::string got = session.eval.locals.get(kScratch, "");
+    session.eval.locals.erase(kScratch);
+    if (!consumed || !fe.rc.empty()) {
+      int rc = 198;
+      try {
+        if (!fe.rc.empty()) rc = std::stoi(fe.rc);
+      } catch (...) {
+      }
+      return rcError(fe.message.empty() ? std::string("invalid syntax") : fe.message, rc,
+                     "syntax_error");
+    }
+    session.eval.setEString(name, got);
+    if (!session.ePostedLive) session.noteEOnFit(name);
+    noteEOnFitContract(session, name, 'm');
+    return ojson::array();
+  }
   if (!value.empty() && value.front() == '=') {
     const std::string expr = strutil::trim(value.substr(1));
     std::string raised;
@@ -464,10 +508,12 @@ ojson runLocal(const eval::ParsedCommand& parsed, SessionState& session) {
     }
     session.eval.setEString(name, *v);
     if (!session.ePostedLive) session.noteEOnFit(name);  // round 3: on top of the fit
+    noteEOnFitContract(session, name, 'm');
     return ojson::array();
   }
   session.eval.setEString(name, dequoteOnce(value));
   if (!session.ePostedLive) session.noteEOnFit(name);  // round 3: on top of the fit
+  noteEOnFitContract(session, name, 'm');
   return ojson::array();
 }
 
@@ -530,10 +576,33 @@ ojson runMatrix(const eval::ParsedCommand& parsed, SessionState& session) {
   while (at < em.size() && (em[at].first == "b" || em[at].first == "V")) ++at;
   em.insert(em.begin() + static_cast<std::ptrdiff_t>(at), {name, std::move(posted)});
   if (!session.ePostedLive) session.noteEOnFit(name);  // ends at the next fit, as `ereturn local`
+  noteEOnFitContract(session, name, 'x');
   return ojson::array();
 }
 
 }  // namespace
+
+void noteEContractName(SessionState& session, const std::string& name, char kind) {
+  if (!session.eNameContract.has_value()) return;
+  SessionState::ENameContract& c = *session.eNameContract;
+  const auto listed = [&name](const std::vector<std::string>& v) {
+    return std::find(v.begin(), v.end(), name) != v.end();
+  };
+  if (kind == 's' && c.scalars.has_value()) {
+    if (!listed(*c.scalars)) c.scalars->push_back(name);
+  } else if (kind == 'm' && c.macros.has_value()) {
+    std::vector<std::string>& m = *c.macros;
+    m.erase(std::remove(m.begin(), m.end(), name), m.end());
+    const std::string* v = session.eval.eStrings.find(name);
+    if (v != nullptr && !v->empty()) m.insert(m.begin(), name);
+  } else if (kind == 'x' && c.matrices.has_value()) {
+    std::vector<std::string>& x = *c.matrices;
+    if (listed(x)) return;
+    size_t at = 0;
+    while (at < x.size() && (x[at] == "b" || x[at] == "V")) ++at;
+    x.insert(x.begin() + static_cast<std::ptrdiff_t>(at), name);
+  }
+}
 
 ojson runEreturn(const eval::ParsedCommand& parsed, SessionState& session) {
   if (parsed.varlist.empty()) {

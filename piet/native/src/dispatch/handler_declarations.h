@@ -3,6 +3,7 @@
 #pragma once
 #include "types.h"
 #include "piet/handlers/estimation.h"
+#include "piet/handlers/descriptive.h"  // CorrExtra
 namespace piet {
 namespace handlers {
 ojson runSummarizeAweight(const std::optional<std::vector<std::string>>& varlist, bool detail,
@@ -18,18 +19,20 @@ ojson runXtileStata(const std::string& newvar, const std::string& expText,
                     const std::optional<std::string>& ifExpr,
                     const std::optional<std::string>& inRange,
                     const std::optional<std::string>& weightVar, SessionState& session,
-                    const std::optional<std::string>& weightType);
+                    const std::optional<std::string>& weightType,
+                    bool leavesCountR = true);
 // BUG-1014 (descriptive/descriptive_statistics.cpp): correlate/pwcorr with covariance and weights.
 ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, bool sig, bool covar,
                    const std::string& weightFlag, const std::string& weightVar,
                    SessionState& session, const std::optional<std::string>& ifExpr,
-                   const std::optional<std::string>& inRange);
+                   const std::optional<std::string>& inRange, const CorrExtra& extra = CorrExtra());
 // BUG-1014 (descriptive/descriptive_statistics.cpp): tabstat with [aw=]/[fw=].
 ojson runTabstatWeighted(const std::vector<std::string>& varlist,
                          const std::optional<std::string>& byVal,
                          const std::optional<std::string>& statsVal, SessionState& session,
                          const std::optional<std::string>& ifExpr, bool wantGroups, bool noTotal,
-                         const std::string& weightFlag, const std::string& weightVar);
+                         const std::string& weightFlag, const std::string& weightVar,
+                         const std::optional<std::string>& inRange = std::nullopt);
 // BUG-1520: the weighted per-group calls of the by-prefix driver -- descriptive/summarize.cpp
 // (summarize; `weightFlag` --aweight/--fweight/--iweight) and
 // descriptive/descriptive_statistics.cpp (tabstat on a group slice;

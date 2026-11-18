@@ -400,11 +400,126 @@ struct ColView {
   const std::vector<std::string>* levels = nullptr;
 };
 
+PyValue colValue(const ColView& cv, int64_t i);
+
+// An explicit subscript `var[idx]` in a row expression reads the value of `var` at
+// observation `idx` of the whole frame, whatever row is being evaluated. The grammar
+// has no `[`, so the text is rewritten (rewriteCellSubscripts) to a call of
+// __cellat(column number, idx), which reads the columns of the evalRows call in
+// progress. Stata's rules (the numeric subscript on the engine's plane and the string
+// subscript of assert, oracle 2026-10-29): the index truncates toward zero, and an
+// index outside 1.._N -- or a missing one -- is `.` for a numeric variable and "" for
+// a string variable; a string index is a type mismatch, r(109).
+struct CellSource {
+  const std::vector<std::pair<std::string, ColView>>* cols = nullptr;
+  int64_t n = 0;
+};
+thread_local std::vector<CellSource> tlCellSources;  // one per open evalRows
+thread_local int tlGroupRelativeSubscripts = 0;  // open GroupRelativeSubscripts scopes
+
+struct CellSourceScope {
+  CellSourceScope(const std::vector<std::pair<std::string, ColView>>& cols, int64_t n) {
+    tlCellSources.push_back({&cols, n});
+  }
+  ~CellSourceScope() { tlCellSources.pop_back(); }
+  CellSourceScope(const CellSourceScope&) = delete;
+  CellSourceScope& operator=(const CellSourceScope&) = delete;
+};
+
+constexpr const char* kCellAtFn = "__cellat";
+
+PyValue fnCellAt(const std::vector<PyValue>& args) {
+  if (args.size() != 2 || tlCellSources.empty()) throw eval::PyExc("__cellat: no row source");
+  const CellSource& src = tlCellSources.back();
+  const double c = args[0].numAsDouble();
+  if (!(c >= 0) || c >= static_cast<double>(src.cols->size()))
+    throw eval::PyExc("__cellat: no such column");
+  const ColView& cv = (*src.cols)[static_cast<size_t>(c)].second;
+  if (args[1].isStr()) throw eval::PyExc("r(109): type mismatch");
+  const double x = args[1].numAsDouble();
+  // `.` and the extended missings are the sentinel's side of the line, as sumTerm reads them.
+  if (!std::isnan(x) && x < eval::kStataMissingSentinel && std::fabs(x) < 9e18) {
+    const int64_t obs = static_cast<int64_t>(std::trunc(x));
+    if (obs >= 1 && obs <= src.n) return colValue(cv, obs - 1);
+  }
+  return cv.isFactor ? PyValue::str("") : PyValue::floating(eval::kStataMissingSentinel);
+}
+
+// Replace every `column[index]` of `expr`, `column` a variable of `cols`, by
+// __cellat(its position in cols, index); an index may hold subscripts of its own. A
+// matrix element (`name[i,j]`: a comma at the top level of the brackets), anything inside
+// a string literal, and a name that is part of a longer one or follows a `.` are not
+// read. Returns false for brackets that do not close, leaving `expr` as it was.
+bool rewriteCellSubscripts(std::string& expr,
+                           const std::vector<std::pair<std::string, ColView>>& cols) {
+  if (expr.find('[') == std::string::npos) return true;
+  const auto isId0 = [](char c) { return cecon::ident::isIdentStartByte(c); };
+  const auto isId = [](char c) { return cecon::ident::isIdentByte(c); };
+  std::string out;
+  size_t i = 0;
+  while (i < expr.size()) {
+    const char c = expr[i];
+    if (c == '"') {  // a string literal is data
+      const size_t close = expr.find('"', i + 1);
+      const size_t end = close == std::string::npos ? expr.size() : close + 1;
+      out.append(expr, i, end - i);
+      i = end;
+      continue;
+    }
+    if (!isId0(c) || (i > 0 && (isId(expr[i - 1]) || expr[i - 1] == '.'))) {
+      out += c;
+      ++i;
+      continue;
+    }
+    size_t j = i;
+    while (j < expr.size() && isId(expr[j])) ++j;
+    const std::string name = expr.substr(i, j - i);
+    size_t at = cols.size();
+    if (j < expr.size() && expr[j] == '[')
+      for (size_t k = 0; k < cols.size(); ++k)
+        if (cols[k].first == name) {
+          at = k;
+          break;
+        }
+    if (at == cols.size()) {
+      out += name;
+      i = j;
+      continue;
+    }
+    int depth = 0;
+    bool quoted = false, comma = false;
+    size_t close = std::string::npos;
+    for (size_t e = j; e < expr.size(); ++e) {
+      if (expr[e] == '"') quoted = !quoted;
+      if (quoted) continue;
+      if (expr[e] == '[' || expr[e] == '(') ++depth;
+      if (expr[e] == ',' && depth == 1) comma = true;
+      if ((expr[e] == ']' || expr[e] == ')') && --depth == 0) {
+        close = e;
+        break;
+      }
+    }
+    if (close == std::string::npos) return false;
+    if (comma) {  // a matrix element, not a cell
+      out.append(expr, i, close + 1 - i);
+      i = close + 1;
+      continue;
+    }
+    std::string inner = expr.substr(j + 1, close - j - 1);
+    if (!rewriteCellSubscripts(inner, cols)) return false;
+    out += std::string(kCellAtFn) + "(" + std::to_string(at) + ", " + inner + ")";
+    i = close + 1;
+  }
+  expr = std::move(out);
+  return true;
+}
+
 // Build a fresh PyNamespace with the base fns bound (math + Stata fns +
 // scalar()). Column/_n/_N values are bound per-row by the caller.
 eval::PyNamespace baseNamespace(SessionState& session) {
   eval::PyNamespace ns = eval::mathNamespace(/*withInfNan=*/false);
   eval::addStataFns(ns);
+  ns.fns[kCellAtFn] = fnCellAt;
   eval::addRowPlaneRegexs(ns);  // read through evalRows' RegexsRowScope
   eval::addRowPlaneSum(ns);     // running totals kept by evalRows' RunningSumRowScope
   eval::addScalarFn(ns, [&session](const std::string& name) -> std::optional<std::string> {
@@ -491,6 +606,19 @@ std::string rowFailureReason(SessionState& session,
   ns.consts["_N"] = PyValue::floating(static_cast<double>(n));
   ns.consts["_SMISS"] = PyValue::floating(eval::kStataMissingSentinel);
   const eval::PyEvalOutcome out = eval::evalPyExprDetailed(expr, ns);
+  // A name that is neither a variable nor a scalar: Stata's r(111), "NAME not
+  // found" (a string function's argument, `gen L = strlen(b)`, is the case that
+  // used to surface as the coarse rc 1).
+  {
+    static const std::string kNameError = "NameError: name '";
+    if (out.status == eval::PyEvalOutcome::Status::Raised && out.error.rfind(kNameError, 0) == 0) {
+      const size_t end = out.error.find('\'', kNameError.size());
+      if (end != std::string::npos) {
+        *text = out.error.substr(kNameError.size(), end - kNameError.size()) + " not found";
+        return "r(111)";
+      }
+    }
+  }
   if (out.status != eval::PyEvalOutcome::Status::Raised || out.error.rfind("r(", 0) != 0)
     return std::string();
   const size_t close = out.error.find(')');
@@ -512,7 +640,10 @@ namespace row_eval_detail {
 // s`, `gen z = s & 1`: StataBE 19.5), as runCount already says it.
 ojson rowErrBlock(const std::string& msg, const EvalRowsResult& er) {
   if (er.errReason.empty()) return errBlock(msg);
-  return eval::errorBlock("engine_error", er.errReason == "r(109)" ? "type mismatch" : msg,
+  return eval::errorBlock("engine_error",
+                          er.errReason == "r(109)" ? "type mismatch"
+                          : (er.errReason == "r(111)" && !er.errText.empty()) ? er.errText
+                                                                              : msg,
                           std::nullopt, std::nullopt, std::nullopt, er.errReason);
 }
 
@@ -539,8 +670,11 @@ namespace row_eval_detail {
 // `rhsPy`/`condPy` are already rewrite_expr'd. If rhsPy is empty-optional,
 // condition-only mode (count/filter): only `mask` is meaningful.
 EvalRowsResult evalRows(SessionState& session, Datastore& ds,
-                        const std::optional<std::string>& rhsPy,
-                        const std::optional<std::string>& condPy) {
+                        const std::optional<std::string>& rhsIn,
+                        const std::optional<std::string>& condIn) {
+  // The expressions as the loops below read them: a `var[idx]` rewritten to a call
+  // (rewriteCellSubscripts) once the columns are known.
+  std::optional<std::string> rhsPy = rhsIn, condPy = condIn;
   EvalRowsResult r;
   int64_t n = ds.nRows();
   r.values.resize(static_cast<size_t>(n));
@@ -592,6 +726,15 @@ EvalRowsResult evalRows(SessionState& session, Datastore& ds,
       cols.emplace_back(name, cv);
     }
   }
+
+  // An explicit subscript on a variable (`s[_n-1]`, `x[1]`) is read from the columns above
+  // (fnCellAt); the scope stays open while the expressions compile and run.
+  const CellSourceScope cellScope(cols, n);
+  for (std::optional<std::string>* e : {&rhsPy, &condPy})
+    if (e->has_value() && tlGroupRelativeSubscripts == 0) {
+      std::string rewritten = **e;
+      if (rewriteCellSubscripts(rewritten, cols)) **e = std::move(rewritten);
+    }
 
   // === Slot-compiled fast path =============================================
   // Parse each expression ONCE and resolve every identifier ONCE to a slot /
@@ -1096,6 +1239,9 @@ bool needsConditionMask(SessionState& session, const std::string& cond) {
       std::regex_replace(maskStringLiterals(cond), reFactorCompare, std::string("0"));
   return referencesFactor(rest, factorCols);
 }
+
+GroupRelativeSubscripts::GroupRelativeSubscripts() { ++tlGroupRelativeSubscripts; }
+GroupRelativeSubscripts::~GroupRelativeSubscripts() { --tlGroupRelativeSubscripts; }
 
 bool namesObsPosition(const std::string& expr) {
   const std::string masked = maskStringLiterals(expr);

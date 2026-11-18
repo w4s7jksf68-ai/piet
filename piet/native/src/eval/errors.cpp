@@ -147,10 +147,41 @@ nlohmann::json engineError(const std::string& message, const std::string& code,
     if (message == std::string("[no_obs] ") + text)
       return errorBlock("engine_error", text, std::nullopt, lineNumber, context, std::string(rc));
   }
+  // fracreg's outcome outside [0,1] (apps/cmds/cmds_zicount.cpp cmd_fracreg): Stata's
+  // "invalid outcome variable" r(2000) (vs-stata bank 38011671 `fracreg logit mpg
+  // weight length`).
+  if (message.rfind("[bad_input] fracreg: outcome '", 0) == 0 &&
+      message.find("must satisfy 0 <= y <= 1") != std::string::npos)
+    return errorBlock("engine_error",
+                      "invalid outcome variable\n    Your outcome variable should contain values "
+                      "inside the interval [0,1]",
+                      std::nullopt, lineNumber, context, std::string("r(2000)"));
+  // exposure(E) with E <= 0 on the estimation sample (apps/cmds common.cpp
+  // run_fepois_emit_v for poisson/ppmlhdfe, cmds_panel.cpp cmd_nbreg): poisson,
+  // nbreg and ppmlhdfe all assert E > 0 over the sample and exit r(459).
+  if (message == "[bad_input] exposure() must be greater than zero")
+    return errorBlock("engine_error", "exposure() must be greater than zero", std::nullopt, lineNumber,
+                      context, std::string("r(459)"));
+  // tobit with no uncensored observation (apps/cmds/cmds_mle.cpp): Stata's r(1400)
+  // "initial values not feasible" (vs-stata bank a55fdfae).
+  if (message == "[no_convergence] tobit: initial values not feasible")
+    return errorBlock("engine_error", "initial values not feasible", std::nullopt, lineNumber,
+                      context, std::string("r(1400)"));
   // ... and nl's own words for the same two refusals (apps/cmds/cmds_nlgmm.cpp).
   if (const std::string rc = nlSampleRc(message); !rc.empty())
     return errorBlock("engine_error", message.substr(9), std::nullopt, lineNumber, context,
                       "r(" + rc + ")");
+  // The engine's level range refusal ("<cmd>: --level must be in [10, 99.99] (got
+  // 0).", apps/cmds) is Stata's r(198) "level() must be between 10 and 99.99
+  // inclusive" for every command that takes level(): vs-stata bank 70443ff6f18044c8
+  // (`nl ..., l(0)`) and 8e734ba5b2e26756 (`xtabond ..., l(2)`), as `set level 0`
+  // (b835168b6f75949a). It used to reach the user at rc 1 under the engine's flag name.
+  {
+    static const std::string kLevelTail = ": --level must be in [10, 99.99] (got ";
+    if (message.rfind("[engine_error] ", 0) == 0 && message.find(kLevelTail) != std::string::npos)
+      return errorBlock("engine_error", "level() must be between 10 and 99.99 inclusive",
+                        std::nullopt, lineNumber, context, std::string("r(198)"));
+  }
   // BUG-1247: so does nlcom's refusal of a combination missing at e(b)
   // (src/estimators/nlcom.h): "expression (ln(_b[x] - 2)) evaluates to missing", r(498).
   static const std::string kNlcomTag = "[engine_error] expression (";
@@ -245,6 +276,46 @@ std::string timeSpanRefusal(const std::string& msg, std::string* rc) {
   return std::string();
 }
 
+namespace {
+// The name a "not found" refusal is about: "variable NAME not found", "column
+// 'NAME' not found ...", "column not found: NAME". "" when the message has none.
+std::string notFoundName(const std::string& msg) {
+  static const std::string kVar = "variable ", kNot = " not found";
+  const size_t nf = msg.find(kNot);
+  if (nf == std::string::npos) return std::string();
+  const size_t col = msg.rfind("column '", nf);
+  if (col != std::string::npos && nf > col + 8 && msg[nf - 1] == '\'')
+    return msg.substr(col + 8, nf - 1 - (col + 8));
+  const size_t v = msg.rfind(kVar, nf);
+  if (v != std::string::npos && msg.find(' ', v + kVar.size()) == nf)
+    return msg.substr(v + kVar.size(), nf - (v + kVar.size()));
+  static const std::string kCol = "column not found: ";
+  const size_t c2 = msg.find(kCol);
+  if (c2 != std::string::npos) {
+    const std::string rest = msg.substr(c2 + kCol.size());
+    return rest.substr(0, rest.find_first_of(" \t,;"));
+  }
+  return std::string();
+}
+
+// A "not found" refusal whose NAME no variable name can be -- a leading `-`, a
+// `+`, nothing but digits: Stata refuses the token as r(198) "<token> invalid
+// name" before any lookup (StataBE 19.5: `sort -price`, `bysort foreign
+// (-price)`, `clonevar p2 = price+1`, `hist price, by(1)`; every bank cell
+// whose PIET refusal names such a token is r(198) in Stata). "" otherwise. A
+// token with factor-variable or time-series operators is not judged here: most
+// commands take them, and the few whose Stata varlist refuses them are answered
+// by tokenize() (registry.h StataOperators).
+std::string missingNameSyntaxRc(const std::string& msg) {
+  const std::string name = notFoundName(msg);
+  if (name.empty()) return std::string();
+  if (name[0] == '-' || name.find('+') != std::string::npos ||
+      name.find_first_not_of("0123456789") == std::string::npos)
+    return "198";
+  return std::string();
+}
+}  // namespace
+
 // BS-100: see errors.h's doc comment for the full mapping + rationale.
 std::string coarseRc(const nlohmann::ordered_json& block) {
   // BUG-187 (P2-PERF ARC-P). When a call site KNOWS the exact Stata return
@@ -262,6 +333,13 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
     const size_t from = digits.size() > 1 && digits[0] == '-' ? 1 : 0;
     if (!digits.empty() &&
         digits.find_first_not_of("0123456789", from) == std::string::npos) {
+      // An arm's r(111) "variable X not found" assumed X was a name; when no
+      // name can look like X, Stata refused the token before any lookup.
+      if (digits == "111") {
+        if (const std::string rc = missingNameSyntaxRc(block.value("message", std::string()));
+            !rc.empty())
+          return rc;
+      }
       return digits;
     }
   }
@@ -302,6 +380,9 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
                               lower.find("could not remove directory") != std::string::npos)) {
       return "693";
     }
+    // A "not found" refusal whose NAME is no variable name at all
+    // (missingNameSyntaxRc): a syntax answer, so before the r(111) rules below.
+    if (const std::string rc = missingNameSyntaxRc(msg); !rc.empty()) return rc;
     // N3 (BETA Phase C batch C1): variable-not-found previously fell all
     // the way to the generic "1" default — Stata's own r(111) "variable
     // not found" is the correct coarse bucket (oracle-pinned: both
@@ -323,6 +404,15 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
     // r(111) for all of them. These are the only producers of the phrase.
     if (lower.find("unknown variable") != std::string::npos) return "111";
     if (lower.find("factor variables may not contain") != std::string::npos) return "452";
+    // A call of a name that is no Stata function: r(133) "unknown function NAME()".
+    if (lower.rfind("unknown function ", 0) == 0) return "133";
+    // The engine's order condition, "[under_identified] under-identified: fewer
+    // instruments than endogenous regressors": StataBE 19.5 r(481) "equation
+    // not identified; must have at least as many instruments not in the
+    // regression as there are instrumented variables" on every bank cell that
+    // carries it (vs-stata bank 2026-11-10: ivregress x2, ivreghdfe x1).
+    if (lower.find("under-identified: fewer instruments than endogenous") != std::string::npos)
+      return "481";
     // The engine's missing-column refusals: "[missing_column] column not found:
     // X" (feols/fepois/iv), "[missing_column] logit: column 'X' not found in
     // dataset", collapse's "no column: X". Stata: "variable X not found" r(111)
@@ -400,6 +490,12 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
       return "110";
     }
     if (lower.find("predicts data perfectly") != std::string::npos) {
+      return "2000";
+    }
+    // logit/probit/cloglog: an outcome constant on the sample (all 0 or all nonzero),
+    // or after the perfect predictors were dropped, is r(2000) (bank 9f4f02d7).
+    if (lower.find("outcome") != std::string::npos && lower.find("does not vary") != std::string::npos &&
+        lower.find("r(2000)") != std::string::npos) {
       return "2000";
     }
     // FU-835: the engine's sample-size refusal in Stata's own words (src/core/
@@ -502,6 +598,46 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
       for (unsigned char c : name) ident = ident && (std::isalnum(c) || c == '_' || c >= 0x80);
       if (ident) return "111";
     }
+    // Refusal classes that fell to the generic "1". ADMISSION RULE (PIET vs
+    // Stata truth bank, 2026-11-11): a phrase is mapped only when EVERY bank
+    // cell whose PIET refusal carries it -- including the lines Stata RAN --
+    // has Stata answering that same code. A phrase that also appears on a line
+    // Stata runs is PIET's own gap or bug there, and keeps PIET's answer; that
+    // is why "is a string variable", "[factor_misuse]", negative weights,
+    // "[collinear]"/"[under_identified]", "matches no coefficient", "matrix X
+    // not found", "unrecognized subcommand", "option required" and the like are
+    // NOT here. Keyed on what the message says, never on a command.
+    const auto has = [&lower](const char* s) { return lower.find(s) != std::string::npos; };
+    // A coefficient or post handle that does not exist: r(111) (`nlcom
+    // _b[zzz]`, `postclose zzzh`). An EMPTY handle is no name at all (r(198)).
+    if (has("unknown coefficient") || (has(" is not open") && !has("handle `` "))) return "111";
+    // The lead a command's syntax requires is missing: r(100) "varlist
+    // required" / "using required".
+    if (has("variable list required") || has("requires at least one variable") ||
+        has("no variables specified") || has("variable name required") ||
+        has("`using` filename required"))
+      return "100";
+    // A numeric variable where a string one is needed: r(109) (`split price`).
+    if (has(" is a numeric variable")) return "109";
+    // A matrix that must be positive definite and is not: r(506).
+    if (has("is not positive definite")) return "506";
+    // A file the USER named that cannot be opened or written: r(603) (`log using
+    // zzzdir/l.log`, `texsave using zzzdir/t.tex`). PIET's own scratch files
+    // ("could not open scratch CSV for write", the .dta sidecar) are internal
+    // failures, not Stata's.
+    if ((has("could not open \"") || has("cannot write ")) && !has("scratch") &&
+        !has("sidecar") && !has("write back"))
+      return "603";
+    // PIET's own syntax refusals worded in its own sentences: r(198).
+    if (has("unknown subcommand") || has("syntax is `") || has("specify at most one of") ||
+        has(") required") || has("parse error") || has("unexpected end of expression") ||
+        has("invalid label name") || has("is not valid with --") || has("cannot parse") ||
+        has("no stub variables specified") || has("unknown direction") ||
+        has("expected `import delimited") || has("expected `export delimited") ||
+        has("invalid -- ") || has("must be positive") || has("must be specified") ||
+        has("expression group(s)") || has("no variable names found") ||
+        has("step cannot be zero") || has("handle `` is not open"))
+      return "198";
   }
   return "1";  // historical default — every other class (BS-118: post-beta)
 }

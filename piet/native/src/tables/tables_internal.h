@@ -319,6 +319,7 @@ struct Model {
   ojson snap;       // the eststo snapshot
   ojson added;      // {scalars, locals, matrices}
   ojson escalars;   // Stata-spelled e() scalars
+  ojson emacros = ojson::object();  // the e() macros (name -> text) the results carry
 };
 
 
@@ -617,7 +618,8 @@ std::string estaddSubstR(const std::string& expr, SessionState& session);
 
 
 // A 1xk matrix in the `added.matrices` shape.
-ojson rowMatrix(const std::vector<std::string>& colnames, const std::vector<double>& values);
+ojson rowMatrix(const std::vector<std::string>& colnames, const std::vector<double>& values,
+                const std::string& rowname);
 
 
 double jsonNum(const ojson& v);
@@ -672,8 +674,11 @@ struct PseudoCoef {
 };
 
 
+// `locals`: the e() macros the subcommand posts besides e(cmd)/e(subcmd)
+// (estpost tabstat: e(stats), e(vars), e(byvar)); an empty one is not posted.
 void postPseudoEstimate(SessionState& session, const std::string& estimator, double nObs,
-                        const ojson& matrices, const std::vector<PseudoCoef>& coefs);
+                        const ojson& matrices, const std::vector<PseudoCoef>& coefs,
+                        const std::vector<std::pair<std::string, std::string>>& locals = {});
 
 
 // The two statistics that become e(b) and e(se). `mean`/`sd` when they were
@@ -839,6 +844,10 @@ struct CoefRowView {
 // p missing and both limits 0 (w2at_table_writers.log:4726-4773 wt_p01 `x1 x2
 // 0b.g 1.g 2.g _cons`, row 3 `0|0|.|.|0|0`; regsave wt_r01 row 3 `0b.g` 0 0 0 0).
 std::vector<CoefRowView> coefViews(const ojson& snap);
+
+
+// `eform` as estout reads it: the transform() text it stands for ("" when none).
+std::string eformTransformRaw(const std::vector<std::pair<std::string, eval::OptValue>>& opts);
 
 
 // `level(#)` other than the level the model was FITTED at cannot be honoured

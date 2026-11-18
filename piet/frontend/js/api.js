@@ -342,6 +342,13 @@ export class HTTPClient {
         // hydrate" — so this stays honest rather than implying a blob exists.
         default_export_dir: '',
         memory_budget_mb: 0, compute_cores: 0, provenance_hash: false,
+        // tabulate's table-size limits: 0 = Stata's own limit.
+        tab_oneway_max_rows: 0, tab_twoway_max_rows: 0, tab_twoway_max_cols: 0,
+        tab_summarize_max_cells: 0,
+        table_limit_defaults: { tab_oneway_max_rows: 12000, tab_twoway_max_rows: 1200,
+          tab_twoway_max_cols: 80, tab_summarize_max_cells: 375 },
+        table_limit_ceilings: { tab_oneway_max_rows: 1000000, tab_twoway_max_rows: 1000000,
+          tab_twoway_max_cols: 1000000, tab_summarize_max_cells: 200000 },
         sys: { total_ram_mb: ramMb, cpu_count: cores, recommended_budget_mb: Math.round(ramMb / 2) },
         settings_file: '(mock — not persisted)',
       };

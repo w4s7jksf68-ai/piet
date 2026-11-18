@@ -187,12 +187,15 @@ void testAerReshape() {
     check(firstError(r.blocks).is_null(),
           "AER-RESHAPE (ii): `split sv, parse(\"-\") gen(p)` runs clean. Got `" +
               errText(firstError(r.blocks)) + "`");
-    const double nv = rOf(s, "nvars");
-    check(nv == 3.0,
-          "AER-RESHAPE (ii): r(nvars) == 3 -- three parts, so the parse() delimiter was honoured "
-          "rather than the whitespace default (which would find ONE part in \"a-b-c\" and is the "
-          "exact reason `gen = word(v,j)` was rejected as the implementation). Got " +
-              fullPrec(nv));
+    // split.ado posts r(k_new) as the scalar count and r(nvars) as a macro
+    // (vs-stata bank, StataBE 19.5: `split make` -> k_new 3, nvars "3").
+    const double nv = rOf(s, "k_new");
+    const std::string* nvMacro = s.eval.rStrings.find("nvars");
+    check(nv == 3.0 && nvMacro != nullptr && *nvMacro == "3",
+          "AER-RESHAPE (ii): r(k_new) == 3 and r(nvars) == \"3\" -- three parts, so the parse() "
+          "delimiter was honoured rather than the whitespace default (which would find ONE part "
+          "in \"a-b-c\" and is the exact reason `gen = word(v,j)` was rejected as the "
+          "implementation). Got " + fullPrec(nv));
     const std::vector<std::string> names = varNames(s);
     check(hasName(names, "p1") && hasName(names, "p2") && hasName(names, "p3"),
           "AER-RESHAPE (ii): ...and the columns are named p1 p2 p3 off gen()'s stub, not off the "
@@ -727,30 +730,18 @@ void testAerReshape() {
           "worst version of this defect -- the command reports failure and did the thing. Got " +
               fullPrec(nRows(s2)) + " rows, " + std::to_string(varNames(s2).size()) + " variables");
 
-    // (c) `sample ..., by()` -- an option this build does not implement. It
-    // must be refused as an OPTION, not accepted and dropped.
+    // (c) `sample ..., by()` draws within each group (vs-stata bank: sample.ado's by(varlist)):
+    // 10 percent of two groups of ten is one row from each, int(10*10/100 + .5) = 1.
     piet::SessionState s3(workdir);
     s3.eval.cwd = workdir;
     s3.cwd = workdir;  // resolveUserPath reads THIS field (fileio/user_paths.cpp).
     (void)exec("clear\nset obs 20\ngen double g = 1\nreplace g = 2 in 11/20\n", s3);
     auto r3 = exec("sample 10, by(g)\n", s3);
-    auto err3 = firstError(r3.blocks);
-    check(!err3.is_null(),
-          "AER-RESHAPE (xiii/c): `sample 10, by(g)` is REFUSED. by() changes the ANSWER -- it "
-          "makes the draw stratified -- so accepting and ignoring it returns a plain sample under "
-          "a stratified sample's name, with rc 0 and no way to tell");
-    check(errField(err3, "code") == "unsupported_option",
-          "AER-RESHAPE (xiii/c): ...under `unsupported_option`, not `unsupported_command`: the "
-          "command exists and one option does not, and a caller branching on the code is entitled "
-          "to that difference. Got `" + errField(err3, "code") + "`");
-    check(rcOf(err3) == "198",
-          "AER-RESHAPE (xiii/c): ...at r(198), Stata's option error. Asserted separately from the "
-          "code because a refusal built with the default engine_error code arrives as rc 1 and "
-          "every do-file branching on 198 takes the wrong branch. Got r(" + rcOf(err3) + ")");
-    check(nRows(s3) == 20.0,
-          "AER-RESHAPE (xiii/c): ...and it sampled NOTHING. The reject net has to fire before the "
-          "handler, or the user gets a refusal message and a frame that has already lost half its "
-          "rows. Got " + fullPrec(nRows(s3)));
+    check(firstError(r3.blocks).is_null(),
+          "AER-RESHAPE (xiii/c): `sample 10, by(g)` runs: by() makes the draw stratified");
+    check(nRows(s3) == 2.0,
+          "AER-RESHAPE (xiii/c): ...and keeps one row of each group (2 rows). Got " +
+              fullPrec(nRows(s3)));
   }
 
   fs::remove_all(workdir, ec);

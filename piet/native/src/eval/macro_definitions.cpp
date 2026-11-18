@@ -61,7 +61,7 @@ std::string extMacroFnName(const std::string& tok) {
       {"sortedby", 4}, {"label", 3},    {"char", 4},         {"list", 4},         {"word", 4},
       {"length", 6},   {"subinstr", 8}, {"pwd", 3},          {"dir", 3},          {"rownames", 4},
       {"colnames", 4}, {"roweq", 4},    {"rowfullnames", 4}, {"colfullnames", 4}, {"coleq", 4},
-      {"rowsof", 6},   {"colsof", 6}};
+      {"rowsof", 6},   {"colsof", 6},   {"sysdir", 6}};
   for (const auto& n : kNames) {
     const std::string full = n.full;
     if (tok.size() >= n.shortest && full.compare(0, tok.size(), tok) == 0) return full;
@@ -122,6 +122,31 @@ bool varPlaneIsAuthoritative(const EvalSession& session) {
 bool varKnownMissing(const EvalSession& session, const std::string& name) {
   if (!varPlaneIsAuthoritative(session)) return false;
   return session.varLabels.find(std::string(kVarExistsPrefix) + name) == nullptr;
+}
+
+// The variable a name unambiguously abbreviates under `set varabbrev on` (Stata's
+// default; the dispatcher keeps `set varabbrev off` under this global, cclass.h
+// kSetMarkerPrefix): the one variable of the plane whose name starts with it.
+// nullopt when the plane is not authoritative, abbreviation is off, or none or
+// several match (*ambiguous set for several). StataBE 19.5: `: type pri` on auto
+// is int (truth bank cell bfd2533c926af70e).
+static std::optional<std::string> varAbbreviationTarget(const EvalSession& session,
+                                                 const std::string& name, bool* ambiguous) {
+  *ambiguous = false;
+  if (!varPlaneIsAuthoritative(session) || name.empty()) return std::nullopt;
+  if (const std::string* off = session.globals.find(" __piet_set_varabbrev"))
+    if (*off == "off") return std::nullopt;
+  const std::string prefix = std::string(kVarExistsPrefix) + name;
+  std::optional<std::string> hit;
+  for (const auto& kv : session.varLabels.items()) {
+    if (kv.first.compare(0, prefix.size(), prefix) != 0) continue;
+    if (hit.has_value()) {
+      *ambiguous = true;
+      return std::nullopt;
+    }
+    hit = kv.first.substr(std::string(kVarExistsPrefix).size());
+  }
+  return hit;
 }
 
 
@@ -197,6 +222,23 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
 
   std::smatch m;
 
+  // `: s(macros)` -- the s() macro names, oldest first. s() lives in rStrings
+  // under the "\x01s:" key prefix (program.cpp kSClassKeyPrefix; s() holds
+  // macros only).
+  {
+    static const std::regex reSNames(R"(^:\s*s\(\s*macros\s*\)\s*$)");
+    if (tok == "s" && std::regex_match(rhs, reSNames)) {
+      static const std::string kSPrefix = "\x01s:";
+      std::string out;
+      for (const auto& item : session.rStrings.items()) {
+        if (item.first.compare(0, kSPrefix.size(), kSPrefix) != 0) continue;
+        if (!out.empty()) out += ' ';
+        out += item.first.substr(kSPrefix.size());
+      }
+      return out;
+    }
+  }
+
   // These are names of the actual live postings, in publication order. No
   // sorting, deleted entries, or zero/missing placeholders are manufactured.
   // Fixed oracle: w2v_estpost_ematrix.log ep13_ematrices / ep13_escalars.
@@ -243,6 +285,62 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
       for (const auto& item : session.eStrings.items()) append(item.first);
     } else {
       for (const auto& item : session.eMatrices) append(item.first);
+    }
+    return out;
+  }
+
+  // `: r(scalars)`, `: r(macros)`, `: r(matrices)` -- the names r() holds, as
+  // the e() forms above give e()'s, and `: s(macros)` the s() macros. A user
+  // program that walks r() reads them (the truth bank's own record loop: after
+  // `summarize` Stata lists `N sum_w mean Var sd min max sum`). The order is
+  // `return list`'s (newest posting first, results/return_list.cpp): Stata's
+  // where a handler posts in Stata's order (describe), not for every command
+  // (summarize posts in another order); the SET of names is the contract. While a name Stata
+  // posts for the live r-class command is missing from PIET's r()
+  // (EvalSession::rUnposted) the list would be short, so it is refused by name,
+  // as an incomplete e() list is.
+  static const std::regex reRNames(R"(^:\s*r\(\s*(scalars|macros|matrices)\s*\)\s*$)");
+  static const std::regex reSNames(R"(^:\s*s\(\s*macros\s*\)\s*$)");
+  if (tok == "r" && std::regex_match(rhs, m, reRNames)) {
+    const std::string kind = m.str(1);
+    if (!session.rUnposted.empty()) {
+      if (err != nullptr) {
+        std::string missing;
+        for (const auto& n : session.rUnposted) missing += (missing.empty() ? "" : " ") + n;
+        err->rc = "111";
+        err->message = ": r(" + kind + ") is not available after `" + session.rClassCmd +
+                       "`: Stata also posts " + missing + ", which this version of PIET does not";
+      }
+      return std::nullopt;
+    }
+    std::string out;
+    auto append = [&](const std::string& name) {
+      if (name.empty() || isReservedStoreKey(name)) return;
+      if (!out.empty()) out += ' ';
+      out += name;
+    };
+    if (kind == "scalars") {
+      const auto& items = session.rValues.items();
+      for (auto it = items.rbegin(); it != items.rend(); ++it) append(it->first);
+    } else if (kind == "macros") {
+      const auto& items = session.rStrings.items();
+      for (auto it = items.rbegin(); it != items.rend(); ++it) append(it->first);
+    } else {
+      for (auto it = session.rMatrices.rbegin(); it != session.rMatrices.rend(); ++it)
+        append(it->first);
+    }
+    return out;
+  }
+  if (tok == "s" && std::regex_match(rhs, m, reSNames)) {
+    // s() lives in rStrings under the reserved prefix "\x01s:" (macros.cpp
+    // kSClassKeyPrefix, program.cpp's `sreturn local`).
+    static const std::string kSPrefix = "\x01s:";
+    std::string out;
+    const auto& items = session.rStrings.items();
+    for (auto it = items.rbegin(); it != items.rend(); ++it) {
+      if (it->first.compare(0, kSPrefix.size(), kSPrefix) != 0) continue;
+      if (!out.empty()) out += ' ';
+      out += it->first.substr(kSPrefix.size());
     }
     return out;
   }
@@ -350,8 +448,168 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
     const bool global = m.str(1)[0] == 'g';
     const std::string bad = macroNameError(global, m.str(2));
     if (!bad.empty()) return rejectSyntax(bad);
+    // In bytes (StataBE 19.5, vs-stata bank e2884aaacb74733f `héllo` 6,
+    // 93ca64d56274ae45 `가나다` 9); ustrlen counts characters.
     return std::to_string(
-        utf8Len(global ? session.globals.get(m.str(2), "") : session.locals.get(m.str(2), "")));
+        (global ? session.globals.get(m.str(2), "") : session.locals.get(m.str(2), "")).size());
+  }
+
+  // copy local|global <name>: the value as stored, references and all
+  // unexpanded (StataBE 19.5, vs-stata bank 5d28f5421a19d7e7 `<a  b>`,
+  // fac0402c7a446eaa); strlen / ustrlen / udstrlen local|global <name>: its
+  // length in bytes, characters and display columns (b1bd38238c9731a9 `aé`
+  // 3 2 2, 93ca64d56274ae45 `가나다` ustrlen 3).
+  static const std::regex reCopyLen(R"(^:\s*(copy|strlen|ustrlen|udstrlen)\s+)" + kLocalOrGlobal +
+                                    R"(\s+([\w\x80-\xff]+)\s*$)");
+  if (std::regex_match(rhs, m, reCopyLen)) {
+    const bool global = m.str(2)[0] == 'g';
+    const std::string bad = macroNameError(global, m.str(3));
+    if (!bad.empty()) return rejectSyntax(bad);
+    const std::string v = global ? session.globals.get(m.str(3), "") : session.locals.get(m.str(3), "");
+    const std::string f = m.str(1);
+    if (f == "copy") return v;
+    if (f == "strlen") return std::to_string(v.size());
+    if (f == "ustrlen") return std::to_string(utf8Len(v));
+    size_t cols = 0;  // udstrlen: an East Asian wide character takes two columns
+    for (size_t k = 0; k < v.size();) {
+      const unsigned char c = static_cast<unsigned char>(v[k]);
+      size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+      if (k + n > v.size()) n = v.size() - k;
+      unsigned cp = n == 1 ? c : n == 2 ? (c & 0x1F) : n == 3 ? (c & 0x0F) : (c & 0x07);
+      for (size_t q = 1; q < n; ++q) cp = (cp << 6) | (static_cast<unsigned char>(v[k + q]) & 0x3F);
+      const bool wide = (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) ||
+                        (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+                        (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+                        (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x20000 && cp <= 0x3FFFD);
+      cols += wide ? 2 : 1;
+      k += n;
+    }
+    return std::to_string(cols);
+  }
+
+  // environment NAME: the operating-system environment variable, "" when it
+  // is not set (StataBE 19.5 `local h : environment NOSUCHENV_ZQ` is empty,
+  // vs-stata bank f8e26aa4daef1687); env, envi, ... abbreviate it.
+  static const std::regex reEnv(R"(^:\s*env(?:i(?:r(?:o(?:n(?:m(?:e(?:n(?:t)?)?)?)?)?)?)?)?\s+(\S+)\s*$)");
+  if (std::regex_match(rhs, m, reEnv)) {
+    const char* v = std::getenv(m.str(1).c_str());
+    return std::string(v != nullptr ? v : "");
+  }
+
+  // piece #p #l of "string" [, nobreak]: the #p-th piece of the string cut
+  // into pieces of at most #l characters at blanks; a word longer than #l is
+  // cut too, unless nobreak keeps it whole (StataBE 19.5, vs-stata bank
+  // 288ba02a6fde4fe1 `the quick|brown fox|jumps over` at 10, 756c5e9d06dc721f
+  // `piece 2 4 of "abcdefghij"` efgh, cd0bc46007d4c29f nobreak abcdefgh).
+  static const std::regex rePiece(
+      R"RX(^:\s*piece\s+(\d+)\s+(\d+)\s+of\s+(?:`"([\s\S]*)"'|"([^"]*)")\s*(?:,\s*(\w+))?\s*$)RX");
+  if (std::regex_match(rhs, m, rePiece)) {
+    const long long want = std::stoll(m.str(1));
+    const long long width = std::stoll(m.str(2));
+    const std::string text = m[3].matched ? m.str(3) : m.str(4);
+    bool nobreak = false;
+    if (m[5].matched) {
+      const std::string o = m.str(5);
+      if (o.size() < 3 || std::string("nobreak").compare(0, o.size(), o) != 0)
+        return rejectSyntax("option " + o + " not allowed");
+      nobreak = true;
+    }
+    if (want < 1 || width < 1) return rejectSyntax();
+    std::vector<std::string> pieces;
+    std::string cur;
+    for (std::string w : stataWords(text)) {
+      while (!nobreak && static_cast<long long>(utf8Len(w)) > width) {
+        if (!cur.empty()) {
+          pieces.push_back(cur);
+          cur.clear();
+        }
+        size_t cut = 0;
+        for (long long c = 0; c < width && cut < w.size(); ++c) {
+          ++cut;
+          while (cut < w.size() && (static_cast<unsigned char>(w[cut]) & 0xC0) == 0x80) ++cut;
+        }
+        pieces.push_back(w.substr(0, cut));
+        w = w.substr(cut);
+      }
+      if (w.empty()) continue;
+      if (cur.empty()) {
+        cur = w;
+      } else if (static_cast<long long>(utf8Len(cur) + 1 + utf8Len(w)) <= width) {
+        cur += " " + w;
+      } else {
+        pieces.push_back(cur);
+        cur = w;
+      }
+    }
+    if (!cur.empty()) pieces.push_back(cur);
+    return want <= static_cast<long long>(pieces.size()) ? pieces[static_cast<size_t>(want - 1)]
+                                                         : std::string();
+  }
+
+  // permname NAME [, length(#)]: NAME when no variable has it, else NAME with
+  // the first free number appended, the stem cut so the whole fits in # (32)
+  // characters (StataBE 19.5, vs-stata bank 122803ea86dd1565 `price` price1,
+  // f93c81bdcf72c3ea a 46-character name cut to 32); a word that is no name
+  // is r(198) "WORD invalid name" (3cb7ae2ad82f8bc8).
+  static const std::regex rePermname(R"(^:\s*permname\s+([^,]*?)\s*(?:,\s*([\s\S]*))?$)");
+  if (std::regex_match(rhs, m, rePermname)) {
+    const std::string word = m.str(1);
+    size_t len = 32;
+    if (m[2].matched) {
+      static const std::regex reLenOpt(R"(^\s*l(?:e(?:n(?:g(?:t(?:h)?)?)?)?)?\(\s*(\d+)\s*\)\s*$)");
+      std::smatch lm;
+      const std::string opt = m.str(2);
+      if (!std::regex_match(opt, lm, reLenOpt)) return rejectSyntax("option " + strip(opt) + " not allowed");
+      len = static_cast<size_t>(std::stoul(lm.str(1)));
+      if (len < 1 || len > 32) return rejectSyntax();
+    }
+    const std::string first = word.substr(0, word.find_first_of(" \t"));
+    bool ok = !first.empty() && first.size() == word.size() && isIdentStart(first[0]);
+    for (char c : first) ok = ok && isIdentChar(c);
+    if (!ok) return rejectSyntax(first + " invalid name");
+    const auto taken = [&](const std::string& n) {
+      return varPlaneIsAuthoritative(session) &&
+             session.varLabels.find(std::string(kVarExistsPrefix) + n) != nullptr;
+    };
+    std::string base = word.size() > len ? word.substr(0, len) : word;
+    if (!taken(base)) return base;
+    for (long long k = 1; k < 100000; ++k) {
+      const std::string suffix = std::to_string(k);
+      std::string stem = word.size() + suffix.size() > len ? word.substr(0, len - suffix.size()) : word;
+      if (!taken(stem + suffix)) return stem + suffix;
+    }
+    return rejectSyntax();
+  }
+
+  // all {globals|scalars|numeric scalars|string scalars|matrices} ["pattern"]:
+  // the names, newest first (StataBE 19.5, vs-stata bank dbdedf61e263716e
+  // `ZQ2 ZQ1`, 019eb567a1b66f40 `b2 a1`, 0cfe74d1f1047ea8 `M2 M1`); any other
+  // kind (`all numeric variables`) is r(198) (bacb1d2e62da6bc6).
+  static const std::regex reAll(
+      R"RX(^:\s*all\s+(globals|scalars|matrices|numeric\s+scalars|string\s+scalars)\s*(?:"([^"]*)")?\s*$)RX");
+  if (rhs.compare(0, 1, ":") == 0 && std::regex_search(rhs, std::regex(R"(^:\s*all\b)"))) {
+    if (!std::regex_match(rhs, m, reAll)) return rejectSyntax();
+    const std::string kind = m.str(1);
+    const std::string pat = m[2].matched ? m.str(2) : std::string("*");
+    std::vector<std::string> names;
+    if (kind == "globals") {
+      for (const auto& kv : session.globals.items()) names.push_back(kv.first);
+    } else if (kind == "matrices") {
+      for (const auto& kv : session.matrices) names.push_back(kv.first);
+    } else {
+      if (kind.rfind("string", 0) != 0)
+        for (const auto& kv : session.scalars.items()) names.push_back(kv.first);
+      if (kind.rfind("numeric", 0) != 0)
+        for (const auto& kv : session.stringScalars) names.push_back(kv.first);
+    }
+    std::string outList;
+    for (auto it = names.rbegin(); it != names.rend(); ++it) {
+      const std::string& n = *it;
+      if (n.empty() || !isIdentStart(n[0])) continue;  // PIET's own bookkeeping names
+      if (!strutil::globMatch(pat, n)) continue;
+      outList += (outList.empty() ? "" : " ") + n;
+    }
+    return outList;
   }
 
   // subinstr local|global <name> <from> <to> [, all word count(local|global <n>)]
@@ -823,6 +1081,18 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
     const std::filesystem::path cwd = std::filesystem::current_path(ec);
     return ec ? std::string() : cwd.u8string();
   }
+  // `: sysdir KEY` -- the directory Stata keeps under that key (STATA, BASE, SITE,
+  // PLUS, PERSONAL, OLDPLACE, ...), the value `sysdir list` shows and c(sysdir_key)
+  // answers (bank sysdir cells 4cb9fbb6b093b4c1, 7dd0da9f3352647e).
+  if (fn == "sysdir") {
+    static const std::regex reSysdir(R"(^:\s*sysdir\s+([A-Za-z_]\w*)\s*$)");
+    if (std::regex_match(rhs, m, reSysdir) && session.cValue) {
+      std::string key = m.str(1);
+      for (char& ch : key) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      if (auto v = session.cValue("sysdir_" + key)) return *v;
+    }
+    return refuseUnanswered();
+  }
   static const std::regex reDataLabel(R"(^:\s*data label\s*$)");
   if (std::regex_match(rhs, m, reDataLabel)) {
     return session.dataLabel ? session.dataLabel() : std::string();
@@ -942,11 +1212,22 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
   // ledger close as the measured remainder.
   static const std::regex reVarType(R"(^:\s*type\s+([\w\x80-\xff]+)\s*$)");
   if (std::regex_match(rhs, m, reVarType)) {
-    if (varKnownMissing(session, m.str(1))) {
-      rejectMissingVar(m.str(1));
-      return std::nullopt;
+    std::string var = m.str(1);
+    if (varKnownMissing(session, var)) {
+      bool ambiguous = false;
+      if (auto full = varAbbreviationTarget(session, var, &ambiguous)) {
+        var = *full;
+      } else {
+        if (ambiguous && err != nullptr) {
+          err->rc = "111";
+          err->message = var + " ambiguous abbreviation";
+        } else {
+          rejectMissingVar(var);
+        }
+        return std::nullopt;
+      }
     }
-    if (const std::string* t = session.varLabels.find(std::string(kVarTypePrefix) + m.str(1))) {
+    if (const std::string* t = session.varLabels.find(std::string(kVarTypePrefix) + var)) {
       return *t;
     }
     // An unrecorded subtype (or a plane that never synced) keeps the honest
@@ -1497,6 +1778,29 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
         session.scalars.clear();
         session.stringScalars.clear();  // BUG-710
       } else {
+        // A name that is no scalar is r(111) "scalar NAME not found", and
+        // nothing is dropped (vs-stata bank `scalar drop zznotascalar`).
+        for (const auto& t : targets) {
+          // No wildcards: `scalar drop zz*` is r(111) "scalar zz not found"
+          // (StataBE 19.5, vs-stata bank 4718daa51e184552); the pattern was
+          // skipped and nothing dropped at rc 0.
+          if (const size_t w = t.find_first_of("*?~"); w != std::string::npos) {
+            if (errorOut != nullptr) {
+              errorOut->rc = "111";
+              errorOut->message = "scalar " + t.substr(0, w) + " not found";
+            }
+            return true;
+          }
+          bool known = session.stringScalars.count(t) != 0;
+          for (const auto& kv : session.scalars.items()) known = known || kv.first == t;
+          if (!known) {
+            if (errorOut != nullptr) {
+              errorOut->rc = "111";
+              errorOut->message = "scalar " + t + " not found";
+            }
+            return true;
+          }
+        }
         for (const auto& t : targets) {
           session.scalars.erase(t);
           session.stringScalars.erase(t);  // BUG-710
@@ -1527,6 +1831,51 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
       if (failedExp.has_value() && takeCodedExpandError(*failedExp, errorOut)) return true;
       std::string name = sdName;
       std::string expr = strip(sdExpr);
+      // A name longer than 32 characters is r(198) "NAME invalid name"
+      // (StataBE 19.5, vs-stata bank 98e55974d2e74375).
+      {
+        size_t chars = 0;
+        for (char c : name)
+          if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) ++chars;
+        if (chars > 32) {
+          if (errorOut != nullptr) {
+            errorOut->rc = "198";
+            errorOut->message = name + " invalid name";
+          }
+          return true;
+        }
+      }
+      // `scalar define` takes an expression and nothing else: an `if` or a
+      // comma outside parentheses and quotes is r(101) "if not allowed" /
+      // "options not allowed" (vs-stata bank `scalar x = 5 if foreign`,
+      // `scalar x = 5, zznotanoption`).
+      {
+        int depth = 0;
+        bool inStr = false;
+        for (size_t i = 0; i < expr.size(); ++i) {
+          const char c = expr[i];
+          if (c == '"') inStr = !inStr;
+          if (inStr) continue;
+          if (c == '(' || c == '[') ++depth;
+          else if ((c == ')' || c == ']') && depth > 0) --depth;
+          else if (depth == 0 && c == ',') {
+            if (errorOut != nullptr) {
+              errorOut->rc = "101";
+              errorOut->message = "options not allowed";
+            }
+            return true;
+          } else if (depth == 0 && i > 0 && (expr[i - 1] == ' ' || expr[i - 1] == '\t') &&
+                     expr.compare(i, 2, "if") == 0 &&
+                     (i + 2 == expr.size() || expr[i + 2] == ' ' || expr[i + 2] == '\t' ||
+                      expr[i + 2] == '(')) {
+            if (errorOut != nullptr) {
+              errorOut->rc = "101";
+              errorOut->message = "if not allowed";
+            }
+            return true;
+          }
+        }
+      }
       {
         // BUG-456: an unknown coefficient name is r(111) here as everywhere
         // else (Stata V4: `scalar s = _b[nosuch]` -> r(111)); the scalar stays
@@ -1644,6 +1993,16 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
       std::regex_match(stripped, m, reIncPre)) {
     std::string incOp = m.str(1);
     std::string incName = m.str(2);
+    // An undefined (or empty) local is r(111) `local macro `NAME' not found`
+    // (StataBE 19.5 `local ++undef`, vs-stata bank 5615db6bb8ae1159); it
+    // counted from 0.
+    if (const std::string* cur = session.locals.find(incName); cur == nullptr || cur->empty()) {
+      if (errorOut != nullptr) {
+        errorOut->rc = "111";
+        errorOut->message = "local macro `" + incName + "' not found";
+      }
+      return true;
+    }
     double val = 0.0;
     auto f = pythonFloat(session.locals.get(incName, "0"));
     if (f) val = *f;
@@ -1661,6 +2020,16 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
   if (matchMacroDef(stripped, "local", 5, mdName, mdRest)) {
     std::string name = mdName;
     std::string rhs = strip(mdRest);
+    // A local is stored as `_NAME`, a name of at most 32 characters: a
+    // 32-character local name is r(198) "_NAME invalid name" (vs-stata bank
+    // 9e0d035db13bd7eb), as for the extended functions (macroNameError).
+    if (const std::string bad = macroNameError(false, name); !bad.empty()) {
+      if (errorOut != nullptr) {
+        errorOut->rc = "198";
+        errorOut->message = bad;
+      }
+      return true;
+    }
 
     // Compound double-quote RHS: `local x `"...."'` -- ONE span from the first
     // `" to the end (EM3b: nesting-aware, so `"a"' `"b"' is not one span). EM3a:
@@ -1795,6 +2164,15 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
   if (matchMacroDef(stripped, "global", 6, mdName, mdRest)) {
     std::string name = mdName;
     std::string rhs = strip(mdRest);
+    // A global is a Stata name of at most 32 characters: 33 is r(198) "NAME
+    // invalid name" (vs-stata bank 73e35b1d3f492636).
+    if (const std::string bad = macroNameError(true, name); !bad.empty()) {
+      if (errorOut != nullptr) {
+        errorOut->rc = "198";
+        errorOut->message = bad;
+      }
+      return true;
+    }
 
     // BUG-247: extended macro function form `global NAME : <func> ...` — the
     // `local` twin's dispatch, which this branch never had: every colon form

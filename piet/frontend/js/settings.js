@@ -6,6 +6,15 @@ import { setGridMemoryBudgetMb } from './grid.js';
 import { RECENT_KEY } from './recent-files.js';
 import { SPLIT_KEY } from './layout.js';
 
+// The Settings boxes for tabulate's table-size limits and the native settings
+// field each one edits.
+const TABLE_LIMIT_FIELDS = [
+  ['set-tab-oneway-rows', 'tab_oneway_max_rows'],
+  ['set-tab-twoway-rows', 'tab_twoway_max_rows'],
+  ['set-tab-twoway-cols', 'tab_twoway_max_cols'],
+  ['set-tab-summarize-cells', 'tab_summarize_max_cells'],
+];
+
 export function createSettingsController({ getClient, layout, flashStatus }) {
   let _settingsCache = null;
   let _uiStatePersistTimer = null;
@@ -197,6 +206,24 @@ export function createSettingsController({ getClient, layout, flashStatus }) {
     const followDo = document.getElementById('set-follow-do-folder');
     if (followDo) followDo.checked = !s || s.follow_do_file_folder !== false;
 
+    // Table-size limits: 0 (or an absent field) is Stata's limit, shown as an
+    // empty box whose placeholder names that limit. Each box's ceiling is native's.
+    const ceilings = (s && s.table_limit_ceilings) || {};
+    for (const [id, key] of TABLE_LIMIT_FIELDS) {
+      const box = document.getElementById(id);
+      if (!box) continue;
+      const v = s ? Number(s[key]) : 0;
+      box.value = v > 0 ? String(v) : '';
+      const stata = s && s.table_limit_defaults ? Number(s.table_limit_defaults[key]) : 0;
+      if (stata > 0) box.placeholder = String(stata);
+      if (Number(ceilings[key]) > 0) box.max = String(ceilings[key]);
+    }
+    for (const [id, key] of [['set-tab-cell-ceiling', 'tab_twoway_max_rows'],
+      ['set-tab-summarize-ceiling', 'tab_summarize_max_cells']]) {
+      const el = document.getElementById(id);
+      if (el && Number(ceilings[key]) > 0) el.textContent = Number(ceilings[key]).toLocaleString('en-US');
+    }
+
     const fsSel = document.getElementById('set-fontsize');
     if (fsSel) fsSel.value = localStorage.getItem('piet-font-size') || 'medium';
     const pa = document.getElementById('set-paste-autorun');
@@ -224,13 +251,32 @@ export function createSettingsController({ getClient, layout, flashStatus }) {
       extcompat: !!document.getElementById('set-extcompat')?.checked,
       follow_do_file_folder: !!document.getElementById('set-follow-do-folder')?.checked,
     };
+    // Table-size limits: an empty box is 0 ("Stata's limit"); anything else must be
+    // a whole number from 1 to the ceiling. A box that holds something else (text
+    // the number box could not read, a fraction, a number out of range) stops the
+    // save with a message, so a typo never silently resets or shrinks a limit.
+    for (const [id, key] of TABLE_LIMIT_FIELDS) {
+      const box = document.getElementById(id);
+      if (!box) continue;
+      const text = String(box.value ?? '').trim();
+      const unreadable = !!(box.validity && box.validity.badInput);
+      if (text === '' && !unreadable) { partial[key] = 0; continue; }
+      const max = Number(box.max) > 0 ? Number(box.max) : 1000000;
+      if (unreadable || !/^[0-9]+$/.test(text) || !(Number(text) >= 1 && Number(text) <= max)) {
+        if (status) status.textContent = '⚠ Not saved. Table size limits: type a whole number from 1 to '
+          + `${max.toLocaleString('en-US')}, or leave the box empty for Stata's limit.`;
+        box.focus();
+        return;
+      }
+      partial[key] = Number(text);
+    }
     try {
       await getClient().setSettings(partial);
       // N1: keep the save-time cache current so a save right after Apply (no
       // reopen of Settings in between) sees the new export folder immediately.
       _settingsCache = { ..._settingsCache, ...partial };
-      if (status) status.textContent = 'Saved. Compute cores apply to the next command; '
-        + 'scratch directory & working directory apply on restart.';
+      if (status) status.textContent = 'Saved. Compute cores and table size limits apply to the next '
+        + 'command; scratch directory & working directory apply on restart.';
     } catch (err) {
       if (status) status.textContent = '⚠ Could not save settings: '
         + String(err && err.message ? err.message : err);

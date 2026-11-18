@@ -178,6 +178,17 @@ int run_zi(const std::vector<std::string>& a, bool nb) {
     // Wald χ² on the count-equation SLOPES only (the intercept is the last design
     // column; the inflation and lnα rows are not part of the model test).
     add_wald(out, V, np, r.beta, g.k - 1);
+    // With the default VCE Stata's model test is the likelihood-ratio statistic
+    // against the constant-only fit (both equations' constants): bank f3102717
+    // `zip ten age grade, inflate(_cons)` LR chi2(2) 130.93315817298753 =
+    // 2(e(ll) - e(ll_0)) = 2(-8102.7752646 + 8168.2418437), where the Wald said 131.30.
+    if (vce == "iid" && g.k - 1 > 0 && std::isfinite(r.ll_const) && r.ll_const != 0.0) {
+        const double lr = 2.0 * (r.ll - r.ll_const);
+        out["chi2"] = lr;
+        out["df_chi2"] = g.k - 1;
+        out["p_chi2"] = chi2_pvalue(lr, static_cast<double>(g.k - 1));
+        out["chi2type"] = "LR";
+    }
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
     if (level_set) out["level"] = level;
     add_warnings(out, g.warnings);
@@ -191,10 +202,74 @@ int cmd_zip(const std::vector<std::string>& a) { return run_zi(a, false); }
 
 int cmd_zinb(const std::vector<std::string>& a) { return run_zi(a, true); }
 
-// fracreg — fractional response quasi-MLE (Stata `fracreg logit y x…`). The
-// estimator IS logit's IRLS: the Bernoulli quasi-likelihood is maximized by the
-// same normal equations for any y in [0,1], and its bread (the weighted observed
-// information) is already what the sandwich needs.
+// The Bernoulli quasi-log-likelihood of `fracreg logit` for y in [0,1]:
+// sum_i y_i eta_i - ln(1 + exp(eta_i)), score y_i - p_i, curvature p_i (1 - p_i).
+class FracLogitObjective final : public MlObjective {
+public:
+    FracLogitObjective(const double* X, int64_t n, int k, const double* y)
+        : X_(X), n_(n), k_(k), y_(y), eta_(static_cast<size_t>(n)), s_(static_cast<size_t>(n)),
+          scaled_(static_cast<size_t>(n) * static_cast<size_t>(k)) {}
+    double loglik(const std::vector<double>& b) override {
+        index(b);
+        double ll = 0.0;
+        for (int64_t i = 0; i < n_; ++i) ll += term(eta_[static_cast<size_t>(i)], y_[i]);
+        return ll;
+    }
+    double evaluate(const std::vector<double>& b, std::vector<double>& g, std::vector<double>& A) override {
+        index(b);
+        double ll = 0.0;
+        for (int64_t i = 0; i < n_; ++i) {
+            const size_t ii = static_cast<size_t>(i);
+            const double e = eta_[ii];
+            ll += term(e, y_[i]);
+            const double p = 1.0 / (1.0 + std::exp(-e));
+            s_[ii] = y_[i] - p;
+            const double root = std::sqrt(std::max(0.0, p * (1.0 - p)));
+            for (int c = 0; c < k_; ++c)
+                scaled_[static_cast<size_t>(c) * static_cast<size_t>(n_) + ii] =
+                    X_[static_cast<size_t>(c) * static_cast<size_t>(n_) + ii] * root;
+        }
+        g.assign(static_cast<size_t>(k_), 0.0);
+        A.assign(static_cast<size_t>(k_) * static_cast<size_t>(k_), 0.0);
+        la::xtv(X_, n_, k_, s_.data(), g.data());
+        la::xtx(scaled_.data(), n_, k_, A.data());
+        return ll;
+    }
+
+private:
+    void index(const std::vector<double>& b) { la::mat_vec(X_, n_, k_, b.data(), eta_.data()); }
+    // y eta - ln(1 + e^eta), without overflow for a large |eta|
+    static double term(double e, double y) {
+        const double soft = e > 0 ? e + std::log1p(std::exp(-e)) : std::log1p(std::exp(e));
+        return y * e - soft;
+    }
+    const double* X_;
+    int64_t n_;
+    int k_;
+    const double* y_;
+    std::vector<double> eta_, s_, scaled_;
+};
+
+// Stata's starting point for fracreg: the linear regression of y on the design.
+std::vector<double> frac_ols_start(const double* X, int64_t n, int k, const double* y) {
+    std::vector<double> A(static_cast<size_t>(k) * static_cast<size_t>(k), 0.0), b(static_cast<size_t>(k), 0.0),
+        xy(static_cast<size_t>(k), 0.0);
+    la::xtx(X, n, k, A.data());
+    la::xtv(X, n, k, y, xy.data());
+    if (la::spd_inverse(A.data(), k) != 0) return {};
+    for (int r = 0; r < k; ++r)
+        for (int c = 0; c < k; ++c)
+            b[static_cast<size_t>(r)] += A[static_cast<size_t>(r) * static_cast<size_t>(k) + static_cast<size_t>(c)] *
+                                         xy[static_cast<size_t>(c)];
+    return b;
+}
+
+// fracreg — fractional response quasi-MLE (Stata `fracreg logit y x…`): ml's
+// modified Newton-Raphson on the Bernoulli quasi-likelihood from the linear
+// regression's coefficients, stopping where ml's documented rule stops (StataBE
+// 19.5 bank 2bef1615 `fracreg logit fr weight length`: e(ic) 3, e(ll)
+// -44.450904071827146; e(ll_0) is the constant-only fit's, started at mean(y) the
+// same way). The bread of the sandwich is the inverse of -H at the final iterate.
 int cmd_fracreg(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), y = opt(a, "--y"), xcsv = opt(a, "--x");
     std::string link = opt(a, "--link", "logit");
@@ -239,13 +314,26 @@ int cmd_fracreg(const std::vector<std::string>& a) {
                               "fracreg: outcome '" + y + "' must satisfy 0 <= y <= 1 (found " +
                               std::to_string(v) + ")");
 
-    LogitResult r = logit_fit(g.X.data(), g.n, g.k, g.y.data(), 100, 1e-14, nullptr);
-    if (r.separated) { std::fprintf(stderr, "fracreg: quasi-MLE failed (singular information).\n"); return 1; }
+    MlMaxOptions mo;
+    if (has(a, "--iterate")) mo.maxiter = std::stoi(opt(a, "--iterate"));
+    std::vector<double> start = frac_ols_start(g.X.data(), g.n, g.k, g.y.data());
+    if (start.empty()) { std::fprintf(stderr, "fracreg: quasi-MLE failed (singular information).\n"); return 1; }
+    FracLogitObjective obj(g.X.data(), g.n, g.k, g.y.data());
+    const MlPath path = ml_newton_path(obj, start, mo);
+    bool finite = !path.failed && std::isfinite(path.ll) && path.inv_curvature.size() ==
+                  static_cast<size_t>(g.k) * static_cast<size_t>(g.k);
+    for (double v : path.b) finite = finite && std::isfinite(v);
+    if (!finite) { std::fprintf(stderr, "fracreg: quasi-MLE failed (singular information).\n"); return 1; }
+    struct { std::vector<double> beta, bread; } r{path.b, path.inv_curvature};
 
-    // Sandwich: score e_i = y_i - p_i (the quasi-likelihood's), bread = r.bread.
-    std::vector<double> e(static_cast<size_t>(g.n));
-    for (int64_t i = 0; i < g.n; ++i)
-        e[static_cast<size_t>(i)] = g.y[static_cast<size_t>(i)] - r.p[static_cast<size_t>(i)];
+    // Sandwich: score e_i = y_i - p_i (the quasi-likelihood's), bread = inv(-H).
+    std::vector<double> eta(static_cast<size_t>(g.n));
+    la::mat_vec(g.X.data(), g.n, g.k, r.beta.data(), eta.data());
+    std::vector<double> e(static_cast<size_t>(g.n)), pr(static_cast<size_t>(g.n));
+    for (int64_t i = 0; i < g.n; ++i) {
+        pr[static_cast<size_t>(i)] = 1.0 / (1.0 + std::exp(-eta[static_cast<size_t>(i)]));
+        e[static_cast<size_t>(i)] = g.y[static_cast<size_t>(i)] - pr[static_cast<size_t>(i)];
+    }
     std::vector<double> meat(static_cast<size_t>(g.k) * g.k, 0.0);
     double factor;
     int n_clusters = 0;
@@ -279,12 +367,35 @@ int cmd_fracreg(const std::vector<std::string>& a) {
                          {"z", z}, {"p", (se > 0) ? z_pvalue(z) : 1.0},
                          {"ci_lo", b - zc * se}, {"ci_hi", b + zc * se}});
     }
-    double ll = frac::loglik(r.p.data(), g.y.data(), g.n);
-    double ll0 = frac::null_loglik(g.y.data(), g.n);
-    json out = {{"estimator", "fracreg"}, {"link", "logit"}, {"vce", vce},
+    const double ll = path.ll;
+    // e(ll_0): the constant-only quasi-likelihood fit, under the same maximize options
+    double ll0 = 0.0;
+    {
+        std::vector<double> ones(static_cast<size_t>(g.n), 1.0);
+        double ybar = 0.0;
+        for (double v : g.y) ybar += v;
+        ybar /= static_cast<double>(g.n);
+        FracLogitObjective o0(ones.data(), g.n, 1, g.y.data());
+        const MlPath p0 = ml_newton_path(o0, std::vector<double>{ybar}, mo);
+        ll0 = (!p0.failed && std::isfinite(p0.ll)) ? p0.ll : frac::null_loglik(g.y.data(), g.n);
+        if (ybar <= 0.0 || ybar >= 1.0) ll0 = 0.0;
+    }
+    json out = {{"estimator", "fracreg"}, {"depvar", y}, {"link", "logit"}, {"vce", vce},
                 {"n_obs", g.n}, {"n_dropped_missing", g.n_dropped},
-                {"converged", r.converged}, {"iters", r.iters},
+                {"converged", path.converged}, {"iters", path.ic},
                 {"coefs", coefs}, {"ll", ll}};
+    // ml's record: e(ic), e(ilog), e(gradient) and e(V_modelbased) (inverse of -H)
+    out["ic"] = path.ic;
+    out["ilog"] = path.ilog;
+    {
+        json gv = json::array();
+        for (double v : path.gradient) gv.push_back(std::isfinite(v) ? json(v) : json(nullptr));
+        out["e_gradient"] = {{"names", g.names}, {"values", gv}};
+        json tmp;
+        add_e_v(tmp, g.names, path.inv_curvature);
+        out["e_Vmb"] = std::move(tmp["e_V"]);
+    }
+    if (has(a, "--emit-v")) add_e_v(out, g.names, V);
     if (ll0 != 0.0) {
         out["ll_0"] = ll0;
         out["r2_pseudo"] = 1.0 - ll / ll0;

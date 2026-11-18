@@ -65,6 +65,16 @@ namespace piet::handlers {
 using ojson = nlohmann::ordered_json;
 using namespace statcmd_detail;
 
+// Option vocabularies, registered so the dispatcher canonicalizes an
+// abbreviation (`sktest x, noa`, `spearman a b c, mat`) to the name these
+// handlers read; an unregistered net accepted the abbreviation and then missed
+// it in its raw-key comparison, silently running the default.
+namespace {
+const eval::OptVocab& kVocabSktest = eval::registerOptVocab({"sktest"}, {{"noadjust"}, {}});
+const eval::OptVocab& kVocabSpearman = eval::registerOptVocab(
+    {"spearman"}, {{"stats", "print", "star", "matrix", "pw", "bonferroni", "sidak"}, {"exact"}});
+}  // namespace
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -147,6 +157,12 @@ struct SpearmanPair {
   size_t n = 0;
   double rho = std::numeric_limits<double>::quiet_NaN();
   double p = std::numeric_limits<double>::quiet_NaN(), p_l = p, p_u = p;
+  // spearman.ado's hidden/historical returns: the permutation moments' skewness
+  // and kurtosis (only when Moments ran, N >= 4), the old t-based p, and which
+  // distribution gave r(p).
+  bool moments = false;
+  double skewness = p, kurtosis = p, p_tdist = p;
+  std::string dist;
 };
 
 // One pair over the rows where both are present (Spearman2: the ranks are taken
@@ -164,85 +180,185 @@ SpearmanPair spearmanPair(const std::vector<double>& xs, const std::vector<doubl
   if (n < 3) return out;
   const std::vector<double> rx = midranks(x), ry = midranks(y);
   const double nn = static_cast<double>(n);
-  double mx = 0.0, my = 0.0;
-  for (size_t i = 0; i < n; ++i) {
-    mx += rx[i];
-    my += ry[i];
+
+  // rho: correlate on the ranks (centred at their exact mean).
+  double rho;
+  {
+    double mx = 0.0, my = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      mx += rx[i];
+      my += ry[i];
+    }
+    mx /= nn;
+    my /= nn;
+    double sxx = 0.0, syy = 0.0, sxy = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      const double a = rx[i] - mx, b = ry[i] - my;
+      sxx += a * a;
+      syy += b * b;
+      sxy += a * b;
+    }
+    if (sxx == 0.0 || syy == 0.0) {
+      // A constant variable: correlate's r(rho) is missing, which spearman.ado's
+      // `rho >= 1` test takes as 1 (a missing value is above every number): rho 1,
+      // p_tdist 0, the moments missing (r(kurtosis) r(skewness) `.`) and the p-value
+      // the normal approximation on sqrt(N-1) (vs-stata bank f761c0c5 `spearman x y`
+      // with x constant on 4 rows: rho 1, p .0832645, dist normal).
+      out.rho = 1.0;
+      out.p_tdist = 0.0;
+      if (n >= 4) {
+        out.moments = true;
+        out.kurtosis = out.skewness = std::numeric_limits<double>::quiet_NaN();
+      }
+      const double z = std::sqrt(nn - 1.0);
+      out.p_l = normalCdf(z);
+      out.p_u = normalCdf(-z);
+      out.p = std::min(1.0, 2.0 * std::min(out.p_l, out.p_u));
+      out.dist = "normal";
+      return out;
+    }
+    rho = sxy / std::sqrt(sxx * syy);
   }
-  mx /= nn;
-  my /= nn;
-
-  std::vector<double> X(n), Y(n);
-  for (size_t i = 0; i < n; ++i) {
-    X[i] = rx[i] - mx;
-    Y[i] = ry[i] - my;
+  // Spearman2's old t-distribution p (r(p_tdist)); a |rho| of 1 is clamped.
+  if (rho >= 1.0) {
+    rho = 1.0;
+    out.p_tdist = 0.0;
+  } else if (rho <= -1.0) {
+    rho = -1.0;
+    out.p_tdist = 0.0;
+  } else {
+    const double df = nn - 2.0;
+    const double t = std::fabs(rho) * (std::sqrt(df) / std::sqrt(1.0 - std::pow(rho, 2.0)));
+    out.p_tdist = std::min(1.0, cecon::t_twosided_pvalue(t, df));
   }
-  auto powsum = [&](const std::vector<double>& v, int k) {
-    double s = 0.0;
-    for (double a : v) s += std::pow(a, k);
-    return s;
-  };
-  const double S2 = powsum(X, 2), S3 = powsum(X, 3), S4 = powsum(X, 4);
-  const double T2 = powsum(Y, 2), T3 = powsum(Y, 3), T4 = powsum(Y, 4);
-  if (S2 == 0.0 || T2 == 0.0) return out;  // a constant variable: no correlation
 
-  double Tobs = 0.0;
-  for (size_t i = 0; i < n; ++i) Tobs += X[i] * Y[i];
-  const double rho = Tobs / std::sqrt(S2 * T2);
-
-  const double ET2 = S2 * T2 / (nn - 1.0);
-  const double e3x = S3 / 3.0, e3y = T3 / 3.0;
-  const double ET3 = S3 * T3 / nn + 3.0 * S3 * T3 / (nn * (nn - 1.0)) +
-                     36.0 * e3x * e3y / (nn * (nn - 1.0) * (nn - 2.0));
-  const double C2x = (S2 * S2 - S4) / 2.0, C2y = (T2 * T2 - T4) / 2.0;
-  const double Dx = S4 - S2 * S2 / 2.0, Dy = T4 - T2 * T2 / 2.0;
-  const double e4x = (S2 * S2 - 2.0 * S4) / 8.0, e4y = (T2 * T2 - 2.0 * T4) / 8.0;
-  const double ET4 = S4 * T4 / nn + 4.0 * S4 * T4 / (nn * (nn - 1.0)) +
-                     12.0 * C2x * C2y / (nn * (nn - 1.0)) +
-                     24.0 * Dx * Dy / (nn * (nn - 1.0) * (nn - 2.0)) +
-                     576.0 * e4x * e4y / (nn * (nn - 1.0) * (nn - 2.0) * (nn - 3.0));
-
-  const double v = ET2;
-  const double g3 = ET3 / std::pow(v, 1.5);
-  const double g4 = ET4 / (v * v);
-  const double rr = 6.0 * (g4 - g3 * g3 - 1.0) / (6.0 + 3.0 * g3 * g3 - 2.0 * g4);
-  const double d = 1.0 - 24.0 * (rr + 1.0) /
-                             ((rr + 2.0) * (rr + 3.0) * g4 - 3.0 * (rr - 6.0) * (rr + 1.0));
-
-  // CLAMP before the root. When both variables are tie-free the centred ranks
-  // are symmetric, so S3 = T3 = 0 exactly, g3 = 0, and the true d is 0 -- but in
-  // double precision it lands on the wrong side of zero about half the time.
-  // Measured over n = 5..500 with tie-free ranks: d < 0 for 239 of 496 sample
-  // sizes, first at n = 13 (-6.66e-16). std::sqrt of that is NaN, and the NaN
-  // propagates through alpha, beta, l, u, s and p, so the command would return a
-  // MISSING p-value on ordinary continuous data. At d = 0 the clamp correctly
-  // yields alpha = beta = r/2, the symmetric beta.
-  const double dc = (d > 0.0) ? d : 0.0;
-  const double a = rr * (1.0 - std::sqrt(dc)) / 2.0;
-  const double b = rr * (1.0 + std::sqrt(dc)) / 2.0;
-  const double alpha = (g3 > 0.0) ? a : b;
-  const double beta = (g3 > 0.0) ? b : a;
-
+  // The p-value is spearman.ado's (Spearman2 -> Moments -> BetaFit), computed
+  // in ITS order of operations: the four permutation moments of T = sum x*y come
+  // from running sums over each variable centred at the INTEGER part of its mean
+  // (Center: "integers better for recursive formulas"), and the uncentred offset
+  // is removed only at the end (m3 - 3 m1 m2 - m1^3, ...). That subtraction is
+  // where Stata's digits are decided: an algebraically equal closed form on
+  // exactly centred ranks lands 1e-8..1e-6 (relative) away from the p it posts.
   double p = std::numeric_limits<double>::quiet_NaN();
   double p_l = p, p_u = p;
-  if (alpha > 0.0 && beta > 0.0) {
-    const double sc = std::sqrt(v * (alpha + beta + 1.0) / (alpha * beta));
-    const double l = -alpha * sc, u = beta * sc;
-    if (u > l) {
-      const double s = (Tobs - l) / (u - l);
-      // TWO functions, not one algebraic identity. The manual calls ibeta and
-      // ibetatail separately and the difference is not cosmetic: for strongly
-      // positive rho, `1 - p_l` annihilates the answer. Measured at n = 74 with
-      // tie-free ranks and rho = 0.9999, the subtraction returns exactly 0 where
-      // the upper tail is 6.8136e-32. Both display as 0.0000, so a check value
-      // cannot see it -- but r(p_u) is a published return and a golden at
-      // rtol 1e-9 diverges once the tail drops below about 1e-7.
-      p_l = cecon::betai(alpha, beta, s);
-      p_u = cecon::betaitail(alpha, beta, s);
-      const double pm = std::min(p_l, p_u);
-      p = std::min(1.0, 2.0 * pm);
+  bool beta = false;
+  if (n >= 4) {
+    struct Sums {
+      double N, mean, sd2, sumx3, sumx2x, sumxxx, sumx4, sumx3x, sumx2x2, sumx2xx, sumxxxx;
+    };
+    // Center + Recurse for one variable: v holds the centred values.
+    auto centre = [&](const std::vector<double>& r) {
+      double sum = 0.0;
+      for (double a : r) sum += a;
+      const double mean = sum / nn;
+      const double c = std::fabs(mean) < 1.0 ? mean : std::trunc(mean);
+      std::vector<double> v(r.size());
+      for (size_t i = 0; i < r.size(); ++i) v[i] = r[i] - c;
+      return v;
+    };
+    auto recurse = [&](std::vector<double> v) {
+      std::sort(v.begin(), v.end());
+      Sums S{};
+      S.N = nn;
+      double sum = 0.0;
+      for (double a : v) sum += a;
+      S.mean = sum / nn;
+      double ss = 0.0;
+      for (double a : v) ss += (a - S.mean) * (a - S.mean);
+      S.sd2 = ss / (nn - 1.0);
+      double sx = 0, sx2 = 0, sx3 = 0, sx4 = 0;             // running sum(x^k), through k-1
+      double sxx = 0, sx2x = 0, sxxx = 0, sx3x = 0, sx2x2 = 0, sx2xx = 0, sxxxx = 0;
+      for (size_t k = 0; k < n; ++k) {
+        const double a = v[k];
+        if (k >= 1) {
+          // each recurrence reads the PREVIOUS row's running sums
+          const double nsxxxx = k >= 3 ? sxxxx + a * sxxx : 0.0;
+          const double nsx2xx = k >= 2 ? sx2xx + a * (sx2x + a * sxx) : 0.0;
+          const double nsxxx = k >= 2 ? sxxx + a * sxx : 0.0;
+          const double nsx2x2 = sx2x2 + (a * a) * sx2;
+          const double nsx3x = sx3x + a * (sx3 + (a * a) * sx);
+          const double nsx2x = sx2x + a * (sx2 + a * sx);
+          const double nsxx = sxx + a * sx;
+          sxxxx = nsxxxx; sx2xx = nsx2xx; sxxx = nsxxx; sx2x2 = nsx2x2;
+          sx3x = nsx3x; sx2x = nsx2x; sxx = nsxx;
+        }
+        sx += a;
+        sx2 += a * a;
+        sx3 += a * a * a;
+        sx4 += (a * a) * (a * a);
+      }
+      S.sumx3 = sx3; S.sumx4 = sx4; S.sumx2x = sx2x; S.sumxxx = sxxx;
+      S.sumx3x = sx3x; S.sumx2x2 = sx2x2; S.sumx2xx = sx2xx; S.sumxxxx = sxxxx;
+      return S;
+    };
+    const std::vector<double> X = centre(rx), Y = centre(ry);
+    double stat = 0.0;
+    for (size_t i = 0; i < n; ++i) stat += X[i] * Y[i];
+    const Sums a = recurse(X), b = recurse(Y);
+    // Every expression below is spearman.ado's, grouped as STATA evaluates it:
+    // `/` binds before `*`, and `-` before `+` ([U] 13.2.5 Order of evaluation),
+    // so `6*(a)/(b)` is 6*((a)/(b)) and `36*s*t/(N-2)` is (36*s)*(t/(N-2)). The
+    // beta fit's d = 1 - 24(r+1)/(...) cancels to a few ulps, and its square
+    // root moves alpha and beta by ~1e-8: grouped as C groups it, r(p) is off by
+    // up to 5e-7 (relative) on ordinary data; grouped as Stata does, it is
+    // Stata's to the last digits (auto: mpg/price, its foreign==0 subsample,
+    // and the three pairs of `spearman mpg price weight rep78`).
+    const auto sq = [](double v) { return std::pow(v, 2.0); };  // Stata's x^2
+    const double m1 = (nn * a.mean) * b.mean;
+    const double m2 = ((nn - 1.0) * a.sd2) * b.sd2;
+    const double b3 = (3.0 * a.sumx2x) * b.sumx2x + (36.0 * a.sumxxx) * (b.sumxxx / (nn - 2.0));
+    const double m3 =
+        ((a.sumx3 * b.sumx3 + b3 / (nn - 1.0)) / nn - (3.0 * m1) * m2) - std::pow(m1, 3.0);
+    const double b4inner =
+        (24.0 * a.sumx2xx) * b.sumx2xx + (576.0 * a.sumxxxx) * (b.sumxxxx / (nn - 3.0));
+    const double b4 =
+        ((4.0 * a.sumx3x) * b.sumx3x + (12.0 * a.sumx2x2) * b.sumx2x2) + b4inner / (nn - 2.0);
+    const double m4 = ((((a.sumx4 * b.sumx4 + b4 / (nn - 1.0)) / nn) - (4.0 * m1) * m3) -
+                       (6.0 * sq(m1)) * m2) -
+                      std::pow(m1, 4.0);
+    const double g4 = m4 / sq(m2);
+    const double g3 = m3 / std::pow(std::sqrt(m2), 3.0);
+    out.moments = true;
+    out.kurtosis = g4;
+    out.skewness = g3;
+
+    // BetaFit: the four-parameter beta with these moments.
+    const double rr = 6.0 * ((g4 - sq(g3) - 1.0) / (6.0 + (3.0 * sq(g3) - 2.0 * g4)));
+    const double den = ((rr + 2.0) * (rr + 3.0)) * g4 - (3.0 * (rr - 6.0)) * (rr + 1.0);
+    double d = 1.0 - 24.0 * ((rr + 1.0) / den);
+    // d < 0: the symmetric beta (tie-free ranks give g3 = 0 and a d that lands a
+    // rounding error either side of 0).
+    if (d < 0.0) d = 0.0;
+    d = std::sqrt(d);
+    const double alpha = g3 > 0.0 ? (rr / 2.0) * (1.0 - d) : (rr / 2.0) * (1.0 + d);
+    const double bet = g3 > 0.0 ? (rr / 2.0) * (1.0 + d) : (rr / 2.0) * (1.0 - d);
+    if (alpha > 0.0 && bet > 0.0) {
+      const double e = std::sqrt(m2 * ((alpha + bet + 1.0) / (alpha * bet)));
+      const double lower = m1 - alpha * e, upper = m1 + bet * e;
+      if (lower < upper && !std::isnan(lower) && !std::isnan(upper)) {
+        const double sc = (stat - lower) / (upper - lower);
+        // TWO functions, not one algebraic identity. The manual calls ibeta and
+        // ibetatail separately and the difference is not cosmetic: for strongly
+        // positive rho, `1 - p_l` annihilates the answer. Measured at n = 74 with
+        // tie-free ranks and rho = 0.9999, the subtraction returns exactly 0 where
+        // the upper tail is 6.8136e-32. Both display as 0.0000, so a check value
+        // cannot see it -- but r(p_u) is a published return and a golden at
+        // rtol 1e-9 diverges once the tail drops below about 1e-7.
+        p_l = cecon::betai(alpha, bet, sc);
+        p_u = cecon::betaitail(alpha, bet, sc);
+        beta = true;
+      }
     }
   }
+  if (!beta) {
+    // No beta fit (fewer than 4 observations, or moments it cannot match): the
+    // normal approximation on sqrt(N-1) rho.
+    const double z = std::sqrt(nn - 1.0) * rho;
+    p_l = normalCdf(z);
+    p_u = normalCdf(-z);
+  }
+  p = std::min(1.0, 2.0 * std::min(p_l, p_u));
+  out.dist = beta ? "beta" : "normal";
 
   out.rho = rho;
   out.p = p;
@@ -265,12 +381,52 @@ ojson runSpearman(const eval::ParsedCommand& parsed, SessionState& session) {
   // stats()/print()/star() choose what the table prints; matrix forces the
   // matrix form. exact, pw, bonferroni and sidak change the numbers and are not
   // served here: named refusals.
-  static const std::unordered_set<std::string> kKnown = {"stats", "print", "star", "matrix"};
-  static const std::unordered_set<std::string> kUnimpl = {"exact", "pw", "bonferroni", "sidak"};
+  const std::unordered_set<std::string>& kKnown = kVocabSpearman.known;
+  const std::unordered_set<std::string>& kUnimpl = kVocabSpearman.unimplemented;
   if (auto e = eval::rejectUnknownOptions(parsed.opts, kKnown, kUnimpl)) return ojson(*e);
-  bool matrixForm = false;
+  bool matrixForm = false, pw = false, bonferroni = false, sidak = false;
+  bool showRho = false, showObs = false, showP = false;
+  double printLvl = -1, starLvl = -1;
   for (const auto& [k, v] : parsed.opts) {
+    if (k == "stats" && !v.isBool) {
+      std::istringstream iss(v.strValue);
+      std::string w;
+      while (iss >> w) {
+        showRho = showRho || w == "rho";
+        showObs = showObs || w == "obs";
+        showP = showP || w == "p";
+      }
+    }
+    if ((k == "print" || k == "star") && !v.isBool) {
+      char* end = nullptr;
+      const double d = std::strtod(strutil::trim(v.strValue).c_str(), &end);
+      (k == "print" ? printLvl : starLvl) = d;
+    }
     if (k == "matrix") matrixForm = true;
+    if (k == "pw") pw = true;
+    if (k == "bonferroni") bonferroni = true;
+    if (k == "sidak") sidak = true;
+    // print() and star() are `numlist min=1 max=1 >0 <1` (spearman's syntax):
+    // a word that is no number is r(121) "star() invalid -- invalid number"
+    // (vs-stata bank 23597affda830e60 `st(rho obs p)`; `st(.01)` runs).
+    if ((k == "star" || k == "print") && !v.isBool) {
+      std::istringstream iss(v.strValue);
+      std::string w;
+      size_t n = 0;
+      auto bad = [&](const std::string& why, const char* rc) {
+        return ojson(eval::errorBlock("syntax_error", k + "() invalid -- " + why, std::nullopt,
+                                      std::nullopt, std::nullopt, std::string(rc)));
+      };
+      while (iss >> w) {
+        char* end = nullptr;
+        const double d = std::strtod(w.c_str(), &end);
+        if (end == nullptr || *end != '\0') return bad("invalid number", "r(121)");
+        if (!(d > 0 && d < 1)) return bad("invalid numlist has elements outside of allowed range", "r(125)");
+        ++n;
+      }
+      if (n == 0) return bad("invalid numlist has too few elements", "r(122)");
+      if (n > 1) return bad("invalid numlist has too many elements", "r(123)");
+    }
     if (k == "stats" && !v.isBool) {
       std::istringstream iss(v.strValue);
       std::string w;
@@ -282,6 +438,9 @@ ojson runSpearman(const eval::ParsedCommand& parsed, SessionState& session) {
                                         std::string("r(198)")));
     }
   }
+  if (bonferroni && sidak)
+    return ojson(eval::errorBlock("syntax_error", "options bonferroni and sidak may not be combined",
+                                  std::nullopt, std::nullopt, std::nullopt, std::string("r(198)")));
   if (parsed.varlist.size() < 2) {
     return ojson(eval::errorBlock("syntax_error", "too few variables specified", std::nullopt,
                                   std::nullopt, std::nullopt, std::string("r(102)")));
@@ -307,7 +466,9 @@ ojson runSpearman(const eval::ParsedCommand& parsed, SessionState& session) {
     if (!numericColumn(ds, vars[j], &cols[j], &err)) return aerError("spearman: " + err);
   }
   if (k > 2) matrixForm = true;
-  if (matrixForm) {
+  // pw (more than two variables): each pair over its own complete rows, ranked
+  // there (spearman.ado's PairwiseRanks); otherwise one listwise sample.
+  if (matrixForm && !(pw && k > 2)) {
     // marksample: the listwise sample over every variable.
     const size_t nr = cols[0].size();
     for (size_t i = 0; i < nr; ++i) {
@@ -334,6 +495,17 @@ ojson runSpearman(const eval::ParsedCommand& parsed, SessionState& session) {
   for (size_t i = 0; i + 1 < k; ++i) {
     for (size_t j = i + 1; j < k; ++j) {
       last = spearmanPair(cols[i], cols[j]);
+      // bonferroni / sidak: each of p, p_l, p_u and p_tdist adjusted for the
+      // k(k-1)/2 pairs, min(1, nrho*x) / min(1, 1-(1-x)^nrho) (spearman.ado's
+      // Bonferroni and Sidak; vs-stata bank 13b0c8df `spearman mpg price weight
+      // rep78, stats(rho p) b`). A pair spearman.ado computed nothing for is left.
+      if ((bonferroni || sidak) && !last.dist.empty()) {
+        const double nrho = static_cast<double>(k) * (static_cast<double>(k) - 1.0) / 2.0;
+        for (double* x : {&last.p, &last.p_l, &last.p_u, &last.p_tdist}) {
+          const double a = bonferroni ? nrho * *x : 1.0 - std::pow(1.0 - *x, nrho);
+          *x = std::isnan(a) ? 1.0 : std::min(1.0, a);
+        }
+      }
       Nobs.data[i][j] = Nobs.data[j][i] = static_cast<double>(last.n);
       Rho.data[i][j] = Rho.data[j][i] = last.rho;
       P.data[i][j] = P.data[j][i] = last.p;
@@ -355,6 +527,25 @@ ojson runSpearman(const eval::ParsedCommand& parsed, SessionState& session) {
 
   eval::replaceRClass(session.eval);
   std::vector<std::string> posted = {"N", "rho", "p", "p_l", "p_u"};
+  // The hidden and historical returns spearman.ado leaves (listed by `:
+  // r(scalars)` / `: r(macros)` and readable by name): r(kurtosis) r(skewness)
+  // when the moments were taken, r(p_tdist), r(dist).
+  if (last.n >= 3 && !last.dist.empty()) {
+    if (last.moments) {
+      session.eval.rValues.set("kurtosis", last.kurtosis);
+      session.eval.rValues.set("skewness", last.skewness);
+      session.eval.markRHidden("kurtosis");
+      session.eval.markRHidden("skewness");
+      posted.insert(posted.end(), {"kurtosis", "skewness"});
+    }
+    session.eval.rValues.set("p_tdist", last.p_tdist);
+    session.eval.rStrings.set("dist", last.dist);
+    // Hidden: `return list` shows N rho p p_l p_u only (vs-stata bank 07617806
+    // `spearman mpg price weight rep78, stats(rho p) bo`).
+    session.eval.markRHidden("p_tdist");
+    session.eval.markRMacroHidden("dist");
+    posted.insert(posted.end(), {"p_tdist", "dist"});
+  }
   session.eval.rValues.set("N", static_cast<double>(last.n));
   session.eval.rValues.set("rho", last.rho);
   session.eval.rValues.set("p", last.p);
@@ -379,6 +570,48 @@ ojson runSpearman(const eval::ParsedCommand& parsed, SessionState& session) {
     std::snprintf(buf, sizeof(buf), "                  Prob = %.4f", last.p);
     out << buf << "\n";
   } else {
+    // spearman.ado's Display_Table: the observation counts (one number, or the
+    // min / avg / max of r(Nobs)), the key when obs or p is shown, then per variable
+    // a row for each statistic in stats() (rho by default): a pair whose p-value is
+    // above print() is blank, a rho whose p-value is at or below star() starred.
+    if (!showRho && !showObs && !showP) showRho = true;
+    double mn = nanv, mx = nanv, sum = 0;
+    for (const auto& row : Nobs.data)
+      for (double v : row) {
+        if (std::isnan(mn) || v < mn) mn = v;
+        if (std::isnan(mx) || v > mx) mx = v;
+        sum += v;
+      }
+    const auto fc = [](double v) {  // %11.0fc, trimmed
+      char b[64];
+      std::snprintf(b, sizeof b, "%.0f", std::round(v));
+      std::string d = b, outS;
+      const bool neg = !d.empty() && d[0] == '-';
+      if (neg) d = d.substr(1);
+      for (size_t i2 = 0; i2 < d.size(); ++i2) {
+        if (i2 > 0 && (d.size() - i2) % 3 == 0) outS += ',';
+        outS += d[i2];
+      }
+      return (neg ? "-" : "") + outS;
+    };
+    if (mn == mx) {
+      out << "\nNumber of observations = " << fc(mn) << "\n";
+    } else {
+      const std::string a = fc(mn), b = fc(sum / static_cast<double>(k * k)), c = fc(mx);
+      const size_t w = std::max({a.size(), b.size(), c.size()});
+      const auto pad = [w](const std::string& t) { return std::string(w - t.size(), ' ') + t; };
+      out << "\nNumber of observations:\n";
+      out << "                      min = " << pad(a) << "\n";
+      out << "                      avg = " << pad(b) << "\n";
+      out << "                      max = " << pad(c) << "\n";
+    }
+    if (showObs || showP) {
+      out << "\n+-----------------+\n|  Key            |\n|-----------------|\n";
+      if (showRho) out << "|   rho           |\n";
+      if (showObs) out << "|   Number of obs |\n";
+      if (showP) out << "|   p-value       |\n";
+      out << "+-----------------+\n";
+    }
     out << "\n";
     std::snprintf(buf, sizeof(buf), "%12s |", "");
     out << buf;
@@ -387,14 +620,46 @@ ojson runSpearman(const eval::ParsedCommand& parsed, SessionState& session) {
       out << buf;
     }
     out << "\n-------------+" << std::string(9 * k, '-') << "\n";
+    const auto shown = [&](size_t i, size_t j) {
+      const double pv = P.data[i][j];
+      return printLvl == -1 || i == j || (!std::isnan(pv) && pv <= printLvl);
+    };
+    const auto num = [&](const char* fmt, double v) {
+      if (std::isnan(v)) return std::string("      .");
+      std::snprintf(buf, sizeof(buf), fmt, v);
+      return std::string(buf);
+    };
+    const std::string cont = std::string(13, ' ') + "| ";
     for (size_t i = 0; i < k; ++i) {
-      std::snprintf(buf, sizeof(buf), "%s |", fitLeft(abbrevCp(vars[i], 12), 12).c_str());
+      std::snprintf(buf, sizeof(buf), "%s | ", fitLeft(abbrevCp(vars[i], 12), 12).c_str());
       out << buf;
-      for (size_t j = 0; j <= i; ++j) {
-        std::snprintf(buf, sizeof(buf), " %8.4f", Rho.data[i][j]);
-        out << buf;
+      if (showRho) {
+        for (size_t j = 0; j <= i; ++j) {
+          if (!shown(i, j)) { out << std::string(9, ' '); continue; }
+          const double pv = P.data[i][j];
+          const bool star = i != j && !std::isnan(pv) && pv <= starLvl;
+          out << " " << num("%7.4f", Rho.data[i][j]) << (star ? "*" : " ");
+        }
+        out << "\n";
       }
-      out << "\n";
+      if (showObs) {
+        if (showRho) out << cont;
+        for (size_t j = 0; j <= i; ++j) {
+          if (!shown(i, j)) { out << std::string(9, ' '); continue; }
+          std::snprintf(buf, sizeof(buf), " %7.0f ", Nobs.data[i][j]);
+          out << buf;
+        }
+        out << "\n";
+      }
+      if (showP) {
+        if (showRho || showObs) out << cont;
+        for (size_t j = 0; j <= i; ++j) {
+          if (!shown(i, j)) { out << std::string(9, ' '); continue; }
+          out << " " << num("%7.4f", P.data[i][j]) << " ";
+        }
+        out << "\n";
+      }
+      if (int(showRho) + int(showObs) + int(showP) > 1) out << std::string(13, ' ') << "|\n";
     }
   }
   return displayBlock(out.str());
@@ -404,7 +669,7 @@ ojson runSpearman(const eval::ParsedCommand& parsed, SessionState& session) {
 // Royston's (1991c) adjustment ([R] sktest, Methods and formulas).
 ojson runSktest(const eval::ParsedCommand& parsed, SessionState& session) {
   if (parsed.varlist.empty()) return aerError("sktest: no variables specified", "syntax_error");
-  static const std::unordered_set<std::string> kKnown = {"noadjust"};
+  const std::unordered_set<std::string>& kKnown = kVocabSktest.known;
   if (auto e = eval::rejectUnknownOptions(parsed.opts, kKnown)) return ojson(*e);
   bool noadjust = false;
   for (const auto& [k, v] : parsed.opts) {
@@ -412,9 +677,34 @@ ojson runSktest(const eval::ParsedCommand& parsed, SessionState& session) {
     if (k == "noadjust") noadjust = true;
   }
 
-  ColumnScope scope(session, parsed, parsed.varlist, "sktest");
+  // [aweight=] / [fweight=]: sktest.ado's `summarize ..., detail` with the weights
+  // (vs-stata bank 841286fd aweight, 71eac487 fweight r(N) 1018): the moments are
+  // weighted, N is the row count under aw and the weights' sum under fw; marksample
+  // drops a row whose weight is missing or zero.
+  std::string wvar;
+  bool fweight = false;
+  if (parsed.weightVar.has_value() && !parsed.weightVar->empty() && parsed.weightType.has_value()) {
+    const std::string t = strutil::lower(*parsed.weightType);
+    if (t == "fw" || t == "fweight") fweight = true;
+    else if (!(t == "aw" || t == "aweight")) return aerErrorReason("weights not allowed", 101);
+    wvar = *parsed.weightVar;
+  }
+  std::vector<std::string> scopeCols = parsed.varlist;
+  if (!wvar.empty()) scopeCols.push_back(wvar);
+  ColumnScope scope(session, parsed, scopeCols, "sktest");
   if (scope.failed()) return scope.error();
   Datastore& ds = *scope.get();
+  std::vector<double> wcol;
+  if (!wvar.empty()) {
+    std::string werr;
+    if (!numericColumn(ds, wvar, &wcol, &werr)) return aerError("sktest: " + werr);
+    for (double w : wcol) {
+      if (std::isnan(w)) continue;
+      if (w < 0) return aerErrorReason("negative weights encountered", 402);
+      if (fweight && w != std::floor(w))
+        return aerErrorReason("may not use noninteger frequency weights", 401);
+    }
+  }
 
   struct Row {
     std::string name;
@@ -428,11 +718,24 @@ ojson runSktest(const eval::ParsedCommand& parsed, SessionState& session) {
     row.name = vn;
     std::vector<double> raw;
     std::string err;
-    if (!numericColumn(ds, vn, &raw, &err)) return aerError("sktest: " + err);
-    std::vector<double> z;
-    for (double d : raw)
-      if (!std::isnan(d)) z.push_back(d);
-    const double nn = static_cast<double>(z.size());
+    // A string variable has no numeric observations: sktest.ado's `summ` finds
+    // none, so its row is N 0 with every statistic missing (StataBE 19.5,
+    // `sktest make`: rc 0). Its level codes are not data.
+    const bool isString = ds.has(vn) && ds.dtype(vn) == "factor";
+    if (!isString && !numericColumn(ds, vn, &raw, &err)) return aerError("sktest: " + err);
+    std::vector<double> z, zw;
+    for (size_t i = 0; i < raw.size(); ++i) {
+      if (std::isnan(raw[i])) continue;
+      if (!wcol.empty()) {
+        const double w = i < wcol.size() ? wcol[i] : std::numeric_limits<double>::quiet_NaN();
+        if (std::isnan(w) || w == 0.0) continue;
+        zw.push_back(w);
+      }
+      z.push_back(raw[i]);
+    }
+    double wsum = 0.0;
+    for (double w : zw) wsum += w;
+    const double nn = fweight ? wsum : static_cast<double>(z.size());
     row.N = nn;
     const double nanv = std::numeric_limits<double>::quiet_NaN();
     row.pSkew = row.pKurt = row.chi2 = row.pChi2 = nanv;
@@ -443,21 +746,24 @@ ojson runSktest(const eval::ParsedCommand& parsed, SessionState& session) {
     // CONTINUES to the next variable. The manual sentence about "a minimum of
     // eight observations" is Description prose, not an emitted error -- turning
     // it into one would abort whole commands that Stata completes.
-    if (z.size() >= 8) {
+    if (nn >= 8) {
+      // the (weighted) central moments; every weight 1 unweighted
+      const auto wt = [&](size_t i) { return zw.empty() ? 1.0 : zw[i]; };
+      const double W = zw.empty() ? static_cast<double>(z.size()) : wsum;
       double m = 0.0;
-      for (double d : z) m += d;
-      m /= nn;
+      for (size_t i = 0; i < z.size(); ++i) m += wt(i) * z[i];
+      m /= W;
       double m2 = 0, m3 = 0, m4 = 0;
-      for (double d : z) {
-        const double e = d - m;
+      for (size_t i = 0; i < z.size(); ++i) {
+        const double e = z[i] - m;
         const double e2 = e * e;
-        m2 += e2;
-        m3 += e2 * e;
-        m4 += e2 * e2;
+        m2 += wt(i) * e2;
+        m3 += wt(i) * e2 * e;
+        m4 += wt(i) * e2 * e2;
       }
-      m2 /= nn;
-      m3 /= nn;
-      m4 /= nn;
+      m2 /= W;
+      m3 /= W;
+      m4 /= W;
       if (m2 > 0.0) {
         const double g1 = m3 / std::pow(m2, 1.5);
         const double b2 = m4 / (m2 * m2);
@@ -534,6 +840,16 @@ ojson runSktest(const eval::ParsedCommand& parsed, SessionState& session) {
   session.eval.rValues.set("p_kurt", last.pKurt);
   session.eval.rValues.set("chi2", last.chi2);
   session.eval.rValues.set("p_chi2", last.pChi2);
+  // sktest.ado's `return historical` results: r(P_skew) r(P_kurt) r(P_chi2) (the
+  // last variable's, as the lower-case names) and r(Utest), the per-variable
+  // table without N. Listed by `: r(scalars)` / `: r(matrices)` and readable by
+  // name in StataBE 19.5, so they are posted, not merely declared.
+  session.eval.rValues.set("P_skew", last.pSkew);
+  session.eval.rValues.set("P_kurt", last.pKurt);
+  session.eval.rValues.set("P_chi2", last.pChi2);
+  // Historical results are hidden: `return list` shows N p_skew p_kurt chi2
+  // p_chi2 and r(table) only (vs-stata bank dc346b1e `sktest wage hours tenure`).
+  for (const char* h : {"P_skew", "P_kurt", "P_chi2"}) session.eval.markRHidden(h);
 
   // r(table): one row per variable, in varlist order. Declared in the manual's
   // Stored results and previously unreachable in PIET -- there was no r-class
@@ -553,6 +869,22 @@ ojson runSktest(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
   if (!replaced) session.eval.rMatrices.emplace_back("table", std::move(tbl));
+  eval::EvalMatrix utest;
+  utest.colnames = {"P_skew", "P_kurt", "chi2", "P_chi2"};
+  for (const auto& r : rows) {
+    utest.rownames.push_back(r.name);
+    utest.data.push_back({r.pSkew, r.pKurt, r.chi2, r.pChi2});
+  }
+  replaced = false;
+  for (auto& kv : session.eval.rMatrices) {
+    if (kv.first == "Utest") {
+      kv.second = utest;
+      replaced = true;
+      break;
+    }
+  }
+  session.eval.rHiddenMatrices.emplace_back("Utest", utest.gen);
+  if (!replaced) session.eval.rMatrices.emplace_back("Utest", std::move(utest));
 
   std::ostringstream out;
   char buf[256];

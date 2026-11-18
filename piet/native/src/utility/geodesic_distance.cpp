@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
+#include "datamgmt/using_dataset.h"
 #include "piet/display_hardening.h"
 #include "piet/handlers/data_values.h"
 #include "piet/handlers/observations.h"
@@ -32,6 +33,7 @@
 #include "piet/eval/pyvalue.h"  // pythonFloatRepr -- round-trippable CSV numerics
 #include "piet/eval/session.h"
 #include "piet/eval/tokenizer.h"
+#include <set>
 #include "piet/inrange_filter.h"
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
@@ -46,7 +48,9 @@ namespace {
 // `sphere` selects haversine, `radius()` replaces the sphere's radius, `miles`
 // converts the unit.
 const piet::eval::OptVocab& kVocabGeodist = piet::eval::registerOptVocab(
-    {"geodist"}, {{"generate", "gen", "miles", "sphere", "radius"}, {}});
+    {"geodist"}, {{"generate", "gen", "miles", "sphere", "radius", "ellipsoid"}, {},
+                  // geodist.ado's minimum abbreviations: `Generate(g) Ellipsoid(e)`.
+                  {{"g", "generate"}, {"ge", "generate"}, {"e", "ellipsoid"}}});
 
 // geonear. `within()` (a distance cutoff), `long` (a reshaped long result) and
 // `report` (a diagnostic table) are real geonear options that would each need a
@@ -335,9 +339,9 @@ constexpr double kKmPerMileDivisor = 1.609344;
 double degToRad(double d) { return d * kPi / 180.0; }
 
 // nullopt == did not converge.
-std::optional<double> vincentyKm(double lat1, double lon1, double lat2, double lon2) {
-  const double a = 6378137.0;              // WGS84 semi-major axis, metres
-  const double f = 1.0 / 298.257223563;    // WGS84 flattening
+std::optional<double> vincentyKm(double lat1, double lon1, double lat2, double lon2,
+                                 double a = 6378137.0,                // WGS84 semi-major axis, metres
+                                 double f = 1.0 / 298.257223563) {    // WGS84 flattening
   const double b = (1.0 - f) * a;          // semi-minor axis
   const double L = degToRad(lon2 - lon1);
   const double U1 = std::atan((1.0 - f) * std::tan(degToRad(lat1)));
@@ -400,6 +404,8 @@ double haversineKm(double lat1, double lon1, double lat2, double lon2, double ra
 // different arithmetic.
 struct GeoMode {
   bool sphere = false;           // haversine instead of Vincenty
+  double ellipsoidA = 6378137.0;               // ellipsoid(a, f): the semi-major axis, metres
+  double ellipsoidF = 1.0 / 298.257223563;     // and its flattening
   double radiusKm = kSphereRadiusKm;
   bool miles = false;
 };
@@ -424,7 +430,7 @@ GeoOutcome geoDistance(double lat1, double lon1, double lat2, double lon2, const
   if (mode.sphere) {
     km = haversineKm(lat1, lon1, lat2, lon2, mode.radiusKm);
   } else {
-    auto v = vincentyKm(lat1, lon1, lat2, lon2);
+    auto v = vincentyKm(lat1, lon1, lat2, lon2, mode.ellipsoidA, mode.ellipsoidF);
     if (!v.has_value()) {
       r.noConverge = true;
       return r;
@@ -441,6 +447,33 @@ bool readGeoMode(const std::vector<std::pair<std::string, eval::OptValue>>& opts
                  const std::string& verb, bool allowSphere, GeoMode* mode, ojson* err) {
   if (allowSphere) mode->sphere = hasFlag(opts, "sphere");
   mode->miles = hasFlag(opts, "miles");
+  if (allowSphere)
+    if (auto ell = optStr(opts, "ellipsoid")) {
+      // ellipsoid(a, f^-1): the semi-major axis in metres and the RECIPROCAL of the flattening
+      // (WGS84 is ellipsoid(6378137, 298.257223563)); the help text calls the second number "the
+      // flattening", but the command takes its reciprocal (vs-stata bank 068c26c0a4c11554:
+      // ellipsoid(6378137,.0033528107) reads as f^-1 = .00335 and every pair fails to converge).
+      std::string t = *ell;
+      for (char& c : t)
+        if (c == ',') c = ' ';
+      std::istringstream in(t);
+      std::string sa, sf, extra;
+      double av = 0.0, fv = 0.0;
+      if (!(in >> sa >> sf) || (in >> extra) || !parseStrictDouble(sa, &av) ||
+          !parseStrictDouble(sf, &fv)) {
+        *err = ojson(eval::errorBlock("syntax_error",
+                                      "the reference ellipsoid parameters (a,f^-1) are not numbers",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+        return false;
+      }
+      if (fv == 0.0) {
+        *err = gxSyntax(verb + ": ellipsoid(" + *ell + ") has a zero reciprocal flattening.");
+        return false;
+      }
+      fv = 1.0 / fv;
+      mode->ellipsoidA = av;
+      mode->ellipsoidF = fv;
+    }
   if (auto rad = optStr(opts, "radius")) {
     double v = 0.0;
     if (!parseStrictDouble(*rad, &v) || !(v > 0.0)) {
@@ -525,7 +558,11 @@ ojson runGeodist(const eval::ParsedCommand& parsed, SessionState& session) {
     const GeoOutcome o = geoDistance(args[0].value, args[1].value, args[2].value, args[3].value,
                                      mode);
     if (o.badLatitude) {
-      return gxError(kCmd + ": a latitude outside [-90, 90] has no distance.");
+      // geodist.ado checks the literals: `latitude 1 must be between -90 and 90`, r(198).
+      return ojson(eval::errorBlock("syntax_error",
+                                    std::string("latitude ") + (std::fabs(args[0].value) > 90.0 ? "1" : "2") +
+                                        " must be between -90 and 90",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(198)"));
     }
     session.eval.rValues.set("distance", o.value);
     // Stata's own %12.0g rendering of the immediate form's one number.
@@ -552,7 +589,11 @@ ojson runGeodist(const eval::ParsedCommand& parsed, SessionState& session) {
   std::vector<std::vector<double>> cols(4);
   for (size_t i = 0; i < 4; ++i) {
     if (args[i].constant) continue;
-    if (!ds->has(args[i].var)) return gxError("variable " + args[i].var + " not found");
+    if (!ds->has(args[i].var))
+      return ojson(eval::errorBlock("syntax_error",
+                                    "Was expecting a number or a numeric scalar instead of -" +
+                                        args[i].var + "-",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(198)"));
     if (ds->dtype(args[i].var) == "factor") {
       return gxError(kCmd + ": `" + args[i].var +
                      "' is a string variable; a coordinate has to be numeric.");
@@ -655,6 +696,27 @@ ojson runGeonear(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabGeonear.known,
                                             kVocabGeonear.unimplemented))
     return ojson(*err);
+  // An option named twice -- under any two spellings -- is refused at the second one, as typed
+  // (vs-stata bank: `neighbors(a b c) n(3)` and `neighbors(a b c) ne(3)` are r(198)
+  // "option n() not allowed"; `nea(3)` is nearcount, a different option, and runs).
+  {
+    std::vector<std::string> typedNames;
+    try {
+      const auto asTyped = eval::tokenize(parsed.raw).opts;
+      if (asTyped.size() == parsed.opts.size())
+        for (const auto& kv : asTyped) typedNames.push_back(kv.first);
+    } catch (const eval::TokenizerError&) {
+    }
+    std::set<std::string> seenKeys;
+    for (size_t oi = 0; oi < parsed.opts.size(); ++oi) {
+      if (seenKeys.insert(parsed.opts[oi].first).second) continue;
+      const std::string typed = oi < typedNames.size() ? typedNames[oi] : parsed.opts[oi].first;
+      return ojson(eval::errorBlock("syntax_error",
+                                    "option " + typed + (parsed.opts[oi].second.isBool ? "" : "()") +
+                                        " not allowed",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    }
+  }
   if (!session.hasData()) return ojson(eval::noDataLoaded());
 
   // `id lat lon using FILE` -- `using` arrives as an ordinary varlist token.
@@ -732,7 +794,9 @@ ojson runGeonear(const eval::ParsedCommand& parsed, SessionState& session) {
   const int64_t n = master->nRows();
 
   // ---- using frame -------------------------------------------------------
-  const std::string usingResolved = resolveUserPath(session, trimOf(dequote(trimOf(usingTyped))));
+  // [D] geonear's using takes the .dta a bare name stands for, as merge's does.
+  const std::string usingResolved =
+      dv_detail::resolveUsingDataset(session, trimOf(dequote(trimOf(usingTyped))));
   session.materializeVirtualSave(usingResolved);  // BUG-125: a save_virtual'd tempfile
   {
     std::error_code ec;

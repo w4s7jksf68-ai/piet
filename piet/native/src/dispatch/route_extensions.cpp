@@ -38,6 +38,7 @@ bool route_extensions(std::string& cmd,
     // `display r(mean)` is precisely how the corpus uses it.
     if (r.is_object() && r.value("type", std::string()) != "error") {
       eval::captureRFromBlock(r, session.eval);
+      handlers::gstatsPublishGroupResults(parsed, session);
     }
     if (!(r.is_array() && r.empty())) blocks.push_back(r);
     return true;
@@ -175,6 +176,9 @@ bool route_extensions(std::string& cmd,
         {"sencode", &handlers::runSencode},       {"fillmissing", &handlers::runFillmissing},
         {"astile", &handlers::runAstile},         {"matsort", &handlers::runMatsort},
         {"matselrc", &handlers::runMatselrc},
+        {"numlist", &handlers::runNumlist},       {"tsunab", &handlers::runTsunab},
+        {"fvexpand", &handlers::runFvexpand},     {"dtaversion", &handlers::runDtaversion},
+        {"misstable", &handlers::runMisstable},
     };
     auto it1 = kTierOne.find(cmd);
     if (it1 != kTierOne.end()) {
@@ -342,6 +346,11 @@ bool route_extensions(std::string& cmd,
 
   if (cmd == "notes") {
     pushEnvResult(blocks, handlers::runNotes(parsed, session));
+    return true;
+  }
+
+  if (cmd == "char") {
+    pushEnvResult(blocks, handlers::runChar(parsed, session));
     return true;
   }
 

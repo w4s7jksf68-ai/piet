@@ -709,13 +709,15 @@ int run_ivml(const std::vector<std::string>& a, IvKind kind, const char* cmd) {
         };
         put_eq(y, sname, 0, ne, ne, ks);                                // [endog, x..., _cons]
         put_eq(endog[0], wname, static_cast<size_t>(ks), 0, 0, kw);     // [x..., z..., _cons]
-        names.push_back("/:athrho2_1");
+        // Free parameters are named `/athrho2_1`, `/lnsigma2` in Stata's e(b)
+        // (vs-stata bank b8ad8db9: colfullnames e(b) ... /athrho2_1 /lnsigma2).
+        names.push_back("/athrho2_1");
         order.push_back(static_cast<size_t>(r.i_athrho));
         if (is_tobit) {
-            names.push_back("/:lnsigma1");
+            names.push_back("/lnsigma1");
             order.push_back(static_cast<size_t>(r.i_lnse));
         }
-        names.push_back("/:lnsigma2");
+        names.push_back("/lnsigma2");
         order.push_back(static_cast<size_t>(r.i_lnsv));
         json values = json::array();
         for (size_t i : order) values.push_back(i == kNone ? 0.0 : r.theta[i]);

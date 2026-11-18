@@ -29,6 +29,7 @@ struct XtlogitFeResult {
     int64_t n_obs = 0, n_groups = 0;
     int64_t n_dropped_const = 0;   // K_i ∈ {0, T_i}
     int64_t n_dropped_size = 0;    // T_i < 2
+    int64_t n_dropped_obs = 0;     // rows of the dropped panels (Stata's e(N_drop))
     // Row counts of the panels used (after the drops): Stata's e(g_min)/e(g_avg)/
     // e(g_max) over e(sample). 0 when no panel is kept.
     int64_t g_min = 0, g_max = 0;
@@ -40,6 +41,11 @@ struct XtlogitFeResult {
     double loglik = 0;
     int iters = 0;
     bool converged = false;
+    // ml's iteration log (the start, then after each iteration), the gradient at
+    // beta, and the log likelihood at beta = 0 (Stata's e(ilog), e(gradient), e(ll_0)).
+    std::vector<double> ilog;
+    std::vector<double> gradient;
+    double ll_0 = 0;
 };
 
 // Optimizer: Newton-Raphson with halving / forward steps and ml's default stop

@@ -32,6 +32,23 @@ bool tryTempDeclIntercept(const std::string& line, SessionState& session,
     std::string nm;
     while (namesIss >> nm) names.push_back(nm);
   }
+  // Each name is a local macro's name: letters, digits and `_`, at most 31
+  // bytes. Anything else is r(198) "invalid name" before a name is minted
+  // (StataBE 19.5: `tempvar a, zznotanoption` is r(198); it used to mint `a,`).
+  for (const auto& nm : names) {
+    if (nm.find_first_of("`$") != std::string::npos) continue;  // not expanded yet
+    bool ok = !nm.empty() && nm.size() <= 31;
+    for (char c : nm)
+      ok = ok && (std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+                  static_cast<unsigned char>(c) >= 0x80);
+    if (!ok) {
+      out = nlohmann::ordered_json::array(
+          {echo, nlohmann::ordered_json(eval::errorBlock("syntax_error", nm + " invalid name",
+                                                         std::nullopt, std::nullopt, std::nullopt,
+                                                         "r(198)"))});
+      return true;
+    }
+  }
   nlohmann::ordered_json r = (u4First == "tempfile")   ? handlers::runTempfile(names, session)
                              : (u4First == "tempname") ? handlers::runTempname(names, session)
                                                        : handlers::runTempvar(names, session);
@@ -995,7 +1012,8 @@ std::string substituteRowExprRefs(const std::string& in, SessionState& session,
     if (e.find('[') != std::string::npos || lc.find("colsof") != std::string::npos ||
         lc.find("rowsof") != std::string::npos || lc.find("colnumb") != std::string::npos ||
         lc.find("rownumb") != std::string::npos || lc.find("mreldif") != std::string::npos ||
-        lc.find("el(") != std::string::npos) {
+        lc.find("el(") != std::string::npos || lc.find("det(") != std::string::npos ||
+        lc.find("trace(") != std::string::npos) {
       e = eval::substituteMatrixRefs(e, session.eval);
     }
   }

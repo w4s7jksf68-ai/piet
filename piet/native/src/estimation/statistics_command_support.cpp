@@ -44,6 +44,7 @@
 #include "io/win_compat.h"
 #include "piet/loops.h"
 #include "piet/session_state.h"
+#include "piet/storage_type.h"  // appendStoreTypeArg
 #include "piet/strutil.h"
 #include "piet/twoway_opts.h"
 #include "estimation_internal.h"
@@ -205,15 +206,17 @@ bool estimWriteCsv(const std::string& path, const std::vector<double>& v) {
 
 // Write one f64 column into the session frame.
 bool estimWriteColumn(SessionState& session, const std::string& name,
-                      const std::vector<double>& vals, ojson* err) {
+                      const std::vector<double>& vals, ojson* err, const std::string& storeType) {
   const std::string csv = estimMintCsv(session.workdir(), "aerestim");
   if (!estimWriteCsv(csv, vals)) {
     *err = aerError("could not write the values payload", "data_io");
     return false;
   }
   const std::string out = mintScratchPath(session.workdir(), "aerestim");
-  const CobraRunResult r = runCobra({"setcol", "--data", *session.currentHbin(), "--var", name,
-                                     "--values", csv, "--dtype", "f64", "--new", "--out", out});
+  std::vector<std::string> argv = {"setcol", "--data", *session.currentHbin(), "--var", name,
+                                   "--values", csv, "--dtype", "f64", "--new", "--out", out};
+  storage::appendStoreTypeArg(argv, storeType);
+  const CobraRunResult r = runCobra(argv);
   if (!r.ok) {
     *err = aerError("could not create " + name, "data_io");
     return false;

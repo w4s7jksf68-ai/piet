@@ -133,6 +133,10 @@ XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
         if (m > 1e-12) var_cols.push_back(c);
     }
     int kv = static_cast<int>(var_cols.size());
+    // dof = N - n_g - kv (FE absorbs n_g group means; within OLS estimates kv slopes;
+    // each time-invariant dropped covariate would be absorbed by FE, contributing 0).
+    const double dof_e = static_cast<double>(N) - static_cast<double>(n_g) - static_cast<double>(kv);
+    R.df_e_within = dof_e;
     std::vector<double> X_dm_v(static_cast<size_t>(N) * std::max(1, kv));
     for (int j = 0; j < kv; ++j) {
         int c = var_cols[static_cast<size_t>(j)];
@@ -155,9 +159,6 @@ XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
         double e = y_dm[static_cast<size_t>(i)] - yh;
         SSR_w += e * e;
     }
-    // dof = N - n_g - kv (FE absorbs n_g group means; within OLS estimates kv slopes;
-    // each time-invariant dropped covariate would be absorbed by FE, contributing 0).
-    double dof_e = static_cast<double>(N) - static_cast<double>(n_g) - static_cast<double>(kv);
     double sigma_e2 = SSR_w / dof_e;
     R.sigma_e = std::sqrt(std::max(0.0, sigma_e2));
 

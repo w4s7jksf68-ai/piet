@@ -37,7 +37,9 @@ struct OptKeyResolution {
   // "floor" is the NARROWING pass (AER scope-2 B4): the key is a proper prefix
   // of an option whose minimum abbreviation a live capture measured as longer,
   // so it was deliberately left unresolved and `exactOnly` set.
-  const char* stage = "unchanged";  // "minimums" | "floor" | "vocab" | "unchanged"
+  // "bank" / "bank-refuse": the 2026-11-10 truth bank measured this exact
+  // spelling — it meant `resolved`, or StataBE refused it (r(198)).
+  const char* stage = "unchanged";  // "minimums" | "floor" | "vocab" | "bank" | "bank-refuse" | "unchanged"
 };
 
 // THE option-name resolution rule, exported so there is exactly one copy of it.
@@ -47,7 +49,13 @@ struct OptKeyResolution {
 // dispatchImpl runs this over every parsed option key; `piet_native
 // --dump-optvocab --resolve` runs the same function so it reports the
 // dispatcher's real answer rather than a reimplementation of it.
-OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::string& key);
+// `form`: 1 = the option was typed bare, 2 = with an argument list, 0 = unknown.
+// The measured-spelling table (generated/opt_abbrev_bank20261110.inc) is keyed
+// on it and is consulted only for 1 and 2.
+// `sub`: the first word after the command as typed, lower-cased, a leading "("
+// removed — the subcommand, for the commands whose rows are keyed on it.
+OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::string& key,
+                                            int form = 0, const std::string& sub = std::string());
 
 }  // namespace piet
 

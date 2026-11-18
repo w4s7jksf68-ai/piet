@@ -50,16 +50,32 @@ bool constant_over(const double* col, const std::vector<size_t>& rows) {
 }
 
 // The columns' sample means and the p x p covariance matrix with divisor N - 1.
+// The sample's means and covariance, `matrix accum ..., dev means()` divided by N - 1:
+// unweighted, N the row count; [aw=] the weighted moments with the weights rescaled to
+// sum to the row count (N the row count); [fw=] each row counted w times (N = sum w).
 void sample_moments(const std::vector<const double*>& columns, const std::vector<size_t>& rows,
+                    const double* weight, bool fweight, double& count,
                     std::vector<double>& means, std::vector<double>& covariance) {
     const size_t p = columns.size();
-    const double count = static_cast<double>(rows.size());
+    std::vector<double> w(rows.size(), 1.0);
+    if (weight != nullptr) {
+        double total = 0.0;
+        for (size_t t = 0; t < rows.size(); ++t) total += (w[t] = weight[rows[t]]);
+        if (!fweight)
+            for (double& x : w) x *= static_cast<double>(rows.size()) / total;
+        count = fweight ? total : static_cast<double>(rows.size());
+    } else {
+        count = static_cast<double>(rows.size());
+    }
     std::vector<std::vector<double>> deviations(p, std::vector<double>(rows.size()));
     means.assign(p, 0.0);
     for (size_t a = 0; a < p; ++a) {
-        double total = 0.0;
-        for (size_t i : rows) total += columns[a][i];
-        means[a] = total / count;
+        double total = 0.0, wsum = 0.0;
+        for (size_t t = 0; t < rows.size(); ++t) {
+            total += w[t] * columns[a][rows[t]];
+            wsum += w[t];
+        }
+        means[a] = total / wsum;
         std::transform(rows.begin(), rows.end(), deviations[a].begin(),
                        [&](size_t i) { return columns[a][i] - means[a]; });
     }
@@ -67,7 +83,8 @@ void sample_moments(const std::vector<const double*>& columns, const std::vector
     for (size_t a = 0; a < p; ++a) {
         for (size_t b = a; b < p; ++b) {
             double cross = 0.0;
-            for (size_t t = 0; t < rows.size(); ++t) cross += deviations[a][t] * deviations[b][t];
+            for (size_t t = 0; t < rows.size(); ++t)
+                cross += w[t] * deviations[a][t] * deviations[b][t];
             covariance[a * p + b] = covariance[b * p + a] = cross / (count - 1.0);
         }
     }
@@ -116,7 +133,24 @@ PcaResult pca_fit(const std::vector<std::string>& names, const std::vector<const
     PcaResult fit;
 
     // Screening, in Stata's measured order: the sample size comes before zero variance.
-    const std::vector<size_t> sample = listwise_rows(cols, keep);
+    // a weighted fit's sample also drops rows whose weight is missing or zero
+    // (marksample); a negative weight is r(402), a fractional fweight r(401)
+    std::vector<char> allowed = keep;
+    if (o.weight != nullptr) {
+        for (size_t i = 0; i < allowed.size(); ++i) {
+            if (!allowed[i]) continue;
+            const double wi = o.weight[i];
+            if (std::isnan(wi) || wi == 0.0) { allowed[i] = 0; continue; }
+            bool complete = true;
+            for (const double* col : cols) complete = complete && !std::isnan(col[i]);
+            if (!complete) continue;
+            if (wi < 0.0) throw EngineError("bad_input", "pca: negative weights encountered", "r(402)");
+            if (o.fweight && wi != std::floor(wi))
+                throw EngineError("bad_input", "pca: may not use noninteger frequency weights",
+                                  "r(401)");
+        }
+    }
+    const std::vector<size_t> sample = listwise_rows(cols, allowed);
     if (sample.empty()) throw EngineError("bad_input", "pca: no observations", "r(2000)");
     if (sample.size() == 1)
         throw EngineError("bad_input", "pca: insufficient observations", "r(2001)");
@@ -133,12 +167,13 @@ PcaResult pca_fit(const std::vector<std::string>& names, const std::vector<const
         throw EngineError("bad_input", "pca: too few variables specified", "r(102)");
 
     const size_t p = analysed.size();
-    fit.n_obs = static_cast<int>(sample.size());
+    double count = 0.0;
     fit.p = static_cast<int>(p);
     fit.ctype = o.covariance ? "covariance" : "correlation";
 
     // The analysed matrix.
-    sample_moments(analysed, sample, fit.means, fit.c);
+    sample_moments(analysed, sample, o.weight, o.fweight, count, fit.means, fit.c);
+    fit.n_obs = static_cast<int>(count);
     fit.vars.resize(p);
     for (size_t j = 0; j < p; ++j) fit.vars[j] = fit.c[j * p + j];
     if (!o.covariance) {

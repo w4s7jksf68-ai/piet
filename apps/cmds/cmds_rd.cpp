@@ -118,6 +118,20 @@ int cmd_rdrobust(const std::vector<std::string>& a) {
     const Dataset& ds = acquire_data(data);
     const double* yv = require_num(ds, "rdrobust", y);
     const double* xv = require_num(ds, "rdrobust", x);
+    // rdrobust.ado's first check on the sample (rows with y and x present):
+    // c <= min(x) or c >= max(x) is r(125) "c() should be set within the range
+    // of x" (vs-stata bank 1d7a0d89 `rdrobust wage x, c(100)`).
+    {
+        double lo = std::numeric_limits<double>::infinity(), hi = -lo;
+        for (int64_t i = 0; i < ds.n_rows(); ++i) {
+            if (std::isnan(yv[i]) || std::isnan(xv[i])) continue;
+            lo = std::min(lo, xv[i]);
+            hi = std::max(hi, xv[i]);
+        }
+        if (lo <= hi && (cfg.c <= lo || cfg.c >= hi))
+            throw EngineError("bad_input", "c() should be set within the range of " + x,
+                              "r(125)");
+    }
     auto t0 = std::chrono::steady_clock::now();
     RdRobustResult R = rd_robust_run(yv, xv, ds.n_rows(), cfg);
     auto t1 = std::chrono::steady_clock::now();

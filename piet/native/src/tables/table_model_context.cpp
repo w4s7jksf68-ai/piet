@@ -4,6 +4,7 @@
 #include "tables_internal.h"
 #include "estout_internal.h"
 #include "piet/user_paths.h"
+#include "results/stored_estimates_internal.h"  // mergeLiveEScalars
 namespace piet::handlers::table_detail {
 
 
@@ -24,24 +25,10 @@ ojson emptyBag() {
 // ONE table of Stata-spelling -> cobra-key (eval/macros.h); it was exposed at
 // namespace scope for this call precisely so a third copy would not appear.
 ojson buildEScalars(const ojson& est) {
-  ojson out = ojson::object();
-  if (!est.is_object()) return out;
-  for (const auto& [stataName, engineKey] : eval::eScalarKey()) {
-    if (out.contains(stataName)) continue;
-    if (!est.contains(engineKey)) continue;
-    const ojson& v = est.at(engineKey);
-    if (!v.is_number()) continue;
-    const double d = v.get<double>();
-    if (std::isnan(d)) continue;
-    // the engine's n_clusters 0 means "unclustered": Stata has no e(N_clust)
-    // there, so the cell stays empty (BUG-1466; the e() resolver's own rule)
-    if (stataName == "N_clust" && d == 0.0) continue;
-    out[stataName] = d;
-  }
-  // `r2` is the one name whose snapshot spelling can differ from the block's:
-  // makeSnapshot prefers r2_within when present, and a table asking for `r2`
-  // must get the number the snapshot itself reports.
-  return out;
+  // One reading of a block's e() scalars: the one runEststo stores
+  // (results/stored_estimates_snapshot.cpp escalarsFrom), so an active and a
+  // stored model answer the same stats().
+  return est.is_object() ? stored_estimates_detail::escalarsFrom(est) : ojson::object();
 }
 
 
@@ -68,6 +55,7 @@ Model materializeModel(SessionState& session, const std::string& name, const ojs
     if (!m.added.contains(k) || !m.added[k].is_object()) m.added[k] = ojson::object();
   }
 
+  if (snap.contains("emacros") && snap["emacros"].is_object()) m.emacros = snap["emacros"];
   if (snap.contains("escalars") && snap["escalars"].is_object()) {
     m.escalars = snap["escalars"];
   } else if (session.lastEstBlock.has_value() &&
@@ -256,9 +244,13 @@ bool activeModel(SessionState& session, const std::string& cmd, Model* out, ojso
       out->snap = snap;
       out->added = emptyBag();
       out->escalars = buildEScalars(snap);
+      out->emacros = stored_estimates_detail::emacrosFrom(session);
       return true;
     }
-    *errOut = tblErrorRc(cmd + ": no estimation result in memory. Run a regression first.", 301);
+    // outreg2 reads e(b) at once: the matrix is not found, r(111) (vs-stata bank
+    // fd6d13fb); the other table commands say "last estimates not found", r(301).
+    *errOut = tblErrorRc(cmd + ": no estimation result in memory. Run a regression first.",
+                         cmd == "outreg2" ? 111 : 301);
     return false;
   }
   ojson snap = *session.lastEstBlock;
@@ -280,6 +272,10 @@ bool activeModel(SessionState& session, const std::string& cmd, Model* out, ojso
     if (!out->added.contains(k) || !out->added[k].is_object()) out->added[k] = ojson::object();
   }
   out->escalars = buildEScalars(snap);
+  // the live e() store's own scalars (regress's e(ll)) and macros, as a stored
+  // model keeps them
+  stored_estimates_detail::mergeLiveEScalars(out->escalars, session);
+  out->emacros = stored_estimates_detail::emacrosFrom(session);
   if (!out->escalars.contains("N") && snap.contains("n_obs")) {
     out->escalars["N"] = jsonNum(snap["n_obs"]);
   }
@@ -297,6 +293,9 @@ ojson emitTable(const std::string& cmd, SessionState& session, const std::string
   const std::string resolved = resolveUserPath(session, userPath);
   ojson guard = guardOverwrite(cmd, resolved, userPath, replace, append);
   if (!guard.is_null()) return guard;
+  // estout's `replace` erases the old file first, and Stata says so when there was none
+  // (vs-stata bank ab16e19a, c27c0586: `(file t.md not found)`).
+  const bool noOldFile = replace && !append && !cecon::native_exists(resolved);
   std::string payload = bytes;
   if (append && cecon::native_exists(resolved)) {
     bool ok = false;
@@ -310,6 +309,9 @@ ojson emitTable(const std::string& cmd, SessionState& session, const std::string
   if (!werr.is_null()) return werr;
   // The USER's spelling, never the resolved absolute path: bundle D echoed the
   // resolved path and baked a build machine's workdir into a golden.
+  if (noOldFile && (cmd == "esttab" || cmd == "estout")) {
+    return displayBlock("(file " + userPath + " not found)\n(output written to " + userPath + ")");
+  }
   return displayBlock("(output written to " + userPath + ")");
 }
 }

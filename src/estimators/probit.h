@@ -23,6 +23,7 @@ struct ProbitResult {
     std::vector<double> ilog;      // log likelihood at iteration 0..ic
     std::vector<double> bread_oim; // inv(observed information) of the ml Hessian, k*k
     int64_t n_cdf = 0, n_cds = 0;  // e(N_cdf) / e(N_cds) (BinaryMlResult, logit.h)
+    std::vector<double> gradient;  // e(gradient): d ll / d beta at the final iterate (k)
 };
 
 // Fit binary probit y ~ X. X is column-major n*k (caller includes an intercept

@@ -468,6 +468,13 @@ ojson writeDelimitedFile(const std::vector<std::string>& varlist, const std::str
       const VarInfo vi = base->varinfo(name);
       o.dispFmt = session.displayFormat(vi);
       o.dateFamily = dateFamilyOf(o.dispFmt);
+      // A number is written without the format's thousands separators (vs-stata
+      // bank: auto's price %8.0gc goes out as 4099 -- outsheet + insheet read it
+      // back numeric, export delimited, datafmt + import delimited keep k 12).
+      {
+        static const std::regex reComma(R"(^(%-?0?[0-9]+(\.[0-9]+)?[gfe])c$)");
+        o.dispFmt = std::regex_replace(o.dispFmt, reComma, "$1");
+      }
       auto vm = session.varMeta.find(name);
       if (vm != session.varMeta.end() && vm->second.stataType.has_value() &&
           !vm->second.stataType->empty()) {
@@ -557,6 +564,16 @@ ojson writeDelimitedFile(const std::vector<std::string>& varlist, const std::str
           if (it == oc[c].labels->end() && v == std::floor(v)) {
             it = oc[c].labels->find(std::to_string(static_cast<long long>(v)));
           }
+          if (it != oc[c].labels->end()) {
+            appendQuotedField(block, it->second, spec.delim, spec.quote);
+            continue;
+          }
+        }
+        // An extended missing value with a label exports as that label too
+        // (vs-stata bank: b = .a labeled "ext miss" is written "ext miss").
+        if (oc[c].labels != nullptr && std::isnan(v) && cecon::missing_kind(v) >= 1) {
+          const std::string key = std::string(".") + static_cast<char>('a' + cecon::missing_kind(v) - 1);
+          auto it = oc[c].labels->find(key);
           if (it != oc[c].labels->end()) {
             appendQuotedField(block, it->second, spec.delim, spec.quote);
             continue;

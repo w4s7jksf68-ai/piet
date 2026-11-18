@@ -12,14 +12,17 @@ the entry points.
 | `save` (`.dta` with the metadata sidecar, `.hbin`, sibling-temp commit, refusals r(602)/r(603)) | `dataset_save.cpp` |
 | `export delimited` writer, numeric and date spelling, quoting | `delimited_export.cpp` |
 | `import delimited` option parsing, encoding, name and type inference | `delimited_import.cpp` |
+| `import delimited` r(encoding) guess for ASCII text (ICU trigram lists) | `charset_guess.cpp`, `charset_guess.h` |
 | Delimited parser, `legalNames`, `typeColumn`, `stageAndAdopt` (shared by every text loader) | `delimited_io.cpp` |
 | `export excel`, cell-range option | `spreadsheet_export.cpp` |
 | `import excel`, date styles, sheet and cell-range selection | `spreadsheet_import.cpp` |
 | `.xlsx` read/write, INFLATE, STORED ZIP writer, worksheet XML; ZIP primitives declared in `zip_io.h` | `xlsx.cpp`, `xlsx.h`, `zip_io.h` |
+| DEFLATE compression (zlib's algorithm; the compressed sizes `zipfile` and `zipsave` store) | `deflate.cpp`, `deflate.h` |
 | `zipfile`, `unzipfile`, `zipsave`, `zipuse` | `zip_commands.cpp` |
 | `insheet`, `outsheet`, `infile` free format | `insheet.cpp`, `outsheet.cpp`, `infile.cpp` |
 | `infix`, `infile using dict`, fixed columns | `fixed_column_import.cpp`, `fixed_column_import.h` |
 | `outfile`, `saveold` | `outfile.cpp`, `saveold.cpp` |
+| `dtaversion` (the `.dta` format number of a file's header, r(version)) | `dta_version.cpp` |
 | `putexcel` (cell writes, `set`, merges, `clear`) | `putexcel.cpp` |
 | `filefilter`, `copy`; `file open/write/read/seek/set/close` with binary mode | `filefilter.cpp`, `file_copy.cpp`; `file_io.cpp` |
 | `postfile`, `post`, `postclose`; `postutil clear`, `postutil dir` | `postfile.cpp`, `postfile_handles.cpp` |

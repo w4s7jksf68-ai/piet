@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "common.h"
+#include <algorithm>
 #include "commands.h"
 
 #include "estimators/csdid.h"
 #include "estimators/xtpois.h"
+#include "estimators/xtpoisre.h"
 #include "estimators/xtreg.h"
 #include "estimators/xtlogit.h"
 #include "estimators/nbreg.h"
+#include "core/collinear.h"
 #include "estimators/posthest.h"  // wald_test/WaldResult (cmd_xtreg's df_chi2/Wald chi2)
 
 namespace cecon {
@@ -68,6 +71,13 @@ int cmd_csdid(const std::vector<std::string>& a) {
         if (v.size() != 2) { std::fprintf(stderr, "--window LO,HI\n"); return 2; }
         wlo = std::stoi(v[0]); whi = std::stoi(v[1]);
     }
+    // `if`: csdid.ado's touse restricts every cell sample, the unit universe
+    // and the time grid alike, so the fit runs on the rows the condition keeps
+    // (vs-stata bank 7a3c76ca `csdid y if sid<=40, ivar(sid) time(year) gvar(gvar)`).
+    const EsampleRequest esreq = esample_request(a, "csdid");
+    const std::string keepif = opt(a, "--keepif");
+    const std::string data_all = data;
+    data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
     auto get_f64 = [&](const std::string& n) -> const double* {
         return require_num(ds, "csdid", n);
@@ -143,7 +153,7 @@ int cmd_csdid(const std::vector<std::string>& a) {
     for (const auto& c : R.cells) {
         cells_j.push_back({
             {"g", c.g}, {"base", c.base}, {"t", c.t},
-            {"att", c.att}, {"se", c.se}, {"n_cell", c.n_cell}, {"ok", c.ok},
+            {"att", c.att}, {"se", c.se}, {"n_cell", c.n_cell}, {"n_trt", c.n_trt}, {"ok", c.ok},
         });
     }
     json events_j = json::array();
@@ -222,11 +232,162 @@ int cmd_csdid(const std::vector<std::string>& a) {
         {"ok", R.ok},
         {"error", R.error},
     };
+    // e(sample): every row some estimated cell used (csdid.ado's cs_sample, the
+    // union of each cell's drdid e(sample)).
+    if (esreq.active() && R.ok) {
+        EsampleRows rows;
+        rows.keep = R.sample_rows;
+        rows.loaded = &ds;
+        emit_esample(esreq, "csdid", data_all, keepif, false, rows, out);
+    }
     emit(out, opt(a, "--out"));
     return R.ok ? 0 : 1;
 }
 
+
+// cobra xtpois --re: the random-effects (gamma) Poisson model, Stata's default
+// xtpoisson (estimators/xtpoisre.h). --x as load_glm reads it (factor variables
+// included; the constant last, dropped under --no-intercept); --offset V or
+// --exposure V (offset ln V); --vce robust|cluster: the sandwich over the panel
+// scores, G/(G-1) (xtpoisson's vce(robust) clusters on the panel).
+static int run_xtpois_re(const std::vector<std::string>& a) {
+    std::string data = opt(a, "--data"), y = opt(a, "--y"), xcsv = opt(a, "--x");
+    const std::string ivar = opt(a, "--ivar");
+    const std::string offv = opt(a, "--offset"), expv = opt(a, "--exposure");
+    const std::string vce = opt(a, "--vce", "iid");
+    if (data_missing(data) || y.empty() || xcsv.empty() || ivar.empty())
+        throw EngineError("bad_input", "xtpois --re: --data, --y, --x and --ivar are required");
+    if (vce != "iid" && vce != "robust" && vce != "cluster")
+        throw EngineError("bad_input", "xtpois --re: --vce must be iid, robust or cluster");
+    if (!offv.empty() && !expv.empty())
+        throw EngineError("bad_input", "xtpois --re: --offset and --exposure are exclusive");
+    const bool level_set = has(a, "--level");
+    const double level = std::stod(opt(a, "--level", "95"));
+    if (level_set && (level < 10.0 || level > 99.99)) {
+        std::fprintf(stderr, "xtpois: --level must be in [10, 99.99] (got %s).\n", opt(a, "--level").c_str());
+        return 2;
+    }
+    const double zc = z_critical(level == 95.0 ? 0.05 : 1.0 - level / 100.0);
+    int max_iter = 300;
+    if (has(a, "--iterate")) max_iter = std::stoi(opt(a, "--iterate"));
+    data = maybe_keepif(data, opt(a, "--keepif"));
+    const Dataset& ds = acquire_data(data);
+    // the panel id rides as a cluster column: listwise with y and x
+    GlmInputs g = load_glm(ds, "xtpois", y, split_csv(xcsv), {ivar}, "", cecon::WeightKind::None,
+                           offv.empty() ? expv : offv);
+    require_sample(g.n);
+    int k = g.k;
+    int cons_col = -1;
+    if (k > 0 && !g.names.empty() && g.names.back() == "(intercept)") {
+        if (has(a, "--no-intercept")) {
+            g.k -= 1;
+            g.X.resize(static_cast<size_t>(g.n) * g.k);
+            g.names.pop_back();
+            k = g.k;
+        } else {
+            cons_col = k - 1;
+        }
+    }
+    if (k == 0) throw EngineError("bad_input", "xtpois --re: no regressors");
+    for (int64_t i = 0; i < g.n; ++i)
+        if (g.y[static_cast<size_t>(i)] < 0)
+            throw EngineError("bad_input", "xtpois --re: " + y + " must be greater than or equal to zero");
+    std::vector<double> off;
+    if (!g.offset.empty()) {
+        off = g.offset;
+        if (!expv.empty())
+            for (double& v : off) {
+                if (!(v > 0)) throw EngineError("bad_input", "xtpois --re: exposure() must be positive");
+                v = std::log(v);
+            }
+    }
+    // panel ids as doubles (the cluster factor's dense codes keep the grouping)
+    std::vector<double> idv(static_cast<size_t>(g.n));
+    for (int64_t i = 0; i < g.n; ++i) idv[static_cast<size_t>(i)] = static_cast<double>(g.cluster[0].codes[static_cast<size_t>(i)]);
+    const double* offp = off.empty() ? nullptr : off.data();
+    XtpoisReResult r = xtpoisson_re_gamma(g.X.data(), g.n, k, g.y.data(), idv.data(), offp, cons_col, max_iter);
+    if (!r.ok)
+        throw EngineError("no_convergence", "xtpois --re: MLE failed (singular information matrix or non-convergent fit).");
+    const int np = k + 1;
+    std::vector<double> V = r.V;
+    int n_clusters = 0;
+    if (vce != "iid") {
+        // xtpoisson.ado's own robust VCE, clustered on the panel (vce(cluster panelvar)
+        // is the same); vs-stata bank 8c1f9870 `xtpoisson fatal beertax unemp, vce(robust)`
+        V = xtpoisson_re_stata_robust(g.X.data(), g.n, k, g.y.data(), idv.data(), offp, r);
+        n_clusters = static_cast<int>(r.n_groups);
+    }
+    auto sd = [&](int p) { return std::sqrt(std::max(0.0, V[static_cast<size_t>(p) * np + p])); };
+    json coefs = json::array();
+    for (int c = 0; c < k; ++c) {
+        const double b = r.theta[static_cast<size_t>(c)], se = sd(c);
+        const double z = se > 0 ? b / se : 0.0;
+        coefs.push_back({{"name", g.names[static_cast<size_t>(c)]}, {"b", b}, {"se", se}, {"z", z},
+                         {"p", se > 0 ? z_twosided_pvalue(z) : 1.0},
+                         {"ci_lo", b - zc * se}, {"ci_hi", b + zc * se}});
+    }
+    const double la_b = r.theta[static_cast<size_t>(k)], la_se = sd(k);
+    // Wald test of the regressors (the constant excluded)
+    std::vector<int> idx;
+    for (int c = 0; c < k; ++c)
+        if (c != cons_col) idx.push_back(c);
+    double chi2 = 0.0;
+    {
+        const int d = static_cast<int>(idx.size());
+        std::vector<double> Vs(static_cast<size_t>(d) * d);
+        for (int i = 0; i < d; ++i)
+            for (int j = 0; j < d; ++j)
+                Vs[static_cast<size_t>(i) * d + j] = V[static_cast<size_t>(idx[static_cast<size_t>(i)]) * np + idx[static_cast<size_t>(j)]];
+        if (d > 0 && la::spd_inverse(Vs.data(), d) == 0)
+            for (int i = 0; i < d; ++i)
+                for (int j = 0; j < d; ++j)
+                    chi2 += r.theta[static_cast<size_t>(idx[static_cast<size_t>(i)])] * Vs[static_cast<size_t>(i) * d + j] *
+                            r.theta[static_cast<size_t>(idx[static_cast<size_t>(j)])];
+    }
+    // XTPOISSON_FE_ROBUST's chi2: e(b)*syminv(V)*e(b)' over every parameter, the
+    // constant and /lnalpha included (bank 8c1f9870 e(chi2) 2630.2993)
+    if (vce != "iid") {
+        std::vector<double> Vi = V;
+        chi2 = 0.0;
+        if (la::spd_inverse(Vi.data(), np) == 0)
+            for (int i = 0; i < np; ++i)
+                for (int j = 0; j < np; ++j)
+                    chi2 += r.theta[static_cast<size_t>(i)] * Vi[static_cast<size_t>(i) * np + j] * r.theta[static_cast<size_t>(j)];
+    }
+    const int df = static_cast<int>(idx.size());
+    json out = {{"estimator", "xtpoisson_re"}, {"vce", vce}, {"n_obs", g.n}, {"n_groups", r.n_groups},
+                {"n_dropped_missing", g.n_dropped},
+                {"g_min", r.g_min}, {"g_avg", r.g_avg}, {"g_max", r.g_max},
+                {"coefs", coefs},
+                {"lnalpha", {{"b", la_b}, {"se", la_se}, {"ci_lo", la_b - zc * la_se}, {"ci_hi", la_b + zc * la_se}}},
+                {"alpha", {{"b", std::exp(la_b)}, {"se", std::exp(la_b) * la_se},
+                           {"ci_lo", std::exp(la_b - zc * la_se)}, {"ci_hi", std::exp(la_b + zc * la_se)}}},
+                {"ll", r.ll}, {"ll_c", r.ll_c},
+                // xtpoisson.ado: a fit below the comparison model (the boundary) is chibar2 0
+                {"chi2_c", r.ll < r.ll_c ? 0.0 : 2.0 * (r.ll - r.ll_c)},
+                {"chi2", chi2}, {"df_chi2", df}, {"p_chi2", chi2_pvalue(chi2, df)}, {"chi2type", "Wald"},
+                {"iters", r.iters}, {"converged", r.converged}, {"ilog", r.ilog}, {"gradient", r.gradient},
+                {"level", level}};
+    if (vce != "iid") out["n_clusters"] = n_clusters;
+    if (!offv.empty()) out["offset"] = offv;
+    if (!expv.empty()) out["offset"] = "ln(" + expv + ")";
+    if (has(a, "--emit-v")) {
+        std::vector<std::string> names = g.names;
+        names.push_back("/lnalpha");
+        add_e_v(out, names, V);
+        if (vce != "iid") {
+            json tmp;
+            add_e_v(tmp, names, r.V);
+            out["e_Vmb"] = std::move(tmp["e_V"]);
+        }
+    }
+    add_warnings(out, g.warnings);
+    emit(out, opt(a, "--out"));
+    return 0;
+}
+
 int cmd_xtpois(const std::vector<std::string>& a) {
+    if (has(a, "--re")) return run_xtpois_re(a);
     std::string data = opt(a, "--data"), y = opt(a, "--y"), xcsv = opt(a, "--x");
     std::string ivar = opt(a, "--ivar");
     std::string off  = opt(a, "--offset");
@@ -413,6 +574,12 @@ int cmd_xtreg(const std::vector<std::string>& a) {
     if (be) B = xtreg_be(X.data(), n_obs, k, yv_v.data(), iv_v.data());
     else R = xtreg_re(X.data(), n_obs, k, yv_v.data(), iv_v.data());
     auto t1 = std::chrono::steady_clock::now();
+    // xtreg, re starts from the within regression, which leaves out the regressors
+    // without within-panel variation; its residual dof N - N_g - (time-varying k)
+    // must be positive, else r(2001) "insufficient observations" (bank 8631427e:
+    // one observation per panel).
+    if (!be && !(R.df_e_within > 0))
+        throw cecon::EngineError("no_obs", "insufficient observations", "r(2001)");
     if (be && !B.ok) {
         std::fprintf(stderr, "xtreg: the between regression produced no coefficients (collinear panel means, or no more panels than parameters).\n");
         return 1;
@@ -588,6 +755,13 @@ int cmd_xtreg(const std::vector<std::string>& a) {
 int cmd_nbreg(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), y = opt(a, "--y"), xcsv = opt(a, "--x");
     std::string off = opt(a, "--offset");
+    // --exposure E: Stata's exposure(E), the offset ln(E) (E must be positive).
+    const std::string expo = opt(a, "--exposure");
+    if (!expo.empty()) {
+        if (!off.empty())
+            throw cecon::EngineError("bad_input", "nbreg: only one of offset() or exposure() can be specified");
+        off = expo;
+    }
     std::string cl  = opt(a, "--cluster");
     std::string vce = opt(a, "--vce", "iid");
     const std::string weight_var = opt(a, "--weight"), wtype = opt(a, "--wtype");
@@ -679,6 +853,11 @@ int cmd_nbreg(const std::vector<std::string>& a) {
     int64_t n_dropped_missing = n_raw - n_obs;
     auto yv_v = gather_rows(yraw, keep);
     std::vector<double> ov_v; if (oraw) ov_v = gather_rows(oraw, keep);
+    if (!expo.empty())
+        for (double& v : ov_v) {
+            if (!(v > 0.0)) throw cecon::EngineError("bad_input", "exposure() must be greater than zero");
+            v = std::log(v);
+        }
     std::vector<double> cv_v; if (craw) cv_v = gather_rows(craw, keep);
     std::vector<double> wv_v; if (wraw) wv_v = gather_rows(wraw, keep);
     std::vector<double> X(static_cast<size_t>(n_obs) * k);
@@ -693,12 +872,82 @@ int cmd_nbreg(const std::vector<std::string>& a) {
             throw cecon::EngineError("bad_input",
                 "nbreg: outcome '" + y + "' has negative values; count models require y >= 0.");
         }
+    // Collinear regressors are omitted, as Stata's nbreg does (the constant first,
+    // then the regressors in order; the later member of a collinear set drops): bank
+    // 673fe183 `nbreg rep78 mpg weight w2` with w2 = weight posts `o.w2` and fits
+    // mpg/weight (e(ll) -114.45060708274941). The rank-deficient design used to come
+    // back "converged" after one iteration with every slope 0 and the constant-only ll.
+    // The fit runs on the kept columns; an omitted one reports b = se = 0 and zero rows
+    // and columns of V.
+    std::vector<char> keep_col(static_cast<size_t>(k), 1);
+    {
+        std::vector<int> order;
+        if (intercept) order.push_back(kx);
+        for (int c = 0; c < kx; ++c) order.push_back(c);
+        std::vector<double> Xo;
+        Xo.reserve(order.size() * static_cast<size_t>(n_obs));
+        for (int c : order)
+            Xo.insert(Xo.end(), X.begin() + static_cast<std::ptrdiff_t>(c) * n_obs,
+                      X.begin() + static_cast<std::ptrdiff_t>(c + 1) * n_obs);
+        const std::vector<char> km =
+            cecon::collinear_keep_mask(Xo.data(), n_obs, static_cast<int>(order.size()));
+        for (size_t j = 0; j < order.size(); ++j)
+            if (!km[j]) keep_col[static_cast<size_t>(order[j])] = 0;
+    }
+    std::vector<int> fit_cols;
+    for (int c = 0; c < k; ++c)
+        if (keep_col[static_cast<size_t>(c)]) fit_cols.push_back(c);
+    const int kf = static_cast<int>(fit_cols.size());
+    std::vector<double> Xf;
+    if (kf < k) {
+        Xf.reserve(static_cast<size_t>(kf) * static_cast<size_t>(n_obs));
+        for (int c : fit_cols)
+            Xf.insert(Xf.end(), X.begin() + static_cast<std::ptrdiff_t>(c) * n_obs,
+                      X.begin() + static_cast<std::ptrdiff_t>(c + 1) * n_obs);
+    }
     auto t0 = std::chrono::steady_clock::now();
-    auto R = nbreg(X.data(), n_obs, k, yv_v.data(),
+    auto R = nbreg(kf < k ? Xf.data() : X.data(), n_obs, kf, yv_v.data(),
                    ov_v.empty() ? nullptr : ov_v.data(),
-                   cv_v.empty() ? nullptr : cv_v.data(), 100, 1e-10,
-                   wv_v.empty() ? nullptr : wv_v.data(), wkind == cecon::WeightKind::Frequency);
+                   cv_v.empty() ? nullptr : cv_v.data(),
+                   has(a, "--iterate") ? std::stoi(opt(a, "--iterate")) : 100, 1e-10,
+                   wv_v.empty() ? nullptr : wv_v.data(), wkind == cecon::WeightKind::Frequency,
+                   // the trailing constant column (collinearity checks keep it first), or
+                   // none under --no-intercept, whatever the regressors hold
+                   intercept && keep_col[static_cast<size_t>(kx)] ? kf - 1 : -1);
     auto t1 = std::chrono::steady_clock::now();
+    if (kf < k && static_cast<int>(R.beta.size()) >= kf && static_cast<int>(R.se_iid.size()) >= kf &&
+        static_cast<int>(R.se_robust.size()) >= kf) {
+        // Back onto the full design: omitted columns are structural zeros.
+        auto widen = [&](const std::vector<double>& v) {
+            std::vector<double> w(static_cast<size_t>(k), 0.0);
+            for (int j = 0; j < kf; ++j) w[static_cast<size_t>(fit_cols[static_cast<size_t>(j)])] = v[static_cast<size_t>(j)];
+            return w;
+        };
+        auto widenV = [&](const std::vector<double>& v) {
+            if (v.size() != static_cast<size_t>(kf + 1) * static_cast<size_t>(kf + 1)) return v;
+            std::vector<int> at(fit_cols);
+            at.push_back(k);  // lnα stays last
+            std::vector<double> w(static_cast<size_t>(k + 1) * static_cast<size_t>(k + 1), 0.0);
+            for (int a2 = 0; a2 <= kf; ++a2)
+                for (int b2 = 0; b2 <= kf; ++b2)
+                    w[static_cast<size_t>(at[static_cast<size_t>(a2)]) * static_cast<size_t>(k + 1) +
+                      static_cast<size_t>(at[static_cast<size_t>(b2)])] =
+                        v[static_cast<size_t>(a2) * static_cast<size_t>(kf + 1) + static_cast<size_t>(b2)];
+            return w;
+        };
+        R.beta = widen(R.beta);
+        if (R.gradient.size() == static_cast<size_t>(kf + 1)) {
+            const double glna = R.gradient.back();
+            R.gradient.pop_back();
+            R.gradient = widen(R.gradient);
+            R.gradient.push_back(glna);
+        }
+        R.se_iid = widen(R.se_iid);
+        R.se_robust = widen(R.se_robust);
+        R.vcov_iid = widenV(R.vcov_iid);
+        R.vcov_robust = widenV(R.vcov_robust);
+        R.k = k;
+    }
     if (static_cast<int>(R.beta.size()) < k || static_cast<int>(R.se_iid.size()) < k ||
         static_cast<int>(R.se_robust.size()) < k) {
         // Structured error → top-level catch emits {"error":{code,message}} as JSON,
@@ -737,6 +986,10 @@ int cmd_nbreg(const std::vector<std::string>& a) {
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
     };
     out["level"] = level;  // always emitted, like Stata's e(level) (BUG-279)
+    // e(sample)'s row count under an fweight / iweight, whose e(N) the handshake
+    // cannot count rows from (bank 2669e294 `nbreg ... [fweight=w]`: 336 rows)
+    if (wkind == cecon::WeightKind::Frequency || wkind == cecon::WeightKind::Importance)
+        out["n_rows"] = R.n_obs;
     // --emit-v (BUG-1196): the fit's full covariance over (β, lnα), `/lnalpha` last
     // (StataBE 19.5 colfullnames e(b) `cnt:x1 cnt:x2 cnt:_cons /lnalpha`), the one
     // the reported SEs are read from. None at the α→0 boundary (lnα is not
@@ -748,6 +1001,30 @@ int cmd_nbreg(const std::vector<std::string>& a) {
             names.push_back((c < kx) ? xcols[static_cast<size_t>(c)].first : std::string("_cons"));
         names.push_back("/lnalpha");
         add_e_v(out, names, Vfit);
+        // ml's record of the fit (none at the α→0 boundary): e(ic) and e(ilog) of the
+        // full model, e(gradient) over (β, lnα), e(V_modelbased) under a sandwich VCE,
+        // e(ll_0) of the constant-only model and e(ll_c) of the Poisson comparison.
+        if (!R.boundary && !R.ilog.empty() && R.gradient.size() == names.size()) {
+            out["ic"] = R.iters;
+            out["ilog"] = R.ilog;
+            out["e_gradient"] = {{"names", names}, {"values", R.gradient}};
+            if (vce != "iid" && R.vcov_iid.size() == names.size() * names.size()) {
+                json tmp;
+                add_e_v(tmp, names, R.vcov_iid);
+                out["e_Vmb"] = std::move(tmp["e_V"]);
+            }
+            if (R.has_ll_0) out["ll_0"] = R.ll_0;
+            // The Poisson comparison (the LR test of alpha = 0) is a likelihood-ratio
+            // test, so it exists only under the model-based VCE: vce(robust),
+            // vce(cluster) and [pweight] (which this command runs as robust) post
+            // no e(ll_c) / e(chi2_c).
+            if (vce == "iid") out["ll_c"] = R.ll_c;
+            if (!cv_v.empty()) {  // e(N_clust)
+                std::vector<double> g(cv_v);
+                std::sort(g.begin(), g.end());
+                out["n_clusters"] = static_cast<int64_t>(std::unique(g.begin(), g.end()) - g.begin());
+            }
+        }
     }
     emit(out, opt(a, "--out"));
     return R.converged ? 0 : 1;
@@ -848,6 +1125,13 @@ int cmd_xtlogit(const std::vector<std::string>& a) {
         {"coefs", coefs},
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
     };
+    // ml's iteration log, the gradient at the estimates and the log likelihood at
+    // beta = 0 (Stata's e(ilog), e(gradient), e(ll_0); vs-stata bank 1ce53089
+    // `xtlogit hi beertax unemp, fe`: e(ll_0) -166.5701, iteration 0 -151.63393).
+    out["ilog"] = R.ilog;
+    out["gradient"] = R.gradient;
+    out["ll_0"] = R.ll_0;
+    out["n_dropped_obs"] = R.n_dropped_obs;  // e(N_drop): the rows of every dropped panel
     if (has(a, "--emit-v"))
         add_e_v(out, xk, vce == "robust" ? R.V_robust : R.V_iid);
     emit(out, opt(a, "--out"));

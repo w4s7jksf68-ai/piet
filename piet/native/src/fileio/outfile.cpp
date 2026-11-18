@@ -43,14 +43,16 @@
 #include "piet/strutil.h"
 #include "xlsx.h"
 #include "file_command_support.h"
+#include "piet/serset.h"  // storageType: the type word a dictionary line states
 
 namespace {
 
 // `wide` asks for one observation per output line, which is exactly and only
-// what this writer does -- honoured by construction. `dictionary` writes a
-// companion .dct and `fast` changes the buffering contract; neither is done.
+// what this writer does -- honoured by construction. `dictionary` puts the
+// dictionary ahead of the data in the same file; `fast` changes the buffering
+// contract and is not done.
 const piet::eval::OptVocab& kVocabOutfile = piet::eval::registerOptVocab(
-    {"outfile"}, {{"replace", "noquote", "comma", "nolabel", "wide"}, {"dictionary", "fast"}});
+    {"outfile"}, {{"replace", "noquote", "comma", "nolabel", "wide", "dictionary"}, {"fast"}});
 
 }  // namespace
 
@@ -107,6 +109,15 @@ ojson runOutfile(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   if (!session.hasData()) return ojson(eval::noDataLoaded());
 
+  // `using filename` is required by the syntax: a line without it is r(100)
+  // "using required" (vs-stata bank 5c6fb3f5fe554155 `outfile make price mpg rep78 foreign`); the last word is not taken as
+  // the file.
+  {
+    bool sawUsing = false;
+    for (const auto& w : quoteAwareWords(preCommaArgs(parsed.raw)))
+      sawUsing = sawUsing || lowerOf(w) == "using";
+    if (!sawUsing) return ioErrorRc("using required", 100);
+  }
   std::vector<std::string> varlist;
   std::string pathArg;
   if (!splitUsing(dropQualifierWords(quoteAwareWords(preCommaArgs(parsed.raw))), &varlist,
@@ -120,11 +131,12 @@ ojson runOutfile(const eval::ParsedCommand& parsed, SessionState& session) {
   const bool noLabel = hasFlag(parsed.opts, "nolabel");
   const bool comma = hasFlag(parsed.opts, "comma");
   const bool wide = hasFlag(parsed.opts, "wide");
+  const bool dictionary = hasFlag(parsed.opts, "dictionary");
 
   std::string resolved = resolveUserPath(session, pathArg);
   // "If filename is specified without a suffix, .raw is assumed" (outfile
-  // help; StataBE `outfile using o2` names `o2.raw`).
-  assumeSuffix(&resolved, &pathArg, ".raw");
+  // help; StataBE `outfile using o2` names `o2.raw`), .dct with dictionary.
+  assumeSuffix(&resolved, &pathArg, dictionary ? ".dct" : ".raw");
   if (auto err = refuseExisting(resolved, pathArg, replace)) return *err;
   if (auto err = refuseIfSessionHbin(session, "outfile", resolved, pathArg)) return *err;
 
@@ -174,6 +186,12 @@ ojson runOutfile(const eval::ParsedCommand& parsed, SessionState& session) {
     } else {
       if (!noLabel) o.labels = labelsFor(session, name);
       o.fmt = session.displayFormat(base->varinfo(name));
+      // No thousands separators in the file (vs-stata bank: auto's weight
+      // %8.0gc written by outfile reads back through infile as 2930, N 74).
+      {
+        static const std::regex reComma(R"(^(%-?0?[0-9]+(\.[0-9]+)?[gfe])c$)");
+        o.fmt = std::regex_replace(o.fmt, reComma, "$1");
+      }
       std::string f = o.fmt;
       if (!f.empty() && f[0] == '%') f.erase(0, 1);
       if (!f.empty() && f[0] == '-') f.erase(0, 1);
@@ -226,6 +244,42 @@ ojson runOutfile(const eval::ParsedCommand& parsed, SessionState& session) {
   };
 
   std::string body;
+  if (dictionary) {
+    // dictionary { ... }: one line per variable -- the storage type, the name,
+    // `:valuelabel` when it has one, and the variable label in `"..."' -- then
+    // the data (StataBE 19.5, bank e19976eaee791b49, 144d10c3b7a8737d,
+    // 61fc418f90911e2c; the value-label name is written whether or not
+    // `nolabel` is, bank 488aa0f8a12db7e3).
+    struct DictLine { std::string type, name, valueLabel, label; };
+    std::vector<DictLine> lines;
+    size_t nameWidth = 8, vlWidth = 10;
+    for (const auto& name : cols) {
+      DictLine dl;
+      dl.name = name;
+      dl.type = serset::storageType(session, *base, name);
+      auto vl = session.varLblname.find(name);
+      if (vl != session.varLblname.end() && base->col(name).dtype != cecon::DType::Factor)
+        dl.valueLabel = ":" + vl->second;
+      const VarInfo info = base->varinfo(name);
+      dl.label = info.label;
+      auto vm = session.varMeta.find(name);
+      if (vm != session.varMeta.end() && vm->second.label.has_value()) dl.label = *vm->second.label;
+      nameWidth = std::max(nameWidth, name.size() + 1);
+      vlWidth = std::max(vlWidth, dl.valueLabel.size() + 2);
+      lines.push_back(std::move(dl));
+    }
+    body += "dictionary {\n";
+    for (const auto& dl : lines) {
+      std::string row = "        ";
+      row += dl.type + std::string(dl.type.size() < 8 ? 8 - dl.type.size() : 1, ' ');
+      row += dl.name + std::string(nameWidth - dl.name.size(), ' ');
+      row += dl.valueLabel + std::string(vlWidth - dl.valueLabel.size(), ' ');
+      if (!dl.label.empty()) row += "`\"" + dl.label + "\"'";
+      while (!row.empty() && row.back() == ' ') row.pop_back();
+      body += row + "\n";
+    }
+    body += "}\n";
+  }
   const int64_t n = ds->nRows();
   for (int64_t r = 0; r < n; ++r) {
     size_t budget = 0;  // each field costs its width plus 2 against the 80 columns

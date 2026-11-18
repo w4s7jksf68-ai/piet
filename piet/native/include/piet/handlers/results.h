@@ -34,6 +34,13 @@ nlohmann::ordered_json runEreturnList(SessionState& session);
 // one error block, or an empty array on silent success.
 nlohmann::ordered_json runEreturn(const eval::ParsedCommand& parsed, SessionState& session);
 
+// A name written into e() on top of a fit (`ereturn local|matrix|scalar` in an
+// eclass program): the fit's ordered e() name lists (SessionState::ENameContract)
+// gain it as an estadd'ed name -- kind 'm' a macro first, 'x' a matrix after
+// `b V`, 's' a scalar last -- so `: e(macros)` etc. keep answering
+// (ereturn_commands.cpp).
+void noteEContractName(SessionState& session, const std::string& name, char kind);
+
 // `matrix NAME = e(b)` / `matrix NAME = e(V)` — capture the last estimation's
 // coefficient vector / diagonal se^2 matrix into session.eval.matrices. Silent
 // on success; other matrix forms return an explicit unsupported error.
@@ -51,6 +58,11 @@ std::string matrixNameAsListed(const std::string& name);
 // reuses that handler's formatter rather than growing a second one that can
 // drift from it (results/scalar_results.cpp::runEreturnList).
 nlohmann::ordered_json runReturnList(SessionState& session);
+// `sreturn list`: the s() macros (`sreturn local` in an sclass program),
+// newest first under a `macros:` header; nothing at all when s() is empty
+// (StataBE 19.5: an empty array, no block). `sreturn clear` empties s().
+nlohmann::ordered_json runSreturnList(SessionState& session);
+void clearSreturn(SessionState& session);
 // `svmat [type] A [, names(col|eqcol|matcol|stub)]` -- matrix columns become
 // variables. Extends _N when the matrix has more rows than the dataset, which
 // is Stata's documented behaviour and the reason this cannot be a pure read.

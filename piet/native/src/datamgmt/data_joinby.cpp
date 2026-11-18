@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 // data joinby.
+#include "data_combine_internal.h"
 #include "data_io_internal.h"
 #include "piet/handlers/data_combine.h"
 namespace piet::handlers::data_io_detail {
@@ -57,7 +58,7 @@ JoinbyUsingResult resolveJoinbyUsing(SessionState& session, const std::string& u
 // carries ul list u through ul, StataBE).
 void adoptUsingOwnVars(SessionState& session, const JoinbyUsingResult& ur,
                        const std::map<std::string, UsingVarMeta>& uMeta,
-                       const std::vector<std::string>& usingOnly) {
+                       const std::vector<std::string>& usingOnly, bool copyValueLabels) {
   for (const auto& nm : usingOnly) {
     auto it = uMeta.find(nm);
     if (it == uMeta.end()) continue;
@@ -72,16 +73,19 @@ void adoptUsingOwnVars(SessionState& session, const JoinbyUsingResult& ur,
       session.varMeta[nm].stataType = *u.stataType;
     }
   }
-  adoptUsingValueLabels(session, ur.usingPath, ur.metaPath, usingOnly, true);
+  if (copyValueLabels)  // joinby's nolabel leaves the using file's value labels behind
+    adoptUsingValueLabels(session, ur.usingPath, ur.metaPath, usingOnly, true);
 }
 }
 namespace piet::handlers {
 using namespace data_io_detail;
+using namespace data_combine_detail;
 
 
-ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usingPathArg,
+ojson runJoinby(const std::vector<std::string>& keylistIn, const std::string& usingPathArg,
                 SessionState& session, const std::string& unmatched,
-                const std::optional<std::string>& mergeVar) {
+                const std::optional<std::string>& mergeVar, bool nolabel) {
+  std::vector<std::string> keylist = keylistIn;
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   // INSPECT-2608: everything this function asks of the MASTER frame is metadata
   // — does a key exist, what are the non-key names, how many rows — and
@@ -113,7 +117,6 @@ ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usin
     for (const auto& info : *card) out.push_back(info.name);
     return out;
   };
-  if (keylist.empty()) return engineErrorBlock("joinby: key variable list required");
   for (const auto& k : keylist) {
     if (!masterHas(k)) return engineErrorBlock("joinby: variable '" + k + "' not found");
   }
@@ -128,9 +131,72 @@ ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usin
     return ojson(eval::errorBlock("engine_error", "variable " + marker + " already defined",
                                   std::nullopt, std::nullopt, std::nullopt, "r(110)"));
 
-  JoinbyUsingResult ur = resolveJoinbyUsing(session, usingPathArg);
+  // With no key list joinby.ado joins on the master variables the using data
+  // also has, each looked up there as `confirm var` does -- a unique
+  // abbreviation counts. None in common is r(198) "no variables in common to
+  // master and using data" (vs-stata bank 1623e817df0653ce). The ado's later
+  // match on such a key needs the exact name in the using data, so a key found
+  // only as an abbreviation is r(111) "variable X not found in using data"
+  // (72dc371e163d7327, 08daa79d2f61ccae).
+  std::optional<JoinbyUsingResult> early;
+  std::string joinNote;
+  if (keylist.empty()) {
+    early = resolveJoinbyUsing(session, usingPathArg);
+    if (!early->ok) return early->errBlock;
+    Datastore u0(early->hbinPath);
+    const std::vector<std::string> unames = u0.names();
+    std::string abbreviatedOnly;
+    for (const auto& nm : masterNames()) {
+      if (std::find(unames.begin(), unames.end(), nm) != unames.end()) {
+        keylist.push_back(nm);
+        continue;
+      }
+      size_t hits = 0;
+      for (const auto& un : unames)
+        if (un.size() > nm.size() && un.compare(0, nm.size(), nm) == 0) ++hits;
+      if (hits == 1) {
+        keylist.push_back(nm);
+        if (abbreviatedOnly.empty()) abbreviatedOnly = nm;
+      }
+    }
+    if (keylist.empty())
+      return ojson(eval::errorBlock(
+          "engine_error",
+          "no variables in common to master and using data\nthus a join is not possible",
+          std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    joinNote = "join on common variables: ";
+    for (size_t i = 0; i < keylist.size(); ++i) joinNote += (i ? " " : "") + keylist[i];
+    if (!abbreviatedOnly.empty())
+      return ojson(eval::errorBlock(
+          "engine_error",
+          joinNote + "\nvariable " + abbreviatedOnly + " not found in using data",
+          std::nullopt, std::nullopt, std::nullopt, "r(111)"));
+  }
+
+  JoinbyUsingResult ur = early.has_value() ? *early : resolveJoinbyUsing(session, usingPathArg);
   if (!ur.ok) return ur.errBlock;
   Datastore usingDs(ur.hbinPath);
+  // A key must be numeric on both sides or string on both: r(106) (vs-stata
+  // bank 5ad69e4f671265b0 `joinby price using "u.dta"` with a string price in
+  // the using data).
+  for (const auto& k : keylist) {
+    if (!usingDs.has(k)) continue;
+    std::string mt;
+    if (master) {
+      mt = master->dtype(k);
+    } else {
+      for (const auto& info : *card)
+        if (info.name == k) mt = info.dtype;
+    }
+    const std::string ut = usingDs.dtype(k);
+    if (!mt.empty() && (mt == "factor") != (ut == "factor"))
+      return ojson(eval::errorBlock(
+          "engine_error",
+          "variable " + k + " is " + (ut == "factor" ? "str" : "numeric") + " in using data and " +
+              (mt == "factor" ? "str" : "numeric") +
+              " in master data\n    key variables must be both numeric or both string.",
+          std::nullopt, std::nullopt, std::nullopt, "r(106)"));
+  }
   // What the using file states about its variables (labels, formats, str#),
   // adopted by the variables the join brings in (dc_j_base_v5 uval
   // `float|%7.1f|[u val]`).
@@ -262,7 +328,23 @@ ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usin
         "joinby: the data were joined, but the estimation-sample marker could not be "
         "withdrawn from the result; e(sample) is not reliable until the next estimation.");
   }
-  adoptUsingOwnVars(session, ur, uMeta, usingExtra);
+  adoptUsingOwnVars(session, ur, uMeta, usingExtra, !nolabel);
+  // A key both files hold is stored wide enough for both: a byte key joined with a
+  // double one is a double afterwards (vs-stata bank: joinby `byte g` with `double g`).
+  for (const auto& k : keylist) {
+    auto uit = uMeta.find(k);
+    if (uit == uMeta.end() || !uit->second.stataType.has_value() ||
+        !isNumericStataType(*uit->second.stataType))
+      continue;
+    const std::optional<std::string> m = numericTypeClaim(session, k);
+    if (m.has_value() && !isNumericStataType(*m)) continue;
+    const std::optional<std::string> promoted = appendPromotedType(m, uit->second.stataType);
+    if (promoted.has_value() && promoted != m) {
+      VarMeta& vm = session.varMeta[k];
+      if (!vm.format.has_value() || vm.format->empty()) vm.format = stataDefaultFormat(m);
+      setNumericTypeClaim(session, k, promoted);
+    }
+  }
   // The marker (joinby.ado DefLabel): a byte with value label
   // __MERGE (1-3 and the 9999 "signature" entry), no variable label, displayed
   // as wide as "both in master and using data" (dc_j_both_v5 `byte|%29.0g|[]`).

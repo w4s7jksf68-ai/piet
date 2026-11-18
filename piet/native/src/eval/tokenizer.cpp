@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <regex>
 #include <sstream>
 #include <unordered_set>
@@ -151,6 +153,49 @@ bool contains(const std::vector<std::string>& v, const std::string& s) {
 // ---------------------------------------------------------------------------
 // Comment stripping (step 2)
 
+// Inline /* */ and //: the text kept from `line`, with `depth` the open /*
+// levels before the line and after it; leaves depth > 0 when a `/*` does not
+// close on this line (everything after it is dropped). A string, plain or
+// compound, is closed at the end of its line.
+std::string scanCommentsInline(const std::string& line, int& depth) {
+  std::string result;
+  bool inString = false;
+  int compound = 0;
+  size_t i = 0;
+  const size_t n = line.size();
+  auto at = [&](size_t k, char a, char b) { return k + 1 < n && line[k] == a && line[k + 1] == b; };
+  while (i < n) {
+    if (depth > 0) {
+      if (at(i, '/', '*')) { ++depth; i += 2; continue; }
+      if (at(i, '*', '/')) { --depth; i += 2; continue; }
+      ++i;
+      continue;
+    }
+    if (inString) {
+      if (line[i] == '"') inString = false;
+    } else if (compound > 0) {
+      if (at(i, '`', '"')) { ++compound; result.append(line, i, 2); i += 2; continue; }
+      if (at(i, '"', '\'')) { --compound; result.append(line, i, 2); i += 2; continue; }
+    } else if (at(i, '`', '"')) {
+      compound = 1;
+      result.append(line, i, 2);
+      i += 2;
+      continue;
+    } else if (line[i] == '"') {
+      inString = true;
+    } else if (at(i, '/', '*')) {
+      depth = 1;
+      i += 2;
+      continue;
+    } else if (at(i, '/', '/') && (i == 0 || line[i - 1] == ' ' || line[i - 1] == '\t')) {
+      break;
+    }
+    result.push_back(line[i]);
+    ++i;
+  }
+  return rstrip(result);
+}
+
 // A /* ... */ comment is white space to Stata, newline included, so a command
 // whose text continues after a `*/` on a LATER line is one command (BUG-698;
 // oracle w2c_ml_getmata.do:324-325 splits a getmata getlist this way, log
@@ -168,47 +213,7 @@ std::vector<std::string> stripComments(const std::vector<std::string>& lines) {
   std::vector<std::string> out;
   int depth = 0;       // open /* levels
   size_t openIdx = 0;  // out[] entry of the line where the open block began
-  // Inline /* */ and //: the text kept from `line`; leaves depth > 0 when a
-  // `/*` does not close on this line (everything after it is dropped). A
-  // string, plain or compound, is closed at the end of its line.
-  auto scanInline = [&depth](const std::string& line) {
-    std::string result;
-    bool inString = false;
-    int compound = 0;
-    size_t i = 0;
-    const size_t n = line.size();
-    auto at = [&](size_t k, char a, char b) { return k + 1 < n && line[k] == a && line[k + 1] == b; };
-    while (i < n) {
-      if (depth > 0) {
-        if (at(i, '/', '*')) { ++depth; i += 2; continue; }
-        if (at(i, '*', '/')) { --depth; i += 2; continue; }
-        ++i;
-        continue;
-      }
-      if (inString) {
-        if (line[i] == '"') inString = false;
-      } else if (compound > 0) {
-        if (at(i, '`', '"')) { ++compound; result.append(line, i, 2); i += 2; continue; }
-        if (at(i, '"', '\'')) { --compound; result.append(line, i, 2); i += 2; continue; }
-      } else if (at(i, '`', '"')) {
-        compound = 1;
-        result.append(line, i, 2);
-        i += 2;
-        continue;
-      } else if (line[i] == '"') {
-        inString = true;
-      } else if (at(i, '/', '*')) {
-        depth = 1;
-        i += 2;
-        continue;
-      } else if (at(i, '/', '/') && (i == 0 || line[i - 1] == ' ' || line[i - 1] == '\t')) {
-        break;
-      }
-      result.push_back(line[i]);
-      ++i;
-    }
-    return rstrip(result);
-  };
+  auto scanInline = [&depth](const std::string& line) { return scanCommentsInline(line, depth); };
   bool openedInStarLine = false;  // BUG-1441: the open block began inside a `*` comment
   for (const auto& line : lines) {
     if (depth > 0) {
@@ -404,7 +409,9 @@ constexpr DefaultWeightRow kDefaultWeight[] = {
 
 // Python: re.split(r'\s+if\s+', pre, maxsplit=1, flags=re.IGNORECASE)
 const std::regex& reSplitIf() {
-  static const std::regex r(R"(\s+if\s+)", std::regex::icase);
+  // `if` then blanks, or `if` glued to its parenthesised condition: StataBE
+  // 19.5 `summarize price if(foreign)` is the qualifier (rc 0).
+  static const std::regex r(R"(\s+if(?:\s+|(?=\()))", std::regex::icase);
   return r;
 }
 
@@ -884,59 +891,6 @@ long long findTrailingQualifierComma(const std::string& post) {
 }
 
 
-// Stata-legal weight types per command, for the weight gate in tokenize().
-// A row exists ONLY where the legal set has a citable source; a command with
-// no row keeps the engine-gap refusal for every weight the registry lacks.
-struct StataLegalWeights {
-  const char* canonical;
-  const char* legal;  // space-separated full type names
-};
-constexpr StataLegalWeights kStataLegalWeights[] = {
-    // summarize: its help
-    // ("aweights, fweights, and iweights are allowed"); oracle
-    // tests/eval/golden/aer_w2/w2_pweight.log:764-768 (`pweights not allowed`,
-    // r(101)) and aer_b4/esttab-beta.log:338 (W_su_pweight_refused, 101).
-    {"summarize", "aweight fweight iweight"},
-    // qreg: its help ("allows
-    // fweights, iweights, and pweights"); oracle
-    // tests/eval/golden/aer_w2/w2p_estim_ev.log:418-419 (`qreg ... [aw=w]` ->
-    // `aweights not allowed`, __rc 101, A_qreg_aw_q50).
-    {"qreg", "fweight iweight pweight"},
-    // qreg2 (SSC): qreg2 `syntax ... [fweight]`; oracle
-    // tests/eval/golden/aer_w2/w2j_e3_qreg2.log:1996-2018 (pw/aw/iw ->
-    // `pweights not allowed` etc., r(101); R01-R03).
-    {"qreg2", "fweight"},
-    // tabulate/tab1: the tabulate help
-    // ("fweights, aweights, and iweights are
-    // allowed"); tab2: "fweights are allowed by
-    // tab2". Oracle w2aj_qualifiers qf_tb_aw_sp / qf_tb_iw_sp serve aw/iw.
-    {"tabulate", "aweight fweight iweight"},
-    {"tab1", "aweight fweight iweight"},
-    {"tab2", "fweight"},
-    // pctile/_pctile/xtile: aweights, fweights and pweights are allowed
-    // (pctile's help and syntax). Oracle
-    // w2aj_qualifiers qf_pt_aw_sp / qf_xq_aw_sp.
-    {"pctile", "aweight fweight pweight"},
-    // _pctile also takes iweights (StataBE 19.5 `_pctile x [iw=wf]` rc 0, BUG-1444).
-    {"_pctile", "aweight fweight iweight pweight"},
-    {"xtile", "aweight fweight pweight"},
-    // BUG-1444 (StataBE 19.5, 2026-10-29, the entry's probe): pweights and
-    // iweights are r(101) on correlate, pwcorr, tabstat (BUG-1151 too: tabstat.ado
-    // takes `[aw fw]`) and cumul; aweights on probit and poisson.
-    {"corr", "aweight fweight"},
-    {"pwcorr", "aweight fweight"},
-    {"tabstat", "aweight fweight"},
-    {"cumul", "aweight fweight"},
-    {"probit", "fweight iweight pweight"},
-    {"poisson", "fweight iweight pweight"},
-    // BUG-1539: aweights and iweights are r(101) on ppmlhdfe (StataBE 19.5,
-    // scratch-laneA2/agents/wml/x1.log).
-    {"ppmlhdfe", "fweight pweight"},
-    // BUG-1537: aweights are r(101) on nbreg (StataBE 19.5, x1.log).
-    {"nbreg", "fweight iweight pweight"},
-    // BUG-1541: aweights are r(101) on proportion (StataBE 19.5, x1.log).
-    {"proportion", "fweight iweight pweight"},
-};
 
 }  // namespace
 
@@ -1065,6 +1019,34 @@ std::pair<size_t, size_t> ifQualifierRange(const std::string& s) {
 }
 }  // namespace
 
+namespace {
+thread_local double tl_callerVersion = 0.0;
+
+// The kind of operator a varlist token carries: 'f' a factor-variable operator
+// (`i.x`, `ib3.x`, `c.x`, `1.x`, `9.2f`, `x#y`), 't' a time-series one only
+// (`L.x`, `l2.x`, `D.x`, `L2D.x`), 0 none (a name, a number, anything else).
+char operatorKind(const std::string& tok) {
+  if (tok.empty()) return 0;
+  {  // a number literal is never an operator token (`ttest x == 1.5e3`)
+    char* end = nullptr;
+    (void)std::strtod(tok.c_str(), &end);
+    if (end != nullptr && *end == '\0') return 0;
+  }
+  static const char* kFvChars =
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.#()";
+  if (tok.find('#') != std::string::npos)
+    return tok.find_first_not_of(kFvChars) == std::string::npos ? 'f' : 0;
+  static const std::regex reOp(
+      R"(((?:(?:[icobLFDSlfds]\d*)+|ib\(\w+\)|\d+)(?:\.(?:(?:[icobLFDSlfds]\d*)+|\d+))*)\.\w*[A-Za-z_]\w*)");
+  static const std::regex reTs(R"((?:[LFDSlfds]\d*)+(?:\.(?:[LFDSlfds]\d*)+)*)");
+  std::smatch m;
+  if (!std::regex_match(tok, m, reOp)) return 0;
+  return std::regex_match(m.str(1), reTs) ? 't' : 'f';
+}
+}  // namespace
+
+void setTokenizeCallerVersion(double version) { tl_callerVersion = version; }
+
 ParsedCommand tokenize(const std::string& line) {
   std::string raw = strip(line);
   if (raw.empty()) {
@@ -1137,6 +1119,11 @@ ParsedCommand tokenize(const std::string& line) {
     for (auto it = std::sregex_iterator(scan.begin(), scan.end(), reGlobalMacro());
          it != std::sregex_iterator(); ++it) {
       const std::string ref = it->str(0);
+      // `${name` with no closing brace is no reference: StataBE prints it as
+      // typed (`display "<${g>"` prints `<${g>`, vs-stata truth bank), and the
+      // expansion pass left it alone, so it is literal text here too. It was
+      // refused as an unexpanded macro, uncaptured, and the do-file stopped.
+      if (ref.size() > 1 && ref[1] == '{' && ref.back() != '}') continue;
       const size_t at = ref.size() > 1 && ref[1] == '{' ? 2 : 1;
       char32_t cp = 0;
       const unsigned char c0 = static_cast<unsigned char>(ref[at]);
@@ -1175,6 +1162,13 @@ ParsedCommand tokenize(const std::string& line) {
   // user's sentence, never a qualifier or an option (w2ao_label_family
   // lb_note_gtcbsast `note gtcbsast: U All HHLD's in sample`, rc 0).
   if ((cmdLower == "note" || cmdLower == "notes") && raw.find(':') != std::string::npos) {
+    // Before the colon is notes' syntax, which takes no weight: StataBE 19.5
+    // `note price [aw=weight]: text` is r(101) "weights not allowed".
+    const std::string head = raw.substr(0, raw.find(':'));
+    std::smatch wm;
+    if (head.find('[') != std::string::npos && searchUnquoted(head, reWeight(), wm))
+      throw TokenizerError(errorBlock("engine_error", "weights not allowed", std::nullopt,
+                                      std::nullopt, std::nullopt, "r(101)"));
     ParsedCommand pc;
     pc.cmd = cmdLower;
     pc.raw = raw;
@@ -1295,6 +1289,122 @@ ParsedCommand tokenize(const std::string& line) {
     opts = parseOpts(postComma);
   }
 
+  // Stata's own syntax, before any PIET gate (registry.h StataLead /
+  // StataQualifiers). Stata reads the line left to right: the lead first (an
+  // empty one is "varlist required", "using required", "=exp required", ...,
+  // or "options not allowed" for the built-ins that parse the comma first),
+  // then the qualifiers its syntax does not take (r(101) "if not allowed", "in
+  // range not allowed", "weights not allowed", "<type>s not allowed", in that
+  // order), then "options not allowed" for a syntax with no options. PIET's own
+  // gates below -- the weight word, the weight policy, the `in` allow-list, and
+  // each arm's option net -- speak only for a form Stata accepts and this engine
+  // lacks; without this step they answered a Stata refusal as a PIET gap,
+  // r(198) "... is not supported in this version of PIET" / "option x not
+  // allowed". An estimation command's empty lead is a replay, which needs the
+  // session's e(): stage_validation.cpp's checkStataLead answers it. A by/bysort
+  // line is judged when the by-driver re-tokenizes its sub-command, and a
+  // prefix form (`xi:`, `cmd :`) belongs to the command after the colon.
+  {
+    const std::string headLower = toLower(rstripChar(cmd, ':'));
+    const bool prefixForm = (!cmd.empty() && cmd.back() == ':') || (!varlist.empty() && varlist[0] == ":");
+    const registry::CommandSpec* gspec =
+        prefixForm || isByPrefixToken(headLower) ? nullptr : registry::findByName(headLower);
+    if (gspec != nullptr) {
+      const auto refuse = [](const std::string& msg, int rc) {
+        throw TokenizerError(errorBlock("engine_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                        "r(" + std::to_string(rc) + ")"));
+      };
+      // Keyed like dispatch's `cmd`: the canonical name, except that a
+      // community-package spelling stays itself (`reghdfe` on the `feols` row
+      // is reghdfe's syntax, not PIET-native feols's).
+      const std::string key = registry::resolveCanonical(headLower);
+      const registry::StataLead* lead = registry::findStataLead(key);
+      const bool leadEmpty = varlist.empty() && (lead == nullptr || !lead->qualifiersAreLead ||
+                                                 (!q.ifExpr && !q.inRange));
+      const bool replayPending = lead != nullptr && lead->replay && leadEmpty && !q.ifExpr &&
+                                 !q.inRange && !q.weightType;
+      if (lead != nullptr && leadEmpty && !lead->replay) {
+        if (!opts.empty() && lead->withOptions != nullptr) refuse(lead->withOptions, lead->withOptionsRc);
+        if (opts.empty() && lead->bare != nullptr) refuse(lead->bare, lead->bareRc);
+      }
+      // The varlist is parsed next: a token with an operator the command's
+      // varlist does not take is r(101) before any variable is looked up.
+      if (const registry::StataOperators* ops = registry::findStataOperators(key)) {
+        for (const auto& tok : varlist) {
+          const char k = operatorKind(tok);
+          if ((k == 'f' && ops->refusesFactor) || (k == 't' && ops->refusesTimeSeries))
+            refuse(ops->refusesTimeSeries ? "factor-variable and time-series operators not allowed"
+                                          : "factor-variable operators not allowed",
+                   101);
+        }
+      }
+      const registry::StataQualifiers* g =
+          gspec->qualifiersRefusedByArm || replayPending ? nullptr : registry::findStataQualifiers(key);
+      if (g != nullptr) {
+        if (q.ifExpr && !g->takesIf) refuse("if not allowed", g->refusalRc);
+        // A lone `=` at the top of the `if` expression ends it and starts an
+        // =exp, which a command without one refuses: `count if price=4099` is
+        // r(101) "=exp not allowed" (StataBE 19.5, vs-stata bank
+        // 4cede0dd199dc4f0, 5f15efb6af4b3163).
+        if (q.ifExpr && g->takesIf && key != "generate" && key != "replace" && key != "egen") {
+          const std::string& e = *q.ifExpr;
+          int depth = 0;
+          for (size_t k = 0; k < e.size(); ++k) {
+            const char c = e[k];
+            if (c == '"') {
+              const size_t close = e.find('"', k + 1);
+              if (close == std::string::npos) break;
+              k = close;
+              continue;
+            }
+            if (c == '(' || c == '[') ++depth;
+            else if ((c == ')' || c == ']') && depth > 0) --depth;
+            else if (c == '=' && depth == 0) {
+              // the character before it, blanks passed over: `price < = 4000`
+              // is `<=` (StataBE reads a relational pair with a blank inside)
+              size_t pk = k;
+              while (pk > 0 && (e[pk - 1] == ' ' || e[pk - 1] == '\t')) --pk;
+              const char prev = pk > 0 ? e[pk - 1] : ' ';
+              const char next = k + 1 < e.size() ? e[k + 1] : ' ';
+              if (next == '=' ) {
+                ++k;
+                continue;
+              }
+              if (std::strchr("<>!~=", prev) == nullptr) refuse("=exp not allowed", 101);
+            }
+          }
+        }
+        if (q.inRange && !g->takesIn) refuse("in range not allowed", g->refusalRc);
+        if (q.weightType && g->weights != nullptr) {
+          const bool legacy = g->legacyWeights != nullptr && tl_callerVersion > 0 &&
+                              tl_callerVersion < g->legacyBelow;
+          const std::string legal = legacy ? g->legacyWeights : g->weights;
+          if (legal.empty()) refuse("weights not allowed", g->refusalRc);
+          std::string typeName = weightWordType(*q.weightType);
+          if (typeName == "weight") {  // `[w=]`: the command's default type, if one is cited
+            typeName.clear();
+            for (const auto& row : kDefaultWeight)
+              if (gspec->canonical == row.canonical) typeName = row.type;
+          }
+          if (!typeName.empty() && (" " + legal + " ").find(" " + typeName + " ") == std::string::npos)
+            refuse(typeName + "s not allowed", g->refusalRc);
+          // xtlogit / xtpoisson take fweights and pweights for the
+          // population-averaged model only: with fe or re (the default) Stata
+          // answers r(101) (vs-stata bank 278ee9d9 `xtlogit hi beertax unemp
+          // [fweight=w]`, c7dc89e1 `xtpoisson ... [pweight=w]`).
+          if ((key == "xtlogit" || key == "xtpoisson") &&
+              (typeName == "fweight" || typeName == "pweight")) {
+            bool pa = false;
+            for (const auto& kv : opts) pa = pa || toLower(kv.first) == "pa";
+            if (!pa) refuse(typeName + "s not allowed with fixed- or random-effects models", 101);
+          }
+        }
+      }
+      if (lead != nullptr && lead->noOptions && !opts.empty() && !replayPending)
+        refuse("options not allowed", 101);
+    }
+  }
+
   // Guard: estimation weights are silently dropped by the engine — EXCEPT
   // for whichever weight TYPES a command's own registry row declares
   // (registry.cpp's WeightPolicy field, reached via registry::findByName()).
@@ -1340,6 +1450,10 @@ ParsedCommand tokenize(const std::string& line) {
       for (const auto& row : kDefaultWeight) {
         if (spec != nullptr && spec->canonical == row.canonical) type = row.type;
       }
+      // A row whose arm answers its own qualifiers (registry.h
+      // qualifiersRefusedByArm) refuses a weight of any type itself, in
+      // Stata's order; the default-type gap is not its answer.
+      if (type.empty() && spec != nullptr && spec->qualifiersRefusedByArm) type = "weight";
       if (type.empty()) {
         if (!isRoutableCommandToken(cmd)) throw TokenizerError(unsupportedCommand(cmd));
         throw TokenizerError(unsupportedOption(
@@ -1380,25 +1494,10 @@ ParsedCommand tokenize(const std::string& line) {
     // deliberately kept out of the registry — registry.h's "Deliberately
     // NOT here" comment) defaults to None, matching the pre-P3 fallback
     // behavior exactly: no weight is legal there either way.
-    // Stata itself declares this weight type illegal for the command: its
-    // answer is r(101) "<type>s not allowed", not an engine gap. Only a
-    // command with a cited row in kStataLegalWeights and a type outside that
-    // row's legal set takes this path. It runs BEFORE PIET's own policy, so a
-    // row whose policy serves more types than Stata admits (tabulate's
-    // AllWeights: Stata refuses its pweight) still answers Stata's r(101).
-    if (weightSpec) {
-      const char* legal = nullptr;
-      for (const auto& row : kStataLegalWeights) {
-        if (weightSpec->canonical == row.canonical) legal = row.legal;
-      }
-      const char* typeName = isAweight ? "aweight" : isFweight ? "fweight"
-                             : isPweight ? "pweight" : isIweight ? "iweight" : nullptr;
-      if (legal && typeName && !std::string(legal).empty() &&
-          (" " + std::string(legal) + " ").find(" " + std::string(typeName) + " ") == std::string::npos) {
-        throw TokenizerError(errorBlock("engine_error", std::string(typeName) + "s not allowed",
-                                        std::nullopt, std::nullopt, std::nullopt, "r(101)"));
-      }
-    }
+    // A weight type Stata itself declares illegal for the command never gets
+    // here: the Stata-grammar step above answered its r(101) first, so a row
+    // whose policy serves more types than Stata admits (tabulate's AllWeights:
+    // Stata refuses its pweight) still answers Stata's refusal.
     registry::WeightPolicy policy = weightSpec ? weightSpec->weight : registry::WeightPolicy::None;
     // `matrix accum` is the one weighted subcommand of `matrix` ([P] matrix
     // accum: aw/fw/iw/pw; w2_glm_lifecycle.do:68 `matrix accum Hd = x1 x2
@@ -1548,6 +1647,144 @@ ParsedCommand tokenize(const std::string& line) {
   return pc;
 }
 
+std::optional<bool> delimitDirective(const std::string& line) {
+  const std::string t = lstrip(line);
+  if (t.size() < 2 || t[0] != '#') return std::nullopt;
+  size_t e = 1;
+  while (e < t.size() && std::isalpha(static_cast<unsigned char>(t[e]))) ++e;
+  const std::string word = toLower(t.substr(1, e - 1));
+  // `#d` .. `#delimit`.
+  if (word.empty() || std::string("delimit").compare(0, word.size(), word) != 0) return std::nullopt;
+  if (e < t.size() && !std::isspace(static_cast<unsigned char>(t[e])) && t[e] != ';')
+    return std::nullopt;
+  std::istringstream rest(t.substr(e));
+  std::string arg;
+  rest >> arg;
+  // Only `cr` (lowercase) restores the end of line; any other word, `CR` and
+  // `x` too, makes `;` the delimiter (StataBE 19.5: "delimiter now ;", vs-stata
+  // bank 1fddc8b96859464b, b5824eb9c606d961).
+  return arg != "cr";
+}
+
+namespace {
+
+// `#delimit ;` ([P] #delimit): from that line to `#delimit cr` (or the end of
+// the file, which restores cr for the caller) a statement ends at `;`, not at
+// the end of a line, and a line end is a blank. Each statement found is handed
+// on as one line, so everything after this pass reads a cr-delimited file; the
+// directive lines themselves stay (the dispatcher prints "delimiter now ;").
+// As StataBE 19.5 reads the ;-delimited text (vs-stata bank dofileparse /
+// dofile2 delimit cells): a `;` inside "..." is text, but a `"` right after a
+// backtick opens nothing (`display `"<a;b>"'` stops at the `;`, 79ee75e8); /*
+// */ is removed wherever it stands (`display "<a>" /* ; */ "<b>"` is <a><b>);
+// `//` and `///` after a blank comment out the rest of the line; a statement
+// that starts with `*` is a comment up to its `;`, over line ends (85a584c5);
+// a directive counts only at the start of a statement; text left without a `;`
+// at the end of the file is not run (1fddc8b9, b5824eb9). Line positions are
+// kept: a statement sits on the line where its `;` is, other lines are blank.
+std::vector<std::string> applyDelimit(const std::vector<std::string>& lines) {
+  std::vector<std::string> out;
+  out.reserve(lines.size());
+  bool semi = false;
+  std::string pending;     // the statement read so far
+  bool starComment = false;  // the statement is a `*` comment
+  int blockDepth = 0;        // open /* levels
+  const auto blankOnly = [](const std::string& x) {
+    return x.find_first_not_of(" \t") == std::string::npos;
+  };
+  int crDepth = 0;  // open /* levels while the end of line delimits
+  for (const std::string& line : lines) {
+    if (!semi) {
+      // Stata ignores all text from /* to */, a directive line included: a
+      // `#delimit ;` inside a block comment changes nothing. The comment is
+      // followed as the comment pass reads the cr-delimited file (strings,
+      // `//`, nesting, a `/*` on a `*` comment line).
+      if (crDepth == 0) {
+        if (const auto d = delimitDirective(line)) {
+          semi = *d;
+          out.push_back(line);
+          continue;
+        }
+        const std::string lead = lstrip(line);
+        (void)scanCommentsInline(!lead.empty() && lead[0] == '*' ? lead.substr(1) : line, crDepth);
+      } else {
+        (void)scanCommentsInline(line, crDepth);
+      }
+      out.push_back(line);
+      continue;
+    }
+    if (blockDepth == 0 && !starComment && blankOnly(pending)) {
+      if (const auto d = delimitDirective(line)) {
+        semi = *d;
+        pending.clear();
+        out.push_back(lstrip(line));
+        continue;
+      }
+    }
+    std::vector<std::string> done;  // statements ending on this line
+    bool inString = false;         // a "..." string ends with its line
+    const size_t n = line.size();
+    for (size_t i = 0; i < n; ++i) {
+      const char c = line[i];
+      const bool pair = i + 1 < n;
+      if (blockDepth > 0) {
+        if (pair && c == '/' && line[i + 1] == '*') {
+          ++blockDepth;
+          ++i;
+        } else if (pair && c == '*' && line[i + 1] == '/') {
+          --blockDepth;
+          ++i;
+        }
+        continue;
+      }
+      if (starComment) {
+        if (c == ';') {
+          starComment = false;
+          pending.clear();
+        }
+        continue;
+      }
+      if (inString) {
+        pending.push_back(c);
+        if (c == '"') inString = false;
+        continue;
+      }
+      if (pair && c == '/' && line[i + 1] == '*') {
+        blockDepth = 1;
+        ++i;
+        continue;
+      }
+      if (pair && c == '/' && line[i + 1] == '/' && (i == 0 || line[i - 1] == ' ' || line[i - 1] == '\t'))
+        break;
+      if (c == '*' && blankOnly(pending)) {
+        starComment = true;
+        continue;
+      }
+      if (c == '"' && !(i > 0 && line[i - 1] == '`')) {
+        inString = true;
+        pending.push_back(c);
+        continue;
+      }
+      if (c == ';') {
+        const std::string stmt = strip(pending);
+        if (!stmt.empty()) done.push_back(stmt);
+        pending.clear();
+        continue;
+      }
+      pending.push_back(c);
+    }
+    if (!starComment) pending.push_back(' ');
+    if (done.empty()) {
+      out.push_back("");
+    } else {
+      for (auto& st : done) out.push_back(std::move(st));
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
 std::vector<std::string> preprocessDo(const std::string& source) {
   // Python str.splitlines() — split on \n, \r\n, \r (and a handful of other
   // unicode line boundaries we don't expect in Stata do-files).
@@ -1574,7 +1811,7 @@ std::vector<std::string> preprocessDo(const std::string& source) {
     // newline) — Python's splitlines() omits it in that case.
     if (!cur.empty()) rawLines.push_back(cur);
   }
-  auto continued = joinContinuations(rawLines);
+  auto continued = joinContinuations(applyDelimit(rawLines));
   auto stripped = stripComments(continued);
   return stripped;
 }

@@ -29,7 +29,7 @@ int cmd_mlogit(const std::vector<std::string>& a) {
     if (data_missing(data) || y.empty() || xcsv.empty()) {
         std::fprintf(stderr,
                      "usage: cobra mlogit --data f.hbin --y Y --x X1,X2 [--base V] "
-                     "[--vce iid|robust|cluster] [--cluster C] [--level P] [--keepif EXPR] "
+                     "[--vce iid|robust|cluster] [--cluster C] [--level P] [--iterate N] [--keepif EXPR] "
                      "[--out f.json]\n"
                      "  multinomial logit; one equation per non-base outcome.\n"
                      "  --base V                 base outcome BY VALUE (default: most frequent,\n"
@@ -68,7 +68,23 @@ int cmd_mlogit(const std::vector<std::string>& a) {
     const Dataset& ds = acquire_data(data);
     std::vector<std::string> cluster_names;
     if (!cluster_var.empty()) cluster_names.push_back(cluster_var);
-    GlmInputs g = load_glm(ds, "mlogit", y, split_csv(xcsv), cluster_names);
+    // --weight / --wtype: fweight, iweight or pweight (mlogit.ado `[fw iw pw]`),
+    // each row's contribution scaled by its weight; a pweight takes the sandwich.
+    const std::string weight_var = opt(a, "--weight"), wtype = opt(a, "--wtype");
+    cecon::WeightKind wkind = cecon::WeightKind::None;
+    if (!weight_var.empty() || !wtype.empty()) {
+        if (weight_var.empty()) throw EngineError("bad_input", "mlogit: --wtype requires --weight");
+        if (wtype == "fw" || wtype == "fweight") wkind = cecon::WeightKind::Frequency;
+        else if (wtype == "iw" || wtype == "iweight") wkind = cecon::WeightKind::Importance;
+        else if (wtype == "pw" || wtype == "pweight") wkind = cecon::WeightKind::Probability;
+        else throw EngineError("bad_input", "mlogit: --wtype must be fw, iw or pw");
+        if (wkind == cecon::WeightKind::Probability && vce == "iid")
+            throw EngineError("bad_input", "mlogit: [pweight=] requires vce(robust)");
+        if (wkind != cecon::WeightKind::Probability && vce != "iid")
+            throw EngineError("unsupported", "mlogit: fweights and iweights are fitted with the default VCE only");
+    }
+    GlmInputs g = load_glm(ds, "mlogit", y, split_csv(xcsv), cluster_names, weight_var, wkind);
+    const double* wt = g.weights.empty() ? nullptr : g.weights.data();
     require_sample(g.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     if (vce == "cluster" && (g.cluster.empty() || g.cluster[0].n_levels < 2))
         throw EngineError("bad_input",
@@ -83,8 +99,16 @@ int cmd_mlogit(const std::vector<std::string>& a) {
     if (K < 2)
         throw EngineError("bad_input",
             "mlogit: outcome '" + y + "' takes fewer than 2 distinct values.");
+    // Outcome frequencies for the default base. An fweight row stands for w
+    // replicated observations, so it counts w times (the fit equals the expanded
+    // data's); other weights count rows.
     std::vector<int64_t> counts(static_cast<size_t>(K), 0);
-    for (int64_t i = 0; i < g.n; ++i) ++counts[static_cast<size_t>(cat[static_cast<size_t>(i)])];
+    std::vector<double> freq(static_cast<size_t>(K), 0.0);
+    for (int64_t i = 0; i < g.n; ++i) {
+        const size_t m = static_cast<size_t>(cat[static_cast<size_t>(i)]);
+        ++counts[m];
+        freq[m] += (wkind == cecon::WeightKind::Frequency && wt) ? wt[i] : 1.0;
+    }
     int base = 0;
     if (base_set) {
         base = -1;
@@ -97,11 +121,27 @@ int cmd_mlogit(const std::vector<std::string>& a) {
         // Stata's default baseoutcome() is the MOST FREQUENT outcome; ties go to the
         // lower value (the scan keeps the first strict maximum).
         for (int m = 1; m < K; ++m)
-            if (counts[static_cast<size_t>(m)] > counts[static_cast<size_t>(base)]) base = m;
+            if (freq[static_cast<size_t>(m)] > freq[static_cast<size_t>(base)]) base = m;
     }
     const int neq = K - 1, np = neq * g.k;
 
-    MlogitResult r = mlogit_fit(g.X.data(), g.n, g.k, cat.data(), K, base);
+    // --iterate N: ml's iterate(#) (default 300; 0 reports the constants-only start).
+    int max_iter = 300;
+    if (has(a, "--iterate")) {
+        const std::string it_s = opt(a, "--iterate");
+        char* end = nullptr;
+        const long v = std::strtol(it_s.c_str(), &end, 10);
+        if (it_s.empty() || end == nullptr || *end != '\0' || v < 0 || v > 16000) {
+            std::fprintf(stderr, "mlogit: --iterate must be an integer in [0, 16000] (got %s).\n",
+                         it_s.c_str());
+            return 2;
+        }
+        max_iter = static_cast<int>(v);
+    }
+    int cons_col = -1;
+    for (int c = 0; c < g.k; ++c)
+        if (g.names[static_cast<size_t>(c)] == "(intercept)") cons_col = c;
+    MlogitResult r = mlogit_fit(g.X.data(), g.n, g.k, cat.data(), K, base, cons_col, max_iter, wt);
     if (!r.ok)
         throw EngineError("no_convergence",
             "mlogit: MLE failed (singular information matrix or non-convergent fit).");
@@ -121,7 +161,7 @@ int cmd_mlogit(const std::vector<std::string>& a) {
     std::vector<double> V = r.vcov;
     int n_clusters = 0;
     if (vce == "robust" || vce == "cluster") {
-        std::vector<double> S = mlogit_scores(g.X.data(), g.n, g.k, cat.data(), r);
+        std::vector<double> S = mlogit_scores(g.X.data(), g.n, g.k, cat.data(), r, wt);
         int64_t rows = g.n;
         const Factor* fac = nullptr;
         double factor;
@@ -200,15 +240,30 @@ int cmd_mlogit(const std::vector<std::string>& a) {
         }
     }
 
-    json out = {{"estimator", "mlogit"}, {"n_obs", g.n}, {"n_dropped_missing", g.n_dropped},
+    // With the default (observed-information) VCE Stata's model test is the
+    // likelihood-ratio statistic 2(ll - ll_0) against the constants-only model
+    // (bank e9b3681e `mlogit race age grade wage`: LR chi2(6) 70.59563857956209 =
+    // 2(-1383.0285584 + 1418.3263777)); under vce(robust)/vce(cluster) it is the
+    // Wald statistic above.
+    const bool lr = (vce == "iid");
+    if (lr && df > 0) chi2 = 2.0 * (r.ll - r.ll_0);
+    int64_t n_obs = g.n;  // e(N): the weight sum under fweights
+    if (wkind == cecon::WeightKind::Frequency) {
+        double sw = 0.0;
+        for (double w : g.weights) sw += w;
+        n_obs = static_cast<int64_t>(std::llround(sw));
+    }
+    json out = {{"estimator", "mlogit"}, {"n_obs", n_obs}, {"n_dropped_missing", g.n_dropped},
                 {"n_cats", K}, {"cat_values", cat_values},
                 {"base_outcome", cat_values[static_cast<size_t>(base)]},
                 {"vce", vce}, {"equations", equations},
                 {"ll", r.ll}, {"ll_0", r.ll_0},
                 {"r2_pseudo", (r.ll_0 != 0) ? 1.0 - r.ll / r.ll_0 : 0.0},
                 {"chi2", chi2}, {"df_chi2", df}, {"p_chi2", chi2_pvalue(chi2, df)},
+                {"chi2type", lr ? "LR" : "Wald"},
                 {"iters", r.iters}, {"converged", r.converged}};
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
+    if (wkind != cecon::WeightKind::None) out["n_rows"] = g.n;  // the e(sample) handshake's rows
     if (level_set) out["level"] = level;
     add_warnings(out, g.warnings);
     // --emit-v (BUG-1196): the fit's V over the non-base equations in θ's order,
@@ -224,6 +279,41 @@ int cmd_mlogit(const std::vector<std::string>& a) {
             for (int c = 0; c < g.k; ++c) names.push_back(std::string(buf) + ":" + g.names[static_cast<size_t>(c)]);
         }
         add_e_v(out, names, V);
+        // e(V_modelbased): the observed-information variance under a sandwich.
+        if (vce != "iid") {
+            json tmp;
+            add_e_v(tmp, names, r.vcov);
+            out["e_Vmb"] = std::move(tmp["e_V"]);
+        }
+    }
+    // ml's iteration log (iteration 0 is the constants-only start, e(ll_0)) and the
+    // gradient at the estimates in θ's order (e(ilog), e(gradient)).
+    out["ilog"] = r.ilog;
+    out["gradient"] = r.gradient;
+    // The largest fitted probability of an observation's own outcome: below
+    // 1 - 1e-6 no observation is completely determined (e(N_cd) 0).
+    {
+        const std::vector<int> eq_of_cat = mlogit_eq_of_cat(r);
+        double pmax = 0.0;
+        std::vector<double> eta(static_cast<size_t>(K), 0.0);
+        for (int64_t i = 0; i < g.n; ++i) {
+            double mx = 0.0;
+            for (int m = 0; m < K; ++m) {
+                const int e = eq_of_cat[static_cast<size_t>(m)];
+                double v = 0.0;
+                if (e >= 0)
+                    for (int c = 0; c < g.k; ++c)
+                        v += g.X[static_cast<size_t>(c) * static_cast<size_t>(g.n) + static_cast<size_t>(i)] *
+                             r.beta[static_cast<size_t>(e) * g.k + c];
+                eta[static_cast<size_t>(m)] = v;
+                mx = std::max(mx, v);
+            }
+            double den = 0.0;
+            for (int m = 0; m < K; ++m) den += std::exp(eta[static_cast<size_t>(m)] - mx);
+            const int own = cat[static_cast<size_t>(i)];
+            pmax = std::max(pmax, std::exp(eta[static_cast<size_t>(own)] - mx) / den);
+        }
+        out["max_p_own"] = pmax;
     }
     emit(out, opt(a, "--out"));
     return 0;

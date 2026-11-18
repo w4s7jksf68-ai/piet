@@ -58,7 +58,86 @@ ojson runXtabond(const eval::ParsedCommand& parsed, SessionState& session) {
     argv.push_back(*parsed.ifExpr);
   }
   std::string lags = "1";
-  for (const auto& [k, v] : parsed.opts) {
+  // The instrument-set options change the GMM-type and standard instruments (and
+  // noconstant the regressors), which the engine's fixed one-step instrument matrix
+  // does not take: fitting without them posted the default model's numbers under
+  // the option (bank 36f2518c `xtabond frate unemp, endogenous(beertax)` e(sig2)
+  // .0232823 against the default fit's .0202885; c9003abe noconstant, 9c25f989
+  // maxlags(), 5f740234 maxldep(), cea8c63d inst(), b07c2ad3 diffvars(), f2f364a6
+  // pre()). Refused by name until the engine builds those instrument sets.
+  //
+  // Every option is read by xtabond's own names and minimum abbreviations (LAgs,
+  // Robust, TWOstep, noCONStant, ARtests, MAXLDep, DIFFvars, INST, MAXLAGs, SMall,
+  // Level, VCE, vsquish, COEFLegend, selegend, NOLSTRETCH, ENDogenous, pre), so
+  // `endog(beertax)` is endogenous() and refused with it; a spelling matching none
+  // is "option ... not allowed with xtabond" r(198), as the parser's leftover check
+  // reports it (`en(beertax)`: below ENDogenous's three letters).
+  static const std::pair<const char*, size_t> kXtabondOpts[] = {
+      {"lags", 2},     {"robust", 1},     {"twostep", 3},  {"noconstant", 6}, {"artests", 2},
+      {"maxldep", 5},  {"diffvars", 4},   {"inst", 4},     {"maxlags", 6},    {"small", 2},
+      {"level", 1},    {"vce", 3},        {"vsquish", 7},  {"coeflegend", 5}, {"selegend", 8},
+      {"nolstretch", 10}, {"endogenous", 3}, {"pre", 3},   {"xtabond", 7},    {"xtdpdsys", 8}};
+  std::vector<std::pair<std::string, eval::OptValue>> opts;
+  for (const auto& [kRaw, v] : parsed.opts) {
+    std::string k;
+    for (const auto& [name, minLen] : kXtabondOpts) {
+      const std::string full = name;
+      if (kRaw.size() >= minLen && kRaw.size() <= full.size() &&
+          full.compare(0, kRaw.size(), kRaw) == 0) {
+        k = full;
+        break;
+      }
+    }
+    if (kRaw == "vcov") k = "vce";
+    if (k.empty())
+      return ojson(eval::errorBlock(
+          "engine_error",
+          "option " + kRaw + (v.isBool ? std::string() : "(" + v.strValue + ")") +
+              " not allowed with xtabond",
+          std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    opts.emplace_back(k, v);
+  }
+  // xtdpd's check behind xtabond: diffvars() with the constant in the model is
+  // r(498) (vs-stata bank ec592263 `xtabond frate beertax, diffvars(unemp)`).
+  {
+    bool diffvars = false, nocons = false;
+    for (const auto& [k, v] : opts) {
+      if (k == "diffvars" && !v.isBool) diffvars = true;
+      if (k == "noconstant" && v.isBool && v.boolValue) nocons = true;
+    }
+    if (diffvars && !nocons)
+      return ojson(eval::errorBlock(
+          "engine_error",
+          "option diffvars() specified incorrectly\n    diffvars() may not be specified if the "
+          "model has a constant or you specify\n    instruments for level equations.",
+          std::nullopt, std::nullopt, std::nullopt, "r(498)"));
+  }
+  for (const auto& [k, v] : opts) {
+    static const std::set<std::string> kInstrumentOpts = {
+        "endogenous", "pre", "inst", "diffvars", "maxlags", "maxldep", "noconstant"};
+    if (kInstrumentOpts.count(k))
+      return engineErrorBlockM4("Option `" + k +
+                                    "` is a valid Stata option that this version of PIET does not "
+                                    "implement for `xtabond` (the engine builds only the default "
+                                    "instrument set).",
+                                "unsupported_option");
+  }
+  for (const auto& [k, v] : opts) {
+    // xtabond's Level(cilevel) is the one-letter option (LAgs() takes two): `l(2)`
+    // is r(198) "level() must be between 10 and 99.99 inclusive" (vs-stata bank
+    // 8e734ba5b2e26756; `la(2)` .. `lags(2)` run).
+    if (k == "level" && !v.isBool) {
+      const std::string a = trimM4(v.strValue);
+      char* end = nullptr;
+      const double lv = std::strtod(a.c_str(), &end);
+      if (a.empty() || end == nullptr || *end != '\0')
+        return ojson(eval::errorBlock("syntax_error", a + " found where number expected",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+      if (lv < 10.0 || lv > 99.99)
+        return ojson(eval::errorBlock("syntax_error",
+                                      "level() must be between 10 and 99.99 inclusive",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    }
     if (k == "lags" && !v.isBool) lags = trimM4(v.strValue);
     else if (k == "twostep" && v.isBool && v.boolValue)
       return engineErrorBlockM4(
@@ -74,8 +153,13 @@ ojson runXtabond(const eval::ParsedCommand& parsed, SessionState& session) {
   // even after the engine grew the right default. Forward what the user asked:
   // nothing -> engine default (conventional); vce(robust) -> robust.
   std::string vceReq;  // empty = let the engine default (conventional) stand
-  for (const auto& [k, v] : parsed.opts) {
-    if ((k == "vce" || k == "vcov") && !v.isBool) {
+  for (const auto& [k, v] : opts) {
+    // the bare `robust` flag is vce(robust) (the parser's old-style VCE spelling)
+    if (k == "robust" && v.isBool && v.boolValue) {
+      vceReq = "robust";
+      continue;
+    }
+    if (k == "vce" && !v.isBool) {
       std::string lv = lowerM4(trimM4(v.strValue));
       if (lv == "robust") {
         vceReq = "robust";

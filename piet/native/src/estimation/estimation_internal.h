@@ -34,6 +34,13 @@ ojson engineErrorBlockM4(const std::string& message, const std::string& code = "
 std::string joinCommaM4(const std::vector<std::string>& v);
 std::string lowerM4(std::string s);
 std::string nextPathM4(const std::string& workdir, const std::string& prefix);
+// A varlist whose terms carry time-series operators (`L.x`, `D.x`, `L2D.x`): each
+// such term is generated under the session's tsset/xtset onto a scratch copy of the
+// working frame (the expression path `generate z = L.x` takes) as a column
+// `__piet_tsvK__`, and `vars` is rewritten to those columns. Returns the copy's path,
+// "" when no term carries an operator, nullopt (with `err`) when it cannot be built.
+std::optional<std::string> tsVarlistFrameM4(SessionState& session, std::vector<std::string>& vars,
+                                            ojson& err);
 double normalPvalue(double z);
 std::string trimM4(const std::string& s);
 EstimationArgvResult buildEstimationArgvM4(const std::string& cobraCmd,
@@ -76,6 +83,10 @@ bool depvarEqColsM4(const std::string& depvar, const ojson& coefs, const char* b
                     std::vector<AncillaryEbColM4>& out);
 bool postAncillaryEbM4(SessionState& session, const ojson& raw,
                        const std::vector<AncillaryEbColM4>& cols);
+// Upper tail of chi2(df) at x (estimation_glm.cpp): a model test's p-value.
+double chi2UpperTailM4(double df, double x);
+// fracreg's e() contract beyond e(b)/e(V), from the fit's reply (categorical_estimation.cpp).
+void postFracregContractM4(SessionState& session, const ojson& raw);
 std::vector<std::string> splitTokensM4(const std::string& s);
 std::vector<std::string> parseAtNumlistM4(const std::string& at);
 void fillCoeftableStatsM4(ojson& block);

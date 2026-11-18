@@ -22,6 +22,7 @@
 // Every other family, link, vce and weight glm accepts is refused BY NAME
 // (refused:glm_*), never approximated -- a refusal is honest, a GLM fitted under
 // a different family or VCE is the silent wrong answer.
+#include "core/distributions.h"  // z_critical: glm level(#)
 #include "piet/handlers/estimation.h"
 #include "piet/handlers/postestimation.h"
 #include "piet/handlers/vce_types.h"
@@ -47,8 +48,43 @@
 #include "piet/inrange_filter.h"
 #include "piet/session_state.h"
 #include "piet/stata_format.h"
+#include "estimator_command_support.h"  // e3::installEsampleMask
 
 namespace piet::handlers {
+
+namespace est_detail {
+// Upper tail of chi2(df): the regularized upper incomplete gamma Q(df/2, x/2)
+// (series below a + 1, continued fraction above).
+double chi2UpperTailM4(double df, double x) {
+    if (!(x > 0)) return 1.0;
+    const double a = df / 2.0, z = x / 2.0, gln = std::lgamma(a);
+    if (z < a + 1.0) {
+        double ap = a, sum = 1.0 / a, del = sum;
+        for (int n = 0; n < 1000; ++n) {
+            ap += 1.0;
+            del *= z / ap;
+            sum += del;
+            if (std::fabs(del) < std::fabs(sum) * 1e-16) break;
+        }
+        return 1.0 - sum * std::exp(-z + a * std::log(z) - gln);
+    }
+    double b = z + 1.0 - a, c = 1.0 / 1e-300, dd = 1.0 / b, h = dd;
+    for (int i = 1; i < 1000; ++i) {
+        const double an = -i * (i - a);
+        b += 2.0;
+        dd = an * dd + b;
+        if (std::fabs(dd) < 1e-300) dd = 1e-300;
+        c = b + an / c;
+        if (std::fabs(c) < 1e-300) c = 1e-300;
+        dd = 1.0 / dd;
+        const double del = dd * c;
+        h *= del;
+        if (std::fabs(del - 1.0) < 1e-16) break;
+    }
+    return std::exp(-z + a * std::log(z) - gln) * h;
+}
+}  // namespace est_detail
+
 
 using ojson = nlohmann::ordered_json;
 
@@ -63,8 +99,8 @@ namespace {
 const eval::OptVocab& kVocabGlm = eval::registerOptVocab(
     {"glm"},
     {{"family", "link", "vce", "iterate", "tolerance", "ltolerance", "nrtolerance", "offset",
-      "exposure", "nolog", "log", "trace", "showstep", "showtolerance"},
-     {"eform", "from", "level", "lnoffset", "noconstant", "robust", "cluster", "asis", "search",
+      "exposure", "nolog", "log", "trace", "showstep", "showtolerance", "cluster", "eform", "level", "robust"},
+     {"from", "lnoffset", "noconstant", "asis", "search",
       "irls", "ml", "score", "notable", "nodisplay", "fisher", "nodots", "scale", "mu", "init",
       "noheader", "disp", "vfactor", "difficult", "technique", "gradient", "hessian",
       "constraints", "collinear", "coeflegend", "nocnsreport"},
@@ -81,7 +117,7 @@ const std::unordered_set<std::string> kGlmMarginsUnimplemented = {
     "asbalanced", "emptycells", "noweights", "continuous", "nochainrule", "mcompare"};
 
 // The e() entries glm posts outside its estimation block (see handlers.h).
-const char* const kGlmEMatrices[] = {"b", "V", "ilog", "gradient"};
+const char* const kGlmEMatrices[] = {"b", "V", "ilog", "gradient", "Cns", "V_modelbased"};
 const char* const kGlmEStrings[] = {"varfunct", "linkt", "opt", "technique", "a"};
 
 ojson errRc(const std::string& message, int rc) {
@@ -148,6 +184,34 @@ void toCol(std::string& s, size_t col) {
     if (s.size() + 1 < col) s.append(col - 1 - s.size(), ' ');
 }
 
+// b' inv(V) b for a symmetric positive definite q x q V (row-major), by Cholesky;
+// nullopt when V is not positive definite.
+std::optional<double> waldQuadForm(const std::vector<double>& V, const std::vector<double>& b, int q) {
+    const size_t n = static_cast<size_t>(q);
+    std::vector<double> L(n * n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j <= i; ++j) {
+            double sum = V[i * n + j];
+            for (size_t k = 0; k < j; ++k) sum -= L[i * n + k] * L[j * n + k];
+            if (i == j) {
+                if (!(sum > 0.0)) return std::nullopt;
+                L[i * n + i] = std::sqrt(sum);
+            } else {
+                L[i * n + j] = sum / L[j * n + j];
+            }
+        }
+    }
+    double out = 0.0;
+    std::vector<double> y(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {  // L y = b; b' inv(V) b = y'y
+        double sum = b[i];
+        for (size_t k = 0; k < i; ++k) sum -= L[i * n + k] * y[k];
+        y[i] = sum / L[i * n + i];
+        out += y[i] * y[i];
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // The model specification, kept on the estimation block (key "glm_model") so
 // `margins` rebuilds exactly the fitted design from the fit-time frame.
@@ -163,6 +227,7 @@ struct FamilySpec {
     double alpha = 1.0;
     std::string alphaText = "1";  // e(a): the nbinomial argument as typed
     std::string varfunct, varfuncf;
+    std::string varfunc;  // e(varfunc): glm's variance-function program (glim_v#)
     // parseFamily only rejects what is wrong with the family's own arguments. A
     // valid family this build does not fit waits here until parseLink has judged
     // link(): an error in link() outranks a refusal of the family.
@@ -173,6 +238,8 @@ struct FamilySpec {
 struct LinkSpec {
     cecon::GlmLinkFn link = cecon::GlmLinkFn::Identity;
     std::string linkt, linkf;
+    std::string link_prog;  // e(link): glm's link program (glim_l#)
+    std::string power;      // e(power): the link's power, "." when it has none
 };
 
 // Resolve a variable name: exact match, else Stata's unique-abbreviation rule.
@@ -481,6 +548,7 @@ bool parseFamily(const std::string& rawIn, FamilySpec& fs, ojson& err) {
         case kFamGaussian:
             fs.fam = cecon::GlmFamily::Gaussian;
             fs.varfunct = "Gaussian";
+            fs.varfunc = "glim_v1";
             fs.varfuncf = "1";
             fs.tag = "gaussian";
             return true;
@@ -490,12 +558,14 @@ bool parseFamily(const std::string& rawIn, FamilySpec& fs, ojson& err) {
         case kFamPoisson:
             fs.fam = cecon::GlmFamily::Poisson;
             fs.varfunct = "Poisson";
+            fs.varfunc = "glim_v3";
             fs.varfuncf = "u";
             fs.tag = "poisson";
             return true;
         case kFamGamma:
             fs.fam = cecon::GlmFamily::Gamma;
             fs.varfunct = "Gamma";
+            fs.varfunc = "glim_v4";
             fs.varfuncf = "u^2";
             fs.tag = "gamma";
             return true;
@@ -503,6 +573,7 @@ bool parseFamily(const std::string& rawIn, FamilySpec& fs, ojson& err) {
             if (tooMany()) return false;
             fs.fam = cecon::GlmFamily::Bernoulli;
             fs.varfunct = "Bernoulli";
+            fs.varfunc = "glim_v2";
             fs.varfuncf = "u*(1-u)";
             fs.tag = "bernoulli";
             if (tokens.size() < 2 || tokens[1] == "1") return true;
@@ -517,6 +588,7 @@ bool parseFamily(const std::string& rawIn, FamilySpec& fs, ojson& err) {
             if (tooMany()) return false;
             fs.fam = cecon::GlmFamily::NegBinomial;
             fs.varfunct = "Neg. Binomial";
+            fs.varfunc = "glim_v6";
             fs.tag = "nbinomial";
             if (tokens.size() == 2) {
                 const std::string& arg = tokens[1];
@@ -609,24 +681,32 @@ bool parseLink(const std::string& rawIn, const FamilySpec& fs, LinkSpec& ls, ojs
         case kLnkIdentity:
             ls.link = cecon::GlmLinkFn::Identity;
             ls.linkt = "Identity";
+            ls.link_prog = "glim_l01";
+            ls.power = "1";
             ls.linkf = "u";
             tagOfLink = "identity";
             break;
         case kLnkLog:
             ls.link = cecon::GlmLinkFn::Log;
             ls.linkt = "Log";
+            ls.link_prog = "glim_l03";
+            ls.power = "0";
             ls.linkf = "ln(u)";
             tagOfLink = "log";
             break;
         case kLnkLogit:
             ls.link = cecon::GlmLinkFn::Logit;
             ls.linkt = "Logit";
+            ls.link_prog = "glim_l02";
+            ls.power = "0";
             ls.linkf = "ln(u/(1-u))";
             tagOfLink = "logit";
             break;
         case kLnkProbit:
             ls.link = cecon::GlmLinkFn::Probit;
             ls.linkt = "Probit";
+            ls.link_prog = "glim_l08";
+            ls.power = ".";
             ls.linkf = "invnorm(u)";
             tagOfLink = "probit";
             break;
@@ -676,6 +756,11 @@ struct ModelSpec {
     std::optional<std::string> ifExpr, inRange;
     std::string weightVar;   // aweight variable, "" = none
     std::string clusterVar;  // "" = OIM
+    // vce(robust): the sandwich of the per-observation scores, i.e. the cluster
+    // VCE with every observation its own cluster (StataBE bank 8aa87f1b `glm ...,
+    // family(poisson) robust`: e() as cluster(sid)'s but vce robust, no
+    // e(clustvar)/e(N_clust))
+    bool robust = false;
     std::string offsetVar;   // offset() or exposure() variable, "" = none
     bool exposure = false;
 };
@@ -698,6 +783,7 @@ ojson specToJson(const ModelSpec& m) {
     j["in"] = m.inRange ? ojson(*m.inRange) : ojson(nullptr);
     j["weight"] = m.weightVar;
     j["cluster"] = m.clusterVar;
+    if (m.robust) j["robust"] = true;
     j["offset"] = m.offsetVar;
     j["exposure"] = m.exposure;
     return j;
@@ -721,6 +807,7 @@ ModelSpec specFromJson(const ojson& j) {
     if (j.contains("in") && j["in"].is_string()) m.inRange = j["in"].get<std::string>();
     m.weightVar = j.value("weight", std::string());
     m.clusterVar = j.value("cluster", std::string());
+    m.robust = j.value("robust", false);
     m.offsetVar = j.value("offset", std::string());
     m.exposure = j.value("exposure", false);
     return m;
@@ -875,6 +962,10 @@ bool buildDesign(const Datastore& ds, const ModelSpec& m, cecon::GlmFamily fam, 
         out.cl.resize(static_cast<size_t>(n));
         for (int64_t i = 0; i < n; ++i) out.cl[i] = ids[cl[rows[i]]];
         out.nClust = g;
+    } else if (m.robust) {
+        out.cl.resize(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i) out.cl[i] = i;
+        out.nClust = n;
     }
     auto addCol = [&](const std::vector<double>& c, const std::string& name) {
         out.X.insert(out.X.end(), c.begin(), c.end());
@@ -1135,8 +1226,9 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     if (parsed.varlist.empty()) return errRc("varlist required", 100);
 
     // ---- options ----
-    std::string famRaw, linkRaw, vceRaw, offsetRaw, exposureRaw;
-    bool sawVce = false, noLog = false;
+    std::string famRaw, linkRaw, vceRaw, offsetRaw, exposureRaw, clusterOptRaw;
+    bool sawVce = false, noLog = false, robustOpt = false;
+    std::optional<double> levelPct;
     cecon::GlmOptions opt;
     auto num = [](const eval::OptValue& v, double& out) {
         if (v.isBool) return false;
@@ -1154,7 +1246,27 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
         } else if (k == "offset") offsetRaw = v.isBool ? std::string() : trim(v.strValue);
         else if (k == "exposure") exposureRaw = v.isBool ? std::string() : trim(v.strValue);
         else if (k == "nolog") noLog = true;
-        else if (k == "iterate") {
+        else if (k == "level") {
+            double lv = 0;
+            if (!num(v, lv) || !(lv >= 10.0 && lv <= 99.99))
+                return errRc("level() must be between 10 and 99.99 inclusive", 198);
+            levelPct = lv;
+        }
+        // cluster(varname): glm's spelling of vce(cluster varname) (bank 138473a3
+        // `glm fatal beertax unemp, family(poisson) cluster(sid)`). glm declares it
+        // with one variable, and robust and eform as flags: a missing or extra argument
+        // is a syntax error, r(198).
+        else if (k == "cluster") {
+            const std::string cv = v.isBool ? std::string() : trim(v.strValue);
+            if (cv.empty()) return errRc("option cluster() incorrectly specified", 198);
+            if (splitWs(cv).size() > 1) return errRc("too many variables specified", 103);
+            clusterOptRaw = cv;
+        } else if (k == "robust") {
+            if (!v.isBool) return errRc("option robust() incorrectly specified", 198);
+            robustOpt = v.boolValue;
+        } else if (k == "eform") {
+            if (!v.isBool) return errRc("option eform() incorrectly specified", 198);
+        } else if (k == "iterate") {
             double it = 0;
             if (!num(v, it) || it != std::floor(it)) return syntaxErr("option iterate() incorrectly specified");
             if (it < 0) return syntaxErr("iterate() must be positive");
@@ -1162,6 +1274,9 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
         } else if (k == "tolerance" || k == "ltolerance" || k == "nrtolerance") {
             double t = 0;
             if (!num(v, t) || t < 0) return syntaxErr("option " + k + "() incorrectly specified");
+            // glm.ado: the log-likelihood tolerance lies in [0,1) -- `ltolerance(10)`
+            // is r(198) "ltolerance() must be in [0,1)" (vs-stata bank 6362d6ebaf56d5ea).
+            if (k == "ltolerance" && t >= 1) return syntaxErr("ltolerance() must be in [0,1)");
             (k == "tolerance" ? opt.tol : k == "ltolerance" ? opt.ltol : opt.nrtol) = t;
         }
         // log / trace / showstep / showtolerance change only the iteration
@@ -1181,21 +1296,38 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     opt.alpha = fs.alpha;
 
     // ---- vce ----
+    // vce(), cluster() and robust combine as Stata's vce parser combines them: with
+    // vce(), cluster() is allowed only beside vce(cluster) of the same variable (another
+    // one: "in conflict", r(100)) and vce(oim); beside vce(robust) it is "only one of",
+    // r(198). robust is allowed beside vce(robust) and vce(cluster). Without vce(),
+    // cluster() is vce(cluster), else robust is vce(robust).
     ModelSpec spec;
+    std::string clusterOptVar;  // cluster() beside vce(cluster): checked once resolved
     if (sawVce) {
         const std::string t = lower(trim(vceRaw));
         std::string rest;
         const std::string canon = canonicalVceType(vceRaw, &rest);
         if (t == "oim") {
-            // the default, spelled out
+            // the default, spelled out; cluster() or robust beside it is not served
+            if (!clusterOptRaw.empty()) return refuse("glm_vce_oim_cluster");
+            if (robustOpt) return refuse("glm_vce_oim_robust");
         } else if (canon == "cluster") {
             const std::vector<std::string> cv = splitWs(rest);
             if (cv.empty()) return syntaxErr("option vce(cluster) requires a variable");
             if (cv.size() > 1) return refuse("glm_vce_multiway_cluster");
             spec.clusterVar = cv[0];
+            clusterOptVar = clusterOptRaw;
+        } else if (canon == "robust" && rest.empty()) {
+            if (!clusterOptRaw.empty())
+                return errRc("only one of options cluster() or vce(robust) is allowed", 198);
+            spec.robust = true;
         } else if (!t.empty()) {
             return refuse("glm_vce_" + splitWs(t)[0]);
         }
+    } else if (!clusterOptRaw.empty()) {
+        spec.clusterVar = clusterOptRaw;
+    } else if (robustOpt) {
+        spec.robust = true;
     }
 
     // ---- weights ----
@@ -1227,6 +1359,12 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
         return resolveVar(*live, rawName, out, err);
     };
     if (!spec.clusterVar.empty() && !resolveAux(spec.clusterVar, spec.clusterVar)) return err;
+    if (!clusterOptVar.empty()) {
+        std::string other;
+        if (!resolveAux(clusterOptVar, other)) return err;
+        if (other != spec.clusterVar)
+            return errRc("options cluster(clustvar) and vce(cluster clustvar) are in conflict", 100);
+    }
     if (parsed.weightVar.has_value() && !parsed.weightVar->empty() &&
         !resolveAux(trim(*parsed.weightVar), spec.weightVar))
         return err;
@@ -1262,7 +1400,8 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     // follow (oracle syn_C: phi = Pearson/199 while e(df) = 239).
     const int64_t rank = glmVceRank(r.V, static_cast<size_t>(d.k));
     const double df = static_cast<double>(d.n - rank);
-    const bool clustered = !spec.clusterVar.empty();
+    // the sandwich fits: vce(cluster) and vce(robust), the latter one observation per cluster
+    const bool clustered = !spec.clusterVar.empty() || spec.robust;
     const std::string crit = clustered ? "Log pseudolikelihood" : "Log likelihood";
 
     ojson blocks = ojson::array();
@@ -1320,7 +1459,7 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
         s = crit; toCol(s, std::max<size_t>(18, crit.size() + 2)); s += "= " + gfmt(r.ll, 12);
         toCol(s, 51); s += "BIC"; toCol(s, 67); s += "="; toCol(s, 70); s += gfmt(bic, 9);
         L.push_back(s);
-        if (clustered) {
+        if (clustered && !spec.robust) {
             const std::string note = "(Std. err. adjusted for " + std::to_string(d.nClust) +
                                      " clusters in " + spec.clusterVar + ")";
             L.push_back("");
@@ -1366,7 +1505,57 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     block["dispers_ps"] = r.deviance_p / r.phi / df;
     block["aic"] = aic;
     block["bic"] = bic;
-    if (clustered) {
+    // glm's ml settings and model scalars (StataBE 19.5 bank, every ML glm fit of
+    // the families and links fitted here: e(vf) 1, e(nbml) 0, e(k_eq) 1,
+    // e(k_eq_model) 0, e(k_dv) 1, e(noconstant) 0, e(canonical) 1 for the
+    // canonical pairs gaussian/identity, binomial/logit and poisson/log, 0 for
+    // binomial/probit, gamma/log and nbinomial/log; e(power) 1 identity, 0
+    // logit/log, the macro "." after probit). e(chi2) is ml's Wald test that
+    // every estimated slope is 0 (bank 5cb00c3c `glm ..., family(poisson)`
+    // chi2 3086.44, chi2type Wald); a V that does not invert posts none.
+    std::optional<double> modelP;  // e(p), posted after the model install below
+    {
+        const bool canonical = (fs.fam == cecon::GlmFamily::Gaussian && ls.link == cecon::GlmLinkFn::Identity) ||
+                               (fs.fam == cecon::GlmFamily::Bernoulli && ls.link == cecon::GlmLinkFn::Logit) ||
+                               (fs.fam == cecon::GlmFamily::Poisson && ls.link == cecon::GlmLinkFn::Log);
+        block["canonical"] = canonical ? 1.0 : 0.0;
+        block["vf"] = 1.0;
+        block["nbml"] = 0.0;
+        block["k_eq"] = 1.0;
+        block["k_eq_model"] = 0.0;
+        block["k_dv"] = 1.0;
+        block["noconstant"] = 0.0;
+        block["consonly"] = spec.terms.empty() ? 1.0 : 0.0;
+        double autoCns = 0.0;
+        for (size_t i = 0; i < K; ++i) autoCns += d.estIndex[i] < 0 ? 1.0 : 0.0;
+        block["k_autoCns"] = autoCns;
+        if (ls.power != ".") block["power"] = std::stod(ls.power);
+        std::vector<int> slope;  // estimable columns other than the constant
+        for (size_t i = 0; i < K; ++i)
+            if (d.estIndex[i] >= 0 && d.names[i] != "_cons") slope.push_back(d.estIndex[i]);
+        const int q = static_cast<int>(slope.size());
+        const size_t ke = static_cast<size_t>(d.k);
+        if (q > 0 && r.V.size() == ke * ke && r.beta.size() == ke) {
+            std::vector<double> Vs(static_cast<size_t>(q) * static_cast<size_t>(q)), bs(static_cast<size_t>(q));
+            for (int a = 0; a < q; ++a) {
+                bs[static_cast<size_t>(a)] = r.beta[static_cast<size_t>(slope[static_cast<size_t>(a)])];
+                for (int c = 0; c < q; ++c)
+                    Vs[static_cast<size_t>(a) * static_cast<size_t>(q) + static_cast<size_t>(c)] =
+                        r.V[static_cast<size_t>(slope[static_cast<size_t>(a)]) * ke +
+                            static_cast<size_t>(slope[static_cast<size_t>(c)])];
+            }
+            if (const auto w = waldQuadForm(Vs, bs, q)) {
+                const double chi2 = *w;
+                if (std::isfinite(chi2)) {
+                    block["chi2"] = chi2;
+                    modelP = est_detail::chi2UpperTailM4(static_cast<double>(q), chi2);
+                }
+            }
+        }
+    }
+    if (spec.robust) {
+        block["vcov_type"] = "robust";
+    } else if (clustered) {
         block["n_clusters"] = d.nClust;
         block["vcov_type"] = "cluster(" + spec.clusterVar + ")";
     } else {
@@ -1394,8 +1583,8 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
         for (const auto& a : t.atoms) term += std::string(term.empty() ? "" : "#") + (a.factor ? "i." : "c.") + a.var;
         lm.x.push_back(term);
     }
-    lm.vcov = clustered ? "cluster" : "oim";
-    if (clustered) lm.cluster = {spec.clusterVar};
+    lm.vcov = spec.robust ? "robust" : clustered ? "cluster" : "oim";
+    if (clustered && !spec.robust) lm.cluster = {spec.clusterVar};
     lm.depvar = spec.depvar;
     lm.dataPath = basePath;
     if (spec.ifExpr) lm.fitKeepif = *spec.ifExpr;
@@ -1404,18 +1593,58 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
         lm.fitWtype = "aw";
     }
     lm.result = block;
+    // e(sample): the design's rows. Without if/in the design read the working
+    // frame itself, so its rows are the head's (a filtered fit reads a projected
+    // copy whose rows are not, and keeps e(sample) unavailable).
+    const bool filtered = (spec.ifExpr && !spec.ifExpr->empty()) || (spec.inRange && !spec.inRange->empty());
+    if (!filtered && session.datastore() != nullptr) {
+        std::vector<char> mask(static_cast<size_t>(session.datastore()->nRows()), 0);
+        bool inRange = true;
+        for (int64_t r : d.rows) {
+            if (r < 0 || static_cast<size_t>(r) >= mask.size()) inRange = false;
+            else mask[static_cast<size_t>(r)] = 1;
+        }
+        if (inRange) (void)e3::installEsampleMask(session, lm, mask);
+    }
     session.setLastModel(lm);
     session.lastEstBlock = block;
     session.estAddedClear();
     // setLastModel publishes e(cmd/depvar/vce/clustvar) and ERASES e(vcetype) for
     // a non-engine vce spelling; glm's own macros go in after it.
-    session.eval.setEString("vce", clustered ? "cluster" : "oim");
+    session.eval.setEString("vce", spec.robust ? "robust" : clustered ? "cluster" : "oim");
     session.eval.setEString("vcetype", clustered ? "Robust" : "OIM");
     session.eval.setEString("varfunct", fs.varfunct);
     session.eval.setEString("linkt", ls.linkt);
     session.eval.setEString("opt", "moptimize");
     session.eval.setEString("technique", "nr");
     session.eval.setEString("a", fs.alphaText);
+    // The family's and link's programs and formulas, ml's settings, and the
+    // Newey-West lag glm records even without hac (the sample's rows less 2:
+    // bank 5cb00c3c N 336, e(hac_lag) "334"). Noted on the fit, so the next
+    // model install drops them.
+    const auto postNoted = [&session](const char* name, const std::string& v) {
+        session.eval.setEString(name, v);
+        session.noteEOnFit(name);
+    };
+    if (modelP) e3::setEScalarOnFit(session, "p", *modelP);
+    postNoted("link", ls.link_prog);
+    postNoted("varfunc", fs.varfunc);
+    postNoted("linkf", ls.linkf);
+    postNoted("varfuncf", fs.varfuncf);
+    postNoted("m", "1");
+    if (ls.power == ".") postNoted("power", ".");
+    postNoted("hac_lag", std::to_string(d.n - 2));
+    postNoted("opt1", "ML");
+    postNoted("oim", "oim");
+    postNoted("chi2type", "Wald");
+    postNoted("crittype", clustered ? "log pseudolikelihood" : "log likelihood");
+    postNoted("ml_method", "e2");
+    postNoted("user", "glim_lf");
+    postNoted("singularHmethod", "m-marquardt");
+    postNoted("which", "max");
+    postNoted("deriv_useminbound", "off");
+    if (!spec.offsetVar.empty())
+        postNoted("offset", spec.exposure ? "ln(" + spec.offsetVar + ")" : spec.offsetVar);
     // e(b)/e(V) are POSTED (the coeftable fallback would synthesize a diagonal
     // V and drop the base columns); e(ilog) is ml's 1 x 20, zero-filled.
     // glm's ML fit names its one equation after the depvar
@@ -1432,7 +1661,11 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     for (size_t i = 0; i < r.ilog.size() && i < ilog.size(); ++i) ilog[i] = r.ilog[i];
     std::vector<std::string> ilogNames;
     for (int i = 1; i <= 20; ++i) ilogNames.push_back("c" + std::to_string(i));
-    postEMatrix(session, "ilog", rowVector(ilog, ilogNames));
+    {
+        eval::EvalMatrix ilogM = rowVector(ilog, ilogNames);
+        ilogM.rownames = {"r1"};  // StataBE: `matrix list e(ilog)` row r1
+        postEMatrix(session, "ilog", std::move(ilogM));
+    }
     std::vector<double> grad(K, 0.0);
     for (size_t i = 0; i < K; ++i)
         if (d.estIndex[i] >= 0) grad[i] = r.gradient[static_cast<size_t>(d.estIndex[i])];
@@ -1442,7 +1675,70 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     eval::EvalMatrix gradM = rowVector(grad, eqNames);
     gradM.rownames = {"r1"};
     postEMatrix(session, "gradient", std::move(gradM));
+    // e(Cns): ml's constraint matrix for the base levels (one row each, 1 in the
+    // level's column, and a last column _Cns:_r of 0), posted only when there is
+    // one (bank 94c843ce `glm fatal beertax i.year, family(poisson)`: 1 x 10 on
+    // `fatal:beertax fatal:1982b.year ... _Cns:_r`).
+    {
+        eval::EvalMatrix cns;
+        cns.colnames = eqNames;
+        cns.colnames.push_back("_Cns:_r");
+        for (size_t i = 0; i < K; ++i) {
+            if (d.estIndex[i] >= 0) continue;
+            std::vector<double> row(K + 1, 0.0);
+            row[i] = 1.0;
+            cns.data.push_back(std::move(row));
+            cns.rownames.push_back("r" + std::to_string(cns.data.size()));
+        }
+        if (!cns.data.empty()) postEMatrix(session, "Cns", std::move(cns));
+        else dropEMatrix(session, "Cns");
+    }
+    // e(V_modelbased) after vce(cluster): the inverse Hessian the sandwich was
+    // built on, on e(V)'s stripe (bank 5eeb21b0).
+    if (clustered && r.V_oim.size() == r.V.size()) {
+        std::vector<double> bp2, Vmb;
+        expandPosted(d, r.beta, r.V_oim, bp2, Vmb);
+        for (size_t a = 0; a < K; ++a)
+            for (size_t c = 0; c < a; ++c) {
+                const double m = 0.5 * (Vmb[a * K + c] + Vmb[c * K + a]);
+                Vmb[a * K + c] = m;
+                Vmb[c * K + a] = m;
+            }
+        postEMatrix(session, "V_modelbased", square(Vmb, eqNames));
+    } else {
+        dropEMatrix(session, "V_modelbased");
+    }
 
+    // eform: exp(b), exp(b) se and the exponentiated interval in the reported
+    // table, z and p unchanged; e(b) is untouched and r(table) carries eform 1
+    // (bank b7486d54 `glm hi beertax unemp, family(binomial) link(logit) eform`).
+    bool eform = false;
+    for (const auto& [k, v] : parsed.opts)
+        if (k == "eform" && v.isBool && v.boolValue) eform = true;
+    // level(#): the reported interval b -/+ invnormal(1 - (1 - level/100)/2) se
+    // (bank 3f513b3e `glm ..., family(poisson) le(90)`: r(table) crit 1.6448536)
+    if (levelPct.has_value() && block.contains("coeftable") && block["coeftable"].is_array()) {
+        const double zc = cecon::z_critical(1.0 - *levelPct / 100.0);
+        for (auto& row : block["coeftable"]) {
+            if (!row.is_object() || !row.contains("b") || !row["b"].is_number() || !row.contains("se") ||
+                !row["se"].is_number() || !(row["se"].get<double>() > 0))
+                continue;
+            const double b = row["b"].get<double>(), se = row["se"].get<double>();
+            row["ci_lo"] = b - zc * se;
+            row["ci_hi"] = b + zc * se;
+        }
+    }
+    if (eform && block.contains("coeftable") && block["coeftable"].is_array()) {
+        for (auto& row : block["coeftable"]) {
+            if (!row.is_object() || !row.contains("b") || !row["b"].is_number()) continue;
+            const double e = std::exp(row["b"].get<double>());
+            row["b"] = e;
+            if (row.contains("se") && row["se"].is_number()) row["se"] = e * row["se"].get<double>();
+            if (row.contains("ci_lo") && row["ci_lo"].is_number()) row["ci_lo"] = std::exp(row["ci_lo"].get<double>());
+            if (row.contains("ci_hi") && row["ci_hi"].is_number()) row["ci_hi"] = std::exp(row["ci_hi"].get<double>());
+        }
+        block["coef_metric"] = "eform";
+    }
     blocks.push_back(block);
     if (!r.converged) blocks.push_back(displayBlock("Warning: Convergence not achieved."));
     return blocks;
@@ -1729,6 +2025,8 @@ ojson runGlmMargins(const eval::ParsedCommand& parsed, SessionState& session) {
         postEMatrix(session, "V", square(MV, names));
         dropEMatrix(session, "ilog");
         dropEMatrix(session, "gradient");
+        dropEMatrix(session, "Cns");
+        dropEMatrix(session, "V_modelbased");
         // `post` replaces e() wholesale: the glm's own macros go with it.
         for (const char* k : kGlmEStrings) session.eval.setEString(k, "");
     }
@@ -1757,7 +2055,7 @@ ojson runGlmMargins(const eval::ParsedCommand& parsed, SessionState& session) {
             if (tok.rfind("i.", 0) == 0 || tok.rfind("c.", 0) == 0) tok = tok.substr(2);
             xvars += (xvars.empty() ? "" : " ") + tok;
         }
-        postGlmDydxRClass(session, block, names, est, Vrows, tableRows, xvars, !spec.clusterVar.empty());
+        postGlmDydxRClass(session, block, names, est, Vrows, tableRows, xvars, !spec.clusterVar.empty(), &G);
     }
     return blocks;
 }

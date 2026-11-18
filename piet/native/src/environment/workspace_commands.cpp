@@ -151,8 +151,16 @@ ojson runClear(const std::string& subIn, SessionState& session) {
     return silentEcho();
   }
 
+  // `clear frames` is `frames reset`: every frame dropped and the default frame
+  // emptied (vs-stata bank: `clear frames` after `use auto` -> N 0, k 0).
+  if (sub == "frames") {
+    ojson r = runFramesReset(session);
+    if (r.is_object() && r.value("type", "") == "error") return r;
+    return silentEcho();
+  }
+
   static const std::unordered_set<std::string> kNoStoreSubs = {
-      "ado", "rngstream", "rngstreams", "frames", "collect"};
+      "ado", "rngstream", "rngstreams", "collect"};
   if (kNoStoreSubs.count(sub)) {
     ojson out;
     out["type"] = "echo";
@@ -346,7 +354,10 @@ ojson runCd(const std::string& dirArgIn, SessionState& session) {
   fs::path abs = fs::weakly_canonical(p, ec);
   if (ec) abs = p.lexically_normal();
   if (!fs::is_directory(abs)) {
-    return engineErrorBlock("Directory not found: " + abs.u8string());
+    // Stata: r(170) "unable to change to NAME" for a missing directory and for a
+    // file alike (bank cells ef3e3fcca22917d1, 68e2bb4b14f09f2d).
+    return eval::errorBlock("engine_error", "unable to change to " + dirArg, std::nullopt,
+                            std::nullopt, std::nullopt, "r(170)");
   }
   session.cwd = abs.u8string();
   session.eval.cwd = *session.cwd;

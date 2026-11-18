@@ -77,6 +77,10 @@ set_source_files_properties(
   src/estimation/quantile_estimation.cpp
   src/estimation/mediation_estimation.cpp
   src/estimation/inference_statistics.cpp
+  # spearman's p replays spearman.ado's scalar arithmetic step for step: its beta
+  # fit takes sqrt() of a d that cancels to a few ulps, so one fused multiply-add
+  # moves alpha/beta by ~1e-8 and r(p) with them.
+  src/estimation/rank_and_normality_tests.cpp
   src/estimation/count_estimation.cpp
   src/estimation/did_two_period.cpp
   src/postestimation/postestimation_context.cpp
@@ -296,6 +300,7 @@ add_library(piet_core OBJECT
   src/environment/shell_translation.cpp
   src/environment/sleep_and_error_commands.cpp
   src/environment/environment_command_support.cpp
+  src/environment/stata_settings.cpp
   src/datamgmt/winsor.cpp
   src/matrix/matrix_to_variables.cpp
   src/matrix/variables_to_matrix.cpp
@@ -563,6 +568,12 @@ add_library(piet_core OBJECT
   src/datamgmt/astile.cpp
   src/datamgmt/column_write_support.cpp
   src/matrix/matrix_sort_select.cpp
+  # vs-stata bank (2026-11-11): programmer list parsers and the .dta format probe.
+  src/datamgmt/list_parsing_commands.cpp
+  src/fileio/dta_version.cpp
+  src/fileio/charset_guess.cpp
+  src/fileio/deflate.cpp
+  src/utility/misstable.cpp
   # AER scope-2 B2-3: Stata business calendars (bcal create + bofd/dofb).
   # The reader/writer/index arithmetic live apart from the handler so the
   # selftest can pin the .stbcal BYTES against StataBE's own files.
@@ -759,9 +770,9 @@ target_link_libraries(piet_settings INTERFACE Iconv::Iconv)
 # — the RC strings, the manifest assemblyIdentity, and the Inno installer's
 # AppVersion all trace back to PIET_VERSION_VALUE here. Editing these three
 # lines is still the one and only version bump.
-set(PIET_VERSION_VALUE    "A.0.2")
-set(PIET_CONTRACT_A_VALUE "1.26.0")
-set(PIET_CONTRACT_B_VALUE "2.10.0")
+set(PIET_VERSION_VALUE    "A.1.0")
+set(PIET_CONTRACT_A_VALUE "1.27.0")
+set(PIET_CONTRACT_B_VALUE "2.11.0")
 target_compile_definitions(piet_settings INTERFACE
   PIET_VERSION_STRING="${PIET_VERSION_VALUE}"
   PIET_CONTRACT_A_VERSION="${PIET_CONTRACT_A_VALUE}"

@@ -401,16 +401,25 @@ void testEvaluatorSmoke() {
     check(e.block.at("token") == "`x'", "tokenize: macro ref token captured");
   }
 
-  // tokenize: estimation weights rejected (Doctrine ① guard). `list` carries
-  // WeightPolicy::None (unaffected by the P3 weights wave — `regress` used to
-  // be this probe's command, but it moved to WeightPolicy::AllWeights and
-  // [aw=] is now legal there; see testBS096QualifierPolicyTable for that
-  // newly-legal case).
+  // tokenize: estimation weights rejected (Doctrine ① guard). `reg3` carries
+  // WeightPolicy::None while Stata's reg3 takes aweights (reg3.ado `[aw fw]`),
+  // so its [aw=] is an engine gap: unsupported_option. `regress` used to be
+  // this probe's command (AllWeights since the P3 weights wave), then `list` --
+  // whose Stata syntax takes no weight at all, so its [aw=] is Stata's own
+  // r(101) "weights not allowed" (StataBE 19.5 truth bank 2026-11-10), not a gap.
   try {
-    tokenize("list y x [aw=w]");
+    tokenize("reg3 y x [aw=w]");
     check(false, "tokenize: weight must throw TokenizerError");
   } catch (const TokenizerError& e) {
     check(e.block.at("code") == "unsupported_option", "tokenize: weight -> unsupported_option");
+  }
+  try {
+    tokenize("list y x [aw=w]");
+    check(false, "tokenize: a weight on `list` must throw TokenizerError");
+  } catch (const TokenizerError& e) {
+    check(e.block.value("message", std::string()) == "weights not allowed" &&
+              e.block.value("reason", std::string()) == "r(101)",
+          "tokenize: a weight on `list` is Stata's r(101) `weights not allowed`");
   }
 
   // scanOneToken: compound-quote awareness, bind semantics

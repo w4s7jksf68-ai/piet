@@ -601,7 +601,7 @@ ojson runCount(const std::optional<std::string>& ifExpr, SessionState& session,
 
 ojson runList(const std::optional<std::vector<std::string>>& varlist,
               const std::optional<std::string>& ifExpr, const std::optional<std::string>& inRange,
-              SessionState& session) {
+              SessionState& session, bool noLabel) {
   Datastore* ds = session.datastore();
   if (ds == nullptr) return eval::noDataLoaded();
 
@@ -628,7 +628,10 @@ ojson runList(const std::optional<std::vector<std::string>>& varlist,
   // variables render label TEXT (mirrors browse.py's run_browse, which
   // always passes session.get_value_label_map() to Datastore.browse — list
   // and browse share the same underlying renderer in the oracle).
-  auto vlMap = session.valueLabelMapForBrowse();
+  // `nolabel` lists the stored codes instead of the label text: an empty map
+  // is exactly a dataset with no value-label definitions attached.
+  auto vlMap = noLabel ? decltype(session.valueLabelMapForBrowse()){}
+                       : session.valueLabelMapForBrowse();
   // format-display-default-lifecycle: every listed column carries the format
   // its cells display in, from the one resolver (SessionState::displayFormat):
   // a `format` command's, the file's own, else the declared type's default

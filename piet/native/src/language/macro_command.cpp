@@ -231,7 +231,14 @@ ojson macroList(const std::vector<std::string>& toks, SessionState& session) {
       if (!internalMacroName(l[i].first, true) && !l[i].second.empty())
         lines.push_back(listLine("_" + l[i].first, l[i].second));
   } else {
-    for (const auto& t : toks) {
+    for (const auto& tTyped : toks) {
+      // `macro list` takes names, not patterns. A local's name read stops at
+      // a wildcard, so `_g*` asks for the local `g` (StataBE 19.5: "local macro
+      // `g' not found", r(111); vs-stata bank 7ec21faee44c4dd2); a global
+      // pattern stays an invalid name, r(198) (`zzg*`, 47ee71a80b132948).
+      std::string t = tTyped;
+      if (const size_t w = t.find_first_of("*?~"); w != std::string::npos && w > 1 && t[0] == '_')
+        t = t.substr(0, w);
       const bool isLocal = t.size() > 1 && t[0] == '_';
       const std::string bare = isLocal ? t.substr(1) : t;
       if (!(isLocal ? validLocalName(bare) : validGlobalName(bare))) {

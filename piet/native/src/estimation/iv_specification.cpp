@@ -172,6 +172,7 @@ IvParenResult parseIvParenM4(const std::vector<std::string>& tokens, bool exogAf
   std::vector<std::string> instr = splitTokensM4(insideStr.substr(eq + 1));
   if (endog.empty() || instr.empty()) {
     r.errored = true;
+    r.noInstruments = !endog.empty() && instr.empty();
     r.errorMsg = "malformed (endog = instruments) block: need at least one endogenous regressor "
                  "and at least one instrument";
     return r;

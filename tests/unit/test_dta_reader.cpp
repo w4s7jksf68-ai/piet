@@ -7,6 +7,7 @@
 // full pandas cross-check; this unit test pins the expected numbers so a
 // regression is caught even without the Python oracle installed).
 #include <cmath>
+#include <exception>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -181,6 +182,16 @@ static void check_strl_o_boundary(const std::string& path, const std::string& ta
     }
 }
 
+static void check_strl_ref_corrupt(const std::string& path, const std::string& tag) {
+    bool threw = false;
+    try {
+        (void)read_dta(path);
+    } catch (const std::exception& e) {
+        threw = std::string(e.what()).find("corrupt") != std::string::npos;
+    }
+    check(threw, tag + ": a strL ref past the dataset's observations is a corrupt file");
+}
+
 int test_dta_reader_main() {
     std::printf("test_dta_reader:\n");
     const cobra_test::ValidateBase base{"dta_fixtures/"};
@@ -249,8 +260,12 @@ int test_dta_reader_main() {
     // BUG-072: strL GSO offset >= 65536, per-format decode.
     check_strl_o_boundary(base + "probe117.dta", "strl_o_probe117");            // small-o control
     check_strl_o_boundary(base + "probe118.dta", "strl_o_probe118");            // small-o control
-    check_strl_o_boundary(base + "bug072_fmt117_o65536.dta", "strl_o_117");     // the bug (117)
-    check_strl_o_boundary(base + "bug072_fmt118_o65536.dta", "strl_o_118");     // 118 twin, no regression
+    // The BUG-072 fixtures hold 4 observations but strL refs with o >= 65535:
+    // StataBE 19.5 refuses both as corrupt (`use` r(688), "the strL component of
+    // the file is corrupt"; vs-stata bank 2026-11-10), so the reader does too.
+    // These legs pinned a successful decode before.
+    check_strl_ref_corrupt(base + "bug072_fmt117_o65536.dta", "strl_o_117");
+    check_strl_ref_corrupt(base + "bug072_fmt118_o65536.dta", "strl_o_118");
 
     std::printf("%s\n", fail ? "FAILED" : "PASSED");
     return fail;

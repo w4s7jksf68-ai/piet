@@ -51,6 +51,7 @@
 #include "piet/datastore.h"
 #include "piet/dispatcher.h"
 #include "piet/eval/errors.h"
+#include "piet/eval/macros.h"  // evalArith -- the map() expression
 #include "piet/eval/session.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/loops.h"  // expandVarlist -- the ONE varlist wildcard/range expander
@@ -81,17 +82,23 @@ namespace {
 // option, which is what Stata answers too.
 
 // renvars' full transformation set, from renvars.ado's own `syntax` line. All
-// but two are implemented, and the two that are not are refused rather than
-// approximated: `map()` builds a NEW NAME BY EVALUATING A STATA EXPRESSION
-// (`local newname = <expr>` after substituting the symbol), which is a name
-// derivation this build has no way to run, and `symbol()` only names the
-// placeholder character map() substitutes -- accepting it alone would be
-// accepting half of a feature. `display` and `test` are read: they are the
-// package's own dry-run surface.
+// are implemented. `map()` builds a new name by evaluating a Stata expression
+// after the symbol (`@` unless symbol() names another) has been replaced by the
+// old name, as the vs-stata bank shows (`map("x_" + "@")` renames price to
+// x_price); an expression that does not evaluate is r(133). `display` and
+// `test` are read: they are the package's own dry-run surface.
 const piet::eval::OptVocab& kVocabRenvars = piet::eval::registerOptVocab(
     {"renvars"}, {{"upper", "lower", "prefix", "postfix", "suffix", "presub", "postsub", "subst",
-                   "predrop", "postdrop", "trim", "trimend", "display", "test"},
-                  {"map", "symbol"}});
+                   "predrop", "postdrop", "trim", "trimend", "map", "symbol", "display", "test"},
+                  {}});
+
+// renvarlab takes renvars' transformations, `label` (names from the variable
+// labels) and the dry-run pair. Nothing of the package is left unimplemented.
+const piet::eval::OptVocab& kVocabRenvarlab = piet::eval::registerOptVocab(
+    {"renvarlab"}, {{"upper", "lower", "prefix", "postfix", "suffix", "presub", "postsub", "subst",
+                     "predrop", "postdrop", "trim", "trimend", "map", "symbol", "label", "display",
+                     "test"},
+                    {}});
 
 ojson k1Syntax(const std::string& message) {
   return ojson(eval::engineError(message, "syntax_error"));
@@ -109,6 +116,12 @@ const ojson* firstError(const ojson& result) {
     }
   }
   return nullptr;
+}
+
+// One line of the `display` / `test` listing: the old name right-aligned in 34
+// columns, then the new one (vs-stata bank, `renvars price mpg, upper display`).
+std::string renameLine(const std::string& from, const std::string& to) {
+  return std::string(from.size() < 34 ? 34 - from.size() : 0, ' ') + from + " -> " + to;
 }
 
 ojson displayBlock(const std::string& text) {
@@ -321,8 +334,10 @@ struct RenvarsPlan {
 // integer-argument options with a non-integer argument.
 static std::string renvarsTransform(const std::string& name,
                              const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-                             const std::string& which, bool* ok, std::string* why) {
+                             const std::string& which, bool* ok, std::string* why,
+                             SessionState& session, int* rc, const char* mapMsg) {
   *ok = true;
+  *rc = 7;
   auto words = [&](const std::string& key) {
     return splitWords(optStr(opts, key).value_or(std::string()));
   };
@@ -349,6 +364,32 @@ static std::string renvarsTransform(const std::string& name,
 
   if (which == "upper") return upperOf(name);
   if (which == "lower") return lowerOf(name);
+  if (which == "map") {
+    // The expression with every symbol replaced by the old name, evaluated as
+    // `local newname = <expr>` would; any failure to evaluate is r(133).
+    std::string expr = optStr(opts, "map").value_or(std::string());
+    std::string sym = word1("symbol");
+    if (sym.empty()) sym = "@";
+    std::string subst;
+    for (size_t i = 0; i < expr.size();) {
+      if (expr.compare(i, sym.size(), sym) == 0) {
+        subst += name;
+        i += sym.size();
+      } else {
+        subst.push_back(expr[i++]);
+      }
+    }
+    std::string err;
+    bool isStr = false;
+    const std::optional<std::string> v = eval::evalArith(subst, &session.eval, &err, &isStr);
+    if (!v.has_value() || !err.empty()) {
+      *ok = false;
+      *rc = 133;
+      *why = mapMsg;
+      return name;
+    }
+    return *v;
+  }
   if (which == "prefix") return word1("prefix") + name;
   if (which == "postfix" || which == "suffix") return name + word1(which);
   if (which == "subst") {
@@ -470,7 +511,7 @@ ojson runRenvars(const eval::ParsedCommand& parsed, SessionState& session) {
     // and giving both is legal so long as they agree.
     static const char* kTransforms[] = {"upper",   "lower",    "prefix", "postfix", "suffix",
                                         "presub",  "postsub",  "subst",  "predrop", "postdrop",
-                                        "trim",    "trimend"};
+                                        "trim",    "trimend",  "map"};
     std::vector<std::string> given;
     for (const char* t : kTransforms) {
       const bool present = (std::string(t) == "upper" || std::string(t) == "lower")
@@ -498,9 +539,14 @@ ojson runRenvars(const eval::ParsedCommand& parsed, SessionState& session) {
     for (const auto& nm : oldVars) {
       bool ok = true;
       std::string why;
-      const std::string out = renvarsTransform(nm, parsed.opts, which, &ok, &why);
-      if (!ok) return k1ErrorRc(why, 7);
-      if (out != nm) plan.pairs.emplace_back(nm, out);
+      int rcX = 7;
+      const std::string out =
+          renvarsTransform(nm, parsed.opts, which, &ok, &why, session, &rcX, "inappropriate map?");
+      if (!ok) return k1ErrorRc(why, rcX);
+      // A transformation that leaves nothing of the name is not a rename: the
+      // variable keeps its name (vs-stata bank: `renvars mpg, predrop(3)` and
+      // `renvars price mpg, trim(0)` say "no renames necessary", rc 0).
+      if (out != nm && !out.empty()) plan.pairs.emplace_back(nm, out);
     }
   }
 
@@ -534,14 +580,14 @@ ojson runRenvars(const eval::ParsedCommand& parsed, SessionState& session) {
     ojson blocks = ojson::array();
     blocks.push_back(displayBlock("specification would result in the following renames:"));
     for (const auto& [from, to] : plan.pairs)
-      blocks.push_back(displayBlock("  " + from + " -> " + to));
+      blocks.push_back(displayBlock(renameLine(from, to)));
     return blocks;
   }
 
   ojson blocks = ojson::array();
   std::vector<std::string> fromNames, toNames;
   for (const auto& [from, to] : plan.pairs) {
-    if (wantDisplay) blocks.push_back(displayBlock("  " + from + " -> " + to));
+    if (wantDisplay) blocks.push_back(displayBlock(renameLine(from, to)));
     ojson r = runRename(from, to, session);
     if (const ojson* e = firstError(r)) return *e;
     fromNames.push_back(from);
@@ -549,6 +595,194 @@ ojson runRenvars(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   // See runTolower: one mutation block for the whole plan, so the variable
   // plane this command just rewrote is actually published.
+  blocks.push_back(mutationResult(session, "rename", toNames, fromNames));
+  return blocks;
+}
+
+// ===========================================================================
+// renvarlab
+// ===========================================================================
+//
+//     renvarlab oldvars \ newvars [, display test]
+//     renvarlab [varlist], <exactly one transformation option> [label] [display test]
+//
+// The same transformations as renvars (`renvarsTransform` above), with the
+// package's own checks, which are stricter and carry other codes (vs-stata bank):
+// every new name is tested as it is derived -- empty r(6) "Resulting variable
+// name () is invalid", not a legal name r(7), a name already in the data
+// (including a variable that is itself being renamed) r(110), two variables onto
+// one name r(110) -- and nothing is renamed unless every name passes. A
+// transformation that changes nothing is the message "No renames necessary: all
+// new names match old names". `label` derives the new name from the variable
+// label: alone, the label is made into a name (strtoname); with a transformation
+// option the transformation is applied to the label text itself.
+static std::string labelToName(const std::string& s) {
+  std::string out;
+  for (unsigned char c : s) out.push_back((c >= 0x80 || std::isalnum(c) || c == '_') ? static_cast<char>(c) : '_');
+  if (!out.empty() && out[0] >= '0' && out[0] <= '9') out.insert(out.begin(), '_');
+  if (out.size() > 32) {
+    size_t cut = 32;
+    while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) --cut;
+    out.resize(cut);
+  }
+  return out;
+}
+
+ojson runRenvarlab(const eval::ParsedCommand& parsed, SessionState& session) {
+  const bool wantDisplay = hasFlag(parsed.opts, "display");
+  const bool wantTest = hasFlag(parsed.opts, "test");
+
+  // ---- the one-to-one form: renvarlab oldvars \ newvars -------------------
+  // The new names are a Stata newvarlist, so a name already in the data is
+  // r(110) "variable X already defined" (vs-stata bank `renvarlab price \ mpg`),
+  // and the two lists must be as long as each other (r(198)). Its options are
+  // display and test.
+  const auto sep = std::find_if(parsed.varlist.begin(), parsed.varlist.end(),
+                                [](const std::string& t) { return t == "\\" || t == "/"; });
+  if (sep != parsed.varlist.end()) {
+    if (!session.hasData()) return ojson(eval::noDataLoaded());
+    std::vector<std::string> have;
+    ojson nerr;
+    if (!columnNames(session, &have, &nerr)) return nerr;
+    std::vector<std::string> olds;
+    if (sep == parsed.varlist.begin()) {
+      olds = have;
+    } else {
+      loops::VarlistExpandResult ex = loops::expandVarlist(
+          joinWith(std::vector<std::string>(parsed.varlist.begin(), sep), " "), session);
+      if (ex.isError) return ex.error;
+      olds = ex.tokens;
+    }
+    const std::vector<std::string> news(sep + 1, parsed.varlist.end());
+    std::set<std::string> seen;
+    for (const auto& nm : news) {
+      if (!strutil::isValidStataIdentifier(nm)) return k1ErrorRc(nm + " invalid name", 198);
+      if (std::find(have.begin(), have.end(), nm) != have.end() || !seen.insert(nm).second)
+        return k1ErrorRc("variable " + nm + " already defined", 110);
+    }
+    for (const auto& [k, v] : parsed.opts) {
+      (void)v;
+      if (k != "display" && k != "test") return k1ErrorRc("option " + k + " not allowed", 198);
+    }
+    if (news.size() != olds.size())
+      return k1ErrorRc("lists of old and new varnames unequal in length", 198);
+    ojson blocks = ojson::array();
+    if (wantTest) {
+      blocks.push_back(displayBlock("specification would result in the following renames:"));
+      for (size_t i = 0; i < olds.size(); ++i)
+        blocks.push_back(displayBlock(renameLine(olds[i], news[i])));
+      return blocks;
+    }
+    std::vector<std::string> fromNames, toNames;
+    for (size_t i = 0; i < olds.size(); ++i) {
+      if (wantDisplay) blocks.push_back(displayBlock(renameLine(olds[i], news[i])));
+      ojson r = runRename(olds[i], news[i], session);
+      if (const ojson* e = firstError(r)) return *e;
+      fromNames.push_back(olds[i]);
+      toNames.push_back(news[i]);
+    }
+    blocks.push_back(mutationResult(session, "rename", toNames, fromNames));
+    return blocks;
+  }
+
+  // ---- the transformation form --------------------------------------------
+  // Exactly one transformation option (`label` is not one: it chooses what the
+  // transformation is applied to), counted before any option this build does
+  // not know is refused, as the package counts them before it acts on any
+  // (vs-stata bank `renvarlab price mpg, upper prefix(x)`).
+  static const char* const kTransforms[] = {"upper",    "lower",   "prefix",  "postfix", "suffix",
+                                            "predrop",  "postdrop", "trim",   "trimend", "map",
+                                            "presub",   "postsub", "subst"};
+  std::vector<std::string> given;
+  for (const char* t : kTransforms) {
+    const std::string key = t;
+    const bool present = (key == "upper" || key == "lower") ? hasFlag(parsed.opts, key)
+                                                            : optStr(parsed.opts, key).has_value();
+    if (present) given.push_back(key);
+  }
+  {
+    const std::optional<std::string> sfx = optStr(parsed.opts, "suffix");
+    const std::optional<std::string> pfx = optStr(parsed.opts, "postfix");
+    if (sfx.has_value() && pfx.has_value()) {
+      const auto unq = [](const std::string& v) {
+        const std::vector<std::string> w = splitWords(v);
+        return w.empty() ? std::string() : w[0];
+      };
+      if (unq(*sfx) != unq(*pfx)) return k1Syntax("postfix() and suffix() differ");
+      given.erase(std::remove(given.begin(), given.end(), std::string("suffix")), given.end());
+    }
+  }
+  if (given.size() > 1) return k1Syntax("exactly one transformation option should be specified");
+  if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabRenvarlab.known,
+                                            kVocabRenvarlab.unimplemented))
+    return ojson(*err);
+  const bool label = hasFlag(parsed.opts, "label");
+  if (given.empty() && !label) return k1Syntax("exactly one transformation option should be specified");
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
+
+  std::vector<std::string> existing;
+  {
+    ojson nerr;
+    if (!columnNames(session, &existing, &nerr)) return nerr;
+  }
+  std::vector<std::string> vars;
+  if (parsed.varlist.empty()) {
+    vars = existing;
+  } else {
+    loops::VarlistExpandResult ex = loops::expandVarlist(joinWith(parsed.varlist, " "), session);
+    if (ex.isError) return ex.error;
+    vars = ex.tokens;
+  }
+  if (vars.empty()) return k1Syntax("no variables to rename");
+
+  const std::set<std::string> taken(existing.begin(), existing.end());
+  std::vector<std::pair<std::string, std::string>> plan;
+  std::set<std::string> targets;
+  for (const auto& nm : vars) {
+    std::string base = nm;
+    if (label) {
+      const auto mi = session.varMeta.find(nm);
+      base = (mi != session.varMeta.end() && mi->second.label.has_value()) ? *mi->second.label
+                                                                           : std::string();
+    }
+    std::string out;
+    if (given.empty()) {
+      out = labelToName(base);
+    } else {
+      bool ok = true;
+      std::string why;
+      int rcX = 7;
+      out = renvarsTransform(base, parsed.opts, given[0], &ok, &why, session, &rcX, "Error in map");
+      if (!ok) return k1ErrorRc(why, rcX);
+    }
+    if (out == nm) continue;
+    if (out.empty()) return k1ErrorRc("Resulting variable name () is invalid", 6);
+    if (!strutil::isValidStataIdentifier(out))
+      return k1ErrorRc("Resulting variable name (" + out + ") is invalid", 7);
+    if (taken.count(out) != 0) return k1ErrorRc("Variable name (" + out + ") already exists.", 110);
+    if (!targets.insert(out).second)
+      return k1ErrorRc("new variable " + out + " mentioned more than once", 110);
+    plan.emplace_back(nm, out);
+  }
+
+  ojson blocks = ojson::array();
+  if (plan.empty()) {
+    blocks.push_back(displayBlock("No renames necessary: all new names match old names"));
+    return blocks;
+  }
+  if (wantTest) {
+    blocks.push_back(displayBlock("specification would result in the following renames:"));
+    for (const auto& [from, to] : plan) blocks.push_back(displayBlock(renameLine(from, to)));
+    return blocks;
+  }
+  std::vector<std::string> fromNames, toNames;
+  for (const auto& [from, to] : plan) {
+    if (wantDisplay) blocks.push_back(displayBlock(renameLine(from, to)));
+    ojson r = runRename(from, to, session);
+    if (const ojson* e = firstError(r)) return *e;
+    fromNames.push_back(from);
+    toNames.push_back(to);
+  }
   blocks.push_back(mutationResult(session, "rename", toNames, fromNames));
   return blocks;
 }

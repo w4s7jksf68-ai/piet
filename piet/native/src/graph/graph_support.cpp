@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <regex>
@@ -12,6 +13,7 @@
 #include "piet/session_state.h"
 #include "vendor/nlohmann/json.hpp"
 #include "piet/eval/errors.h"
+#include "piet/handlers/graph.h"
 #include "graph_support.h"
 
 namespace piet::handlers::graph_detail {
@@ -147,6 +149,137 @@ std::string firstNameToken(const std::string& raw) {
 
 // A refusal with the oracle's own rc (errors.h errorBlock, reason "r(#)": the
 // shape coarseRc() honours, so `display _rc` is never 1).
+}  // namespace piet::handlers::graph_detail
+
+namespace piet::handlers {
+using ojson = nlohmann::ordered_json;
+
+// mlabel(varlist): see graph.h. A word is checked only when it is a plain name or
+// plainly not one (starts with a digit, `%`, ...); anything carrying a wildcard,
+// range, time-series or factor operator is the plot's to expand.
+std::optional<ojson> mlabelVarlistRefusal(
+    SessionState& session, Datastore& ds,
+    const std::vector<std::pair<std::string, eval::OptValue>>& opts) {
+  (void)session;
+  for (const auto& [k, v] : opts) {
+    if (k != "mlabel" || v.isBool) continue;
+    for (const std::string& w : graph_detail::splitWsG(v.strValue)) {
+      if (w.find_first_of("*?~-") != std::string::npos) continue;  // wildcard / range: the plot's
+      const bool nameLike = std::isalpha(static_cast<unsigned char>(w[0])) || w[0] == '_';
+      if (!nameLike) {  // bank: `mlabel(45)` "45 invalid name", `mla(%5.0fc)` "invalid '%'": r(198)
+        return graph_detail::stataRefusal(w + " invalid name", 198);
+      }
+      bool allWord = true;
+      for (char c : w) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) allWord = false;
+      }
+      if (!allWord) continue;  // a ts/factor operator or subscript: the plot expands it
+      if (w.size() > 32) return graph_detail::stataRefusal(w + " invalid name", 198);
+      if (ds.has(w)) continue;
+      int hits = 0;  // `set varabbrev on` (Stata's default): a unique prefix names the variable
+      for (const auto& n : ds.names()) {
+        if (n.compare(0, w.size(), w) == 0) ++hits;
+      }
+      if (hits == 1) continue;
+      return graph_detail::stataRefusal(
+          hits == 0 ? "variable " + w + " not found" : "variable " + w + " ambiguous abbreviation",
+          111);
+    }
+  }
+  return std::nullopt;
+}
+
+// unabbreviateGraphVar: see graph.h.
+std::string unabbreviateGraphVar(SessionState& session, Datastore& ds, const std::string& word) {
+  if (word.empty() || ds.has(word)) return word;
+  if (const std::string* off = session.eval.globals.find(" __piet_set_varabbrev"))
+    if (*off == "off") return word;
+  for (char c : word)
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) return word;
+  std::string hit;
+  int hits = 0;
+  for (const auto& n : ds.names()) {
+    if (n.size() > word.size() && n.compare(0, word.size(), word) == 0) {
+      hit = n;
+      ++hits;
+    }
+  }
+  return hits == 1 ? hit : word;
+}
+
+// graphStyleWordRefusal: see graph.h. The value of msymbol / connect / pstyle / recast is a
+// list of style words; a top-level comma (suboptions of an option that takes none) or a
+// `word(` group is not one.
+std::optional<ojson> graphStyleWordRefusal(
+    const std::vector<std::pair<std::string, eval::OptValue>>& opts) {
+  for (const auto& [k, v] : opts) {
+    if (v.isBool) continue;
+    // predopts() goes to predict, which has no level() (bank: `twoway lfit price weight,
+    // predopts(level(90))` r(198) "option level() not allowed")
+    if (k == "predopts" && v.strValue.find("level(") != std::string::npos)
+      return graph_detail::stataRefusal("option level() not allowed", 198);
+    if (k != "msymbol" && k != "ms" && k != "connect" && k != "pstyle" && k != "recast") continue;
+    const std::string& t = v.strValue;
+    if (t.find('(') != std::string::npos) {
+      std::string sub;  // the first `word(...)` group, as Stata prints the refused sub-option
+      size_t open = t.find('(');
+      size_t b = open;
+      while (b > 0 && (std::isalnum(static_cast<unsigned char>(t[b - 1])) || t[b - 1] == '_')) --b;
+      int depth = 0;
+      size_t e = open;
+      for (; e < t.size(); ++e) {
+        if (t[e] == '(') ++depth;
+        if (t[e] == ')' && --depth == 0) break;
+      }
+      sub = t.substr(b, (e < t.size() ? e + 1 : t.size()) - b);
+      return graph_detail::stataRefusal("option(s) " + sub + " not allowed", 198);
+    }
+    if (t.find(',') != std::string::npos) return graph_detail::stataRefusal("invalid 'editcopy'", 198);
+  }
+  return std::nullopt;
+}
+
+// The plot types that do NOT own each of the four options. Evidence, all StataBE 19.5
+// (vs-stata bank 2026-11-10 unless noted): horizontal is refused on scatter, line,
+// connected and the lfit/qfit family; barwidth on scatter, line, rcap, rspike (and the
+// plot types that share their class: connected, the fit family, kdensity, function,
+// rarea, rcapsym, rline, rscatter, rconnected); base on scatter, line, rarea,
+// histogram (+ the same class siblings); range on scatter, line, histogram (+ the
+// range-less range plots). spike/area/dropline/bar/dot own barwidth, base and
+// horizontal; the fit family, function and kdensity own range; histogram owns
+// horizontal and barwidth.
+bool plotTypeRefusesOption(const std::string& plotType, const std::string& key) {
+  std::string t;
+  for (char c : plotType) t += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (t == "hist") t = "histogram";
+  const bool plain = t == "scatter" || t == "connected" || t == "line";
+  const bool fit = t == "lfit" || t == "qfit" || t == "lfitci" || t == "qfitci";
+  const bool rangePlot = t == "rarea" || t == "rcap" || t == "rcapsym" || t == "rspike" ||
+                         t == "rline" || t == "rscatter" || t == "rconnected";
+  // level(), stdp, stdf, stdr and nofit belong to the confidence-band plots (lfitci, qfitci)
+  // alone (bank: `twoway lfit price weight, level(90)` r(198) "option level() not allowed")
+  if (key == "level" || key == "stdp" || key == "stdf" || key == "stdr" || key == "nofit")
+    return t == "lfit" || t == "qfit";
+  if (key == "horizontal") return plain || fit;
+  if (key == "barwidth") return plain || fit || rangePlot || t == "kdensity" || t == "function";
+  if (key == "base") return plain || fit || rangePlot || t == "kdensity" || t == "histogram";
+  if (key == "range") return plain || rangePlot || t == "histogram";
+  return false;
+}
+
+std::string plotTypeOwnSpelling(const std::string& plotType, const std::string& key) {
+  std::string t;
+  for (char c : plotType) t += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  const bool fit = t == "lfit" || t == "qfit" || t == "lfitci" || t == "qfitci";
+  if (fit && key == "r") return "range";
+  if ((t == "lfitci" || t == "qfitci") && key == "l") return "level";
+  return std::string();
+}
+
+}  // namespace piet::handlers
+
+namespace piet::handlers::graph_detail {
+
 ojson stataRefusal(const std::string& message, int rc) {
   return ojson(eval::errorBlock(rc == 198 ? "syntax_error" : "engine_error", message, std::nullopt,
                                 std::nullopt, std::nullopt, "r(" + std::to_string(rc) + ")"));

@@ -61,6 +61,7 @@ extern const eval::OptVocab& kVocabIvFirst;
 extern const eval::OptVocab& kVocabPpmlD;
 extern const eval::OptVocab& kVocabPoisson;
 extern const eval::OptVocab& kVocabNbreg;
+extern const eval::OptVocab& kVocabPoissonLog;
 extern const eval::OptVocab& kVocabXtPoissonLogit;
 extern const eval::OptVocab& kVocabDfullerPperron;
 }

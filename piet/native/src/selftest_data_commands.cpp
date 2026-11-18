@@ -63,14 +63,22 @@ void testBS002BysortParentheticalSort() {
 // dropped an option, reordered a by(), or forwarded to a neighbouring handler.
 // The identity does not.
 //
-// WHAT THE COMPARISON IGNORES, AND WHY EXACTLY TWO THINGS. (1) The command
+// WHAT THE COMPARISON IGNORES, AND WHY ONLY THESE. (1) The command
 // ECHO, filtered on the text's own leading '.' -- the same rule renderText uses
 // in testAerResultsBundle above, and for the same reason: some printers reuse
 // the "echo" block TYPE for real output, so a type filter would throw away the
 // thing under test. (2) The alias SPELLING itself, rewritten to the native
 // spelling before the compare, because a block that records which command
 // produced it would otherwise differ on the one byte an alias is entitled to
-// differ on. Everything else must match byte for byte.
+// differ on. Everything else must match byte for byte -- with one named
+// exception that is not a weakening: gtools' gcollapse posts r(J), r(minJ),
+// r(maxJ), which collapse does not (vs-stata truth bank 646c48dbe7b9289d,
+// `gcollapse (mean) price mpg, by(foreign) double` on auto: r(J) 2, r(minJ) 22,
+// r(maxJ) 52, r(N) 74), and its block carries them as gtools_J / gtools_minJ /
+// gtools_maxJ. Those three keys, and only they, are dropped from the ALIAS
+// side before the compare (kGtoolsOnlyKeys), and the leg after the table asserts
+// their values against the group sizes, so they are checked, just not against
+// a native command that has no such field.
 //
 // EVERY EQUIVALENCE LEG ALSO ASSERTS ITS SIGNATURE IS NON-EMPTY. Two commands
 // that both did nothing at all compare equal, and an equality check that can be
@@ -137,7 +145,9 @@ void testAerGtoolsBundle() {
     return std::nan("");
   };
   // The comparable part of a block list: see this function's header for the
-  // two exclusions and why there are exactly two.
+  // exclusions (echo, alias spelling, the named gtools-only keys) and why only those.
+  static const std::vector<std::string> kGtoolsOnlyKeys = {"gtools_J", "gtools_minJ",
+                                                           "gtools_maxJ"};
   auto signature = [](const nlohmann::ordered_json& blocks, const std::string& alias,
                       const std::string& native) {
     std::string out;
@@ -145,7 +155,13 @@ void testAerGtoolsBundle() {
       if (!b.is_object()) continue;
       const std::string t = b.value("text", std::string());
       if (!t.empty() && t[0] == '.') continue;
-      out += b.dump();
+      if (!alias.empty()) {
+        nlohmann::ordered_json c = b;
+        for (const auto& k : kGtoolsOnlyKeys) c.erase(k);
+        out += c.dump();
+      } else {
+        out += b.dump();
+      }
       out += "\n";
     }
     if (!alias.empty()) {
@@ -228,6 +244,43 @@ void testAerGtoolsBundle() {
                 "match -- a shim that dropped an option or reordered by() differs HERE while "
                 "still answering rc 0. Got alias `" + aSig + "` vs native `" + bSig + "`");
     }
+  }
+
+  // --- the gtools-only results the identity above leaves out, checked by value:
+  // fatalities is 48 states x 7 years, so J 48, minJ = maxJ 7, N 336 (gtools'
+  // r(J) r(minJ) r(maxJ); bank 646c48dbe7b9289d for gcollapse, 3b2ece9f7cf9737e
+  // for glevelsof: `glevelsof make in 1/5` r(J) 5 r(minJ) 1 r(maxJ) 1 r(N) 5).
+  {
+    auto rOf = [](const piet::SessionState& s, const char* k) {
+      const double* v = s.eval.rValues.find(k);
+      return v != nullptr ? *v : std::nan("");
+    };
+    auto num = [](double v) { return std::isnan(v) ? std::string(".") : std::to_string(v); };
+    piet::SessionState gs(workdir);
+    (void)exec(kLoad, gs);
+    const auto g = exec("gcollapse (mean) fatal beertax, by(state)\n", gs);
+    double bJ = std::nan(""), bMin = std::nan(""), bMax = std::nan("");
+    for (const auto& b : g.blocks) {
+      if (!b.is_object() || !b.contains("gtools_J")) continue;
+      bJ = b["gtools_J"].get<double>();
+      bMin = b.contains("gtools_minJ") ? b["gtools_minJ"].get<double>() : std::nan("");
+      bMax = b.contains("gtools_maxJ") ? b["gtools_maxJ"].get<double>() : std::nan("");
+    }
+    check(bJ == 48.0 && bMin == 7.0 && bMax == 7.0 && rOf(gs, "J") == 48.0 &&
+              rOf(gs, "minJ") == 7.0 && rOf(gs, "maxJ") == 7.0 && rOf(gs, "N") == 336.0,
+          "GTOOLS EQUIV/gtools-only: `gcollapse ..., by(state)` carries gtools_J 48, gtools_minJ 7, "
+          "gtools_maxJ 7 and posts r(J) 48, r(minJ) 7, r(maxJ) 7, r(N) 336 (bank "
+          "646c48dbe7b9289d). Got block " + num(bJ) + "/" + num(bMin) + "/" + num(bMax) +
+              ", r() " + num(rOf(gs, "J")) + "/" + num(rOf(gs, "minJ")) + "/" +
+              num(rOf(gs, "maxJ")) + "/" + num(rOf(gs, "N")));
+    piet::SessionState ls(workdir);
+    (void)exec(kLoad, ls);
+    (void)exec("glevelsof state, local(lv)\n", ls);
+    check(rOf(ls, "J") == 48.0 && rOf(ls, "minJ") == 7.0 && rOf(ls, "maxJ") == 7.0 &&
+              rOf(ls, "N") == 336.0,
+          "GTOOLS EQUIV/gtools-only: `glevelsof state` posts r(J) 48, r(minJ) 7, r(maxJ) 7, "
+          "r(N) 336 (bank 3b2ece9f7cf9737e). Got " + num(rOf(ls, "J")) + "/" +
+              num(rOf(ls, "minJ")) + "/" + num(rOf(ls, "maxJ")) + "/" + num(rOf(ls, "N")));
   }
 
   // --- gisid: silent on success, so equivalence is taken where there IS
@@ -1662,22 +1715,21 @@ void testAerUtilRefusals() {
               fullPrec(runR(s, "summarize fsize", "sum")));
   }
 
-  // ── (vi) `unique ..., by()` with no `gen()` refuses BY NAME. ──────────────
-  // by() without gen() has nowhere to put its per-group answer, and Stata's
-  // `unique` prints nothing in that form. Printing the ungrouped count instead
-  // would answer a question the user did not ask, under rc 0.
+  // ── (vi) `unique ..., by()` with no `gen()` writes _Unique. ───────────────
+  // unique.ado: `if "`generate'"=="" { cap drop _Unique ; local generate
+  // _Unique }`. The vs-stata bank (StataBE 19.5, 2026-11-10) measured `unique
+  // rep78, by(foreign)` on auto at rc 0 with k 12 -> 13. This leg used to pin a
+  // refusal; it now pins the variable and its first-row-per-group fill.
   {
     piet::SessionState s(workdir);
     seed(s);
     (void)exec("clear\nset obs 4\ngen ug = 1\nreplace ug = 2 in 3/4\ngen uv = _n\n", s);
     auto r = exec("unique uv, by(ug)\n", s);
-    const nlohmann::ordered_json e = firstError(r.blocks);
-    check(!e.is_null(),
-          "AER-UTIL/refuse (vi): `unique uv, by(ug)` without gen() is refused rather than "
-          "silently answered as the ungrouped form");
-    check(errField(e, "reason") == "refused:unique_by_without_gen",
-          "AER-UTIL/refuse (vi): ...naming its OWN cause, so a caller can tell this apart from a "
-          "misspelled option. Got `" + errField(e, "reason") + "`");
+    check(firstError(r.blocks).is_null(),
+          "AER-UTIL (vi): `unique uv, by(ug)` without gen() runs (unique.ado writes _Unique). "
+          "Got `" + errText(firstError(r.blocks)) + "`");
+    check(runR(s, "summarize _Unique", "N") == 2.0 && runR(s, "summarize _Unique", "sum") == 4.0,
+          "AER-UTIL (vi): ...and _Unique holds 2 on each group's first row (N 2, sum 4)");
   }
 
   // ── (vii) the two options this arm does not implement are refused BY NAME. ─
@@ -2318,13 +2370,25 @@ void testC4BS044ClearScoping() {
     check(session.programs.empty(), "C4/BS-044: `clear programs` drops captured programs");
   }
 
-  // (d) no-backing-store subcommands (mata/ado/rngstream/frames/collect) —
-  // honest scoped no-ops: must NOT wipe the dataset (the pre-fix bug every
-  // subcommand shared).
+  // (d) no-backing-store subcommands (mata/ado/rngstream/collect) — honest
+  // scoped no-ops: must NOT wipe the dataset (the pre-fix bug every subcommand
+  // shared). `clear frames` is not one of them: it is `frames reset`, which
+  // leaves a single EMPTY default frame (vs-stata bank, StataBE 19.5: `clear
+  // frames` after `use auto` reads N 0, k 0); this leg pinned the no-op before.
   {
     piet::SessionState session(workdir);
     (void)piet::dispatch("sysuse fatalities, clear", session);
-    for (const std::string& sub : {"mata", "ado", "rngstream", "frames", "collect"}) {
+    auto fr = piet::dispatch("clear frames", session);
+    bool frErr = false;
+    for (const auto& b : fr)
+      if (b.is_object() && b.value("type", std::string()) == "error") frErr = true;
+    check(!frErr && !session.hasData(),
+          "C4/BS-044: `clear frames` runs and empties the default frame (frames reset)");
+  }
+  {
+    piet::SessionState session(workdir);
+    (void)piet::dispatch("sysuse fatalities, clear", session);
+    for (const std::string& sub : {"mata", "ado", "rngstream", "collect"}) {
       auto blocks = piet::dispatch("clear " + sub, session);
       bool sawError = false;
       for (const auto& b : blocks) {
@@ -2596,20 +2660,18 @@ void testBS090InRangeExpansion() {
           "keep-in-1/14-reduced copy's plain `duplicates report year`");
   }
 
-  // (j) duplicates drop ... in a/b — honest reject, same disclosed boundary
-  // as its pre-existing `if` reject (dedup-then-splice-back needs more than
-  // a simple filter). `force' is spelled: without it duplicates refuses a
-  // varlist drop first (r(198); w2ah_data_verbs.log
-  // ah_dup_drop_noforce), so the `in' refusal is only reachable with it.
+  // (j) duplicates drop ... in a/b -- de-duplicates the rows the range selects among themselves and
+  // leaves the rest (vs-stata bank: `duplicates drop foreign if mpg>20, force` deletes 34 of 36
+  // selected observations). The 14-row slice holds 7 distinct years twice each: 7 rows go.
+  // `force' is spelled: without it duplicates refuses a varlist drop first (r(198); w2ah_data_verbs.log
+  // ah_dup_drop_noforce).
   freshA();
   {
     auto blocksA = piet::dispatch("duplicates drop year in 1/14, force", sessA);
-    auto errA = findBlockOfType(blocksA, "error");
-    check(!errA.is_null(), "BS-090(j): `duplicates drop year in 1/14, force` still honestly rejects "
-                           "(same disclosed boundary as its pre-existing `if` reject)");
-    check(errA.value("message", std::string()).find("with `in`") != std::string::npos,
-          "BS-090(j): reject message names the `in` qualifier specifically — got: " +
-              errA.value("message", std::string()));
+    check(!hasError(blocksA), "BS-090(j): `duplicates drop year in 1/14, force` runs");
+    auto mutA = findBlockOfType(blocksA, "data_mutation");
+    check(!mutA.is_null() && mutA.value("n_rows_after", -1) == 329,
+          "BS-090(j): only the 14-row slice is de-duplicated (336 -> 329 rows)");
   }
 
   // (k) collapse ... in a/b, by(state) — 2-state slice collapses to

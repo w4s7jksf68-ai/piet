@@ -10,6 +10,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "piet/eval/tokenizer.h"
 #include "piet/session_state.h"
@@ -23,6 +24,10 @@ namespace file_command_detail {
 bool isTypeToken(const std::string& tok, bool* isString);
 eval::ParsedCommand joinSpacedOptionValues(const eval::ParsedCommand& parsed);
 std::optional<ojson> requireEmptyOrClear(const eval::ParsedCommand& parsed, SessionState& session);
+// infile's free-format reader: `words` = the varlist spec, `dataBytes` the data.
+ojson infileFromBytes(const std::vector<std::string>& words, const std::string& dataBytes,
+                      const std::string& resolved, const eval::ParsedCommand& parsed,
+                      SessionState& session);
 ojson runDictionaryRead(const std::string& verb, const std::string& dictArg,
                         const eval::ParsedCommand& parsed, SessionState& session);
 

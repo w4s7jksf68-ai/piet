@@ -31,6 +31,7 @@
 #include "estimation_internal.h"
 #include "estimators/posthest.h"  // cecon::margins_parse_at (header-inline)
 
+#include "estimator_command_support.h"
 #include "extended_estimation_internal.h"
 #include "estimation_options.h"
 
@@ -99,8 +100,20 @@ ojson runMediate(const eval::ParsedCommand& parsed, SessionState& session) {
         "syntax_error");
   }
 
-  std::vector<std::string> yToks = splitTokensM4(pg.groups[0]);
-  std::vector<std::string> mToks = splitTokensM4(pg.groups[1]);
+  // The outcome and mediator blocks are `(depvar [indepvars] [, model noconstant])`
+  // where model is one of linear (default), probit, logit, expmean, poisson.
+  // Split each at its first comma; the option words are read below in Stata's
+  // order (varlist first, then the options, outcome before mediator).
+  auto splitModelBlock = [](const std::string& g, std::string* vars, std::string* opts) {
+    const size_t c = g.find(',');
+    *vars = c == std::string::npos ? g : g.substr(0, c);
+    *opts = c == std::string::npos ? std::string() : g.substr(c + 1);
+  };
+  std::string yVarPart, yOptPart, mVarPart, mOptPart;
+  splitModelBlock(pg.groups[0], &yVarPart, &yOptPart);
+  splitModelBlock(pg.groups[1], &mVarPart, &mOptPart);
+  std::vector<std::string> yToks = splitTokensM4(yVarPart);
+  std::vector<std::string> mToks = splitTokensM4(mVarPart);
   if (yToks.empty() || mToks.empty()) {
     return engineErrorBlockM4(
         "syntax_error: mediate's outcome/mediator blocks each require a variable name",
@@ -146,6 +159,88 @@ ojson runMediate(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   std::string tVar = tToks[0];
 
+  // mediate parses each block's varlist first: a name that is no variable (nor
+  // the abbreviation of one) is r(111) "variable zzz not found" ahead of any
+  // model-form check (vs-stata bank d0314497 `mediate (zzz age) (hours age)
+  // (union)`). Operator / factor terms are left to the fit.
+  {
+    Datastore* ds = session.datastore();
+    std::vector<std::string> names = {yVar, mVar, tVar};
+    names.insert(names.end(), controls.begin(), controls.end());
+    for (std::string n : names) {
+      const size_t cut = n.find(',');
+      if (cut != std::string::npos) n = n.substr(0, cut);
+      n = trimM4(n);
+      if (n.empty() || n.find_first_of(".#*?~-") != std::string::npos || ds->has(n)) continue;
+      bool prefix = false;
+      for (const auto& have : ds->names())
+        if (have.compare(0, n.size(), n) == 0) prefix = true;
+      if (!prefix) return stataRefusalM4b("variable " + n + " not found", 111);
+    }
+  }
+
+  // Each model block's options: exactly the five model words and noCONStant;
+  // anything else, or two model words, is r(198) "invalid <which> model
+  // specification".
+  struct ModelSpecM4 {
+    std::string model = "linear";
+    bool noconstant = false;
+  };
+  auto parseModelOpts = [](const std::string& opts, const char* which, ModelSpecM4* out,
+                           ojson* err) -> bool {
+    std::vector<std::string> models;
+    for (const std::string& raw : splitTokensM4(opts)) {
+      std::string w = raw;
+      std::transform(w.begin(), w.end(), w.begin(), [](unsigned char ch) { return std::tolower(ch); });
+      if (w == "linear" || w == "probit" || w == "logit" || w == "poisson") {
+        models.push_back(w);
+      } else if (w.size() >= 3 && std::string("expmean").compare(0, w.size(), w) == 0) {
+        models.push_back("expmean");
+      } else if (w.size() >= 6 && std::string("noconstant").compare(0, w.size(), w) == 0) {
+        out->noconstant = true;
+      } else {
+        *err = stataRefusalM4b(std::string("invalid ") + which +
+                                   " model specification; option " + raw + " not allowed",
+                               198);
+        return false;
+      }
+    }
+    if (models.size() > 1) {
+      *err = stataRefusalM4b(std::string("invalid ") + which +
+                                 " model specification; the " + which +
+                                 " model must be one of linear, probit, logit, expmean, or poisson",
+                             198);
+      return false;
+    }
+    if (!models.empty()) out->model = models.front();
+    return true;
+  };
+  ModelSpecM4 ySpec, mSpec;
+  {
+    ojson err;
+    if (!parseModelOpts(yOptPart, "outcome", &ySpec, &err)) return err;
+    if (!parseModelOpts(mOptPart, "mediator", &mSpec, &err)) return err;
+  }
+  if (ySpec.model == "logit" && (mSpec.model == "linear" || mSpec.model == "expmean")) {
+    return stataRefusalM4b("logit outcome model may not be combined with " + mSpec.model +
+                               " mediator model; consider using probit instead of logit",
+                           197);
+  }
+  if (yVar == mVar && mVar == tVar)
+    return stataRefusalM4b("outcome, mediator, and treatment variables must be different variables", 198);
+  if (yVar == mVar)
+    return stataRefusalM4b("outcome and mediator variables must be different variables", 198);
+  if (yVar == tVar)
+    return stataRefusalM4b("outcome and treatment variables must be different variables", 198);
+  if (mVar == tVar)
+    return stataRefusalM4b("mediator and treatment variables must be different variables", 198);
+  if (ySpec.model != "linear" || mSpec.model != "linear" || ySpec.noconstant || mSpec.noconstant) {
+    return engineErrorBlockM4(
+        "mediate: only linear outcome and mediator models with a constant are implemented in this "
+        "version of PIET (" + ySpec.model + " outcome, " + mSpec.model + " mediator requested).",
+        "unsupported_option");
+  }
+
   std::vector<std::pair<std::string, eval::OptValue>> tOpts = eval::parseOpts(tOptPart);
   // BUG-263: this is a second-source opts vector (same class as BUG-262's
   // runLog re-parse) — the dispatcher-level canonicalization point never sees
@@ -174,6 +269,82 @@ ojson runMediate(const eval::ParsedCommand& parsed, SessionState& session) {
   // honest-reject naming continuous(#level0 #level1) as the only supported
   // form, rather than silently answering with a different treatment model.
   if (!sawContinuousFlag && !continuousVal.has_value()) {
+    // A binary or multivalued treatment is not fitted here, but Stata's own
+    // refusals of the treatment variable come first and are reproduced: over
+    // the if/in rows it must hold nonnegative integers (r(459)); over the
+    // estimation sample (if/in and every model variable nonmissing) no rows is
+    // r(2000), one level is r(459) "does not vary", and more than 10 levels
+    // without `force` is r(459). Checked only when every model term is a plain
+    // variable name (an operator or factor term goes straight to the refusal).
+    std::vector<std::string> modelVars = {yVar, mVar, tVar};
+    modelVars.insert(modelVars.end(), controls.begin(), controls.end());
+    Datastore* ds = session.datastore();
+    bool plain = !parsed.inRange.has_value();
+    for (const auto& v : modelVars)
+      if (!ds->has(v) || ds->dtype(v) != "f64") plain = false;
+    bool force = false;
+    for (const auto& [k, v] : parsed.opts)
+      if (k == "force") force = true;
+    if (plain) {
+      const size_t N = static_cast<size_t>(ds->nRows());
+      std::vector<char> inIf(N, 1);
+      if (parsed.ifExpr.has_value()) {
+        // The if is evaluated into a 0/1 column on a scratch copy of the data
+        // (a missing condition is true, Stata's rule), like a marked-sample
+        // temporary: the data in memory is not touched, so c(changed) and the
+        // sort order stay as they were when mediate then refuses.
+        SessionState::ResidentSuspend statelessChain(session);
+        session.ensureMaterializedHead();
+        RowIndexCache maskFrame;
+        maskFrame.path = *session.currentHbin();
+        maskFrame.nRows = static_cast<int64_t>(N);
+        if (auto refusal = addIfMaskColumn(session, maskFrame, *parsed.ifExpr, {}))
+          return *refusal;
+        {
+          Datastore maskData(maskFrame.path);
+          const double* truth = maskData.col(maskFrame.maskVar).f64();
+          for (size_t i = 0; i < N; ++i) inIf[i] = truth[i] != 0.0;
+        }
+        cecon::native_unlink(maskFrame.path);
+        ds = session.datastore();
+      }
+      auto column = [&ds, N](const std::string& name) {
+        const double* p = ds->col(name).f64();
+        return std::vector<double>(p, p + N);
+      };
+      const std::vector<double> tv = column(tVar);
+      for (size_t i = 0; i < N; ++i) {
+        if (!inIf[i] || std::isnan(tv[i])) continue;
+        if (tv[i] < 0 || tv[i] != std::floor(tv[i])) {
+          return stataRefusalM4b("treatment variable " + tVar +
+                                     " may only contain nonnegative integer values; use option "
+                                     "continuous() if you want " + tVar +
+                                     " to be treated as a continuous variable",
+                                 459);
+        }
+      }
+      std::vector<char> touse = inIf;
+      for (const auto& v : modelVars) {
+        const std::vector<double> c = column(v);
+        for (size_t i = 0; i < N; ++i)
+          if (std::isnan(c[i])) touse[i] = 0;
+      }
+      std::set<double> levels;
+      for (size_t i = 0; i < N; ++i)
+        if (touse[i]) levels.insert(tv[i]);
+      if (levels.empty()) return stataRefusalM4b("no observations", 2000);
+      if (levels.size() == 1)
+        return stataRefusalM4b("treatment variable " + tVar + " does not vary", 459);
+      if (levels.size() > 10 && !force) {
+        return stataRefusalM4b(
+            "multivalued treatment " + tVar +
+                " has more than 10 levels; use option continuous() if you wish to specify " +
+                tVar +
+                " as a continuous variable, or option force to proceed with it as a discrete "
+                "variable",
+            459);
+      }
+    }
     return engineErrorBlockM4(
         "mediate: only a continuous treatment with two explicit levels is supported in this "
         "version of PIET — use `mediate (...) (...) (treatvar, continuous(#level0 #level1))`.",

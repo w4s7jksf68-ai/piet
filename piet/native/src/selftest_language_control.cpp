@@ -184,17 +184,38 @@ void testBS014ProgramBareFormsPrepass() {
           "program body (sysuse+gen after it still ran)");
   }
 
-  // `program list` has NO dispatcher handler (an honest gap) — with BS-014
-  // fixed, it reaches dispatch and is honestly rejected right there, instead
-  // of the capture-pass silently eating the rest of the file with NO error
-  // at all and no later line ever getting a chance to run.
+  // `program list` is served now (language/program.cpp, vs-stata bank 2026-11-11);
+  // until then it had no handler and this arm pinned its honest halt at dispatch.
+  // BS-014's point is unchanged: the capture pass must not eat it as a program
+  // named `list` with the rest of the file as its body. Bare, it lists every
+  // program in memory ([P] program, p.pdf p.455: "If we do not specify the
+  // program that we want listed, program list lists all the programs stored in
+  // memory"), so it runs, the lines after it run, and the listing is Stata's:
+  // `zzpa:` then the body lines numbered (bank 214aaa41e5073c15, `program list
+  // zzpa` after a two-line zzpa). A name that is no program is r(111) (bank
+  // ae537cfd9f01c3d4, `capture program list zq1` -> 111).
   {
     piet::SessionState session(workdir);
-    std::string src = std::string("program list") + "\nsysuse fatalities, clear\ngen bs014mark2 = 1\n";
+    std::string src = std::string("program define zzpa\ndisplay \"line one\"\nlocal x = 1\nend\n") +
+                      "program list\nsysuse fatalities, clear\ngen bs014mark2 = 1\n" +
+                      "capture program list nosuchprogram014\nlocal bs014rc = _rc\n";
     auto result = piet::doexec::executeDoSource(src, session, piet::dispatch);
-    check(result.stoppedAtReason.has_value(),
-          "BS-014: `program list` reaches dispatch and honestly halts there "
-          "(not a silent no-op over the whole rest of the file)");
+    std::string listed;
+    for (const auto& b : result.blocks)
+      if (b.is_object() && b.value("type", std::string()) == "display")
+        listed += b.value("text", std::string());
+    check(!result.stoppedAtReason.has_value() && session.hasData() &&
+              session.datastore()->has("bs014mark2"),
+          "BS-014: bare `program list` runs at rc 0 and the rest of the file runs after it "
+          "(sysuse+gen) -- not a halt and not a silent capture of the file. Stopped: " +
+              std::string(result.stoppedAtReason.has_value() ? "yes" : "no"));
+    check(listed.find("zzpa:\n  1. display \"line one\"\n  2. local x = 1\n") != std::string::npos,
+          "BS-014: bare `program list` lists the program in memory as Stata does: `zzpa:` then "
+          "`  1. display \"line one\"` `  2. local x = 1` (bank 214aaa41e5073c15; p.pdf p.455). "
+          "Got `" + listed + "`");
+    check(session.eval.locals.get("bs014rc", "") == "111",
+          "BS-014: `program list` of a name that is no program is r(111) (bank "
+          "ae537cfd9f01c3d4). Got `" + session.eval.locals.get("bs014rc", "<unset>") + "`");
     check(session.programs.find("list") == session.programs.end(),
           "BS-014: `program list` was NOT captured as a bogus program named `list`");
   }
@@ -260,6 +281,46 @@ void testBS015CaptureMultilineBlock() {
           "(today, this error incorrectly runs uncaptured and halts the whole do-file instead)");
     check(!result.stoppedAtReason.has_value(),
           "BS-015: the enclosing do-file did not halt because of the captured error");
+  }
+
+  // Raw blocks INSIDE the brace block (vs-stata bank, lane rawblocks): the
+  // whole file is folded once, then runBody hands the block's lines back
+  // through executeDoSource. The `input` fold must pass an already-folded line
+  // through (it used to re-fold it and answer "block not terminated by `end`",
+  // 478 bank cells), and the program's install sentinel must survive the
+  // body's comment strip (it was a `*` line, so a program defined in the block
+  // was never installed after `clear all`: "command pz15 is not supported").
+  {
+    piet::SessionState session(workdir);
+    std::string src =
+        "clear all\n"
+        "capture noisily {\n"
+        "    clear\n"
+        "    input double(x w)\n"
+        "    1 2\n"
+        "    3 .a\n"
+        "    end\n"
+        "    program define pz15, rclass\n"
+        "        return scalar n = 7\n"
+        "    end\n"
+        "    pz15\n"
+        "    global BS015N = r(n)\n"
+        "    quietly count if w == .a\n"
+        "    global BS015A = r(N)\n"
+        "}\n";
+    auto result = piet::doexec::executeDoSource(src, session, piet::dispatch);
+    check(session.eval.locals.get("_rc", "") == "0",
+          "BS-015/raw: `input ... end` and `program ... end` inside `capture noisily { }` run "
+          "clean (_rc 0). Got _rc=" + session.eval.locals.get("_rc", ""));
+    check(session.hasData() && session.datastore()->nRows() == 2,
+          "BS-015/raw: the nested `input` block read its two rows");
+    check(session.eval.globals.get("BS015N", "") == "7",
+          "BS-015/raw: the program defined inside the block is installed and runs (r(n)=7). "
+          "Got `" + session.eval.globals.get("BS015N", "") + "`");
+    check(session.eval.globals.get("BS015A", "") == "1",
+          "BS-015/raw: `.a` typed into `input` is stored as the extended missing .a. Got `" +
+              session.eval.globals.get("BS015A", "") + "`");
+    check(!result.stoppedAtReason.has_value(), "BS-015/raw: the do-file did not halt");
   }
 
   fs::remove_all(workdir, ec);
@@ -969,17 +1030,19 @@ void testBS097OptionNetAndBS018DoNostop() {
 
     // estat's csdid sub-family net is branch-scoped BY `sub` (event has its
     // own {window, post} known-set; simple/calendar/group/pretrend read
-    // none) — this leg does not set up a PIET-native csdid model, so it only
-    // proves the net did not get reordered AHEAD of the pre-existing "no
-    // csdid result in memory" guard (which must still fire first, unchanged).
+    // none). After `regress` the subcommand is routed by e(cmd) before any
+    // csdid option net runs: `event` is not one of regress's estat
+    // subcommands, so it is Stata's r(321) "estat event not valid" (StataBE
+    // 19.5's estat dispatch; vs-stata bank fbfa3fc7 `estat zzz` after regress:
+    // r(321) "estat zzz not valid"), not the csdid "no result in memory" note.
     auto noCsdid = piet::dispatch("estat event, bogusopt", session);
     auto errNoCsdid = firstBlockOfType(noCsdid, "error");
     check(!errNoCsdid.is_null() &&
-              errNoCsdid.value("message", std::string()).find("no csdid result in memory") !=
-                  std::string::npos,
-          "BS-097 estat event: without a prior csdid, still reports the pre-existing "
-          "\"no csdid result in memory\" guard (the branch-scoped option net does not "
-          "run ahead of it)");
+              errNoCsdid.value("message", std::string()).find("estat event not valid") !=
+                  std::string::npos &&
+              errNoCsdid.value("reason", std::string()) == "r(321)",
+          "BS-097 estat event after regress: r(321) \"estat event not valid\" (routed by "
+          "e(cmd) ahead of the csdid option net)");
   }
 
   // levelsof.
@@ -1032,7 +1095,9 @@ void testBS097OptionNetAndBS018DoNostop() {
 
   // duplicates.
   {
-    auto rej = piet::dispatch("duplicates report year, bogusopt", session);
+    // report reads no option at all (vs-stata bank: `duplicates report foreign, zznotanoption` is rc 0),
+    // so the net is exercised on tag, which has a syntax of its own.
+    auto rej = piet::dispatch("duplicates tag year, generate(bsdt) bogusopt", session);
     check(isUnknownOptionReject(rej, "bogusopt"),
           "BS-097 duplicates: unknown option honestly rejects, naming it");
     auto ok = piet::dispatch("duplicates report year", session);
@@ -1053,10 +1118,20 @@ void testBS097OptionNetAndBS018DoNostop() {
           "(freeze corpus shape: `encode grp, gen(grpn)`) still succeeds");
   }
 
+  // count, drop, keep: Stata's syntax for these takes no options at all, so
+  // any option is its r(101) "options not allowed" (StataBE 19.5 truth bank
+  // 2026-11-10: `count , zzabbrprobe`, `drop price, zznotanoption`, `keep
+  // price, zznotanoption`), answered by tokenize()'s Stata-lead step before the
+  // arm's own option net.
+  auto isOptionsNotAllowed = [&](const nlohmann::ordered_json& blocks) {
+    auto err = firstBlockOfType(blocks, "error");
+    return !err.is_null() && err.value("message", std::string()) == "options not allowed" &&
+           piet::eval::coarseRc(err) == "101";
+  };
   // count.
   {
     auto rej = piet::dispatch("count, bogusopt", session);
-    check(isUnknownOptionReject(rej, "bogusopt"), "BS-097 count: unknown option honestly rejects, naming it");
+    check(isOptionsNotAllowed(rej), "BS-097 count: an option is Stata's r(101) `options not allowed`");
     auto ok = piet::dispatch("count", session);
     check(firstBlockOfType(ok, "error").is_null(),
           "BS-097 count over-rejection guard: plain `count` (freeze corpus shape) still succeeds");
@@ -1070,14 +1145,14 @@ void testBS097OptionNetAndBS018DoNostop() {
   {
     (void)piet::dispatch("gen dropProbeBS097 = 1", session);
     auto rej = piet::dispatch("drop dropProbeBS097, bogusopt", session);
-    check(isUnknownOptionReject(rej, "bogusopt"), "BS-097 drop: unknown option honestly rejects, naming it");
+    check(isOptionsNotAllowed(rej), "BS-097 drop: an option is Stata's r(101) `options not allowed`");
     auto ok = piet::dispatch("drop dropProbeBS097", session);
     check(firstBlockOfType(ok, "error").is_null(),
           "BS-097 drop over-rejection guard: plain `drop varlist` still succeeds "
           "(also proves the reject probe just above did NOT actually drop the variable)");
 
     auto rejKeep = piet::dispatch("keep fatal beertax spirits, bogusopt", session);
-    check(isUnknownOptionReject(rejKeep, "bogusopt"), "BS-097 keep: unknown option honestly rejects, naming it");
+    check(isOptionsNotAllowed(rejKeep), "BS-097 keep: an option is Stata's r(101) `options not allowed`");
   }
 
   // append — zero pre-existing consumption (the arm never reads
@@ -1156,17 +1231,19 @@ void testBS097OptionNetAndBS018DoNostop() {
           "BS-097 hausman over-rejection guard: plain `hausman A B` (D5e oracle shape) still "
           "succeeds");
 
-    // BUG-105 secondary ⑤: `alleqs` is real Stata `hausman` syntax ([R]
+    // BUG-105 secondary ⑤: `tconsistent()` is real Stata `hausman` syntax ([R]
     // hausman) this handler doesn't implement — distinct wording from the
     // `bogusopt` typo case just above, same "not allowed" code both ways.
-    auto rejReal = piet::dispatch("hausman feHausBS097 reHausBS097, alleqs", session);
+    // (`alleqs`, the option this arm used to name, is served since stage-3 lane
+    // s3b_post: vs-stata bank b479e666 `hausman tsls tsls3, alleqs` rc 0.)
+    auto rejReal = piet::dispatch("hausman feHausBS097 reHausBS097, tconsistent(FixedFX)", session);
     auto realErr = firstBlockOfType(rejReal, "error");
     check(!realErr.is_null() &&
               realErr.value("code", std::string()) == "unsupported_option" &&
               realErr.value("message", std::string())
                       .find("is a valid Stata option that this version of PIET does not yet "
                             "implement") != std::string::npos,
-          "BUG-105 secondary ⑤: hausman's `alleqs` (a real Stata option this build doesn't "
+          "BUG-105 secondary ⑤: hausman's `tconsistent()` (a real Stata option this build doesn't "
           "implement) is named as such, not lumped with a bogus typo");
   }
 

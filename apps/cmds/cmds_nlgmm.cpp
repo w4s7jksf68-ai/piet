@@ -300,6 +300,26 @@ int cmd_nl(const std::vector<std::string>& a) {
                 {"has_constant", r.cons_param >= 0},
                 {"iterations", iteration_log(r.iters, "rss")},
                 {"converged", r.converged}};
+    // A weighted model with no constant term: Stata's TSS is the uncentred sum of
+    // squares under the RAW weights (summarize y^2 [aw=w], r(sum)), while the RSS is
+    // on the normalized ones, so e(tss), e(mss), e(r2) and e(r2_a) follow that TSS
+    // (bank 400a322e `nl (mpg = {b0=40}*exp({b1=-0.0003}*weight)) [aweight=trunk]`:
+    // e(tss) 449716 = sum trunk*mpg^2, e(rss) 761.80, e(mss) 448954.20, e(r2) .998306).
+    // With a constant the centred TSS is the variance under normalized weights,
+    // which the fit's own TSS already is. A pweight keeps the normalized TSS (bank
+    // f81d642d `[pweight=trunk]`: e(mss) 31928.75).
+    if (!wn.empty() && !pweight && r.cons_param < 0 && sum_w > 0 && d.n > 0) {
+        const double tss = r.tss * sum_w / static_cast<double>(d.n);
+        const double mss = tss - r.rss;
+        out["tss"] = tss;
+        out["mss"] = mss;
+        out["ms_m"] = r.df_m > 0 ? mss / r.df_m : 0.0;
+        out["ms_t"] = r.df_t > 0 ? tss / r.df_t : 0.0;
+        out["r2"] = tss > 0 ? 1.0 - r.rss / tss : 0.0;
+        out["r2_adj"] = (tss > 0 && r.df_t > 0 && r.df_r > 0)
+                            ? 1.0 - (r.rss / r.df_r) / (tss / r.df_t)
+                            : 0.0;
+    }
     if (level_set) out["level"] = level;
     // Weighted only, so an unweighted reply is unchanged: e(wtype), e(sum_w).
     if (!weight_var.empty())

@@ -36,8 +36,18 @@ std::optional<eval::EvalMatrix> evalMatrixRhs(const std::string& rhs, SessionSta
                                               std::string& err);
 void storeMatrixResult(SessionState& session, const std::string& name, eval::EvalMatrix mat);
 std::string formatMatrixCell(double v);
+// `matrix list`'s display options ([P] matrix utility).
+struct MatrixListOptions {
+  bool noblank = false;   // no blank line before the header
+  bool noheader = false;  // no `A[r,c]` line
+  bool nonames = false;   // no row or column names
+  bool nohalf = false;    // a symmetric matrix in full (still headed `symmetric`)
+  bool nodotz = false;    // .z shown as a blank
+  std::string title;      // `A[r,c]:  title`
+};
 std::string renderMatrixList(const std::string& name, const eval::EvalMatrix& m,
-                             const std::function<std::string(double)>& cellText = nullptr);
+                             const std::function<std::string(double)>& cellText = nullptr,
+                             const MatrixListOptions& opts = MatrixListOptions{});
 ojson runMatrixStripe(bool isRow, const std::string& name, const std::string& namesRhs,
                        SessionState& session);
 ojson runMatrixAccum(const std::string& name, const std::string& rhs, SessionState& session);

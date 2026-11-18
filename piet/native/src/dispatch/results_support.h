@@ -20,6 +20,14 @@ std::optional<ojson> readEststoStoreOpts(
 
 size_t findEststoPrefixColon(const std::string& s);
 
+// eststo's addscalars(): each `name exp` pair becomes an e() scalar of the live results before
+// they are stored (eststo.ado _eststo_store). `notes` receives the `(e(name) = value added)` lines;
+// the returned block is the refusal (r(110) a name e() already has, r(198) a malformed list), after
+// which nothing is stored. `added` lists the (name, value) pairs set.
+std::optional<ojson> applyEststoAddscalars(const std::string& spec, SessionState& session,
+                                           std::vector<ojson>* notes,
+                                           std::vector<std::pair<std::string, double>>* added);
+
 // BUG-733: run a fit that writes its own e() values (eval.eScalars / eStrings /
 // eMatrices) BEFORE it calls setLastModel -- grep-measured, exactly runPca,
 // runOaxaca and runTeffects (estimation/principal_components.cpp,

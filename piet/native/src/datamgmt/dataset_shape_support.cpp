@@ -48,6 +48,7 @@
 #include "piet/strutil.h"
 #include "estimation/estimation_internal.h"  // esampleHeadMask / esampleRewriteHeadMask
 #include "engine/scratch_columns.h"          // cumul's if/in restriction and weight columns
+#include "column_write_support.h"
 #include "dataset_shape_support.h"
 
 namespace piet::handlers::dataset_shape_detail {
@@ -139,6 +140,9 @@ std::string csvField(const std::string& s, char delim) {
       break;
     }
   }
+  // padding is data: a cell with a leading or trailing blank is quoted, or the reader trims it
+  if (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.back() == ' ' || s.back() == '\t'))
+    needQuote = true;
   if (!needQuote) return s;
   std::string out = "\"";
   for (char c : s) {
@@ -498,6 +502,11 @@ std::optional<ojson> refuseQualifiers(const eval::ParsedCommand& parsed, const s
         "(`preserve` + `keep in ...`), then run " + verb + "."));
   }
   return std::nullopt;
+}
+
+std::optional<ojson> ifInMask(SessionState& session, const eval::ParsedCommand& parsed,
+                              std::vector<char>* mask) {
+  return column_write_detail::sampleMask(session, parsed, mask, std::string());
 }
 
 }  // namespace piet::handlers::dataset_shape_detail

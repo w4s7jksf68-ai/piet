@@ -152,6 +152,11 @@ const std::map<std::string, Effects>& table() {
       {"esttab",
        [] { Effects e = mk(0, 0, 0, 1, 0, 0, 0, 1); e.usesEstimates = true; return e; }()},
       {"return", mk(0, 1, 0, 0, 0, 0, 0, 0)},
+      // `sreturn clear` and an sclass program's `sreturn local` write s(), a
+      // results store a worker never gives back, as `return` writes r();
+      // `sreturn list` reads the s() an EARLIER sclass program left, so unlike
+      // `return` it reads results it did not set itself.
+      {"sreturn", mk(0, 1, 1, 0, 0, 0, 0, 0)},
       {"timer", mk(0, 1, 0, 0, 0, 1, 0, 0)},
       {"frame", mk(0, 0, 0, 1, 1, 1, 0, 0)},
       {"discard", mk(0, 0, 0, 0, 0, 1, 0, 0)},
@@ -405,6 +410,15 @@ const std::map<std::string, Effects>& table() {
       {"zipsave", mk(0, 0, 0, 1, 0, 0, 0, 1)},
       {"odbc", mk(0, 0, 0, 0, 0, 0, 0, 1)},
       {"spshape2dta", mk(0, 0, 0, 0, 0, 0, 0, 1)},
+      // vs-stata bank (2026-11-11): numlist publishes r() from its argument
+      // alone; tsunab writes a local like fvunab; fvexpand and misstable publish
+      // r() off the data like `ds`/`mdesc`; dtaversion reads a file header and
+      // publishes r().
+      {"numlist", mk(0, 1, 0, 0, 0, 0, 0, 0)},
+      {"tsunab", mk(1, 0, 0, 1, 0, 0, 0, 0)},
+      {"fvexpand", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"misstable", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"dtaversion", mk(0, 1, 0, 0, 0, 0, 0, 0)},
 
       // ---- AER-SCOPE1 bundle I (UTIL, 2026-09-04) -------------------------
       // The counters publish r() and (for unique's by()+gen() form) a column.

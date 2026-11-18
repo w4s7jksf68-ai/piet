@@ -42,7 +42,8 @@ using namespace data_combine_detail;
 ojson runMerge(const std::string& mergeType, const std::vector<std::string>& keylist,
                const std::string& usingPathArg,
                const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-               SessionState& session, bool sequential, bool oldSyntax, bool oldSort) {
+               SessionState& session, bool sequential, bool oldSyntax, bool oldSort, bool fmerge,
+               std::vector<std::string>* broughtVars) {
   if (!session.currentHbin().has_value()) {
     return engineErrorBlock("No dataset loaded. Load a dataset before merge.");
   }
@@ -232,6 +233,27 @@ ojson runMerge(const std::string& mergeType, const std::vector<std::string>& key
   std::vector<std::string> sharedVars;
   for (const auto& n : masterNamesBefore)
     if (!keySet.count(n) && keptUsing.count(n)) sharedVars.push_back(n);
+  if (fmerge) {
+    // fmerge (ftools' join) keys on all-numeric or all-string variables (r(999)), and refuses
+    // a variable the master already holds unless force names the clash (r(108)); the variables
+    // it brings are r(varlist) (vs-stata bank: fmerge 1:1 make foreign -> 999; a shared
+    // `foreign` -> "variable foreign already exists in master dataset").
+    bool anyStr = false, anyNum = false;
+    for (const auto& k : keylist) (master->dtype(k) == "factor" ? anyStr : anyNum) = true;
+    if (anyStr && anyNum)
+      return rcError("engine_error", "variables must be all numeric or all strings", "999");
+    if (!forceOpt && !sharedVars.empty())
+      return rcError("engine_error",
+                     "merge:  variable " + sharedVars.front() + " already exists in master dataset",
+                     "108");
+    if (broughtVars != nullptr) {
+      broughtVars->clear();
+      const std::set<std::string> inMasterNow(masterNamesBefore.begin(), masterNamesBefore.end());
+      for (const auto& n : usingDs.names())
+        if (!keySet.count(n) && keptUsing.count(n) && !inMasterNow.count(n))
+          broughtVars->push_back(n);
+    }
+  }
 
   // ---- the checks the built-in _merge makes after merge.ado sorted the
   // master (:98-104): their refusals leave the master SORTED by the keys ----
@@ -239,6 +261,20 @@ ojson runMerge(const std::string& mergeType, const std::vector<std::string>& key
   std::optional<ojson> lateRefusal;
   if (!marker.empty() && hasVar(marker)) {
     lateRefusal = rcError("engine_error", "variable " + marker + " already defined", "110");
+  }
+  if (!lateRefusal) {
+    for (const auto& k : keylist) {
+      auto km = session.varMeta.find(k);
+      if (km != session.varMeta.end() && km->second.stataType.has_value() &&
+          *km->second.stataType == "strL") {
+        lateRefusal = rcError("engine_error",
+                              "key variable " + k + " is strL in master data.\n    The key "
+                              "variables (on which observations are matched) can be str#, but\n"
+                              "    they cannot be strLs.",
+                              "106");
+        break;
+      }
+    }
   }
   if (!lateRefusal) {
     for (const auto& k : keylist) {
@@ -539,6 +575,7 @@ ojson runMerge(const std::string& mergeType, const std::vector<std::string>& key
                                        {"3", "Matched (3)"},
                                        {"4", "Missing updated (4)"},
                                        {"5", "Nonmissing conflict (5)"}};
+        session.stampLabelSet("_merge");  // `label list` shows the newest set first
       }
       std::map<int, std::string> numericMap;
       for (const auto& [code, text] : session.labelDefs["_merge"]) {

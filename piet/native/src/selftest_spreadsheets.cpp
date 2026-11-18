@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Existing behavioral tests: spreadsheets.
+#include <cstdio>
 #include "selftest_support.h"
 #include "selftest_cases.h"
 
@@ -558,13 +559,16 @@ void testW3aSpreadsheetOptions() {
     auto rdl = exec("import delimited using \"auto.csv\", rowrange(2:4) colrange(1:4) clear\n", s);
     const double* nAfter = nullptr;
     (void)piet::dispatch("count", s);
+    // r(N) is copied out BEFORE varNames() runs: `describe` is r-class and replaces
+    // r(), so a pointer into the r() store would dangle across it.
     nAfter = s.eval.rValues.find("N");
-    check(firstError(rdl.blocks).is_null() && join(varNames(s)) == "make price mpg rep78" &&
-              nAfter != nullptr && *nAfter == 3.0,
+    const double nCounted = nAfter != nullptr ? *nAfter : -1.0;
+    const std::string namesAfter = join(varNames(s));
+    check(firstError(rdl.blocks).is_null() && namesAfter == "make price mpg rep78" &&
+              nCounted == 3.0,
           "W3a ⑦: `rowrange(2:4) colrange(1:4)` (the help file's example shape, our data) -- 4 "
-          "vars, 3 obs, and the names still read from physical row 1. Got {" +
-              join(varNames(s)) + "} x " +
-              (nAfter ? std::to_string(*nAfter) : std::string("<unset>")));
+          "vars, 3 obs, and the names still read from physical row 1. Got {" + namesAfter +
+              "} x " + std::to_string(nCounted));
 
     // BUG-477: `import delimited`'s OWN case() rule. This is a DIFFERENT
     // default from import excel's (tested at "case(upper) upper-cases the

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 M.K. Kim
 #include "xlsx.h"
 #include "zip_io.h"
+#include "fileio/deflate.h"
 
 #include <algorithm>
 #include <cmath>
@@ -459,31 +460,49 @@ struct ZipEntry {
   std::string data;
 };
 
-std::string buildZip(const std::vector<ZipEntry>& entries) {
+// `deflateLevel` < 0 stores every entry (the .xlsx writer); 0-9 writes each file
+// entry deflated at that level (fileio/deflate.h) and adds the sizes of the
+// deflate streams to *compressedBytes. A directory entry is always stored.
+std::string buildZip(const std::vector<ZipEntry>& entries, int deflateLevel = -1,
+                     size_t* compressedBytes = nullptr,
+                     std::vector<size_t>* perEntryCompressed = nullptr) {
   std::string out;
-  struct Rec { uint32_t crc; uint32_t size; uint32_t off; };
+  struct Rec { uint32_t crc; uint32_t size; uint32_t csize; uint16_t method; uint32_t off; };
   std::vector<Rec> recs;
   recs.reserve(entries.size());
+  std::vector<std::string> packed(entries.size());
 
+  size_t entryNo = 0;
   for (const auto& e : entries) {
     Rec r;
     r.off = static_cast<uint32_t>(out.size());
     r.crc = crc32_of(e.data);
     r.size = static_cast<uint32_t>(e.data.size());
+    const bool isDir = !e.name.empty() && e.name.back() == '/';
+    r.method = 0;
+    r.csize = r.size;
+    if (deflateLevel >= 0 && !isDir) {
+      packed[entryNo] = piet::fileio::rawDeflate(e.data, deflateLevel);
+      r.method = 8;
+      r.csize = static_cast<uint32_t>(packed[entryNo].size());
+      if (compressedBytes) *compressedBytes += packed[entryNo].size();
+      if (perEntryCompressed) perEntryCompressed->push_back(packed[entryNo].size());
+    }
     appendLE32(out, 0x04034b50u);
     appendLE16(out, 20);        // version needed
     appendLE16(out, 0);         // flags
-    appendLE16(out, 0);         // method: stored
+    appendLE16(out, r.method);  // method: stored (0) or deflated (8)
     appendLE16(out, 0);         // mod time (fixed — output is byte-deterministic)
     appendLE16(out, 0x21);      // mod date: 1980-01-01
     appendLE32(out, r.crc);
-    appendLE32(out, r.size);
+    appendLE32(out, r.csize);
     appendLE32(out, r.size);
     appendLE16(out, static_cast<uint16_t>(e.name.size()));
     appendLE16(out, 0);         // extra len
     out += e.name;
-    out += e.data;
+    out += r.method == 8 ? packed[entryNo] : e.data;
     recs.push_back(r);
+    ++entryNo;
   }
 
   uint32_t cdOff = static_cast<uint32_t>(out.size());
@@ -492,11 +511,11 @@ std::string buildZip(const std::vector<ZipEntry>& entries) {
     appendLE16(out, 20);        // version made by
     appendLE16(out, 20);        // version needed
     appendLE16(out, 0);
-    appendLE16(out, 0);         // stored
+    appendLE16(out, recs[i].method);  // stored (0) or deflated (8)
     appendLE16(out, 0);
     appendLE16(out, 0x21);
     appendLE32(out, recs[i].crc);
-    appendLE32(out, recs[i].size);
+    appendLE32(out, recs[i].csize);
     appendLE32(out, recs[i].size);
     appendLE16(out, static_cast<uint16_t>(entries[i].name.size()));
     appendLE16(out, 0);         // extra
@@ -1491,11 +1510,12 @@ std::vector<Entry> readEntries(const std::string& path) {
   return out;
 }
 
-std::string build(const std::vector<Entry>& entries) {
+std::string build(const std::vector<Entry>& entries, int deflateLevel, size_t* compressedBytes,
+                  std::vector<size_t>* perEntryCompressed) {
   std::vector<xlsx::ZipEntry> ze;
   ze.reserve(entries.size());
   for (const auto& e : entries) ze.push_back(xlsx::ZipEntry{e.name, e.data});
-  return xlsx::buildZip(ze);
+  return xlsx::buildZip(ze, deflateLevel, compressedBytes, perEntryCompressed);
 }
 
 void commit(const std::string& path, const std::string& bytes) { xlsx::commitZip(path, bytes); }

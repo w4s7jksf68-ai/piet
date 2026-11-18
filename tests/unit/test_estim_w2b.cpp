@@ -162,13 +162,25 @@ static ojson emit_arm(const std::string& tag, const std::string& args,
     if (plain.out.contains("e_V")) fail(tag + ": flagless reply carries e_V");
     if (plain.out.contains("e_Vmb")) fail(tag + ": flagless reply carries e_Vmb");
     if (!flag.out.contains("e_V")) { fail(tag + ": --emit-v reply has no e_V"); return flag.out; }
-    // --emit-v adds covariance keys only: e_V, and e_Vmb (e(V_modelbased)) after a
-    // one-way robust/cluster fit since BUG-1043 (checked in the regress cluster arm).
+    // --emit-v adds the posting keys only: e_V, e_Vmb (e(V_modelbased)) after a one-way
+    // robust/cluster fit since BUG-1043 (checked in the regress cluster arm), and, for the
+    // maximum-likelihood fits, e_gradient: the gradient of the log likelihood at the posted
+    // iterate, which Stata publishes as e(gradient) (vs-stata bank 506b9692 `logistic`: 1 x k,
+    // row r1, e(b)'s column names). One value per name.
     ojson stripped = flag.out;
     stripped.erase("e_V");
     stripped.erase("e_Vmb");
+    if (flag.out.contains("e_gradient")) {
+        const ojson& eg = flag.out["e_gradient"];
+        if (!eg.is_object() || !eg.contains("names") || !eg.contains("values") ||
+            !eg["names"].is_array() || !eg["values"].is_array() || eg["names"].empty() ||
+            eg["names"].size() != eg["values"].size())
+            fail(tag + ": e_gradient is not {names, values} of equal, nonzero length");
+        if (plain.out.contains("e_gradient")) fail(tag + ": flagless reply carries e_gradient");
+        stripped.erase("e_gradient");
+    }
     if (drop_volatile(stripped) != drop_volatile(plain.out))
-        fail(tag + ": --emit-v changed a key other than adding e_V / e_Vmb");
+        fail(tag + ": --emit-v changed a key other than adding e_V / e_Vmb / e_gradient");
 
     const ojson& ev = flag.out["e_V"];
     std::vector<std::string> names;

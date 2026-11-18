@@ -69,7 +69,36 @@ struct Settings {
   // working directory set above). false -> opening never moves it, as in Stata.
   // Absent in every store written before this field existed, which reads as true.
   bool followDoFileFolder = true;
+
+  // Table-size limits of `tabulate`: the row and column counts past which it
+  // answers r(134) "too many values". 0 -> Stata's own limit, that of Stata/SE
+  // and MP (kTab*Default below; User ruling 2026-11-12); a positive number
+  // replaces it, which is how a user raises a limit in Settings (at most the
+  // ceiling below; a larger number is stored as the ceiling). Absent in every
+  // store written before these fields existed, which reads as 0.
+  int64_t tabOnewayMaxRows = 0;      // one-way table: rows
+  int64_t tabTwowayMaxRows = 0;      // two-way table: rows
+  int64_t tabTwowayMaxCols = 0;      // two-way table: columns
+  int64_t tabSummarizeMaxCells = 0;  // tabulate, summarize(): cells (rows x columns)
 };
+
+// Stata's table-size limits ([R] Limits, tabulate). The first three are those of
+// Stata/SE and MP (Stata/BE: 3,000 rows one-way, 300 x 20 two-way); the
+// summarize() limit is the same in every edition.
+inline constexpr int64_t kTabOnewayMaxRowsDefault = 12000;
+inline constexpr int64_t kTabTwowayMaxRowsDefault = 1200;
+inline constexpr int64_t kTabTwowayMaxColsDefault = 80;
+inline constexpr int64_t kTabSummarizeMaxCellsDefault = 375;
+// The most cells a table may have, whatever the limits are set to (one-way: rows;
+// two-way: rows x columns), and the same for a summarize() table, whose cells
+// each hold a mean, a standard deviation and a count. A limit is stored no higher
+// than its ceiling, and a table past it is r(134) like any other too-large table.
+// These are resource bounds, not Stata rules: a table's block grows with its
+// cells and has to fit in memory and in the Results window. Measured 2026-11-12
+// on an 8 GB machine: a two-way table of 1,000,000 cells about 250 MB and 10 MB
+// of block; a two-way summarize() table about 1.1 KB a cell.
+inline constexpr int64_t kTabCellCeiling = 1000000;
+inline constexpr int64_t kTabSummarizeCellCeiling = 200000;
 
 // Detected hardware (SPEC II-1): read once per settings.get. RAM via
 // sysctl/GlobalMemoryStatusEx/sysconf; cores via std::thread::hardware_
@@ -146,6 +175,23 @@ void setExtcompatEnabled(bool on);
 // Drop the cache so the next extcompatEnabled() re-reads from disk. Used by
 // settings.set after a successful write, and by selftest between cases.
 void invalidateExtcompatCache();
+
+// The table-size limits in force for THIS process: each persisted value, or
+// Stata's limit where the user set none. Read from the persisted settings on
+// first use and cached like extcompat (a loop of `tabulate` lines must not read
+// a file per line); settings.set republishes them, so a change in the Settings
+// panel applies to the next command.
+struct TableLimits {
+  int64_t onewayMaxRows = kTabOnewayMaxRowsDefault;
+  int64_t twowayMaxRows = kTabTwowayMaxRowsDefault;
+  int64_t twowayMaxCols = kTabTwowayMaxColsDefault;
+  int64_t summarizeMaxCells = kTabSummarizeMaxCellsDefault;
+  int64_t cellCeiling = kTabCellCeiling;  // rows x columns of any table; not a setting
+};
+TableLimits tableLimits();
+void setTableLimits(const Settings& s);
+// Drop the cache so the next tableLimits() re-reads from disk (selftest).
+void invalidateTableLimitsCache();
 
 // ── Component packs (WS-B step 6 — STRUCTURE ONLY) ──────────────────────────
 // `<config dir>/packs/` — the sibling of settings.json, so one directory holds

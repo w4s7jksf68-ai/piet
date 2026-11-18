@@ -178,7 +178,9 @@ bool keysAlreadyGrouped(Datastore& ds, const std::vector<std::string>& keyNames,
   auto keyLess = [stataStringOrder](double a, double b) {
     if (stataStringOrder) return cecon::stata_cmp(a, b) < 0;
     bool an = std::isnan(a), bn = std::isnan(b);
-    if (an || bn) return !an && bn;  // NaN last; NaN vs NaN is neither
+    // Missing values last, ordered by kind (. < .a < ... < .z), each kind its
+    // own key, as the engine's gsort orders them.
+    if (an || bn) return cecon::stata_cmp(a, b) < 0;
     return a < b;
   };
   struct GsortKeyView {

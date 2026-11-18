@@ -297,10 +297,17 @@ std::string applyStataFmtLocal(const std::string& fmt, const std::string& valueS
           case 'm': r = piet::fmt::renderTm(*tv); break;
           case 'w': r = piet::fmt::renderTw(*tv); break;
           case 'y': r = piet::fmt::renderTy(*tv); break;
-          default: break;  // %tC — named gap
+          // %tC is %tCDDmonCCYY_HH:MM:SS, leap seconds counted (StataBE 19.5
+          // `display %tC 1.6e12` is 13sep2010 12:26:16, vs-stata bank
+          // 6200aff8a5c19dd3).
+          case 'C': r = piet::fmt::renderTDetail('C', *tv, "DDmonCCYY_HH:MM:SS"); break;
+          default: break;
         }
-      } else if (fam == 'd') {
-        r = piet::fmt::renderTdDetail(*tv, detail);
+      } else {
+        // Every family takes the detail codes of [D] Datetime display formats
+        // (`%tm_CCYY` of 2021m7 is ` 2021`, `%tcDDmonCCYY_HH:MM:SS`
+        // 01jan2020 12:34:56; vs-stata bank 957cd1faab7c7113, 491976a915728d8e).
+        r = piet::fmt::renderTDetail(fam, *tv, detail);
       }
       if (r) {
         // BUG-296: right-justify into the family's own field (see

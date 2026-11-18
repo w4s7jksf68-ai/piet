@@ -73,6 +73,7 @@ struct GlmResult {
     int k = 0;               // columns of X (all estimable -- the caller drops base levels)
     std::vector<double> beta;       // k
     std::vector<double> V;          // k*k row-major
+    std::vector<double> V_oim;      // k*k, the inverse Hessian under a cluster VCE (e(V_modelbased)); empty otherwise
     std::vector<double> gradient;   // k, the score at the final point (e(gradient))
     std::vector<double> ilog;       // log likelihood after iteration 0..ic (e(ilog) head)
     std::vector<double> steps;      // step multiplier taken at iteration 1..ic

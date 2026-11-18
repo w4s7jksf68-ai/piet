@@ -135,6 +135,7 @@ struct FixSlot {
   int from = 1;  // 1-based, inclusive
   int to = 1;
   bool isString = false;
+  int line = 1;  // which line of a multi-line record the field is on (1-based)
   bool keepBlanks = false;  // infile %#S
   std::string declaredType;  // "" untyped numeric, "str" bare, "strN", or a numeric type
   std::string label;
@@ -182,7 +183,8 @@ namespace {
 // Read `bytes` through `slots`, stage it, adopt it and apply if/in.
 ojson readFixedAndAdopt(const std::string& verb, const std::string& bytes,
                         const std::vector<FixSlot>& slots, const std::string& source,
-                        const eval::ParsedCommand& parsed, SessionState& session) {
+                        const eval::ParsedCommand& parsed, SessionState& session,
+                        int linesPerRecord = 1) {
   delimited::Table table;
   for (const auto& s : slots) {
     table.names.push_back(s.name);
@@ -192,32 +194,43 @@ ojson readFixedAndAdopt(const std::string& verb, const std::string& bytes,
     ct.stataType = fixSlotType(s);
     table.types.push_back(ct);
   }
-  size_t start = 0;
-  const size_t n = bytes.size();
-  while (start < n) {
-    size_t eol = bytes.find('\n', start);
-    if (eol == std::string::npos) eol = n;
-    std::string line = bytes.substr(start, eol - start);
-    start = eol + 1;
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (line.empty()) continue;  // a blank line is not a record
-    if (line.find('\t') != std::string::npos) {
-      // Columns are counted with tabs expanded to stops every 8 (w2ar
-      // dx_fx_fb16_L1map `1_______5___` for "1<tab>5<tab>2.5", log:2512).
-      std::string expanded;
-      for (char ch : line) {
-        if (ch == '\t') {
-          do expanded += ' ';
-          while (expanded.size() % 8 != 0);
-        } else {
-          expanded += ch;
+  // The physical lines, tabs expanded to stops every 8 (w2ar dx_fx_fb16_L1map
+  // `1_______5___` for "1<tab>5<tab>2.5", log:2512). A blank line is not a
+  // record when a record is one line; in a multi-line record it is a line.
+  std::vector<std::string> physical;
+  {
+    size_t start = 0;
+    const size_t n = bytes.size();
+    while (start < n) {
+      size_t eol = bytes.find('\n', start);
+      if (eol == std::string::npos) eol = n;
+      std::string line = bytes.substr(start, eol - start);
+      start = eol + 1;
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty() && linesPerRecord == 1) continue;
+      if (line.find('\t') != std::string::npos) {
+        std::string expanded;
+        for (char ch : line) {
+          if (ch == '\t') {
+            do expanded += ' ';
+            while (expanded.size() % 8 != 0);
+          } else {
+            expanded += ch;
+          }
         }
+        line = std::move(expanded);
       }
-      line = std::move(expanded);
+      physical.push_back(std::move(line));
     }
+  }
+  const size_t perRecord = static_cast<size_t>(std::max(1, linesPerRecord));
+  for (size_t first = 0; first < physical.size(); first += perRecord) {
     std::vector<std::string> row;
     row.reserve(slots.size());
     for (const auto& s : slots) {
+      static const std::string kNoLine;
+      const size_t at = first + static_cast<size_t>(std::max(1, s.line) - 1);
+      const std::string& line = at < physical.size() ? physical[at] : kNoLine;
       std::string field;
       if (static_cast<size_t>(s.from) <= line.size()) {
         const size_t begin = static_cast<size_t>(s.from) - 1;
@@ -348,13 +361,40 @@ bool parseColRange(const std::string& spec, int* from, int* to) {
   return true;
 }
 
-// infix's command-line / dictionary spec: `[type] name #[-#]` repeated.
-std::optional<ojson> parseInfixSpec(const std::vector<std::string>& words, std::vector<FixSlot>* slots) {
+// infix's command-line / dictionary spec: `[# lines] [#:] [type] name #[-#]`
+// repeated. A spec StataBE cannot read is r(614) "dictionary invalid" (bank
+// e108a36881f0c76d `infix a 5-2 using d.fix`, b70ee864ac49a8b1 `infix`,
+// 389e9a80302a854f); a variable named twice is r(110).
+std::optional<ojson> parseInfixSpec(const std::vector<std::string>& words, std::vector<FixSlot>* slots,
+                                    int* linesPerRecord) {
   std::string pendingType;
   bool pendingIsString = false;
   std::string pendingName;
-  for (const auto& w : words) {
+  int currentLine = 1;
+  *linesPerRecord = 1;
+  size_t first = 0;
+  auto allDigits = [](const std::string& t) {
+    return !t.empty() && std::all_of(t.begin(), t.end(),
+                                     [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
+  };
+  if (words.size() >= 2 && allDigits(words[0]) && lowerOf(words[1]) == "lines") {
+    long long n = 0;
+    if (!parseStrictInt(words[0], &n) || n < 1) return ioErrorRc("dictionary invalid", 614);
+    *linesPerRecord = static_cast<int>(n);
+    first = 2;
+  }
+  for (size_t wi = first; wi < words.size(); ++wi) {
+    const std::string& w = words[wi];
     bool isStr = false;
+    // `2:` moves to the second line of the record.
+    if (w.size() >= 2 && w.back() == ':' && allDigits(w.substr(0, w.size() - 1))) {
+      if (!pendingName.empty()) return ioErrorRc("dictionary invalid", 614);
+      long long k = 0;
+      if (!parseStrictInt(w.substr(0, w.size() - 1), &k) || k < 1 || k > *linesPerRecord)
+        return ioErrorRc("dictionary invalid", 614);
+      currentLine = static_cast<int>(k);
+      continue;
+    }
     if (pendingName.empty() && (isTypeToken(w, &isStr) || lowerOf(w) == "str")) {
       if (lowerOf(w) == "str") isStr = true;
       pendingType = lowerOf(w);
@@ -362,57 +402,93 @@ std::optional<ojson> parseInfixSpec(const std::vector<std::string>& words, std::
       continue;
     }
     if (!w.empty() && std::isdigit(static_cast<unsigned char>(w[0]))) {
-      if (pendingName.empty()) {
-        return ioSyntax("infix: column range `" + w + "` does not follow a variable name");
-      }
+      if (pendingName.empty()) return ioErrorRc("dictionary invalid", 614);
       FixSlot s;
-      if (!parseColRange(w, &s.from, &s.to)) {
-        return ioSyntax("infix: `" + w + "` is not a column range (expected #-# with the first "
-                        "column no greater than the last)");
-      }
+      if (!parseColRange(w, &s.from, &s.to)) return ioErrorRc("dictionary invalid", 614);
       s.name = pendingName;
       s.isString = pendingIsString;
       s.declaredType = pendingType;
+      s.line = currentLine;
       slots->push_back(s);
       pendingName.clear();
       pendingType.clear();
       pendingIsString = false;
       continue;
     }
-    if (!pendingName.empty()) return ioSyntax("infix: variable " + pendingName + " has no column range");
+    if (!pendingName.empty()) return ioErrorRc("dictionary invalid", 614);
     if (!strutil::isValidStataIdentifier(w)) {
       return ioSyntax("infix: invalid variable name `" + w + "' — " +
                       strutil::stataIdentifierRuleText());
     }
     pendingName = w;
   }
-  if (!pendingName.empty()) return ioSyntax("infix: variable " + pendingName + " has no column range");
-  if (slots->empty()) return ioSyntax("infix: no variables named");
+  if (!pendingName.empty()) return ioErrorRc("dictionary invalid", 614);
+  if (slots->empty()) return ioErrorRc("dictionary invalid", 614);
   std::set<std::string> seen;
   for (const auto& s : *slots) {
-    if (!seen.insert(s.name).second) return ioSyntax("infix: variable " + s.name + " named twice");
+    if (!seen.insert(s.name).second) return ioErrorRc("variable " + s.name + " already defined", 110);
   }
   return std::nullopt;
 }
 
-// infile's dictionary entries: `[_column(#)] [type] name [%fmt] ["label"]`.
-// The field starts at _column(#) (else where the previous one ended) and is
-// as wide as the input format says (%4f, %5s, %5S).
+// infile's dictionary entries: directives `_lines(#)`, `_line(#)`, `_newline[(#)]`,
+// `_column(#)`, `_skip(#)` (on a line of their own or ahead of a variable), then
+// `[type] name [%fmt] ["label"]`. The field starts where the directives left
+// the cursor (else where the previous one ended) and is as wide as the input
+// format says (%4f, %5s, %5S).
 std::optional<ojson> parseInfileDictionary(const std::vector<std::string>& entries,
-                                           std::vector<FixSlot>* slots) {
+                                           std::vector<FixSlot>* slots, int* linesPerRecord) {
   int nextCol = 1;
+  int currentLine = 1;
+  *linesPerRecord = 1;
+  auto directive = [&](const std::string& word, const std::string& line,
+                       std::optional<ojson>* failure) -> bool {
+    const std::string lw = lowerOf(word);
+    auto number = [&](size_t open, long long* out) {
+      return word.back() == ')' && parseStrictInt(word.substr(open, word.size() - open - 1), out) && *out >= 0;
+    };
+    long long k = 0;
+    if (lw.compare(0, 8, "_column(") == 0) {
+      if (!number(8, &k) || k < 1) { *failure = ioSyntax("infile: invalid dictionary entry `" + line + "`"); return true; }
+      nextCol = static_cast<int>(k);
+      return true;
+    }
+    if (lw.compare(0, 7, "_lines(") == 0) {
+      if (!number(7, &k) || k < 1) { *failure = ioSyntax("infile: invalid dictionary entry `" + line + "`"); return true; }
+      *linesPerRecord = static_cast<int>(k);
+      return true;
+    }
+    if (lw.compare(0, 6, "_line(") == 0) {
+      if (!number(6, &k) || k < 1) { *failure = ioSyntax("infile: invalid dictionary entry `" + line + "`"); return true; }
+      currentLine = static_cast<int>(k);
+      nextCol = 1;
+      return true;
+    }
+    if (lw == "_newline" || lw.compare(0, 9, "_newline(") == 0) {
+      k = 1;
+      if (lw != "_newline" && (!number(9, &k) || k < 1)) { *failure = ioSyntax("infile: invalid dictionary entry `" + line + "`"); return true; }
+      currentLine += static_cast<int>(k);
+      nextCol = 1;
+      return true;
+    }
+    if (lw.compare(0, 6, "_skip(") == 0) {
+      if (!number(6, &k)) { *failure = ioSyntax("infile: invalid dictionary entry `" + line + "`"); return true; }
+      nextCol += static_cast<int>(k);
+      return true;
+    }
+    return false;
+  };
   for (const auto& line : entries) {
     std::vector<std::string> w = quoteAwareWords(line);
     size_t i = 0;
     FixSlot s;
-    int col = nextCol;
-    if (i < w.size() && lowerOf(w[i]).compare(0, 8, "_column(") == 0 && w[i].back() == ')') {
-      long long c = 0;
-      if (!parseStrictInt(w[i].substr(8, w[i].size() - 9), &c) || c < 1)
-        return ioSyntax("infile: invalid dictionary entry `" + line + "`");
-      col = static_cast<int>(c);
+    std::optional<ojson> failure;
+    while (i < w.size() && directive(w[i], line, &failure)) {
+      if (failure) return failure;
       ++i;
     }
+    if (i == w.size()) continue;  // a line of directives only
+    const int col = nextCol;
     bool isStr = false;
     if (i < w.size() && isTypeToken(w[i], &isStr)) {
       s.declaredType = lowerOf(w[i]);
@@ -432,9 +508,13 @@ std::optional<ojson> parseInfileDictionary(const std::vector<std::string>& entri
       if (k < f.size() && f[k] == 'S') s.keepBlanks = true;
     }
     if (i < w.size()) {
+      // The label is the quoted last word; the word splitter may already have
+      // taken its quotes off.
       const std::string lab = w[i++];
       if (lab.size() >= 2 && lab.front() == '"' && lab.back() == '"')
         s.label = lab.substr(1, lab.size() - 2);
+      else if (i == w.size() && line.find('"') != std::string::npos)
+        s.label = lab;
       else
         return ioSyntax("infile: invalid dictionary entry `" + line + "`");
     }
@@ -444,6 +524,7 @@ std::optional<ojson> parseInfileDictionary(const std::vector<std::string>& entri
     if (width <= 0) return ioSyntax("infile: dictionary entry `" + line + "` has no field width");
     s.from = col;
     s.to = col + width - 1;
+    s.line = currentLine;
     nextCol = s.to + 1;
     if (s.isString) {
       // An infile string keeps its DECLARED width (str5 over %5s, log:3958).
@@ -453,6 +534,9 @@ std::optional<ojson> parseInfileDictionary(const std::vector<std::string>& entri
     slots->push_back(s);
   }
   if (slots->empty()) return ioSyntax("infile: the dictionary declares no variables");
+  std::set<std::string> seen;
+  for (const auto& s : *slots)
+    if (!seen.insert(s.name).second) return ioErrorRc("variable " + s.name + " already defined", 110);
   return std::nullopt;
 }
 
@@ -472,15 +556,48 @@ ojson runDictionaryRead(const std::string& verb, const std::string& dictArg,
   auto dictBytes = readWholeFile(dictPath);
   if (!dictBytes.has_value()) return ioError(verb + ": cannot read " + dictShown, "data_io");
   const Dictionary d = readDictionary(*dictBytes);
-  if (!d.ok) return ioSyntax(verb + ": " + dictShown + " is not a dictionary");
+  // A file that holds no dictionary is r(613) "file does not contain dictionary"
+  // (bank e4b8f2ef21da3432).
+  if (!d.ok) return ioErrorRc("file does not contain dictionary", 613);
   std::vector<FixSlot> slots;
+  int linesPerRecord = 1;
+  // An infile dictionary whose entries state no field (no %fmt, no _column())
+  // reads free format, as the varlist form does (bank 457178718745f291: `int
+  // id`, `str12 name`, `double score` read from d.raw).
+  bool freeFormat = verb == "infile" && !d.entries.empty();
+  if (freeFormat)
+    for (const auto& e : d.entries)
+      if (e.find('%') != std::string::npos || e.find('_') == 0) freeFormat = false;
+  std::string freeDataArg;
+  if (freeFormat) {
+    if (auto u = optStrAny(parsed.opts, {"using"})) freeDataArg = *u;
+    else if (!d.usingFile.empty()) freeDataArg = dequote(d.usingFile);
+    std::vector<std::string> words;
+    for (const auto& e : d.entries)
+      for (const auto& w : quoteAwareWords(e)) words.push_back(w);
+    std::string dataBytes, source = dictPath;
+    if (!freeDataArg.empty()) {
+      std::string dataPath = resolveUserPath(session, freeDataArg);
+      std::string dataShown = typedUserPath(freeDataArg);
+      assumeSuffix(&dataPath, &dataShown, ".raw");
+      session.materializeVirtualSave(dataPath);
+      if (!pathExists(dataPath)) return ioErrorRc("file " + dataShown + " not found", 601);
+      auto b = readWholeFile(dataPath);
+      if (!b.has_value()) return ioError(verb + ": cannot read " + dataShown, "data_io");
+      dataBytes = *b;
+      source = dataPath;
+    } else {
+      dataBytes = d.trailingData;
+    }
+    return infileFromBytes(words, dataBytes, source, parsed, session);
+  }
   if (verb == "infix") {
     std::vector<std::string> words;
     for (const auto& e : d.entries)
       for (const auto& w : quoteAwareWords(e)) words.push_back(w);
-    if (auto err = parseInfixSpec(words, &slots)) return *err;
+    if (auto err = parseInfixSpec(words, &slots, &linesPerRecord)) return *err;
   } else {
-    if (auto err = parseInfileDictionary(d.entries, &slots)) return *err;
+    if (auto err = parseInfileDictionary(d.entries, &slots, &linesPerRecord)) return *err;
   }
   std::string dataArg;
   if (auto u = optStrAny(parsed.opts, {"using"})) dataArg = *u;
@@ -500,13 +617,33 @@ ojson runDictionaryRead(const std::string& verb, const std::string& dictArg,
   } else {
     bytes = d.trailingData;
   }
-  return readFixedAndAdopt(verb, bytes, slots, source, parsed, session);
+  return readFixedAndAdopt(verb, bytes, slots, source, parsed, session, linesPerRecord);
 }
 
 }  // namespace file_command_detail
 
 ojson runInfix(const eval::ParsedCommand& parsedIn, SessionState& session) {
-  const eval::ParsedCommand parsed = joinSpacedOptionValues(parsedIn);
+  eval::ParsedCommand parsed = joinSpacedOptionValues(parsedIn);
+  trimConditionAtUsing(&parsed);
+  // `infix spec in 2/3 using f`: the range sits before `using`, where the line
+  // tokenizer does not look for it; [D] infix reads it as the records to read
+  // (vs-stata bank: 2 observations).
+  if (!parsed.inRange.has_value()) {
+    const std::vector<std::string> w = quoteAwareWords(preCommaArgs(parsed.raw));
+    for (size_t i = 0; i + 1 < w.size(); ++i) {
+      const std::string lw = lowerOf(w[i]);
+      if (lw == "using") break;
+      if (lw == "in") {
+        parsed.inRange = w[i + 1];
+        break;
+      }
+    }
+  }
+  // As for infile: data in memory without `clear` is r(18) before the options
+  // are read (StataBE 19.5 `infix , zzabbrprobe`, `infix ... using d.fix, c`).
+  if (!hasFlag(parsed.opts, "clear")) {
+    if (auto err = requireEmptyOrClear(parsed, session)) return *err;
+  }
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabInfix.known,
                                             kVocabInfix.unimplemented)) {
     return ojson(*err);
@@ -516,12 +653,12 @@ ojson runInfix(const eval::ParsedCommand& parsedIn, SessionState& session) {
   std::string pathArg;
   if (!splitUsing(dropQualifierWords(quoteAwareWords(preCommaArgs(parsed.raw))), &words,
                   &pathArg)) {
-    return ioSyntax("infix: missing the file. Usage: infix [type] var #-# [...] using \"file\" "
-                    "[, clear]");
+    return ioErrorRc("dictionary invalid", 614);
   }
   std::vector<FixSlot> slots;
+  int linesPerRecord = 1;
   if (!words.empty()) {
-    if (auto err = parseInfixSpec(words, &slots)) return *err;
+    if (auto err = parseInfixSpec(words, &slots, &linesPerRecord)) return *err;
   }
   if (auto err = requireEmptyOrClear(parsed, session)) return *err;
   if (words.empty()) {
@@ -536,7 +673,7 @@ ojson runInfix(const eval::ParsedCommand& parsedIn, SessionState& session) {
   if (!pathExists(resolved)) return ioErrorRc("file " + shown + " not found", 601);
   auto bytes = readWholeFile(resolved);
   if (!bytes.has_value()) return ioError("infix: cannot read " + shown, "data_io");
-  return readFixedAndAdopt("infix", *bytes, slots, resolved, parsed, session);
+  return readFixedAndAdopt("infix", *bytes, slots, resolved, parsed, session, linesPerRecord);
 }
 
 }  // namespace piet::handlers

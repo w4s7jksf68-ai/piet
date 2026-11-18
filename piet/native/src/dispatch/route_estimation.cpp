@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "graphics_support.h"
+#include <cmath>
+#include <sstream>
 #include "results_support.h"
 #include "text_support.h"
 #include "pipeline.h"
@@ -105,7 +107,8 @@ bool route_estimation(std::string& cmd,
     // BUG-1490: Stata's r() after sktest, the last variable's scalars and r(table)
     // plus the hidden P_* scalars and r(Utest) (StataBE 19.5, rlife/side2.do
     // `: r(scalars)` `N p_skew p_kurt chi2 p_chi2 P_chi2 P_kurt P_skew`,
-    // `: r(matrices)` `table Utest`); the hidden four refuse by name (unposted).
+    // `: r(matrices)` `table Utest`); the historical four are posted by
+    // runSktest (readable by name in StataBE 19.5).
     if (skBlock.value("type", std::string()) != "error")
       eval::declareRPosted(session.eval, "sktest",
                            {"N", "p_skew", "p_kurt", "chi2", "p_chi2", "P_chi2", "P_kurt",
@@ -332,9 +335,14 @@ bool route_estimation(std::string& cmd,
     // strips, and the whole difference between the two commands is that one
     // token. Routed to the same handler with the method supplied here rather
     // than a second copy of the IV path that could drift from it.
+    // Stata's ivreg is `_regress` with an instrument list (ivreg.ado): its
+    // statistics are regress's small-sample ones -- s^2 = RSS/(N-K), t and F with
+    // e(df_r) = N-K (G-1 under cluster()), the robust/cluster meat scaled as
+    // regress scales it (bank af8d994e: se[mpg] 1131.81 = the asymptotic
+    // 1108.63 x sqrt(74/71), df 71).
     blocks.push_back(
         ojson(handlers::runIvRegress("2sls", parsed, /*allowAbsorb=*/false, "ivregress", session,
-                                     /*smallDefault=*/false, /*forceSmall=*/false)));
+                                     /*smallDefault=*/true, /*forceSmall=*/false)));
     return true;
   }
 
@@ -395,7 +403,7 @@ bool route_estimation(std::string& cmd,
 
 
   if (cmd == "vargranger") {
-    blocks.push_back(ojson(handlers::runVargranger(session)));
+    blocks.push_back(ojson(handlers::runVargranger(parsed, session)));
     return true;
   }
 
@@ -460,7 +468,13 @@ bool route_estimation(std::string& cmd,
 
 
   if (cmd == "svyset") {
-    blocks.push_back(ojson(handlers::runSvyset(parsed, session)));
+    // svyset answers with a list of blocks (the note, the design as printed) or one error.
+    ojson r = ojson(handlers::runSvyset(parsed, session));
+    if (r.is_array()) {
+      for (auto& b : r) blocks.push_back(std::move(b));
+    } else {
+      blocks.push_back(std::move(r));
+    }
     return true;
   }
 
@@ -494,6 +508,11 @@ bool route_estimation(std::string& cmd,
 
 
   if (cmd == "streg") {
+    // The net the handler lacked (options_support.cpp kVocabStreg).
+    if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabStreg.known, kVocabStreg.unimplemented)) {
+      blocks.push_back(ojson(*err));
+      return true;
+    }
     blocks.push_back(ojson(handlers::runStreg(parsed, session)));
     return true;
   }
@@ -501,12 +520,23 @@ bool route_estimation(std::string& cmd,
 
   // ---- P7 wave: ordered / multinomial / zero-inflated / fractional ----
   if (cmd == "ologit" || cmd == "oprobit") {
+    // The net the handler lacked (options_support.cpp kVocabOlogit / kVocabOprobit).
+    const eval::OptVocab& net = cmd == "ologit" ? kVocabOlogit : kVocabOprobit;
+    if (auto err = eval::rejectUnknownOptions(parsed.opts, net.known, net.unimplemented)) {
+      blocks.push_back(ojson(*err));
+      return true;
+    }
     blocks.push_back(ojson(handlers::runOrdered(cmd, parsed, session)));
+    installMlEsampleAfterFit(blocks.back(), session);  // BUG-1214 (vs-stata bank d8de89e3)
     return true;
   }
 
 
   if (cmd == "mlogit") {
+    if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabMlogit.known, kVocabMlogit.unimplemented)) {
+      blocks.push_back(ojson(*err));
+      return true;
+    }
     blocks.push_back(ojson(handlers::runMlogit(parsed, session)));
     installMlEsampleAfterFit(blocks.back(), session);  // BUG-1214
     return true;
@@ -530,6 +560,7 @@ bool route_estimation(std::string& cmd,
       return true;
     }
     blocks.push_back(ojson(handlers::runFracreg(parsed, session)));
+    installMlEsampleAfterFit(blocks.back(), session);  // e(sample) (bank 2bef1615 ESAMPLE 74)
     return true;
   }
 
@@ -628,10 +659,17 @@ bool route_estimation(std::string& cmd,
     // below is exactly the one `or` needs — generalised here instead of copied.
     // e(b) stays in log-odds for both (Stata does the same: `or` is a display
     // metric, `_b[]` is unchanged), which is why only `coeftable` is touched.
-    bool wantOr = false;
-    for (const auto& [ok, ov] : parsed.opts)
+    bool wantOr = false, wantCoef = false;
+    for (const auto& [ok, ov] : parsed.opts) {
       if (ok == "or" && ov.isBool && ov.boolValue) wantOr = true;
-    if ((cmd == "logistic" || wantOr) && block.value("type", "") == "estimation") {
+      // cloglog's eform: exp(b), the same display transform (bank a16bc26d)
+      if (cmd == "cloglog" && ok == "eform" && ov.isBool && ov.boolValue) wantOr = true;
+      // logistic's coef: the coefficient table (bank 18e88440 r(table) eform 0)
+      if (cmd == "logistic" && ok == "coef" && ov.isBool && ov.boolValue) wantCoef = true;
+    }
+    if (cmd == "logistic" && wantCoef && block.value("type", "") == "estimation")
+      block["estimator"] = "logistic";
+    if (((cmd == "logistic" && !wantCoef) || wantOr) && block.value("type", "") == "estimation") {
       if (cmd == "logistic") block["estimator"] = "logistic";
       // A metric marker the renderer can key on without knowing the command —
       // stcox/streg already set this key (applyHazardRatioTableM4).
@@ -670,6 +708,58 @@ bool route_estimation(std::string& cmd,
     // — runPoisson honest-rejects it there.
     // BUG-1251: ppmlhdfe d's new column is announced in a data_mutation block of
     // its own, after the estimation block (the reghdfe residuals() order).
+    // A count outcome is never negative: over the estimation sample (the rows
+    // where the outcome, every regressor and every absorbed variable are
+    // present) a negative value is r(459) "Y must be greater than or equal to
+    // zero", and under poisson an outcome that is zero everywhere r(498) "Y is
+    // zero for all observations" (vs-stata bank 32c6208b5f348674,
+    // a6c3caf72e10aa9f, 6d62b2f7a36ca9bf, a2826a6d27a26d8a). PIET fitted them.
+    // Read only where the sample is the plain rows (no if/in, no weight, no
+    // operators); otherwise the engine decides.
+    if (!parsed.ifExpr.has_value() && !parsed.inRange.has_value() &&
+        !parsed.weightType.has_value() && parsed.varlist.size() >= 1 && session.hasData()) {
+      std::vector<std::string> cols = parsed.varlist;
+      for (const auto& kv : parsed.opts)
+        if (lower(kv.first) == "absorb" && !kv.second.isBool) {
+          std::istringstream aw(kv.second.strValue);
+          std::string t;
+          while (aw >> t) cols.push_back(t);
+        }
+      Datastore* pds = session.datastore();
+      bool plain = pds != nullptr;
+      for (const auto& c : cols)
+        plain = plain && c.find_first_of(".#(),=") == std::string::npos && pds->has(c) &&
+                pds->dtype(c) == "f64";
+      if (plain) {
+        const int64_t nr = pds->nRows();
+        std::vector<const double*> ptr;
+        for (const auto& c : cols) ptr.push_back(pds->col(c).f64());
+        bool neg = false, anyRow = false, allZero = true;
+        for (int64_t r = 0; r < nr; ++r) {
+          bool miss = false;
+          for (const double* p : ptr) miss = miss || std::isnan(p[r]) || p[r] >= 8.98846567431158e307;
+          if (miss) continue;
+          anyRow = true;
+          if (ptr[0][r] < 0) neg = true;
+          if (ptr[0][r] != 0) allZero = false;
+        }
+        const std::string& yv = parsed.varlist[0];
+        if (anyRow && neg) {
+          blocks.push_back(ojson(eval::errorBlock("engine_error",
+                                                  yv + " must be greater than or equal to zero",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(459)")));
+          return true;
+        }
+        if (anyRow && allZero && cmd == "poisson") {
+          blocks.push_back(ojson(eval::errorBlock("engine_error",
+                                                  yv + " is zero for all observations",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(498)")));
+          return true;
+        }
+      }
+    }
     ojson dMutation;
     blocks.push_back(ojson(handlers::runPoisson(cmd, parsed, session, &dMutation)));
     if (dMutation.is_object() && !dMutation.empty()) blocks.push_back(dMutation);
@@ -695,6 +785,7 @@ bool route_estimation(std::string& cmd,
     // (the engine has no RE/PA xtpoisson — Stata's own default IS
     // random-effects, so the bare/`,re`/`,pa` forms all honest-reject).
     blocks.push_back(ojson(handlers::runXtPoisson(parsed, session)));
+    installMlEsampleAfterFit(blocks.back(), session);  // the random-effects fit (vs-stata bank f8d5160a)
     return true;
   }
 
@@ -703,6 +794,7 @@ bool route_estimation(std::string& cmd,
     // BS-075 (BETA D3c): conditional fixed-effects logit MLE, `,fe` ONLY
     // (same RE/PA-absence rationale as xtpoisson above).
     blocks.push_back(ojson(handlers::runXtLogitFe(parsed, session)));
+    installMlEsampleAfterFit(blocks.back(), session);  // xtlogit, fe (vs-stata bank 1ce53089)
     return true;
   }
 
@@ -808,8 +900,39 @@ bool route_estimation(std::string& cmd,
                              std::make_pair("cv_10", "cv_10"), std::make_pair("cv1", "cv_1"),
                              std::make_pair("cv5", "cv_5"), std::make_pair("cv10", "cv_10")})
         put(pr.first, pr.second);
+      // pperron.ado's r(cvalues): the two statistics with their 1/5/10% critical
+      // values, rows "Z(rho)" "Z(t)", columns "test stat" "1% cvalue" "5% cvalue"
+      // "10% cvalue" (GetCrit's Fuller tables).
+      auto num = [&blk](const char* key, double* v) {
+        if (!blk.contains(key) || !blk[key].is_number()) return false;
+        *v = blk[key].get<double>();
+        return true;
+      };
+      double zp, zp1, zp5, zp10, zt, zt1, zt5, zt10;
+      if (cmd == "pperron" && num("Zrho", &zp) && num("zrho_cv_1", &zp1) &&
+          num("zrho_cv_5", &zp5) && num("zrho_cv_10", &zp10) && num("Zt", &zt) &&
+          num("cv_1", &zt1) && num("cv_5", &zt5) && num("cv_10", &zt10)) {
+        eval::EvalMatrix cv;
+        cv.rownames = {"Z(rho)", "Z(t)"};
+        cv.colnames = {"test stat", "1% cvalue", "5% cvalue", "10% cvalue"};
+        cv.data = {{zp, zp1, zp5, zp10}, {zt, zt1, zt5, zt10}};
+        bool put = false;
+        for (auto& kv : session.eval.rMatrices)
+          if (kv.first == "cvalues") {
+            kv.second = cv;
+            put = true;
+          }
+        if (!put) session.eval.rMatrices.emplace_back("cvalues", std::move(cv));
+      }
+    }
+    // `regress`: the test's regression table, drawn after the test.
+    std::optional<std::string> regressTable;
+    if (blk.is_object() && blk.contains("regress_table") && blk["regress_table"].is_string()) {
+      regressTable = blk["regress_table"].get<std::string>();
+      blk.erase("regress_table");
     }
     blocks.push_back(std::move(blk));
+    if (regressTable.has_value()) blocks.push_back(ojson{{"type", "display"}, {"text", *regressTable}});
     return true;
   }
 
@@ -849,12 +972,18 @@ bool route_estimation(std::string& cmd,
     std::optional<std::string> againstVal;
     if (eqPos != std::string::npos) againstVal = trimWs(raw.substr(eqPos + 1));
     blocks.push_back(
-        ojson(handlers::runSdtest(varName, againstVal, parsed.opts, parsed.ifExpr, session)));
+        ojson(handlers::runSdtest(varName, againstVal, parsed.opts, parsed.ifExpr, session,
+                                                parsed.inRange)));
     return true;
   }
 
 
   if (cmd == "hausman") {
+    // One name compares it with the active results (`.`).
+    if (parsed.varlist.size() == 1) {
+      blocks.push_back(ojson(handlers::runHausman(parsed.varlist[0], ".", parsed.opts, session)));
+      return true;
+    }
     if (parsed.varlist.size() != 2) {
       blocks.push_back(ojson(eval::engineError(
           "syntax_error: `hausman` requires exactly two stored estimation names, e.g. `hausman "

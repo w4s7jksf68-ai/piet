@@ -29,6 +29,8 @@ to concatenating this directory directly).
 | `69-acreg-GPL-3.0.txt` | acreg 1.1.0, Colella/Lalive/Sakalli/Thoenig (`estimation/acreg_estimation.cpp`; register row) | GPL-3.0 (stated in the SSC listing; ado marked "Beta Version, please do not circulate") | attribution + licence statement must travel with the binary |
 | `70-qreg2-GPL-3.0.txt` | qreg2 4.00, Machado/Parente/Santos Silva (`estimation/qreg2_estimation.cpp`; register row) | GPL-3.0 (stated in the SSC listing) | attribution + licence statement must travel with the binary |
 | `71-ritest-GPL-3.0.txt` | ritest 1.1.7, Simon Hess (`estimation/ritest_inference.cpp`; register row) | GPL-3.0 (stated in the SSC listing) | attribution + licence statement must travel with the binary |
+| `72-icu-charset-data-Unicode-3.0.txt` | ICU 78 charset-detector trigram lists (`fileio/charset_guess.cpp`; register row) | Unicode License v3 | licence text must travel with the binary |
+| `73-zlib-Zlib.txt` | zlib 1.3.1 deflate (`fileio/deflate.cpp`; register row) | zlib License | notice must travel with the binary |
 
 License texts are verbatim copies of the vendored upstream LICENSE files —
 if a vendor bump changes the upstream text, re-copy it here in the same commit.

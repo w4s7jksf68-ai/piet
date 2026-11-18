@@ -4,6 +4,7 @@
 #include "core/error.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -113,7 +114,12 @@ void fill_fit_scalars(FeolsResult& r, double direct_mss = -1.0) {
     r.df_r = (r.n_clusters > 0) ? static_cast<int64_t>(r.n_clusters - 1)
                                 : static_cast<int64_t>(std::floor(dof_resid + 1e-9));
     r.df_r_exact = (r.n_clusters > 0) ? static_cast<double>(r.n_clusters - 1) : dof_resid;
-    r.r2_a = (dof_resid > 0) ? 1.0 - (1.0 - r.r2) * (n_obs - 1.0) / dof_resid : 0.0;
+    // A fit with no constant (no intercept column, no absorbed effects) adjusts its
+    // uncentered R2 by N, not N-1 (Stata `regress ..., noconstant`: bank 32a601db
+    // `regress price ibn.rep78, noconstant` e(r2_a) .8074745763884801 = 1 -
+    // (1-r2)*69/64; d49754f8 `ibn.foreign mpg, noconstant` .862516377547546).
+    const double n_adj = (icpt < 0 && !(r.tss_total > 0.0)) ? n_obs : n_obs - 1.0;
+    r.r2_a = (dof_resid > 0) ? 1.0 - (1.0 - r.r2) * n_adj / dof_resid : 0.0;
 
     // Wald F over the q slopes: F = (1/q) b_s' (V_ss)^-1 b_s, V_ss = slope sub-block of vcov.
     // Undefined (→ NaN) when there are no slopes or the F reference dof is degenerate:
@@ -197,6 +203,51 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
     // then demeaning unweighted subtracts plain means of √w̃·v instead, which is
     // right only when w̃ is constant within every FE cell (oracle w2_pweight
     // A3_areg_pw_VARYING_w_clusterid, wv varying within id, tells them apart).
+    // Stata `regress`'s e(beta) ([R] regress, Stored results; posted by the built-in
+    // _regress for every OLS fit, beta option or not): b_j*sd(x_j)/sd(y) with the n-1
+    // sample sd over the estimation rows -- centred under noconstant too (StataBE 19.5,
+    // bank 01386761 `regress price mpg weight, noc`: e(beta) -.010743, .54734), and
+    // weighted by the raw weights under every weight type (bank d1d057bf [aw],
+    // 76940a71 [fw], 4b4fc87d [iw], 15739513 [pw]: one value to 1e-13; the weights'
+    // scale cancels in the ratio). The sds are taken here, on the raw no-FE design
+    // before any weighting rescales it, keyed by column name so the collinear
+    // compaction below cannot misalign them.
+    std::vector<std::pair<std::string, double>> beta_sd_x;
+    double beta_sd_y = 0.0;
+    const bool want_beta_std = md.fe.empty() && n > 1;
+    if (want_beta_std && md.weights.empty()) {
+        const double nd = static_cast<double>(n);
+        const double ym = la::sum(dm.y.data(), n) / nd;
+        beta_sd_y = std::sqrt(la::sumsq_dev(dm.y.data(), n, ym) / (nd - 1.0));
+        for (int j = 0; j < k; ++j) {
+            if (dm.xnames[static_cast<size_t>(j)] == "(intercept)") continue;
+            const double* col = dm.X.data() + static_cast<int64_t>(j) * n;
+            const double m = la::sum(col, n) / nd;
+            beta_sd_x.emplace_back(dm.xnames[static_cast<size_t>(j)],
+                                   std::sqrt(la::sumsq_dev(col, n, m) / (nd - 1.0)));
+        }
+    } else if (want_beta_std && static_cast<int64_t>(md.weights.size()) == n) {
+        const double* w = md.weights.data();
+        double sw = 0.0;
+        for (int64_t i = 0; i < n; ++i) sw += w[i];
+        const auto wsd = [&](const double* v) {
+            double sv = 0.0;
+            for (int64_t i = 0; i < n; ++i) sv += w[i] * v[i];
+            const double m = sv / sw;
+            double ss = 0.0;
+            for (int64_t i = 0; i < n; ++i) ss += w[i] * (v[i] - m) * (v[i] - m);
+            return std::sqrt(ss / sw);
+        };
+        if (sw > 0.0) {
+            beta_sd_y = wsd(dm.y.data());
+            for (int j = 0; j < k; ++j) {
+                if (dm.xnames[static_cast<size_t>(j)] == "(intercept)") continue;
+                beta_sd_x.emplace_back(dm.xnames[static_cast<size_t>(j)],
+                                       wsd(dm.X.data() + static_cast<int64_t>(j) * n));
+            }
+        }
+    }
+
     double w_tss = -1.0;  // <0 ⇒ unweighted/FE; ≥0 ⇒ the no-FE weighted centered TSS
     std::vector<double> wt;  // w̃ = w·c, set only on the weighted-FE path
     if (!md.weights.empty()) {
@@ -328,30 +379,15 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
             }
     }
 
-    // Stata `regress`'s e(beta) ([R] regress, Stored results; posted by the built-in
-    // _regress for every unweighted OLS fit, beta option or not): b_j*sd(x_j)/sd(y)
-    // with the n-1 sample sd over the estimation rows. The sds are taken here, on the
-    // raw no-FE design (nothing below the intercept check rescales it unweighted),
-    // keyed by column name so the collinear compaction below cannot misalign them.
-    std::vector<std::pair<std::string, double>> beta_sd_x;
-    double beta_sd_y = 0.0;
-    const bool want_beta_std = md.fe.empty() && md.weights.empty() && md.has_intercept && n > 1;
-    if (want_beta_std) {
-        const double nd = static_cast<double>(n);
-        const double ym = la::sum(dm.y.data(), n) / nd;
-        beta_sd_y = std::sqrt(la::sumsq_dev(dm.y.data(), n, ym) / (nd - 1.0));
-        for (int j = 0; j < k; ++j) {
-            if (dm.xnames[static_cast<size_t>(j)] == "(intercept)") continue;
-            const double* col = dm.X.data() + static_cast<int64_t>(j) * n;
-            const double m = la::sum(col, n) / nd;
-            beta_sd_x.emplace_back(dm.xnames[static_cast<size_t>(j)],
-                                   std::sqrt(la::sumsq_dev(col, n, m) / (nd - 1.0)));
-        }
-    }
-
     // --- HDFE demean (within transform) of y and X ---
     // Weighted: subtract the weighted cell means, THEN scale by √w̃ (see above).
     const double* wdm = weighted_fe ? wt.data() : nullptr;
+    if (md.fe.size() >= 2) {
+        // reghdfe's e(ic): its solver's iteration count over [y X] (hdfe/demean.cpp)
+        std::vector<double> yx(dm.y.begin(), dm.y.begin() + n);
+        yx.insert(yx.end(), dm.X.begin(), dm.X.begin() + static_cast<int64_t>(k) * n);
+        r.hdfe_ic = hdfe_map_cg_iterations(yx.data(), n, k + 1, md.fe, wdm);
+    }
     DemeanReport dy = demean(dm.y.data(), n, 1, md.fe, wdm);
     DemeanReport dx = demean(dm.X.data(), n, k, md.fe, wdm);
     r.demean_iters = std::max(dy.iters, dx.iters);
@@ -379,10 +415,38 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
     std::vector<std::string> full_names = dm.xnames;
     {
         const std::vector<char> late = late_cell_flags(md, dm.xnames);
+        // The plain unweighted fit with a constant over plain variables takes
+        // regress's own sweep rule (collinear_sweep_keep_mask). Factor-variable
+        // designs keep the pivoted pass, which matches Stata's choice there (bank
+        // a07b3cea `i.rep78 r1` omits r1, fc77f0bb `r5 i.rep78` omits 5.rep78, where
+        // the sweep would pick otherwise), as do weighted, absorbed and noconstant fits.
+        bool plain_vars = true, factor_terms = false;
+        std::vector<char> interaction(static_cast<size_t>(k), 0);
+        for (int j = 1; j < k; ++j) {
+            const std::string& nm = dm.xnames[static_cast<size_t>(j)];
+            if (nm.find_first_of(".#()") != std::string::npos) plain_vars = false;
+            const bool cell = nm.find('#') != std::string::npos;
+            interaction[static_cast<size_t>(j)] = cell ? 1 : 0;
+            if (cell || (!nm.empty() && std::isdigit(static_cast<unsigned char>(nm[0])) &&
+                         nm.find('.') != std::string::npos))
+                factor_terms = true;
+        }
+        const bool regress_route = !md.collinear_forward && md.has_intercept && md.fe.empty() &&
+                                   md.weights.empty() && k > 0 && dm.xnames[0] == "(intercept)";
+        // A factor-variable design goes through Stata's _rmcoll instead: in varlist
+        // order with the interaction cells after the other terms, the later member
+        // of a collinear set omitted (bank 5be21bd3 `regress price c.mpg##c.mpg m2`
+        // with m2 = mpg^2 omits c.mpg#c.mpg; a07b3cea `i.rep78 r1` omits r1;
+        // fc77f0bb `r5 i.rep78` omits 5.rep78; 9075b99d `ibn.foreign` omits
+        // 1.foreign; i.foreign##i.rep78 omits 1.foreign#5.rep78).
         std::vector<char> keep =
             md.collinear_forward
                 ? collinear_keep_mask(dm.X.data(), n, k, 1e-7, &late)
-                : collinear_pivot_keep_mask(dm.X.data(), n, k, md.has_intercept ? 0 : -1);
+                : (regress_route && plain_vars)
+                      ? collinear_sweep_keep_mask(dm.X.data(), n, k, 0)
+                      : (regress_route && factor_terms)
+                            ? collinear_keep_mask(dm.X.data(), n, k, 1e-7, &interaction)
+                            : collinear_pivot_keep_mask(dm.X.data(), n, k, md.has_intercept ? 0 : -1);
         int nkeep = 0;
         for (char c : keep) nkeep += c;
         if (nkeep < k) {
@@ -536,12 +600,16 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
     // BUG-1043: regress posts the same bread after a one-way vce(robust) or
     // vce(cluster), unweighted or [fw] (StataBE, the w2s fixture: e(V_modelbased)
     // equals the plain fit's e(V)/e(rmse)^2, x1 cell +1.4cb44ed9785aeX-00b; [fw] the fw
-    // fit's (X'WX)^-1). An aweight's is a constant multiple and a pweight's none:
-    // left unsent.
-    const bool vmb_one_way = (vt == Vcov::HC1 || vt == Vcov::Cluster) &&
-                             (md.weights.empty() || md.weight_kind == WeightKind::Frequency);
-    if (md.fe.empty() && ((subset_multiway && md.weights.empty()) || vmb_one_way))
+    // fit's (X'WX)^-1). [aw]/[pw]/[iw] post (X'WX)^-1 on the RAW weights (bank
+    // 15739513 `regress price mpg weight [pweight=w]`: V_modelbased[1,1] .00057110641,
+    // the [iw=w] fit's e(V)/e(rmse)^2; 911986b4 [aw] robust equal to d08a52ac [iw]
+    // robust), i.e. the normalised fit's bread times the normalising constant n/sum(w).
+    const bool vmb_one_way = vt == Vcov::HC1 || vt == Vcov::Cluster;
+    if (md.fe.empty() && ((subset_multiway && md.weights.empty()) || vmb_one_way)) {
         r.vcov_modelbased = bread;
+        if (!md.weights.empty() && r.sum_w > 0.0 && r.n_eff > 0.0 && r.n_eff != r.sum_w)
+            for (auto& v : r.vcov_modelbased) v *= r.n_eff / r.sum_w;
+    }
 
     // GAP B — reghdfe reconstructed intercept (_cons) for absorb() models.
     // reghdfe reports a "regression through means" intercept when the absorbed FE
@@ -724,9 +792,23 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
         for (size_t j = 0; j < r.names.size(); ++j) {
             for (const auto& [nm, sd] : beta_sd_x) {
                 if (nm != r.names[j]) continue;
-                r.beta_std.emplace_back(nm, r.beta[j] * sd / beta_sd_y);
+                // a regressor with no variation (kept under noconstant) has no
+                // standardized coefficient: missing (bank dec61ebe `regress price mpg
+                // one, noconstant`: e(beta)[1,2] .)
+                r.beta_std.emplace_back(nm, sd > 0.0 ? r.beta[j] * sd / beta_sd_y
+                                                     : std::numeric_limits<double>::quiet_NaN());
                 break;
             }
+        }
+        // An omitted design column's e(beta) is its b (0) scaled the same way, so 0,
+        // except that a column with no variation over the sample has no standardized
+        // coefficient at all: missing (StataBE 19.5, bank 47bc4654 `regress price mpg
+        // one` with one == 1: e(beta) `-.4686 .`; 835071f9 `regress price mpg foreign
+        // if foreign==1`: the same; a collinear column that varies keeps 0, bank
+        // 0f33649a 1o.foreign#3o.rep78).
+        for (const auto& [nm, sd] : beta_sd_x) {
+            if (std::find(r.names.begin(), r.names.end(), nm) != r.names.end()) continue;
+            r.beta_std.emplace_back(nm, sd > 0.0 ? 0.0 : std::numeric_limits<double>::quiet_NaN());
         }
     }
     return r;

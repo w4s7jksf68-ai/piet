@@ -150,6 +150,10 @@ struct Pattern {
 }  // namespace
 
 ojson runXtdescribe(const eval::ParsedCommand& parsed, SessionState& session) {
+  // xtdescribe's syntax has no varlist (the panel comes from xtset or i()/t()):
+  // `xtdescribe sid` is r(101) "varlist not allowed" (vs-stata bank
+  // 7fb402d78a0e4931).
+  if (!parsed.varlist.empty()) return rcError("varlist not allowed", 101);
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabXtdescribe.known,
                                             kVocabXtdescribe.unimplemented))
     return ojson(*err);

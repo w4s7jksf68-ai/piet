@@ -11,6 +11,7 @@
 #include "io/dta_reader.h"  // read_dta — open_using_frame's .dta branch (WS-D2)
 #include <algorithm>  // std::min/std::max (fe_group_sizes)
 #include <cstring>  // strlen — open_using_frame's extension match
+#include <set>  // keepif_own_panels: the panels an `if` sample touches
 #include "estimators/feols.h"
 #include "estimators/fepois.h"
 #include "estimators/iv2sls.h"
@@ -872,6 +873,53 @@ std::vector<char> eval_keepif_mask(const std::string& data_path, const std::stri
     return mask;
 }
 
+std::string keepif_own_panels(const char* cmd, const std::string& data, const std::string& keepif,
+                              const std::string& panelvar, std::vector<char>& mask,
+                              std::vector<int64_t>* source_rows) {
+    if (source_rows) source_rows->clear();
+    mask = eval_keepif_mask(data, keepif);
+    if (panelvar.empty()) return data;
+    auto dsp = std::make_shared<Dataset>(Dataset::open(data));
+    const int64_t n = dsp->n_rows();
+    const double* pv = require_num(*dsp, cmd, panelvar);
+    std::set<double> panels;
+    for (int64_t i = 0; i < n; ++i)
+        if (mask[static_cast<size_t>(i)] && !std::isnan(pv[i])) panels.insert(pv[i]);
+    std::vector<double> own(static_cast<size_t>(n), 0.0);
+    bool all_own = true;
+    for (int64_t i = 0; i < n; ++i) {
+        own[static_cast<size_t>(i)] = panels.count(pv[i]) ? 1.0 : 0.0;
+        if (own[static_cast<size_t>(i)] == 0.0) all_own = false;
+    }
+    if (all_own) return data;
+    Frame fr = Frame::from_dataset_shared(dsp);
+    std::vector<double> idx(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) idx[static_cast<size_t>(i)] = static_cast<double>(i);
+    fr.set_f64_column("__cecon_panel_rowidx", std::move(idx));
+    fr.set_f64_column("__cecon_panel_own", std::move(own));
+    fr.keep_if("__cecon_panel_own");
+    const int64_t m = fr.n_rows();
+    std::vector<char> reduced(static_cast<size_t>(m), 0);
+    const double* src = fr.col("__cecon_panel_rowidx").f64.data();
+    for (int64_t i = 0; i < m; ++i)
+        reduced[static_cast<size_t>(i)] = mask[static_cast<size_t>(src[i])];
+    if (source_rows) {
+        source_rows->resize(static_cast<size_t>(m));
+        for (int64_t i = 0; i < m; ++i)
+            (*source_rows)[static_cast<size_t>(i)] = static_cast<int64_t>(src[i]);
+    }
+    fr.drop("__cecon_panel_rowidx");
+    fr.drop("__cecon_panel_own");
+    static int seq = 0;
+    std::string tmp = native_join_path(
+        keepif_scratch_dir(), "cecon_panelkeep_" + std::to_string(native_process_id()) + "_" +
+                                  std::to_string(seq++) + ".hbin");
+    fr.write_hbin(tmp);
+    g_keepif_scratch.push_back(tmp);
+    mask = std::move(reduced);
+    return tmp;
+}
+
 // True if any token in `names` carries a time-series operator (L./F./D./S.), e.g.
 // "L.x" or the factor-prefixed "i.L.gdp". Pure string parsing (cecon::split_ts) —
 // safe to call before any data is opened.
@@ -1106,6 +1154,15 @@ GlmInputs load_glm(const Dataset& ds, const char* cmd, const std::string& y,
     return g;
 }
 
+// Stata's binary-outcome rule for logit, probit and cloglog: 0 is the negative
+// outcome and every other nonmissing value the positive one ([R] logit; StataBE
+// 19.5 bank 9f4f02d7 `logit rep78 mpg`: "outcome does not vary; remember: 0 =
+// negative outcome, all other nonmissing values = positive outcome", r(2000)).
+void binarize_outcome(std::vector<double>& y) {
+    for (double& v : y)
+        if (v != 0.0 && !std::isnan(v)) v = 1.0;
+}
+
 bool check_binary(const std::vector<double>& y, const char* cmd, const std::string& nm) {
     for (double v : y)
         if (v != 0.0 && v != 1.0) {
@@ -1114,6 +1171,18 @@ bool check_binary(const std::vector<double>& y, const char* cmd, const std::stri
             return false;
         }
     return true;
+}
+
+// After binarize_outcome: an outcome that is all 0 or all nonzero on the sample is
+// refused before any perfect-prediction screen, r(2000) (bank 9f4f02d7 `logit rep78
+// mpg`: rep78 is nonzero on every row). logit, probit and cloglog alike.
+bool check_outcome_varies(const std::vector<double>& y, const char* cmd) {
+    bool any0 = false, any1 = false;
+    for (double v : y) (v == 0.0 ? any0 : any1) = true;
+    if (any0 && any1) return true;
+    std::fprintf(stderr, "%s: outcome does not vary; remember: 0 = negative outcome, all other "
+                 "nonmissing values = positive outcome; r(2000)\n", cmd);
+    return false;
 }
 
 namespace {
@@ -1517,6 +1586,7 @@ json run_feols(const std::string& data, const std::string& y,
     auto t0 = std::chrono::steady_clock::now();
     const Dataset& ds = acquire_data(data);
     auto t1 = std::chrono::steady_clock::now();
+    IbnNoInterceptScope ibn_scope(no_intercept && fes.empty());
     ModelData md = build_model(ds, y, xs, fes, clusters, "", drop_singleton, ts, if_mask,
                                weight_var, weight_kind);
     md.collinear_forward = collinear_forward;  // BUG-1067
@@ -1607,6 +1677,8 @@ json run_feols(const std::string& data, const std::string& y,
           {"demean_converged", r.demean_converged}}},
         {"timing_ms", {{"load", ms(t0, t1)}, {"build", ms(t1, t2)}, {"fit", ms(t2, t3)}}},
     };
+    // reghdfe's e(ic) (two or more absorbed factors only, so other replies keep their bytes)
+    if (r.hdfe_ic > 0) out["hdfe_ic"] = r.hdfe_ic;
     // Weighted extras. Emitted ONLY when weights were actually used, so an unweighted
     // response stays byte-identical to before weights existed (the freeze pins hold).
     if (r.n_eff > 0.0) {
@@ -1856,7 +1928,8 @@ json run_iv(const std::string& data, const std::string& y,
             const std::vector<char>* if_mask, bool small, bool savefirst,
             const std::string& savefprefix, EsampleRows* esample, bool emit_v,
             bool multiway_subset_factors, bool no_intercept, const std::string& weight_var,
-            cecon::WeightKind weight_kind, bool multiway_no_psd_fix, bool dofminus_fe) {
+            cecon::WeightKind weight_kind, bool multiway_no_psd_fix, bool dofminus_fe,
+            bool gmm_efficient_vce, bool inst_collin_check) {
     auto t0 = std::chrono::steady_clock::now();
     const Dataset& ds = acquire_data(data);
     auto t1 = std::chrono::steady_clock::now();
@@ -1870,6 +1943,8 @@ json run_iv(const std::string& data, const std::string& y,
     iv_attach_weights(md, wcol, weight_kind);
     md.multiway_no_psd_fix = multiway_no_psd_fix;
     md.dofminus_fe = dofminus_fe;
+    md.gmm_efficient_vce = gmm_efficient_vce;
+    md.inst_collin_check = inst_collin_check;
     if (esample) { esample->keep = md.keep; esample->loaded = &ds; }  // e(sample) T1a
     auto t2 = std::chrono::steady_clock::now();
     Vcov vt = Vcov::IID;
@@ -2015,6 +2090,13 @@ json run_iv(const std::string& data, const std::string& y,
     }
     add_first_stage(out, r, savefprefix);   // absent key unless --savefirst
     if (emit_v) add_e_v(out, r.names, r.vcov_matrix, &ord);  // reply's coef order; absent by default
+    // ivregress's e(V_modelbased) (one-way robust/cluster 2SLS, no FE), in
+    // e_V's shape: new key, absent everywhere else.
+    if (emit_v && !r.vcov_modelbased.empty()) {
+        json tmp;
+        add_e_v(tmp, r.names, r.vcov_modelbased, &ord);
+        out["e_Vmb"] = std::move(tmp["e_V"]);
+    }
     add_warnings(out, md.warnings);  // BUG-112(8): absent-key when empty
     return out;
 }
@@ -2155,6 +2237,7 @@ json run_feols_multi(const std::string& data, const std::vector<std::string>& ys
                      const std::vector<char>* if_mask, bool no_intercept, double level,
                      bool level_set, EsampleRows* esample, bool collinear_forward) {
     const Dataset& ds = acquire_data(data);
+    IbnNoInterceptScope ibn_scope(no_intercept && fes.empty());
     ModelData md = build_model(ds, ys[0], xs, fes, clusters, "", drop_singleton, ts, if_mask);
     md.collinear_forward = collinear_forward;  // BUG-1067
     // Same common-sample rule as run_iv_multi: ys[0]'s kept rows are every outcome's.
@@ -2223,7 +2306,8 @@ json run_fepois_emit_v(const std::string& data, const std::string& y,
                        bool emit_v, const std::string& d_out = std::string(),
                        const std::string& d_name = std::string(),
                        const cecon::TsMeta* ts = nullptr,
-                       const std::vector<char>* if_mask = nullptr);
+                       const std::vector<char>* if_mask = nullptr, bool stata_ml = false,
+                       bool exposure = false, int ml_maxiter = 300);
 
 json run_fepois(const std::string& data, const std::string& y,
                 const std::vector<std::string>& xs, const std::vector<std::string>& fes,
@@ -2248,7 +2332,8 @@ json run_fepois_emit_v(const std::string& data, const std::string& y,
                        const std::vector<std::string>& clusters, bool drop_zero_fe,
                        bool scale_x2, const std::string& weight_var, cecon::WeightKind weight_kind,
                        bool emit_v, const std::string& d_out, const std::string& d_name,
-                       const cecon::TsMeta* ts, const std::vector<char>* if_mask) {
+                       const cecon::TsMeta* ts, const std::vector<char>* if_mask, bool stata_ml,
+                       bool exposure, int ml_maxiter) {
     auto t0 = std::chrono::steady_clock::now();
     const Dataset& ds = acquire_data(data);
     auto t1 = std::chrono::steady_clock::now();
@@ -2258,6 +2343,14 @@ json run_fepois_emit_v(const std::string& data, const std::string& y,
                                weight_var, weight_kind);
     // ppmlhdfe-parity "fe" separation: drop all-zero FE cells (default on).
     int64_t n_dropped_separation = drop_zero_fe ? drop_zero_outcome_fe_cells(md) : 0;
+    // exposure(E): the offset is ln(E), and E must be positive on the sample
+    if (exposure)
+        for (double& v : md.offset) {
+            if (!(v > 0.0)) throw EngineError("bad_input", "exposure() must be greater than zero");
+            v = std::log(v);
+        }
+    md.stata_ml = stata_ml;  // --stata-ml: Stata `poisson`'s ml iterate (fepois.cpp)
+    md.ml_maxiter = ml_maxiter;  // --iterate: that ml fit's iterate(#)
     auto t2 = std::chrono::steady_clock::now();
     Vcov vt = Vcov::IID;
     if (vcov_type == "hc1" || vcov_type == "HC1" || vcov_type == "robust") vt = Vcov::HC1;
@@ -2371,7 +2464,11 @@ json run_fepois_emit_v(const std::string& data, const std::string& y,
         double dof = (r.n_clusters > 0) ? (r.n_clusters - 1.0) : static_cast<double>(r.dof.dof_resid);
         add_inference(out, r.names, r.beta, r.se, dof);
     }
+    add_omitted(out, r.omitted, r.full_names);
     add_warnings(out, md.warnings);  // BUG-112(8): absent-key when empty
+    // ppmlhdfe's e(ll_0) is the intercept-only null without the offset; emitted only
+    // when an offset was given, so every other reply is byte-identical.
+    if (!md.offset.empty()) out["ll_0_nooffset"] = r.ll_0_nooffset;
     // Multiway clustering: each dimension's own G, in --cluster order (ppmlhdfe's
     // e(N_clust1..k), BUG-1481), as feols and iv emit it; "n_clusters" stays the
     // smallest. Emitted only under --vcov twoway/multiway, so every other reply is
@@ -2389,6 +2486,34 @@ json run_fepois_emit_v(const std::string& data, const std::string& y,
         } else {
             add_e_v(out, r.names, r.vcov_matrix);
         }
+    }
+    // e(V_modelbased) of a pooled sandwich fit, beside e_V (Stata's poisson posts it
+    // under vce(robust) / vce(cluster) and pweights).
+    if (emit_v && !r.has_cons && r.vcov_model.size() == r.vcov_matrix.size() && !r.vcov_model.empty()) {
+        json tmp;
+        add_e_v(tmp, r.names, r.vcov_model);
+        out["e_Vmb"] = std::move(tmp["e_V"]);
+    }
+    // e(sample)'s row count when e(N) is Sum w (an fweight), and under an iweight,
+    // whose sample the handshake also counts in rows (bank c21b18c2 `poisson fatal
+    // beertax unemp [iweight=w]`: e(sample) 336 rows)
+    if ((md.weight_kind == cecon::WeightKind::Frequency || md.weight_kind == cecon::WeightKind::Importance) &&
+        !md.weights.empty())
+        out["n_rows"] = r.n;
+    // --stata-ml: e(ic), e(ilog) and e(gradient) of the ml fit (the gradient on the
+    // full design, 0 for an omitted regressor), only when the ml path ran.
+    if (r.ml_ran) {
+        out["ic"] = r.ic;
+        out["ilog"] = r.ilog;
+        json gn = json::array(), gv = json::array();
+        for (const std::string& nm : r.full_names) {
+            double g = 0.0;
+            for (size_t j = 0; j < r.names.size(); ++j)
+                if (r.names[j] == nm && j < r.gradient.size()) g = r.gradient[j];
+            gn.push_back(nm);
+            gv.push_back(std::isfinite(g) ? json(g) : json(nullptr));
+        }
+        out["e_gradient"] = {{"names", std::move(gn)}, {"values", std::move(gv)}};
     }
     return out;
 }

@@ -498,6 +498,14 @@ std::vector<Item> aggregateBraces(const std::vector<std::string>& lines) {
 // _flatten_body) for loops::executeLoop, which re-parses nested blocks via
 // executeDoSource.
 
+// Appended to a program-install sentinel that stands inside a brace block.
+// StataBE 19.5 leaves a program whose body has no statement undefined when it
+// is defined inside `{ }` (truth bank, all inside the harness's `capture
+// noisily { }`: `program define zq1` / `end` then `zq1` is r(199) "command zq1
+// is unrecognized", `program list zq1` r(111), `program dir` lists none; a
+// comment-only body likewise), while a body with statements defines it.
+const std::string kInBlockMark = std::string("\x1C") + "b";
+
 std::vector<std::string> flattenBody(const std::vector<Item>& body) {
   std::vector<std::string> flat;
   for (const auto& item : body) {
@@ -517,6 +525,14 @@ std::vector<std::string> flattenBody(const std::vector<Item>& body) {
       }
     } else {
       const std::string& s = std::get<std::string>(item);
+      // A program defined INSIDE a brace block carries that fact to its
+      // install (kInBlockMark, see the install site in executeDoSource).
+      if (program::isProgInstallSentinel(s, nullptr) &&
+          !(s.size() >= kInBlockMark.size() &&
+            s.compare(s.size() - kInBlockMark.size(), kInBlockMark.size(), kInBlockMark) == 0)) {
+        flat.push_back(s + kInBlockMark);
+        continue;
+      }
       if (!s.empty()) flat.push_back(s);
     }
   }
@@ -603,6 +619,26 @@ void coalesceMutationVarlists(ojson& blocks) {
     ojson& b = blocks[static_cast<size_t>(i)];
     if (isMutWithVarlist(b)) b.erase("varlist_after");
   }
+}
+
+void appendJoiningBodyContinue(ojson& blocks, const ojson& b) {
+  if (b.is_object() && b.value("type", std::string()) == "display") {
+    for (size_t k = blocks.size(); k-- > 0;) {
+      ojson& prev = blocks[k];
+      if (!prev.is_object()) break;
+      const std::string pt = prev.value("type", std::string());
+      if (pt == "echo") continue;
+      if (pt != "display" || !prev.value("continue", false)) break;
+      prev["text"] = prev.value("text", std::string()) + b.value("text", std::string());
+      if (b.value("continue", false)) {
+        prev["continue"] = true;
+      } else {
+        prev.erase("continue");
+      }
+      return;
+    }
+  }
+  blocks.push_back(b);
 }
 
 ExecuteResult executeDoSource(const std::string& source, SessionState& session,
@@ -867,18 +903,21 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
     }
     // name-binding-display-literals: `display ... _continue` suppresses the
     // newline at the end of its line, so the next display's text continues it
-    // (w2av_name_binding bd_dy_cont `[ab]`, bd_dy_contc `[a b]`). The block
-    // says so (handleDisplay's `continue`); the text is joined onto it here,
-    // past any command echo between them. The stored transcript holds the
-    // joined line; a streaming console was sent the first block already, and
-    // joins the next one's text onto it itself (console.js appendBlock,
-    // BUG-1473), so both show one line.
+    // (w2av_name_binding bd_dy_cont `[ab]`, bd_dy_contc `[a b]`: in a loop,
+    // where no command is echoed). The block says so (handleDisplay's
+    // `continue`); the text is joined onto it here. A command echo between
+    // them takes the rest of the open line, and the next display starts a new
+    // one (StataBE 19.5 do-file: `display "abc" _continue` then `display
+    // "def"` logs `abc. display "def"` then `def`, vs-stata bank
+    // 4d9f4bb6b438d82c; _dots the same, e414d76147316948). The stored
+    // transcript holds the joined line; a streaming console was sent the
+    // first block already, and joins the next one's text onto it itself
+    // (console.js appendBlock, BUG-1473), so both show one line.
     if (!truncated && b.is_object() && b.value("type", std::string()) == "display") {
       for (size_t k = out.blocks.size(); k-- > 0;) {
         ojson& prev = out.blocks[k];
         if (!prev.is_object()) break;
         const std::string pt = prev.value("type", std::string());
-        if (pt == "echo") continue;
         if (pt != "display" || !prev.value("continue", false)) break;
         prev["text"] = prev.value("text", std::string()) + b.value("text", std::string());
         if (b.value("continue", false)) {
@@ -952,11 +991,52 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
     // do-file that does not clear the table keeps byte-identical output and
     // identical stopped_at_line values.
     if (!isBraceBlock(item)) {
-      std::string progName;
-      if (program::isProgInstallSentinel(std::get<std::string>(item), &progName)) {
-        auto it = session.programArchive.find(progName);
+      std::string archiveKey;  // the definition's archive key (program.cpp captureProgams)
+      if (program::isProgInstallSentinel(std::get<std::string>(item), &archiveKey)) {
+        bool inBlock = false;
+        while (archiveKey.size() >= kInBlockMark.size() &&
+               archiveKey.compare(archiveKey.size() - kInBlockMark.size(), kInBlockMark.size(),
+                                  kInBlockMark) == 0) {
+          archiveKey.resize(archiveKey.size() - kInBlockMark.size());
+          inBlock = true;
+        }
+        auto it = session.programArchive.find(archiveKey);
+        bool hasStatement = false;  // the class marker line (program.cpp) is no statement
         if (it != session.programArchive.end()) {
-          session.programs[progName] = it->second;
+          for (const auto& l : it->second.body)
+            if (!trim(l).empty() && l.rfind("* __piet_progclass__ ", 0) != 0) hasStatement = true;
+        }
+        if (it != session.programArchive.end() && (hasStatement || !inBlock)) {
+          // A program that is already defined -- installed by an earlier
+          // definition this run reached, and not dropped since -- is r(110)
+          // "program NAME already defined", and the standing definition stays
+          // (StataBE 19.5, vs-stata bank 5e1cb648c670642e, a5eb0cd42e66d373,
+          // 0d6de5e101690276: also with an identical body). The preprocess-time
+          // registration of a later definition is not a definition the run made.
+          // A standing program with no statement does not count: `program
+          // define p` / `end` twice is taken (0ab4713a1bb36907).
+          const auto standing = session.programs.find(it->second.name);
+          bool standingHasStatement = false;
+          if (standing != session.programs.end())
+            for (const auto& l : standing->second.body)
+              if (!trim(l).empty() && l.rfind("* __piet_progclass__ ", 0) != 0)
+                standingHasStatement = true;
+          if (standing != session.programs.end() && standing->second.installed &&
+              standingHasStatement) {
+            ojson eb = eval::errorBlock("engine_error",
+                                        "program " + it->second.name + " already defined",
+                                        std::nullopt, std::nullopt, std::nullopt, "r(110)");
+            pushBlock(eb);
+            if (handleUncapturedError(eb, lineno, out)) {
+              if (progressOwner)
+                session.progressFinish("error", static_cast<int>(out.blocks.size()));
+              return out;
+            }
+            continue;
+          }
+          ProgramDef def = it->second;
+          def.installed = true;
+          session.programs[def.name] = std::move(def);
           ++session.programsEpoch;  // the table changed shape; summaries must re-derive
         }
         --lineno;

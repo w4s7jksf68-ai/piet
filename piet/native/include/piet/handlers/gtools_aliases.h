@@ -44,6 +44,9 @@ nlohmann::ordered_json runGQuantilesPctile(const eval::ParsedCommand& parsed,
 // `gstats winsor|sum` -- a multiplex, not an alias: the two sub-commands forward
 // to different native handlers and the rest are refused by name.
 nlohmann::ordered_json runGstats(const eval::ParsedCommand& parsed, SessionState& session);
+void gstatsPublishGroupResults(const eval::ParsedCommand& parsed, SessionState& session);
+void gquantilesPublishXtile(const eval::ParsedCommand& parsed, SessionState& session,
+                            const std::string& expText);
 
 }  // namespace piet::handlers
 

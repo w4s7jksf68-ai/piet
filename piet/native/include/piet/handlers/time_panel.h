@@ -32,6 +32,11 @@ struct TsDeclare {
   // relabels the panel line and displayindent() indents every line, each label
   // right-aligned to the longest; noblank and mi change nothing this build draws
   // (it draws no blank line). `display` = one was typed.
+  std::string deltaText;                // delta(# [unit]) as typed ("" = none; wins over `delta`)
+  bool noQuery = false;                 // noquery: no report, r() holds only tdelta/tsfmt/unit/names
+  bool force = false;                   // force: a step below delta() is no refusal
+  std::string panelAlias;               // panellabel(): the panel variable's name in the report
+  std::string timeAlias;                // tsvarlabel(): the time variable's name in the report
   std::string panelLabel = "Panel";
   int indent = 0;
   bool display = false;

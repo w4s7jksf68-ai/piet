@@ -680,6 +680,7 @@ std::string plotLabels(const std::vector<std::string>& plotlabels, const std::ve
 
 ojson runCoefplotJann(SessionState& session, const eval::ParsedCommand& parsed, ojson* drawRows) {
   ojson out = ojson::array();
+  bool restoredStoredModel = false;  // a stored model was read (see the end)
   // the text after the command word
   std::string args;
   {
@@ -694,6 +695,22 @@ ojson runCoefplotJann(SessionState& session, const eval::ParsedCommand& parsed, 
   std::string globalText;
   parseSubgraphs(args, &subgrTexts, &globalText);
   const OptMap G = optMapOf(globalText);
+
+  // The options coefplot does not own go to the twoway call as global options, where
+  // the plot-level ones are r(198) "not allowed" (StataBE 19.5, vs-stata bank cells
+  // for coefplot barwidth/base(0)/dropline/mz/range/xcommon/ycommon) and `by()` is
+  // r(191). `base` bare is coefplot's own (baselevels), so only `base(...)` is refused.
+  for (const Opt& o : G.twoway) {
+    if (o.name == "by" && o.hasArg) {
+      out.push_back(refuseCp("option by() not allowed", 191));
+      return out;
+    }
+    static const std::set<std::string> kPlotLevel = {"dropline", "mz", "xcommon", "ycommon"};
+    if (kPlotLevel.count(o.name) != 0) {
+      out.push_back(refuseCp("option " + o.name + (o.hasArg ? "()" : "") + " not allowed", 198));
+      return out;
+    }
+  }
 
   // global-only options
   const bool horizontalOpt = G.has("horizontal"), verticalOpt = G.has("vertical");
@@ -766,6 +783,45 @@ ojson runCoefplotJann(SessionState& session, const eval::ParsedCommand& parsed, 
     subgrs.push_back(std::move(sg));
   }
   const int nSubgr = static_cast<int>(subgrs.size());
+
+  // barwidth(), base(#) and range() are owned by some plot types and refused by the rest
+  // (vs-stata bank: `coefplot, barwidth(2)` / `base(0)` are r(198) "not allowed", the
+  // points being a scatter). Each plot is drawn as the type recast() names -- its own
+  // recast() first, else the global one -- so `recast(bar) barwidth(0.3)` is fine.
+  // The option word may be abbreviated (barw.., ran..); `base` bare is coefplot's own.
+  {
+    const auto canonical = [](const Opt& o) -> std::string {
+      const auto isAbbrev = [&](const char* full, size_t minLen) {
+        const std::string f(full);
+        return o.name.size() >= minLen && o.name.size() <= f.size() && f.compare(0, o.name.size(), o.name) == 0;
+      };
+      if (isAbbrev("barwidth", 4)) return "barwidth";
+      if (isAbbrev("range", 3)) return "range";
+      if (o.hasArg && o.name == "base") return "base";
+      return std::string();
+    };
+    std::string globalType = "scatter";
+    if (const Opt* r = G.get("recast")) {
+      if (r->hasArg && !strutil::trim(r->arg).empty()) globalType = strutil::trim(r->arg);
+    }
+    for (const auto& sg : subgrs) {
+      for (const auto& plot : sg.plots) {
+        std::string type = globalType;
+        if (const Opt* r = plot.opts.get("recast")) {
+          if (r->hasArg && !strutil::trim(r->arg).empty()) type = strutil::trim(r->arg);
+        }
+        const size_t sp = type.find_first_of(" \t");
+        if (sp != std::string::npos) type.resize(sp);
+        for (const Opt& o : G.twoway) {
+          const std::string key = canonical(o);
+          if (!key.empty() && plotTypeRefusesOption(type, key)) {
+            out.push_back(refuseCp("option " + o.name + (o.hasArg ? "()" : "") + " not allowed", 198));
+            return out;
+          }
+        }
+      }
+    }
+  }
 
   // plot numbering (recycle: restart per subgraph)
   std::vector<std::vector<int>> plotIdx(subgrs.size());
@@ -917,6 +973,7 @@ ojson runCoefplotJann(SessionState& session, const eval::ParsedCommand& parsed, 
             ScopedStored guard(session.eval, *it->second);
             src = readLiveE(session);
             readAtRecord();
+            restoredStoredModel = true;
           }
         } else {
           const MatSpec mspec = parseMatSpec(ms.matrix);
@@ -946,6 +1003,11 @@ ojson runCoefplotJann(SessionState& session, const eval::ParsedCommand& parsed, 
           std::istringstream ls(ch.arg("levels"));
           std::string l;
           while (ls >> l) {
+            // levels() is a numlist: a word that is none (bank: `coefplot, le(off)`) is r(121)
+            if (l.find_first_not_of("0123456789.+-eE/()") != std::string::npos) {
+              out.push_back(refuseCp("levels() invalid -- invalid numlist", 121));
+              return out;
+            }
             levels.push_back(std::atof(l.c_str()));
             cinames.push_back("");
           }
@@ -1004,6 +1066,11 @@ ojson runCoefplotJann(SessionState& session, const eval::ParsedCommand& parsed, 
             std::string w;
             while (ts >> w) words.push_back(w);
             if (words.size() == 1) {
+              // a matrix name: `recast(rcap)` is no name (bank: `coefplot, ci(recast(rcap))` r(198))
+              if (cname.find_first_of("()") != std::string::npos) {
+                out.push_back(refuseCp("(" + ms.name + ": invalid syntax in ci())", 198));
+                return out;
+              }
               llul = {cname + "[1]", cname + "[2]"};
             } else if (cname.find('[') == std::string::npos) {
               if (words.size() != 2) {
@@ -1562,6 +1629,55 @@ ojson runCoefplotJann(SessionState& session, const eval::ParsedCommand& parsed, 
 
   // ---- mlabel expressions (:467-481) and mlbl width ----
   const size_t R = C.size();
+  // `replace mlbl = exp if plot==i` fails when exp names something that is no variable
+  // (bank: `coefplot, ml(red)`, `mla(inside)`, `ml(thick)` r(198) "invalid expression in
+  // mlabel()"); a name that is a variable of the data, a function call, a literal or an @name
+  // is read as an expression. Only an unknown bare name is refused here.
+  // (When mlabel() is typed more than once -- `mlabel(rep78) ml(red)` -- StataBE reads the abbreviated
+  // one as another m-label option and runs at rc 0, so the check is made only for a single one.)
+  int mlabelTyped = 0;
+  {
+    static const std::regex reMl(R"((^|[\s,])ml(a|ab|abe|abel)?\s*\()", std::regex::icase);
+    for (std::sregex_iterator it(parsed.raw.begin(), parsed.raw.end(), reMl), end; it != end; ++it) ++mlabelTyped;
+  }
+  for (int i = 1; i <= Nplots && mlabelTyped <= 1; ++i) {
+    const std::string& ml = mlabelPlot[static_cast<size_t>(i)];
+    if (ml.empty() || ml == "@b") continue;
+    Datastore* dsM = session.datastore();
+    bool unknownName = false;
+    char quote = 0;
+    for (size_t p = 0; p < ml.size() && !unknownName; ++p) {
+      const char ch = ml[p];
+      if (quote != 0) {
+        if (ch == quote) quote = 0;
+        continue;
+      }
+      if (ch == '"') {
+        quote = ch;
+        continue;
+      }
+      if (ch == '@') {
+        while (p + 1 < ml.size() && (std::isalnum(static_cast<unsigned char>(ml[p + 1])) || ml[p + 1] == '_')) ++p;
+        continue;
+      }
+      if (!(std::isalpha(static_cast<unsigned char>(ch)) || ch == '_')) continue;
+      if (p > 0 && (std::isdigit(static_cast<unsigned char>(ml[p - 1])) || ml[p - 1] == '.')) continue;
+      size_t q = p;
+      while (q < ml.size() && (std::isalnum(static_cast<unsigned char>(ml[q])) || ml[q] == '_')) ++q;
+      const std::string nm = ml.substr(p, q - p);
+      size_t nx = q;
+      while (nx < ml.size() && std::isspace(static_cast<unsigned char>(ml[nx]))) ++nx;
+      const bool isCall = nx < ml.size() && ml[nx] == '(';
+      p = q - 1;
+      if (isCall || nm == "_n" || nm == "_N" || nm == "_pi") continue;
+      if (dsM != nullptr && dsM->has(nm)) continue;
+      unknownName = true;
+    }
+    if (unknownName) {
+      out.push_back(refuseCp("invalid expression in mlabel()", 198));
+      return out;
+    }
+  }
   // ---- legend (:526-650) ----
   std::string legendlbls, legendorder;
   {
@@ -1816,6 +1932,15 @@ ojson runCoefplotJann(SessionState& session, const eval::ParsedCommand& parsed, 
       drawRows->push_back(e);
     }
   }
+  // coefplot.ado restores each stored model it plots while its `preserve` is in
+  // force and hands the held results back after the data return: their e(sample)
+  // marker is not on the restored data, so e(sample) reads 0 afterwards (bank
+  // b012181d `coefplot m1 m2`, fb572094 `coefplot m1 || m2, bylabel()`: rc 0,
+  // `count if e(sample)` 0). A plot of the active results alone (`coefplot, ...`)
+  // keeps it (74 in every such cell), as does a refused call (by(): r(191), 74).
+  if (restoredStoredModel && session.lastModel().has_value())
+    session.setLastModelEsample(LastModel::EsampleState::kNone, 0, std::string(),
+                                session.lastModel()->dataPath);
   return out;
 }
 

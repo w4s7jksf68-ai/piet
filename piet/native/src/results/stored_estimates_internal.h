@@ -25,6 +25,14 @@ ojson engineErrorBlockEt(const std::string& message, const std::string& code = "
 ojson estNamelistError(const SessionState::EstNamelist& ex);
 ojson makeSnapshot(const ojson& estBlock);
 ojson escalarsFrom(const ojson& estBlock);
+// The live e() scalar store's numeric entries added to `esc` where it has no
+// value of that name: the scalars a fit posts to the store only (regress's
+// e(ll), e(ll_0), e(rank), e(sum_w)) stay readable from a stored model
+// (estout stats(), aic/bic). Only for the e() of the block being stored.
+void mergeLiveEScalars(ojson& esc, const SessionState& session);
+// The live e() macros (name -> text; an empty one is not posted), as `: e(macros)`
+// names them: what estout's stats() reads for a string statistic (`stats(vce)`).
+ojson emacrosFrom(const SessionState& session);
 ojson emptyAddedBag();
 
 }  // namespace stored_estimates_detail

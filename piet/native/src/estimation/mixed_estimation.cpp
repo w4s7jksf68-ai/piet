@@ -26,6 +26,7 @@
 #include "estimation_internal.h"
 
 #include "estimation_families_internal.h"
+#include "extended_estimation_internal.h"  // stataRefusalM4b
 #include "estimation_options.h"
 
 namespace piet::handlers {
@@ -87,6 +88,21 @@ ojson runMixed(const eval::ParsedCommand& parsed, SessionState& session) {
   pushLevelIfGivenM4(parsed, b.argv);
   ojson raw;
   ojson block = runP7Mle("mixed", b.argv, session, &raw);
+  // vce(cluster v) with groups that span clusters: Stata's r(459) "highest-level
+  // groups are not nested within v" (vs-stata bank 19022fb0 `mixed wage tenure
+  // ttl_exp || industry:, vce(cluster occupation)`); the engine refused it at rc 1.
+  if (block.is_object() && block.value("type", std::string()) == "error") {
+    const std::string msg = block.value("message", std::string());
+    const size_t a = msg.find("mixed: --cluster '");
+    if (a != std::string::npos && msg.find("is not coarser than --group") != std::string::npos) {
+      const size_t s0 = a + std::string("mixed: --cluster '").size();
+      const size_t s1 = msg.find('\'', s0);
+      if (s1 != std::string::npos)
+        return extended_fit_detail::stataRefusalM4b("highest-level groups are not nested within " +
+                                   msg.substr(s0, s1 - s0),
+                               459);
+    }
+  }
   // The random-effects stanza (var(_cons), var(Residual)) is a table Stata always
   // prints below the coefficients; like the ordered models' cutpoints it is not a
   // slope, so the mapper does not carry it and it is appended from the raw

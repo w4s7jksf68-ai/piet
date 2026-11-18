@@ -250,19 +250,6 @@ struct CallerVersionScope {
 };
 
 
-// BUG-1447: describe's r(k) and r(width) are the dataset's, whatever varlist was
-// described (StataBE 19.5: `describe x1 c` on eight variables posts r(k) 8 and the
-// full r(width) 36). r(width) is one observation's storage in bytes: byte 1, int 2,
-// long and float 4, double and strL 8, str# its # (22 for float float byte double
-// str5; 36 with an int, a long and a strL added). The types are the ones describe
-// prints (the recorded storage type, else describe's default); a string whose width
-// was never recorded ("str#") leaves the width unknown, and r(width) refused by name.
-// Read off the resident card when it is current, as runDescribe reads it.
-struct DescribeShape {
-  size_t k = 0;
-  std::optional<double> width;
-};
-
 struct RcHiddenScope {
   RcHiddenScope() { ++tl_rcHiddenDepth; }
   ~RcHiddenScope() { --tl_rcHiddenDepth; }
@@ -277,6 +264,7 @@ struct RcHiddenScope {
 // would leave `eststo m1, bogus: regress y x` accepted-and-ignored.
 struct EststoStoreOpts {
   std::optional<std::string> title;
+  std::optional<std::string> addscalars;  // eststo's addscalars(name exp ... [, replace])
   std::string autoPrefix = "est";  // estout's default; w2_eststo_prefix.log A2/A11
 };
 

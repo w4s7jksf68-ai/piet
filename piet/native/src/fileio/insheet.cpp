@@ -56,7 +56,10 @@ namespace {
 const piet::eval::OptVocab& kVocabInsheet = piet::eval::registerOptVocab(
     {"insheet"}, {{"clear", "names", "nonames", "comma", "tab", "delimiter", "delim", "case",
                    "double", "nodouble"},
-                  {}});
+                  {},
+                  // one-letter spellings Stata resolves by its syntax line's order
+                  // (bank _optabbr/insheet: n -> names, c -> comma, d -> double)
+                  {{"n", "names"}, {"c", "comma"}, {"d", "double"}}});
 
 }  // namespace
 
@@ -76,6 +79,19 @@ using namespace file_command_detail;
 // label) and the storage types import delimited uses (w2ar log:3526-3690).
 
 ojson runInsheet(const eval::ParsedCommand& parsed, SessionState& session) {
+  // Data in memory without `clear` is r(18) before the options are read
+  // (StataBE 19.5: `insheet , zzabbrprobe` and `insheet using data.csv, c` are
+  // both r(18) over a loaded dataset); the full rule, with the clearing, stays
+  // below once the line is known to be valid.
+  if (!hasFlag(parsed.opts, "clear") && session.hasData()) {
+    Datastore* ds = nullptr;
+    try {
+      ds = session.datastore();
+    } catch (const std::exception&) {
+      ds = nullptr;
+    }
+    if (ds != nullptr && ds->nCols() > 0) return ioErrorRc("you must start with an empty dataset", 18);
+  }
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabInsheet.known,
                                             kVocabInsheet.unimplemented)) {
     return ojson(*err);
@@ -83,6 +99,31 @@ ojson runInsheet(const eval::ParsedCommand& parsed, SessionState& session) {
   if (hasFlag(parsed.opts, "double") && hasFlag(parsed.opts, "nodouble"))
     return ioSyntax("options double and nodouble may not be combined");
 
+  // insheet's syntax: `[newvarlist] using filename`, and `comma` with `tab` is
+  // r(198) "both tab and comma not allowed" (vs-stata bank bbfadcf3d4970004).
+  // Without `using` every word is a new variable name: `insheet data.csv,
+  // clear` is r(198) "data.csv invalid name" (ecf4315e29ded686), names alone
+  // r(100) "using required".
+  // A flag option given an argument is r(198) "option X() incorrectly specified"
+  // (bank fefdcc883203573b: `d(";")` is double with an argument).
+  for (const auto& [key, value] : parsed.opts) {
+    static const std::set<std::string> kFlags = {"clear", "names", "nonames", "comma", "tab",
+                                                 "case", "double", "nodouble"};
+    if (kFlags.count(key) && !value.isBool)
+      return ioErrorRc("option " + key + "() incorrectly specified", 198);
+  }
+  if (hasFlag(parsed.opts, "comma") && hasFlag(parsed.opts, "tab"))
+    return ioErrorRc("both tab and comma not allowed", 198);
+  {
+    const std::vector<std::string> words = quoteAwareWords(preCommaArgs(parsed.raw));
+    bool sawUsing = false;
+    for (const auto& w : words) sawUsing = sawUsing || lowerOf(w) == "using";
+    if (!sawUsing) {
+      for (const auto& w : words)
+        if (!strutil::isValidStataIdentifier(w)) return ioErrorRc(w + " invalid name", 198);
+      return ioErrorRc("using required", 100);
+    }
+  }
   std::vector<std::string> varlist;
   std::string pathArg;
   if (!splitUsing(quoteAwareWords(preCommaArgs(parsed.raw)), &varlist, &pathArg)) {
@@ -150,9 +191,12 @@ ojson runInsheet(const eval::ParsedCommand& parsed, SessionState& session) {
 
   // -- the header: `names`/`nonames`, a varlist (implies nonames), else
   // Stata's automatic rule: a first row whose every field is a number is data.
+  // A varlist names the variables; the header row is still found (and skipped)
+  // by the automatic rule (vs-stata bank: `insheet a b c d using data.csv` over
+  // `id,name,score,grp` and 4 rows is 4 observations).
   const bool wantNames = hasFlag(parsed.opts, "names");
-  const bool wantNoNames = hasFlag(parsed.opts, "nonames") || !varlist.empty();
-  if (wantNames && wantNoNames && varlist.empty()) {
+  const bool wantNoNames = hasFlag(parsed.opts, "nonames");
+  if (wantNames && wantNoNames) {
     return ioSyntax("insheet: `names` and `nonames` cannot both be given");
   }
   bool header = true;
@@ -167,7 +211,7 @@ ojson runInsheet(const eval::ParsedCommand& parsed, SessionState& session) {
         break;
       }
     }
-    header = !allNumeric;
+    header = !allNumeric && delimited::firstRecordNamesColumns(rows.fields);
   }
 
   const size_t first = header ? 1 : 0;
@@ -186,10 +230,16 @@ ojson runInsheet(const eval::ParsedCommand& parsed, SessionState& session) {
   delimited::NameResult nr = delimited::legalNames(
       headerCells, hasFlag(parsed.opts, "case") ? delimited::Case::kPreserve : delimited::Case::kLower,
       delimited::Fallback::kLowestFree);
-  if (!header) {
+  if (!header || !varlist.empty()) {
     for (auto& l : nr.labels) l.clear();
   }
   if (varlist.size() > k) return ioErrorRc("too many variables specified", 103);
+  // Fewer names than the file has columns: r(102) (bank 79368ddb0d470264, whose
+  // file of six lines reports "error in line 6").
+  if (!varlist.empty() && varlist.size() < k)
+    return ioErrorRc("too few variables specified\nerror in line " +
+                         std::to_string(rows.fields.size()) + " of file",
+                     102);
   for (size_t i = 0; i < varlist.size(); ++i) nr.names[i] = varlist[i];
 
   delimited::Table table;

@@ -9,6 +9,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -121,6 +122,25 @@ void ensureAdopath(SessionState& session) {
     auto it = session.sysdir.find(key);
     if (it != session.sysdir.end() && !it->second.empty()) session.adopath.push_back(it->second);
   }
+}
+
+// r(builtin) after a listing: 1 when the LAST entry listed is one of Stata's
+// named directories (BASE, SITE, PERSONAL, PLUS, OLDPLACE), 0 when it is a
+// directory the user added (bank adopath cells: after `adopath + zzz` it is 0,
+// after the default list 1). `adopath +` and `adopath -` list the path as well,
+// so they post it too.
+void postAdopathBuiltin(SessionState& session) {
+  bool builtin = false;
+  if (!session.adopath.empty()) {
+    const std::string& last = session.adopath.back();
+    for (const char* key : {"BASE", "SITE", "PERSONAL", "PLUS", "OLDPLACE"}) {
+      auto it = session.sysdir.find(key);
+      if (it != session.sysdir.end() && !it->second.empty() && it->second == last) builtin = true;
+    }
+  }
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("builtin", builtin ? 1.0 : 0.0);
+  eval::declareRPosted(session.eval, "adopath", {"builtin"});
 }
 
 }  // namespace
@@ -360,6 +380,7 @@ nlohmann::ordered_json runAdopath(const std::string& raw, const std::vector<std:
       text += "  [" + std::to_string(i + 1) + "]  \"" + session.adopath[i] + "\"";
     }
     if (text.empty()) text = "  (adopath is empty)";
+    postAdopathBuiltin(session);
     return displayBlock(text);
   }
 
@@ -377,8 +398,34 @@ nlohmann::ordered_json runAdopath(const std::string& raw, const std::vector<std:
   pathArg = dequote(pathArg);
   if (pathArg.empty()) return errBlock("adopath " + op + ": path required", "syntax_error");
 
-  const std::string resolved = resolveUserPath(session, pathArg);
   auto& list = session.adopath;
+  // `adopath - #` removes the #th entry of the path; a number outside 1..n is
+  // r(111) "no #th element in current adopath" (adopath's own rule for a number).
+  if (op == "-") {
+    char* endp = nullptr;
+    const double num = std::strtod(pathArg.c_str(), &endp);
+    if (endp != pathArg.c_str() && *endp == '\0') {
+      if (num < 1 || num > static_cast<double>(list.size()))
+        return errBlockRc("no " + pathArg + "th element in current adopath", "r(111)");
+      list.erase(list.begin() + (static_cast<long>(num) - 1));
+      postAdopathBuiltin(session);
+      return displayBlock("(adopath - " + pathArg + ": recorded for findfile and ado autoload)");
+    }
+  }
+  // The list holds Stata's entries in PIET's form: a codeword (BASE, SITE,
+  // PERSONAL, PLUS, OLDPLACE) as the directory it names and the current
+  // directory as a literal ".". Those spellings, typed as Stata keeps them,
+  // name the entry they stand for; any other text is a directory and is
+  // resolved against the working directory.
+  std::string resolved;
+  if (pathArg == ".") {
+    resolved = ".";
+  } else if (isSysdirName(pathArg) && pathArg != "STATA" && session.sysdir.count(pathArg) &&
+             !session.sysdir[pathArg].empty()) {
+    resolved = session.sysdir[pathArg];
+  } else {
+    resolved = resolveUserPath(session, pathArg);
+  }
   auto found = std::find(list.begin(), list.end(), resolved);
   if (op == "+") {
     // Appending a path already on the list would give findfile two chances to
@@ -388,8 +435,12 @@ nlohmann::ordered_json runAdopath(const std::string& raw, const std::vector<std:
     if (found != list.end()) list.erase(found);
     list.insert(list.begin(), resolved);
   } else {
-    list.erase(std::remove(list.begin(), list.end(), resolved), list.end());
+    // `adopath - X` for an X not on the path: r(111) (bank 24dc413e8c376b62).
+    if (found == list.end())
+      return errBlockRc("\"" + pathArg + "\" not found in adopath", "r(111)");
+    list.erase(found);  // the first match only, as Stata's `adopath - #` of its position
   }
+  postAdopathBuiltin(session);
   // The note names the path AS WRITTEN; the list holds the RESOLVED one. A note
   // that echoed the resolution would bake the capture machine's cwd into every
   // golden that pins it (`adopath + "ado"` prints /mnt/.../ado on one
@@ -433,9 +484,10 @@ nlohmann::ordered_json runSysdir(const std::string& raw, const std::vector<std::
   if (toks.size() < 2) return errBlock("sysdir set: directory name required", "syntax_error");
   const std::string name = upper(dequote(toks[1]));
   if (!isSysdirName(name)) {
-    return errBlock("sysdir set: unknown directory name `" + dequote(toks[1]) +
-                    "' (STATA BASE SITE PLUS PERSONAL OLDPLACE)",
-                    "syntax_error");
+    // StataBE 19.5: r(111) "ZZZ not found" (vs-stata bank `sysdir set ZZZ "x"`).
+    return nlohmann::ordered_json(eval::errorBlock("engine_error", dequote(toks[1]) + " not found",
+                                                   std::nullopt, std::nullopt, std::nullopt,
+                                                   "r(111)"));
   }
   // Taken off the RAW text, not from toks[2]: the path is routinely quoted and
   // contains spaces, and rebuilding it from tokens would lose them.

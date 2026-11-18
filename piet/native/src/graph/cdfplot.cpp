@@ -40,10 +40,10 @@
 
 namespace {
 
-// cdfplot. `normal`/`exponential` overlay a fitted reference CDF and `xlog` is
-// a log x scale; all three are real plot content this build does not draw, and
-// drawing the plot without them is answering a different question, so they are
-// refused rather than ignored.
+// cdfplot. `normal` overlays the normal CDF of the group's own mean and sd (`nocdf` drops the
+// empirical CDF, `samesd` pools the sd over the by() groups) and `xlog` orders and standardises
+// on log(x); all four are drawn. `exponential` is not an option of cdfplot.ado 1.04: Stata
+// hands it on to twoway, so it stays a refusal here.
 // cdfplot.ado 1.04 hands every option it does not own to its `twoway ...,
 // `goptions'`, so the graph-level twoway options PIET's twoway takes are known
 // here too (StataBE 19.5, BUG-1521: `cdfplot x, nodraw`, xlabel(), scheme(),
@@ -58,9 +58,16 @@ const piet::eval::OptVocab& kVocabCdfplot = piet::eval::registerOptVocab(
                    "ymlabel", "tmlabel", "xtick", "ytick", "ttick", "xmtick", "ymtick", "xscale",
                    "yscale", "tscale", "xline", "yline", "tline", "scheme", "graphregion",
                    "plotregion", "xsize", "ysize", "fxsize", "fysize", "aspectratio", "scale", "text",
-                   "ttext"},
-                  {"normal", "exponential", "xlog"},
-                  {{"xti", "xtitle"}, {"yti", "ytitle"}, {"xlabels", "xlabel"}, {"ylabels", "ylabel"}}});
+                   "ttext", "normal", "nocdf", "samesd", "xlog"},
+                  {"exponential"},
+                  // cdfplot.ado declares NORMal and SAMEsd; every other short key is twoway's
+                  // GLOBAL option table (the ladder of the bank: `t(`, `tt(`, `tti(`, `xl(`, `yl(`,
+                  // `xt(`, `yt(`, `l(`, `p(` all run at rc 0).
+                  {{"xti", "xtitle"}, {"yti", "ytitle"}, {"xlabels", "xlabel"}, {"ylabels", "ylabel"},
+                   {"norm", "normal"}, {"norma", "normal"}, {"same", "samesd"}, {"sames", "samesd"},
+                   {"t", "title"}, {"tl", "tlabel"}, {"tt", "ttitle"}, {"tti", "ttitle"},
+                   {"xl", "xlabel"}, {"yl", "ylabel"}, {"xt", "xtitle"}, {"yt", "ytitle"},
+                   {"l", "legend"}, {"p", "plotregion"}}});
 
 }  // namespace
 
@@ -119,6 +126,27 @@ std::vector<std::pair<double, double>> ecdfPoints(const std::vector<double>& xs)
   return pts;
 }
 
+// One group's points: x as plotted, y = rank/N over the values `sortv` orders by (`sortv`
+// equals `xs` except under xlog, where cdfplot.ado sorts and standardises log(x) but plots x).
+// A missing sort value drops the row. The normal-overlay points use the same order.
+struct CdfGroup {
+  std::vector<double> xs;     // x as plotted
+  std::vector<double> sortv;  // ordering value (log(x) under xlog)
+  std::vector<double> w;      // weight of each row (1 without a weight)
+};
+
+std::vector<size_t> cdfOrder(const CdfGroup& g) {
+  std::vector<size_t> order;
+  order.reserve(g.xs.size());
+  for (size_t i = 0; i < g.xs.size(); ++i)
+    if (!std::isnan(g.xs[i]) && !std::isnan(g.sortv[i]) && !std::isnan(g.w[i])) order.push_back(i);
+  std::stable_sort(order.begin(), order.end(),
+                   [&](size_t a, size_t b) { return g.sortv[a] < g.sortv[b]; });
+  return order;
+}
+
+double normalCdfAt(double z) { return 0.5 * std::erfc(-z / std::sqrt(2.0)); }
+
 // The empty option list every layer built in this file styles itself against:
 // `twoway::layerStyle` picks the palette colour for the layer index when no
 // colour option is present, which is exactly what a cdfplot series wants.
@@ -145,18 +173,43 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabCdfplot.known,
                                             kVocabCdfplot.unimplemented))
     return ojson(*err);
+  // cdfplot.ado takes all four weight types and weights each row's step by the weight
+  // expression; a plain variable is read here, a computed expression is not.
+  std::string weightName;
+  bool weightIsFreq = true;  // no weight, or fweight: the sd divides by (sum of w - 1)
   if (parsed.weightType.has_value() && !parsed.weightType->empty()) {
-    return ojson(eval::unsupportedOption(
-        *parsed.weightType + "=" + parsed.weightVar.value_or(""),
-        "`cdfplot` plots an unweighted empirical CDF in this build; a weighted ECDF is a "
-        "different estimator, not a reweighting of this one."));
+    weightName = trimOf(parsed.weightVar.value_or(""));
+    bool plain = !weightName.empty() && (std::isalpha(static_cast<unsigned char>(weightName[0])) || weightName[0] == '_');
+    for (char c : weightName)
+      if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') plain = false;
+    if (!plain) {
+      return ojson(eval::unsupportedOption(
+          *parsed.weightType + "=" + parsed.weightVar.value_or(""),
+          "`cdfplot` reads a weight that is a single variable in this build; a computed weight "
+          "expression is not evaluated."));
+    }
+    const std::string wt = lowerOf(*parsed.weightType);
+    weightIsFreq = (wt == "fw" || wt == "fweight");
   }
   if (!session.hasData()) return ojson(eval::noDataLoaded());
   if (parsed.varlist.size() != 1)
     return gxSyntax(kCmd + ": syntax is `cdfplot varname [if] [in] [, by(groupvar)]` — one "
                            "variable.");
-  const std::string var = trimOf(dequote(trimOf(parsed.varlist[0])));
+  std::string var = trimOf(dequote(trimOf(parsed.varlist[0])));
+  if (Datastore* dsAbbr = session.datastore()) var = unabbreviateGraphVar(session, *dsAbbr, var);
   const std::optional<std::string> byVar = optStr(parsed.opts, "by");
+  auto flag = [&](const char* k) {
+    for (const auto& kv : parsed.opts)
+      if (kv.first == k && (!kv.second.isBool || kv.second.boolValue)) return true;
+    return false;
+  };
+  const bool wantNormal = flag("normal");
+  const bool wantNocdf = flag("nocdf");
+  const bool wantSamesd = flag("samesd");
+  const bool wantXlog = flag("xlog");
+  // cdfplot.ado: nocdf is only for the normal overlay (WARNING, exit 198)
+  if (wantNocdf && !wantNormal)
+    return gxSyntax(kCmd + ": the nocdf option can only be used when the normal option is specified");
 
   // `if`/`in`: the ECDF is computed over the SELECTED sample, which is exactly
   // what the shared filter returns -- no row-alignment problem here, so this
@@ -192,6 +245,7 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
 
   std::vector<std::string> wanted = {var};
   if (byVar.has_value() && !byVar->empty()) wanted.push_back(*byVar);
+  if (!weightName.empty()) wanted.push_back(weightName);
   // The filtered frame is a real file with the selected rows already in it, so
   // the §38 projection is only worth asking for on the unfiltered path.
   std::unique_ptr<Datastore> owned;
@@ -218,10 +272,38 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
     return gxError(kCmd + ": `" + var + "' is a string variable; an ECDF needs a numeric "
                                         "variable.");
   const std::vector<double> x = columnAsDoubles(*ds, var);
+  std::vector<double> wcol(x.size(), 1.0);
+  if (!weightName.empty()) {
+    if (!ds->has(weightName)) return gxError("variable " + weightName + " not found");
+    if (ds->dtype(weightName) == "factor")
+      return ojson(eval::errorBlock("engine_error", "type mismatch", std::nullopt, std::nullopt,
+                                    std::nullopt, "r(109)"));
+    wcol = columnAsDoubles(*ds, weightName);
+  }
+  // cdfplot.ado reduces the data to the selected, non-missing rows and then applies the `in`
+  // range AGAIN to what is left; a range that reaches past the remaining rows is
+  // r(198) "observation numbers out of range" (bank: `cdfplot price if mpg>20 in 1/40`).
+  if (parsed.inRange.has_value() && !parsed.inRange->empty()) {
+    int64_t kept = 0;
+    for (size_t i = 0; i < x.size(); ++i)
+      if (!std::isnan(x[i]) && !std::isnan(wcol[i])) ++kept;
+    const std::string r = *parsed.inRange;
+    int64_t hi = -1;
+    {
+      size_t slash = r.find('/');
+      std::string tail = slash == std::string::npos ? r : r.substr(slash + 1);
+      std::string digits;
+      for (char c : tail)
+        if (std::isdigit(static_cast<unsigned char>(c))) digits += c;
+      if (!digits.empty() && tail.find_first_not_of(" \t0123456789") == std::string::npos) hi = std::stoll(digits);
+    }
+    if (hi > kept) return gxSyntax("observation numbers out of range");
+  }
 
   // Group the rows. Without by(), one group holding everything.
-  std::vector<std::string> groupLabels;
-  std::vector<std::vector<double>> groupValues;
+  std::vector<std::string> groupLabels, groupLevels;
+  std::vector<CdfGroup> groups;
+  auto sortOf = [&](double v) { return wantXlog ? (v > 0 ? std::log(v) : std::nan("")) : v; };
   if (byVar.has_value() && !byVar->empty()) {
     if (!ds->has(*byVar)) return gxError("variable " + *byVar + " not found");
     const bool byFactor = ds->dtype(*byVar) == "factor";
@@ -232,30 +314,84 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
     std::vector<size_t> keys;
     keys.reserve(x.size());
     for (size_t i = 0; i < x.size(); ++i) {
-      if (gText[i].empty()) continue;  // missing group: excluded, like Stata's by()
+      // cdfplot.ado drops rows with a missing x or weight first; a row whose by value is
+      // missing is then a group of its own (Stata's by:), with no level name (see below)
+      if (std::isnan(x[i]) || std::isnan(wcol[i])) continue;
       keys.push_back(i);
     }
+    auto byMissing = [&](size_t i) { return byFactor ? gText[i].empty() : std::isnan(gNum[i]); };
     std::stable_sort(keys.begin(), keys.end(), [&](size_t a, size_t b) {
+      const bool ma = byMissing(a), mb = byMissing(b);
+      if (ma != mb) return mb;  // missing sorts last
+      if (ma) return false;
       if (byFactor) return gText[a] < gText[b];
       return gNum[a] < gNum[b];
     });
     for (size_t pos = 0; pos < keys.size();) {
       size_t end = pos;
       while (end + 1 < keys.size() &&
-             (byFactor ? (gText[keys[end + 1]] == gText[keys[pos]])
-                       : (gNum[keys[end + 1]] == gNum[keys[pos]])))
+             (byMissing(keys[end + 1]) && byMissing(keys[pos])
+                  ? true
+                  : (byFactor ? (gText[keys[end + 1]] == gText[keys[pos]])
+                              : (gNum[keys[end + 1]] == gNum[keys[pos]]))))
         ++end;
-      std::vector<double> vals;
-      vals.reserve(end - pos + 1);
-      for (size_t q = pos; q <= end; ++q) vals.push_back(x[keys[q]]);
-      groupLabels.push_back(*byVar + "=" +
-                            (byFactor ? gText[keys[pos]] : levelText(gNum[keys[pos]])));
-      groupValues.push_back(std::move(vals));
+      CdfGroup grp;
+      grp.xs.reserve(end - pos + 1);
+      for (size_t q = pos; q <= end; ++q) {
+        grp.xs.push_back(x[keys[q]]);
+        grp.sortv.push_back(sortOf(x[keys[q]]));
+        grp.w.push_back(wcol[keys[q]]);
+      }
+      const bool missingGroup = byMissing(keys[pos]);
+      // levelsof leaves the missing value out, so the ado looks up the label of an empty
+      // level: with a value label on the by variable that is `invalid syntax` (r(198)).
+      if (missingGroup && !byFactor && session.valueLabels.count(*byVar) != 0 &&
+          !session.valueLabels.at(*byVar).empty())
+        return gxSyntax("invalid syntax");
+      const std::string lev = missingGroup ? std::string() : (byFactor ? gText[keys[pos]] : levelText(gNum[keys[pos]]));
+      groupLabels.push_back(*byVar + "=" + (missingGroup ? std::string(".") : lev));
+      groupLevels.push_back(lev);
+      groups.push_back(std::move(grp));
       pos = end + 1;
     }
   } else {
-    groupValues.push_back(x);
+    CdfGroup grp;
+    grp.xs = x;
+    grp.w = wcol;
+    for (double v : x) grp.sortv.push_back(sortOf(v));
+    groups.push_back(std::move(grp));
     groupLabels.push_back(var);
+  }
+  const bool byGroups = byVar.has_value() && !byVar->empty();
+
+  // The normal overlay: each group's values standardised by its own mean and sd (n - 1), or
+  // by the pooled within-group sd (samesd: sum of squares over n minus the number of groups).
+  std::vector<double> groupMean(groups.size(), 0.0), groupSd(groups.size(), std::nan(""));
+  if (wantNormal) {
+    double pooledSs = 0.0, pooledW = 0.0, groupCount = 0.0;
+    for (size_t g = 0; g < groups.size(); ++g) {
+      const auto order = cdfOrder(groups[g]);
+      if (order.empty()) continue;
+      double sw = 0.0, swy = 0.0;
+      for (size_t i : order) {
+        sw += groups[g].w[i];
+        swy += groups[g].w[i] * groups[g].sortv[i];
+      }
+      groupMean[g] = swy / sw;
+      double ss = 0.0;
+      for (size_t i : order) {
+        const double d = groups[g].sortv[i] - groupMean[g];
+        ss += groups[g].w[i] * d * d;
+      }
+      pooledSs += ss;
+      pooledW += sw;
+      groupCount += 1.0;
+      groupSd[g] = std::sqrt(ss / (weightIsFreq ? sw - 1.0 : sw));
+    }
+    if (wantSamesd && byGroups) {
+      const double sd = std::sqrt(pooledSs / (weightIsFreq ? pooledW - groupCount : pooledW));
+      for (size_t g = 0; g < groups.size(); ++g) groupSd[g] = sd;
+    }
   }
 
   ojson layers = ojson::array();
@@ -264,26 +400,51 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
   double xMin = std::numeric_limits<double>::infinity();
   double xMax = -std::numeric_limits<double>::infinity();
   int64_t nObs = 0;
-  for (size_t g = 0; g < groupValues.size(); ++g) {
-    const std::vector<std::pair<double, double>> pts = ecdfPoints(groupValues[g]);
-    if (pts.empty()) continue;  // a group with nothing non-missing draws nothing
-    ojson pointsJ = ojson::array();
-    for (const auto& [px, py] : pts) {
-      pointsJ.push_back(ojson::array({px, py}));
-      xMin = std::min(xMin, px);
-      xMax = std::max(xMax, px);
-    }
+  auto addLayer = [&](const ojson& pointsJ, const std::string& key, bool inLegend) {
     ojson lyr;
     lyr["kind"] = "line";
     lyr["points"] = pointsJ;
     lyr["style"] = twoway::layerStyle(kNoLayerOpts, static_cast<int>(layers.size()), "line");
-    lyr["n"] = static_cast<int64_t>(pts.size());
-    if (byVar.has_value() && !byVar->empty()) {
-      legendOrder.push_back(ojson::array({static_cast<int64_t>(layers.size()), groupLabels[g]}));
-    }
-    keyLabels.push_back(groupLabels[g]);
+    lyr["n"] = static_cast<int64_t>(pointsJ.size());
+    if (inLegend) legendOrder.push_back(ojson::array({static_cast<int64_t>(layers.size()), key}));
+    keyLabels.push_back(key);
     layers.push_back(lyr);
-    nObs += static_cast<int64_t>(pts.size());
+    nObs += static_cast<int64_t>(pointsJ.size());
+  };
+  if (!wantNocdf) {
+    for (size_t g = 0; g < groups.size(); ++g) {
+      const auto order = cdfOrder(groups[g]);
+      if (order.empty()) continue;  // a group with nothing non-missing draws nothing
+      double wTotal = 0.0;
+      for (size_t i : order) wTotal += groups[g].w[i];
+      double wRun = 0.0;
+      ojson pointsJ = ojson::array();
+      for (size_t r = 0; r < order.size(); ++r) {
+        const double px = groups[g].xs[order[r]];
+        wRun += groups[g].w[order[r]];
+        pointsJ.push_back(ojson::array({px, wRun / wTotal}));
+        xMin = std::min(xMin, px);
+        xMax = std::max(xMax, px);
+      }
+      const std::string key = wantNormal ? (byGroups ? "c.d.f. of  " + groupLevels[g] + " " : std::string("c.d.f."))
+                                         : groupLabels[g];
+      addLayer(pointsJ, key, byGroups || wantNormal);
+    }
+  }
+  if (wantNormal) {
+    for (size_t g = 0; g < groups.size(); ++g) {
+      const auto order = cdfOrder(groups[g]);
+      if (order.empty()) continue;
+      ojson pointsJ = ojson::array();
+      for (size_t i : order) {
+        const double px = groups[g].xs[i];
+        pointsJ.push_back(ojson::array({px, normalCdfAt((groups[g].sortv[i] - groupMean[g]) / groupSd[g])}));
+        xMin = std::min(xMin, px);
+        xMax = std::max(xMax, px);
+      }
+      addLayer(pointsJ, byGroups ? "Normal c.d.f. for " + groupLevels[g] + " " : std::string("Normal c.d.f."),
+               true);
+    }
   }
   if (!std::isfinite(xMin) || !std::isfinite(xMax)) {
     xMin = 0.0;
@@ -295,6 +456,7 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
   // falls back to the variable NAME rather than printing an empty axis.
   std::string xDefault = session.eval.varLabels.get(var, std::string());
   if (xDefault.empty()) xDefault = var;
+  if (wantXlog) xDefault = "Log " + xDefault;
 
   ojson block;
   block["type"] = "graph";
@@ -342,11 +504,13 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
   block["suppressed"] = session.graphicsOff;
 
   appendBlockNote(block, "(cdfplot: drawn as a line, not a step function)");
+  (void)ecdfPoints;
   {
     // The twoway options this block does not draw (BUG-1521), named as the twoway
     // arm names its own (dispatcher.cpp graphAcceptedNotApplied).
     static const std::unordered_set<std::string> kApplied = {
-        "by", "title", "subtitle", "xtitle", "ytitle", "note", "ylabel", "legend", "name", "saving"};
+        "by", "title", "subtitle", "xtitle", "ytitle", "note", "ylabel", "legend", "name", "saving",
+        "normal", "nocdf", "samesd", "xlog"};
     std::vector<std::string> noted;
     for (const auto& kv : parsed.opts) {
       if (kApplied.count(kv.first) == 0 && std::find(noted.begin(), noted.end(), kv.first) == noted.end())

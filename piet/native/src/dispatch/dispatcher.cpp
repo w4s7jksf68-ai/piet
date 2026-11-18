@@ -60,6 +60,8 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
 
   if (interceptInputBlock(session, echo, blocks, rawCmd)) return blocks;
 
+  if (interceptDelimit(echo, blocks, rawCmd)) return blocks;
+
   if (interceptMata(session, blocks, rawCmd)) return blocks;
 
   if (interceptParallelPrefix(session, blocks, rawCmd)) return blocks;
@@ -133,7 +135,7 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
 
   if (noteConditionProfile(cmd, parsed, blocks)) return blocks;
 
-  if (resolveCommandOptions(cmd, parsed, blocks)) return blocks;
+  if (resolveCommandOptions(cmd, parsed, session, blocks)) return blocks;
 
   if (checkCommunityCommand(cmdTyped, blocks)) return blocks;
 
@@ -172,11 +174,19 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
 
   if (checkCommandArity(cmd, cmdTyped, parsed, blocks)) return blocks;
 
+  if (checkStataLead(cmd, parsed, session, blocks)) return blocks;
+
   if (route_io(cmd, cmdTyped, parsed, session, blocks)) return blocks;
-  if (route_describe(cmd, parsed, session, blocks)) return blocks;
+  if (route_describe(cmd, parsed, session, blocks)) {
+    stampStringVarlistRc(cmd, parsed, blocks);  // summarize's negative weights
+    return blocks;
+  }
   if (route_data_names(cmd, cmdTyped, parsed, session, blocks)) return blocks;
   if (route_data_generate(cmd, cmdTyped, parsed, session, blocks, conditionMask)) return blocks;
-  if (route_estimation(cmd, cmdTyped, parsed, session, blocks, rawCmd, graphLineTyped)) return blocks;
+  if (route_estimation(cmd, cmdTyped, parsed, session, blocks, rawCmd, graphLineTyped)) {
+    stampStringVarlistRc(cmd, parsed, blocks);
+    return blocks;
+  }
   if (route_time(cmd, parsed, session, blocks)) return blocks;
   if (route_session(cmd, parsed, session, blocks)) return blocks;
   if (route_environment(cmd, cmdTyped, parsed, session, blocks)) return blocks;
@@ -184,7 +194,10 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
   if (route_data_combine(cmd, parsed, session, blocks)) return blocks;
   if (route_results(cmd, cmdTyped, parsed, session, blocks, rawCmd)) return blocks;
   if (route_extensions(cmd, cmdTyped, parsed, session, blocks)) return blocks;
-  if (route_tabulation(cmd, cmdTyped, parsed, session, blocks)) return blocks;
+  if (route_tabulation(cmd, cmdTyped, parsed, session, blocks)) {
+    stampStringVarlistRc(cmd, parsed, blocks);  // mean, proportion
+    return blocks;
+  }
   if (route_postestimation(cmd, cmdTyped, parsed, session, blocks)) return blocks;
   if (route_graphics(cmd, cmdTyped, parsed, session, blocks, graphLineTyped, conditionMask)) return blocks;
   if (route_table_family(cmd, parsed, session, blocks)) return blocks;
@@ -344,6 +357,156 @@ void applyAdoResidue(SessionState& session, const ojson& result, const std::stri
   }
 }
 
+// `: e(scalars)` / `: e(macros)` / `: e(matrices)` after a command that Stata
+// runs by holding, copying or restoring the live estimates (`_estimates hold`,
+// `estimates store`'s copy, a restore): the same names come back in another
+// order, so the fit's ordered lists (SessionState::ENameContract) stop naming
+// the order of the kinds that command rewrites, and `: e(kind)` keeps its honest
+// r(111) refusal (the names stay known: eNameMembersFor). Measured on the
+// vs-stata bank (StataBE 19.5, the epilogue's `: e()` enumeration after
+// regress/logit/probit/logistic/poisson; e.g. 23c2154d fresh, b4217a2e lincom,
+// 4952b27b estimates table, e9ec33b3 estat ic, 9dfc6a55 nlcom, e825132d testnl,
+// e1bb91d4 poisson `predict, scores`, 0c2ac980 estimates restore):
+//  - scalars only (macros and matrices keep the fit's order): every `estimates`
+//    subcommand but restore -- `estimates store` itself (3dda0bc1) -- eststo,
+//    lincom, lrtest, contrast, hausman, oaxaca, boottest, coefplot,
+//    event_plot, `test ..., coef`, `predict ..., dfbeta()`, and estat ic,
+//    hettest, imtest, ovtest, vif, archlm, bgodfrey, durbinalt;
+//  - macros and matrices only: estimates restore (the restored scalars are the
+//    stored copy's), nlcom, testnl, outreg2, lassocoef, vargranger, erepost,
+//    estat esize;
+//  - all three: margins and pwcompare (the kinds it rewrites differ with the
+//    form: at() with 3 values the scalars, 2 values or over() the macros),
+//    `predict ..., score(s)` (poisson's rewrites the macros), esttab/estout,
+//    suest (Stata's live e() is then suest's own posting, 54045767) and every
+//    other estat subcommand.
+// Order is kept by predict's other statistics, test, testparm, estat
+// classification/gof/summarize/vce/dwatson/szroeter, lroc, lsens, replay and
+// ereturn display/list. A failed command is treated as a run: the bank's
+// failures mostly come after the hold (`lrtest A zzz`, `suest A zzz`), and a
+// withdrawn order only costs a refusal. Applied at every dispatch frame, so a
+// prefix command (`eststo m1: regress ...`) counts once its fit has run.
+void applyEOrderRewrite(SessionState& session, const std::string& line) {
+  if (!session.eNameContract.has_value()) return;
+  std::istringstream words(line);
+  std::string w1, w2;
+  words >> w1 >> w2;
+  auto word = [](const std::string& w) { return lower(w.substr(0, w.find_first_of(",:"))); };
+  const std::string cmd = registry::resolveCanonical(word(w1));
+  if (cmd.empty()) return;
+  const std::string sub = word(w2);
+  const std::string lowLine = lower(line);
+  const size_t comma = lowLine.find(',');
+  const std::string opts = comma == std::string::npos ? std::string() : lowLine.substr(comma + 1);
+  auto hasOpt = [&opts](const char* prefix) {
+    static const std::regex reWord(R"([A-Za-z_][A-Za-z0-9_]*)");
+    for (std::sregex_iterator it(opts.begin(), opts.end(), reWord), end; it != end; ++it)
+      if (it->str().rfind(prefix, 0) == 0) return true;
+    return false;
+  };
+  auto isSub = [&sub](const char* full, size_t minLen) {
+    return sub.size() >= minLen && std::string(full).compare(0, sub.size(), sub) == 0;
+  };
+  bool s = false, mx = false;
+  if (cmd == "estimates") {
+    if (isSub("restore", 3)) mx = true;
+    else s = true;
+  } else if (cmd == "eststo" || cmd == "lincom" || cmd == "lrtest" || cmd == "contrast" ||
+             cmd == "hausman" || cmd == "oaxaca" || cmd == "boottest" ||
+             cmd == "coefplot" || cmd == "event_plot") {
+    s = true;
+  } else if (cmd == "nlcom" || cmd == "testnl" || cmd == "outreg2" || cmd == "lassocoef" ||
+             cmd == "vargranger" || cmd == "erepost") {
+    mx = true;
+  } else if (cmd == "margins" || cmd == "pwcompare" || cmd == "esttab" || cmd == "estout" ||
+             cmd == "suest") {
+    s = mx = true;
+  } else if (cmd == "test") {
+    s = hasOpt("coef");
+  } else if (cmd == "predict") {
+    if (hasOpt("sc")) s = mx = true;
+    else if (hasOpt("dfb")) s = true;
+  } else if (cmd == "estat") {
+    if (isSub("classification", 4) || isSub("gof", 3) || isSub("summarize", 2) ||
+        isSub("vce", 3) || isSub("dwatson", 3) || isSub("szroeter", 3)) {
+      // order kept
+    } else if (sub == "ic" || isSub("hettest", 4) || isSub("imtest", 3) || isSub("ovtest", 3) ||
+               sub == "vif" || isSub("archlm", 6) || isSub("bgodfrey", 3) ||
+               isSub("durbinalt", 7)) {
+      s = true;
+    } else if (isSub("esize", 5)) {
+      mx = true;
+    } else {
+      s = mx = true;
+    }
+  }
+  SessionState::ENameContract& c = *session.eNameContract;
+  if (s) c.scalarsReordered = true;
+  if (mx) c.macrosReordered = c.matricesReordered = true;
+}
+
+// c(changed) beyond the row rewrites SessionState::load() flags (vs-stata bank
+// 2026-11-10, StataBE 19.5, describe's r(changed) after each command):
+//  - a command that edits only the dataset's metadata marks it changed: format
+//    (with a %fmt), label define/values/variable/data/drop/copy/language NAME,
+//    notes (but `notes list|search`); recast marks it itself, when a type moves;
+//  - a sort does not (`sort price` -> 0), nor does a new variable in the `__`
+//    name space Stata keeps for temporary variables (`gen __x = 1` -> 0);
+// (A dataset left with no variables is not changed either -- `drop _all`,
+// `drop *` -> 0 -- which the drop arm itself applies, route_data_rows.cpp.)
+// Applied at the leaf, after a successful run.
+void applyChangedRule(SessionState& session, const ojson& result, const std::string& rawCmd,
+                      bool changedAtEntry) {
+  if (!session.hasData()) return;
+  if (result.is_array())
+    for (const auto& b : result)
+      if (b.is_object() && b.value("type", std::string()) == "error" && !b.value("captured", false))
+        return;
+  const std::string& line = session.leafCmdExpanded.empty() ? rawCmd : session.leafCmdExpanded;
+  std::istringstream words(line);
+  std::string w1, w2, w3;
+  words >> w1 >> w2 >> w3;
+  auto word = [](std::string w) {
+    w = lower(w.substr(0, w.find_first_of(",:")));
+    return w;
+  };
+  const std::string cmd = registry::resolveCanonical(word(w1));
+  if (cmd.empty()) return;
+  if (cmd == "sort" || cmd == "gsort") {
+    session.datasetChanged = changedAtEntry;
+    return;
+  }
+  if (cmd == "generate") {
+    // [type] name = exp: the name is the first word that is not a storage type.
+    std::string nameTok = word(w2);
+    static const std::regex reType(R"(^(byte|int|long|float|double|str\d+|strl)$)");
+    if (std::regex_match(nameTok, reType)) nameTok = word(w3);
+    nameTok = nameTok.substr(0, nameTok.find('='));
+    if (nameTok.size() > 2 && nameTok.compare(0, 2, "__") == 0) session.datasetChanged = changedAtEntry;
+    return;
+  }
+  const std::string sub = word(w2);
+  if (cmd == "format") {
+    if (line.find('%') != std::string::npos) session.datasetChanged = true;
+    return;
+  }
+  if (cmd == "label") {
+    const bool lists = sub == "dir" || sub == "save" || sub == "l" || sub == "li" ||
+                       sub == "lis" || sub == "list";
+    const bool langQuery = sub.size() >= 4 && std::string("language").compare(0, sub.size(), sub) == 0 &&
+                           w3.empty();
+    if (!lists && !langQuery && !sub.empty()) session.datasetChanged = true;
+    return;
+  }
+  if (cmd == "notes") {
+    // `notes: text`, `notes var: text`, `notes drop|replace|renumber ...` edit;
+    // `notes`, `notes var`, `notes list`, `notes search` read.
+    const bool edits = sub == "drop" || sub == "replace" || sub == "renumber";
+    if (edits || line.find(':') != std::string::npos) session.datasetChanged = true;
+    return;
+  }
+}
+
 }  // namespace
 
 // BS-006 (BUG-028): log-tee wrapper around dispatchImpl() above.
@@ -399,6 +562,7 @@ nlohmann::ordered_json dispatch(const std::string& rawCmd, SessionState& session
   const unsigned long long serialAtEntry = ++g_dispatchSerial;
   const std::uintptr_t eIdAtEntry = handlers::liveEstimationIdentity(session);
   const eval::RStoreMark rMarkAtEntry = session.eval.rMark();
+  const bool changedAtEntry = session.datasetChanged;
   // An r-class arm's declaration (eval::declareRPosted) belongs to the command
   // that made it: a leaf that threw past the hook must not hand it on (RULING.md
   // D.3.1).
@@ -485,6 +649,10 @@ nlohmann::ordered_json dispatch(const std::string& rawCmd, SessionState& session
     throw;
   }
   if (g_dispatchSerial == serialAtEntry) applyAdoResidue(session, result, rawCmd);
+  if (g_dispatchSerial == serialAtEntry) applyChangedRule(session, result, rawCmd, changedAtEntry);
+  applyEOrderRewrite(session, g_dispatchSerial == serialAtEntry && !session.leafCmdExpanded.empty()
+                                  ? session.leafCmdExpanded
+                                  : rawCmd);
   // w2c_postest family 1: r(table) after estimation — the one posting site (see
   // postestimation/rtable_rclass_lifecycle.cpp). Before exitDispatch so its column reads run inside
   // this command's own scratch accounting.

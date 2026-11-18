@@ -268,24 +268,72 @@ ojson runDuplicatesDrop(const std::optional<std::vector<std::string>>& varlist,
   // into an honest reject here (rather than shipping an unverified
   // multi-step engine choreography with no oracle to pin it against) is the
   // deliberate, disclosed scope boundary for this item.
-  if (ifExpr.has_value() && !ifExpr->empty()) {
-    return eval::unsupportedOption(
-        "if",
-        "`duplicates drop` with `if` is not yet supported in this build (dropping duplicates "
-        "within an if-restricted sample while leaving other rows untouched needs more than a "
-        "simple filter) — `duplicates report`/`tag`/`list` all honor `if`.");
-  }
-  // BS-090 (BETA Phase G): `in` needs the EXACT same dedup-then-splice-back
-  // machinery `if` does (a plain filter would silently dedup only the
-  // in-range rows and drop the out-of-range ones' own duplicates too) — the
-  // SAME disclosed scope boundary as the `if` reject just above, not a new
-  // gap this phase introduces.
-  if (inRange.has_value() && !inRange->empty()) {
-    return eval::unsupportedOption(
-        "in " + *inRange,
-        "`duplicates drop` with `in` is not yet supported in this build (dropping duplicates "
-        "within an in-restricted sample while leaving other rows untouched needs more than a "
-        "simple filter) — `duplicates report`/`tag`/`list` all honor `in`.");
+  // `duplicates drop varlist if/in, force`: the observations the qualifier selects are
+  // de-duplicated among themselves, the others stay where they are (vs-stata bank: `duplicates
+  // drop foreign if mpg>20, force` -> 34 observations deleted, r(N) 36 the sample, r(N_drop) 34).
+  // The first of each group in data order stays, and the data keep their order.
+  const bool qualified = (ifExpr.has_value() && !trim(*ifExpr).empty()) ||
+                         (inRange.has_value() && !trim(*inRange).empty());
+  if (qualified) {
+    const std::string S = "__piet_dd_s", O = "__piet_dd_o", K = "__piet_dd_k";
+    std::string qual;
+    if (ifExpr.has_value() && !trim(*ifExpr).empty()) qual += " if (" + *ifExpr + ")";
+    if (inRange.has_value() && !trim(*inRange).empty()) qual += " in " + *inRange;
+    std::string keys;
+    for (const auto& c : cols) keys += (keys.empty() ? "" : " ") + c;
+    Datastore* d0 = session.datastore();
+    if (d0 == nullptr) return eval::noDataLoaded();
+    const int64_t nBefore0 = d0->nRows();
+    const std::string savedLeaf = session.leafCmdExpanded;
+    auto run = [&](const std::string& cmd) -> std::optional<ojson> {
+      ojson b = piet::dispatch("quietly " + cmd, session);
+      session.leafCmdExpanded = savedLeaf;
+      const ojson* e = nullptr;
+      if (b.is_array()) {
+        for (const auto& x : b)
+          if (x.is_object() && x.value("type", std::string()) == "error") e = &x;
+      } else if (b.is_object() && b.value("type", std::string()) == "error") {
+        e = &b;
+      }
+      if (e != nullptr) return *e;
+      return std::nullopt;
+    };
+    auto cleanup = [&]() {
+      for (const char* v : {"__piet_dd_s", "__piet_dd_o", "__piet_dd_k"}) {
+        Datastore* dd = session.datastore();
+        if (dd != nullptr && dd->has(v)) (void)run(std::string("drop ") + v);
+      }
+    };
+    std::optional<ojson> failed;
+    if (!failed) failed = run("generate byte " + S + " = 1" + qual);
+    if (!failed) failed = run("replace " + S + " = 0 if missing(" + S + ")");
+    if (!failed) failed = run("generate long " + O + " = _n");
+    double nSample = 0;
+    if (!failed) {
+      failed = run("count if " + S);
+      if (!failed) {
+        const double* nv = session.eval.rValues.find("N");
+        nSample = nv != nullptr ? *nv : 0;
+      }
+    }
+    if (!failed && nSample <= 0) {
+      cleanup();
+      return rcErrorBlock("no observations", 2000);
+    }
+    if (!failed)
+      failed = run("bysort " + S + " " + keys + " (" + O + "): generate byte " + K + " = (" + S +
+                   " == 0) | _n == 1");
+    if (!failed) failed = run("drop if " + K + " == 0");
+    if (!failed) failed = run("sort " + O);
+    cleanup();
+    if (failed) return *failed;
+    ojson result = mutationResult(session, "duplicates_drop");
+    const int64_t nAfter0 = result.value("n_rows_after", int64_t{0});
+    result["n_dropped"] = nBefore0 - nAfter0;
+    if (auto bad = postDuplicatesR(session, static_cast<int64_t>(nSample),
+                                   {{"N_drop", static_cast<double>(nBefore0 - nAfter0)}}))
+      return *bad;
+    return result;
   }
 
   std::string joined;

@@ -156,17 +156,21 @@ int test_survival_main() {
     near(ss.first_entry, 0.0, 1e-12, 1e-9, "stset: earliest observed entry t = 0");
     near(ss.last_exit, 1.656333, 1e-6, 1e-6, "stset: last observed exit t");
     check(ss.n_excl_missing + ss.n_excl_after_failure + ss.n_excl_negative + ss.n_excl_zero_length +
-                  ss.n_kept == ss.n_total,
+                  ss.n_excl_same_instant + ss.n_kept == ss.n_total,
           "stset: the exclusion counters and the kept count partition the input");
 
     // The P7 fixture triggers exactly ONE of the four exclusion rules, so the
     // other three are exercised on a hand-built six-record frame instead — a
     // counter that can only ever read 0 is not a counter.
     {
-        //  id  time  fail   what stset should do with it
-        //   1   1.0    0     kept, interval (0, 1]
-        //   1   1.0    0     ZERO-LENGTH: (1, 1]
-        //   1   2.0    1     kept, interval (1, 2], the subject's first failure
+        //  id  time  fail   what stset should do with it (Stata's id() rules,
+        //                   st_set.ado; vs-stata bank cf5b2145 `stset studytime,
+        //                   failure(died) id(drug)`: 20 records at the same instant
+        //                   -- every record of a tie -- 27 after the first failure)
+        //   1   1.0    0     SAME INSTANT as the next record: excluded
+        //   1   1.0    0     SAME INSTANT as the previous record: excluded
+        //   1   2.0    1     kept, interval (1, 2] (_t0 the previous record's time,
+        //                    excluded or not), the subject's first failure
         //   1   3.0    0     AFTER FAILURE
         //   2   2.0    0     arrives FIRST in row order but sorts second
         //   2   1.0    0     ... so subject 2 is walked 1.0 then 2.0: (0,1] and (1,2]
@@ -176,8 +180,12 @@ int test_survival_main() {
         const double sfl[7] = {0, 0, 1, 0, 0, 0, 0};
         StsetResult s2 = stset_build(sid, stm, sfl, 7);
         check(s2.ok, "stset(synthetic): builds");
-        check(s2.n_excl_zero_length == 1,
-              "stset(synthetic): 1 zero-length interval — got " + std::to_string(s2.n_excl_zero_length));
+        check(s2.n_excl_same_instant == 2,
+              "stset(synthetic): 2 records at the same instant — got " +
+                  std::to_string(s2.n_excl_same_instant));
+        check(s2.n_excl_zero_length == 0,
+              "stset(synthetic): no other zero-length interval — got " +
+                  std::to_string(s2.n_excl_zero_length));
         check(s2.n_excl_after_failure == 1,
               "stset(synthetic): 1 obs. after the first failure — got " +
                   std::to_string(s2.n_excl_after_failure));
@@ -187,11 +195,11 @@ int test_survival_main() {
         // kept, no negative interval. Records are walked in TIME order regardless
         // of the row order they arrive in, which is what makes that true.
         check(s2.n_excl_negative == 0, "stset(synthetic): sorting by time leaves no negative interval");
-        check(s2.n_kept == 4, "stset(synthetic): 4 records remain — got " + std::to_string(s2.n_kept));
+        check(s2.n_kept == 3, "stset(synthetic): 3 records remain — got " + std::to_string(s2.n_kept));
         check(s2.n_subjects == 2, "stset(synthetic): 2 subjects (the missing-time subject drops out)");
         check(s2.n_failures == 1, "stset(synthetic): 1 failure");
-        near(s2.time_at_risk, 4.0, 1e-12, 1e-9, "stset(synthetic): time at risk (1 + 1) + (1 + 1)");
-        check(s2.st[1] == 0.0 && s2.st[3] == 0.0 && s2.st[6] == 0.0,
+        near(s2.time_at_risk, 3.0, 1e-12, 1e-9, "stset(synthetic): time at risk 1 + (1 + 1)");
+        check(s2.st[0] == 0.0 && s2.st[1] == 0.0 && s2.st[3] == 0.0 && s2.st[6] == 0.0,
               "stset(synthetic): excluded rows PERSIST with _st = 0 (never deleted)");
         check(s2.t0[2] == 1.0 && s2.t[2] == 2.0 && s2.d[2] == 1.0,
               "stset(synthetic): the failure record carries (_t0, _t, _d) = (1, 2, 1)");

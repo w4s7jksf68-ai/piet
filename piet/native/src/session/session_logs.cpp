@@ -488,9 +488,10 @@ void smclWriteEcho(LogState& log, std::string t) {
 void smclWriteBlock(LogState& log, const nlohmann::ordered_json& b, const std::string& type,
                     bool fromDisplay, const std::string& tabstatText, bool& consumedTabstat) {
   if (type == "display" && fromDisplay) {
-    // The text is SMCL already -- it is what the user typed to `display`. If it
+    // The text is SMCL already -- it is what the user typed to `display` (the
+    // `smcl` field when route_results drew its directives into `text`). If it
     // carries directives of its own it may have changed the mode, so forget it.
-    const std::string text = b.value("text", std::string());
+    const std::string text = b.value("smcl", b.value("text", std::string()));
     smclSetMode(log, kModeRes);
     log.stream << text << "\n";
     if (text.find('{') != std::string::npos) log.smclMode = '?';

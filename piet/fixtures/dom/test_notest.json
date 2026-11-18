@@ -1,0 +1,8 @@
+{
+  "type": "estimation",
+  "estimator": "test",
+  "notest": true,
+  "restrictions": [
+    "mpg = 0"
+  ]
+}

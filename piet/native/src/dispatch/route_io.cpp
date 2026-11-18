@@ -4,7 +4,9 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/handlers/session_commands.h"  // runClear (a failed `use ..., clear`)
 #include "piet/handlers/io.h"
+#include "piet/handlers/session_commands.h"  // runClear: a failed `use ... using` leaves no data
 #include "piet/user_paths.h"
 namespace piet::dispatch_detail {
 bool route_io(std::string& cmd,
@@ -32,12 +34,17 @@ bool route_io(std::string& cmd,
       if (key == "clear" || key == "replace") useClears = true;
       else if (key == "nolabel") useNoLabel = true;
     }
-    // A comma inside a quoted filename is part of the filename.
+    // A comma inside a quoted filename is part of the filename, and one inside
+    // parentheses belongs to an `if` expression (`use make if
+    // substr(make,1,3)=="AMC" using a.dta, clear`).
     char quote = 0;
+    int parenDepth = 0;
     for (size_t i = 0; i < afterUse.size(); ++i) {
       if (quote) { if (afterUse[i] == quote) quote = 0; }
       else if (afterUse[i] == '"') quote = afterUse[i];
-      else if (afterUse[i] == ',') { afterUse.resize(i); break; }
+      else if (afterUse[i] == '(') ++parenDepth;
+      else if (afterUse[i] == ')') { if (parenDepth > 0) --parenDepth; }
+      else if (afterUse[i] == ',' && parenDepth == 0) { afterUse.resize(i); break; }
     }
     // [D] use: without `clear`, data changed since they were last saved are
     // not discarded -- r(4) "no; dataset in memory has changed since last
@@ -55,11 +62,107 @@ bool route_io(std::string& cmd,
     afterUse = (b == std::string::npos) ? "" : afterUse.substr(0, b + 1);
     std::string filepath = !afterUse.empty() ? afterUse
                            : (!parsed.varlist.empty() ? parsed.varlist[0] : "");
+    // [D] use: `use [varlist] [if] [in] using filename` loads only those
+    // variables, and of the file's value labels only the ones they carry; the
+    // if/in qualifiers select the file's observations and may only name loaded
+    // variables (vs-stata bank: `use idcode wage union if union==1 in 1/300
+    // using n.dta` -> k 3, N 81; `use price mpg make if foreign==0 in 1/30
+    // using a.dta` -> r(111); `use race married using n.dta`, `label list` ->
+    // 2 label sets). A failure leaves no data in memory, as StataBE's does
+    // (`use zzzvar using a.dta, clear` and `use in 70/100 using a.dta, clear`
+    // over auto in memory -> N 0, k 0).
+    std::string useVarlist, useIf, useIn;
+    bool useUsingForm = false;
+    {
+      static const std::regex reUsing(R"(^(.*?)\s*\busing\s+(.+)$)");
+      std::smatch um;
+      if (!filepath.empty() && filepath.front() != '"' && std::regex_match(filepath, um, reUsing)) {
+        useUsingForm = true;
+        const std::string head = um.str(1);
+        filepath = trimWs(um.str(2));
+        // The words `if` and `in` at the top level (outside quotes and
+        // parentheses) open the qualifiers; what precedes them is the varlist.
+        std::vector<std::pair<size_t, std::string>> kws;  // (offset, "if"/"in")
+        int depth = 0;
+        bool inQ = false;
+        for (size_t i = 0; i < head.size(); ++i) {
+          const char c = head[i];
+          if (c == '"') inQ = !inQ;
+          if (inQ) continue;
+          if (c == '(') ++depth;
+          if (c == ')') --depth;
+          if (depth != 0) continue;
+          const bool startsWord = i == 0 || std::isspace(static_cast<unsigned char>(head[i - 1]));
+          if (!startsWord || i + 2 > head.size()) continue;
+          const std::string w = head.substr(i, 2);
+          const bool endsWord = i + 2 == head.size() ||
+                                std::isspace(static_cast<unsigned char>(head[i + 2])) ||
+                                (w == "if" && head[i + 2] == '(');
+          if ((w == "if" || w == "in") && endsWord) kws.emplace_back(i, w);
+        }
+        useVarlist = trimWs(head.substr(0, kws.empty() ? head.size() : kws.front().first));
+        for (size_t k = 0; k < kws.size(); ++k) {
+          const size_t from = kws[k].first + 2;
+          const size_t to = k + 1 < kws.size() ? kws[k + 1].first : head.size();
+          (kws[k].second == "if" ? useIf : useIn) = trimWs(head.substr(from, to - from));
+        }
+      }
+    }
     if (filepath.empty()) {
       blocks.push_back(ojson(eval::engineError("syntax_error: `use` requires a filename", "syntax_error")));
       return true;
     }
     ojson useResult = handlers::runUse(filepath, session);
+    if (useUsingForm && useResult.value("type", std::string()) != "error" &&
+        (!useVarlist.empty() || !useIf.empty() || !useIn.empty())) {
+      auto failWith = [&](const ojson& err) {
+        (void)handlers::runClear("", session);
+        blocks.push_back(err);
+        return true;
+      };
+      auto firstErr = [](const ojson& r) -> const ojson* {
+        if (r.is_array())
+          for (const auto& b : r)
+            if (b.is_object() && b.value("type", std::string()) == "error") return &b;
+        if (r.is_object() && r.value("type", std::string()) == "error") return &r;
+        return nullptr;
+      };
+      // Columns first: the qualifiers read only the variables loaded.
+      if (!useVarlist.empty()) {
+        ojson kept = piet::dispatch("keep " + useVarlist, session);
+        if (const ojson* e = firstErr(kept)) return failWith(*e);
+      }
+      if (!useIf.empty() || !useIn.empty()) {
+        std::string q = "keep";
+        if (!useIf.empty()) q += " if (" + useIf + ")";
+        if (!useIn.empty()) q += " in " + useIn;
+        ojson rows = piet::dispatch(q, session);
+        if (const ojson* e = firstErr(rows)) return failWith(*e);
+      }
+      std::set<std::string> present, used;
+      if (Datastore* uds = session.datastore())
+        for (const auto& nm : uds->names()) present.insert(nm);
+      for (const auto& [var, lbl] : session.varLblname)
+        if (present.count(var)) used.insert(lbl);
+      for (auto it = session.labelDefs.begin(); it != session.labelDefs.end();) {
+        if (used.count(it->first)) {
+          ++it;
+          continue;
+        }
+        session.labelSeq.erase(it->first);
+        it = session.labelDefs.erase(it);
+      }
+      session.datasetChanged = false;  // read from disk, not changed
+      useResult = handlers::mutationResult(session, "use");
+    }
+    // A file `use` cannot read is r(610) "not Stata format" with the data in
+    // memory untouched (runUse checks the file first); under `clear` Stata had
+    // emptied memory before it looked (StataBE `use f.csv, clear` and `use
+    // t.txt, clear` leave k 0 N 0, vs-stata truth bank).
+    if (useClears && session.hasData() && useResult.is_object() &&
+        useResult.value("type", std::string()) == "error" &&
+        useResult.value("reason", std::string()) == "r(610)")
+      (void)handlers::runClear("", session);
     if (useNoLabel && useResult.value("type", std::string()) != "error") {
       session.labelDefs.clear();
       session.valueLabels.clear();
@@ -115,6 +218,17 @@ bool route_io(std::string& cmd,
           "syntax_error")));
       return true;
     }
+    // sysuse's syntax line takes `clear` and `replace` and nothing else; an
+    // option that is not one of them is r(198) before the file is looked for
+    // (bank sysuse cells a43ec88701812b85, 7f9dc206fd78f349).
+    for (const auto& kv : parsed.opts) {
+      const std::string o = lower(kv.first);
+      if (o != "clear" && o != "replace") {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "option " + kv.first + " not allowed",
+                                                std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+    }
     std::string dsLower = lower(dsArg);
     static const std::string kDtaSuffix = ".dta";
     if (dsLower.size() > kDtaSuffix.size() &&
@@ -163,37 +277,50 @@ bool route_io(std::string& cmd,
     }
     bool replace = false;
     bool emptyOk = false;
+    bool noLabel = false;
+    bool orphans = false;
     if (commaIdx >= 0) {
       std::string optsTail = trimWs(lower(after.substr(static_cast<size_t>(commaIdx) + 1)));
       after = trimWs(after.substr(0, static_cast<size_t>(commaIdx)));
-      // Every `save` suboption besides `replace`/`emptyok` (nolabel/orphans/
-      // version(#)) is unimplemented — reject the first one by name instead
-      // of silently discarding the whole tail (BUG-141 class: a dropped
-      // option looks identical to an honoured one from the caller's side).
-      // B5-D9: `emptyok` is accepted and otherwise ignored -- see kVocabSave's
-      // registration comment for why it is a validated no-op on this verb.
+      // `all` (e(sample) written into the file) is the one valid option that is
+      // still unimplemented: it is refused by name instead of silently dropped
+      // (BUG-141 class: a dropped option looks identical to an honoured one).
+      // Spellings: nolabel from `nol`, orphans from `o`, emptyok from `empty`
+      // (StataBE 19.5, bank _optabbr/save cells); replace in full.
+      auto abbrev = [](const std::string& typed, const char* full, size_t shortest) {
+        return typed.size() >= shortest && std::string(full).compare(0, typed.size(), typed) == 0;
+      };
       std::istringstream optsStream(optsTail);
       std::string opt;
       while (optsStream >> opt) {
         if (opt == "replace") {
           replace = true;
-          continue;
-        }
-        if (opt == "emptyok") {
+        } else if (abbrev(opt, "emptyok", 5)) {
           emptyOk = true;
-          continue;
+        } else if (abbrev(opt, "nolabel", 3)) {
+          noLabel = true;
+        } else if (abbrev(opt, "orphans", 1)) {
+          orphans = true;
+        } else {
+          blocks.push_back(ojson(eval::unsupportedOption(
+              opt, "`save` implements `replace`, `nolabel`, `orphans` and `emptyok`; `all` "
+                   "(e(sample) written into the file) is not implemented.")));
+          return true;
         }
-        blocks.push_back(ojson(eval::unsupportedOption(
-            opt, "`save` supports only `replace`/`emptyok` in this build; nolabel/orphans/"
-                 "version() are not implemented.")));
-        return true;
       }
     }
     std::string filepath = !after.empty() ? after
                            : (!parsed.varlist.empty() ? parsed.varlist[0] : "");
     if (filepath.empty()) {
-      blocks.push_back(ojson(eval::engineError("syntax_error: `save` requires a filename")));
-      return true;
+      // `save, replace`: the dataset's own file; with none, r(198) "invalid
+      // file specification" (bank d931c88eeb0ca7f5, 566e23f7ee9f5797).
+      filepath = session.currentSaveTarget();
+      if (filepath.empty()) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error", "invalid file specification",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                std::string("r(198)"))));
+        return true;
+      }
     }
     // BUG-1458: a dataset with observations but no variables (`clear` / `set
     // obs 3`) is StataBE's r(111) "no variables defined" unless emptyok.
@@ -209,7 +336,7 @@ bool route_io(std::string& cmd,
         return true;
       }
     }
-    blocks.push_back(ojson(handlers::runSaveData(filepath, replace, session)));
+    blocks.push_back(ojson(handlers::runSaveData(filepath, replace, session, 0, noLabel, orphans)));
     return true;
   }
 
@@ -368,10 +495,43 @@ bool route_io(std::string& cmd,
         }
       }
     }
+    {
+      // A word that is no subcommand of Stata's is r(198) `import: unknown
+      // subcommand "WORD"` (bank cells f48e877b4af87fe4, 7543e8efec1d8326,
+      // c894da0309068434): the first word as typed, a file name included.
+      // The subcommands of Stata's own import / export, valid ones this build does
+      // not read or write included: those keep the named "not supported" refusal
+      // below. odbc and jdbc are commands of their own, not subcommands of these.
+      static const std::set<std::string> kImportSubs = {
+          "delimited", "excel", "dbase", "fred", "hav", "have", "haver", "haverd", "haverdi",
+          "haverdir", "haverdire", "haverdirec", "haverdirect", "sas", "sasxport", "sasxport5",
+          "sasxport8", "shp", "spss", "parquet"};
+      static const std::set<std::string> kExportSubs = {
+          "delimited", "excel", "dbas", "dbase", "sas", "sasxport", "sasxport5", "sasxport8",
+          "shp", "spss"};
+      std::string firstWord = trimWs(rawArgsAfterCmd(parsed.raw));
+      firstWord = firstWord.substr(0, firstWord.find_first_of(" \t,"));
+      const auto& subs = cmd == "import" ? kImportSubs : kExportSubs;
+      if (!subs.count(sub) || firstWord.find('.') != std::string::npos) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error",
+                                                cmdTyped + ": unknown subcommand \"" + firstWord + "\"",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
+        return true;
+      }
+    }
     if (sub != "delimited" && sub != "excel") {
       blocks.push_back(ojson(eval::engineError(
           cmdTyped + " " + sub + ": not supported — this build implements `" + cmdTyped +
           " delimited` and `" + cmdTyped + " excel`.")));
+      return true;
+    }
+    if (pathArg.empty() && cmd == "export") {
+      // export's syntax is `[varlist] using filename`: without `using` StataBE
+      // answers r(100) "using required" (vs-stata bank `export delimited make
+      // price mpg rep78 foreign`).
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "using required", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(100)")));
       return true;
     }
     if (pathArg.empty()) {

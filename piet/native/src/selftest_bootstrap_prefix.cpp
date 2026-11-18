@@ -375,12 +375,16 @@ void testW2BsBootstrap() {
             "bound in parentheses\" (o6.log I2; rc o7.log I2|RC|198). Got rc " + r.rc + " `" + r.msg + "`");
   }
 
-  // A command whose e(sample) this build does not record (sureg here) is a
-  // NAMED refusal, never a resample of rows Stata would not draw.
+  // sureg records its e(sample) (its joint listwise rows; vs-stata bank 85be81d5:
+  // `count if e(sample)` 74 and `estimates store` adds _est_S), so bootstrap
+  // resamples those rows and refits sureg on each replicate, as Stata's
+  // bootstrap does for any e-class command with an e(sample). (This arm pinned
+  // the earlier named refusal while sureg recorded none.)
   {
     const Res r = run("bootstrap, rep(20) seed(4): sureg (y x) (c x)", s);
-    w2check(r.rc != "0" && r.msg.find("estimation sample") != std::string::npos,
-            "lane BS: bootstrap of a command whose e(sample) is not recorded (sureg here) "
-            "refuses by name. Got rc " + r.rc + " `" + r.msg + "`");
+    w2check(r.rc == "0" && eStr(s, "cmd") == "sureg" && eStr(s, "prefix") == "bootstrap" &&
+                eScalar(s, "N_reps") == 20.0,
+            "lane BS: bootstrap of sureg (e(sample) recorded) runs: e(cmd) sureg, e(prefix) "
+            "bootstrap, e(N_reps) 20. Got rc " + r.rc + " `" + r.msg + "` cmd `" + eStr(s, "cmd") + "`");
   }
 }

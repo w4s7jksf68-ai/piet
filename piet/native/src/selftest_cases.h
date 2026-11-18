@@ -22,6 +22,7 @@ void testFuzzCampaignBugfixes();
 void testW3FinalFixerBugfixes();
 void testMemoryPreflight();
 void testSettingsPersistence();
+void testTableSizeLimits();
 void testP81Wave2NativeLane();
 void testWaveRegressions20260902();
 void testScratchSupersededDelete();

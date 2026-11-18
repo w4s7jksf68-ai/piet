@@ -57,7 +57,25 @@ nlohmann::ordered_json runLabelLanguage(const std::vector<std::string>& args,
 // Scope = label set + definition + attached variables, NOT Stata's full
 // diagnostic block (Range/Gaps/Unique/Missing — those need a data scan this
 // direct-read report does not perform).
-nlohmann::ordered_json runLabelbook(const std::vector<std::string>& lblnames, SessionState& session);
+// labelbook's options ([D] labelbook): alpha sorts each set by text, detail is
+// the default report (off with problems unless given), length(#) is the
+// shortened-label width, list(#) the number of definitions shown.
+struct LabelbookOptions {
+  bool alpha = false;
+  bool detail = false;
+  bool problems = false;
+  int length = 12;
+  long long list = 32000;
+};
+nlohmann::ordered_json runLabelbook(const std::vector<std::string>& lblnames, SessionState& session,
+                                    const LabelbookOptions& opt = LabelbookOptions());
+
+// `codebook`'s potential-problem lists (r(cons), r(labelnotfound), r(notlabeled), r(str_type),
+// r(str_leading), r(str_trailing), r(str_embedded), r(realdate), r(datachanged)) for `names` over the
+// rows of `ds` (already restricted by if). Replaces r(); `report` also returns the report
+// `codebook, problems` prints (a display block), else a null json.
+nlohmann::ordered_json runCodebookProblems(Datastore& ds, const std::vector<std::string>& names,
+                                           SessionState& session, bool report);
 
 // `datasignature` — the engine's content fingerprint, forwarded verbatim.
 // Stata-SHAPED (`<rows>:<cols>(<meta>):<a>:<b>`) but deliberately NOT
@@ -80,6 +98,7 @@ nlohmann::ordered_json runRecast(const eval::ParsedCommand& parsed, SessionState
 // `notes[:] ...` / `note` -- reads and writes `session.characteristics`, which
 // the .dta writer already round-trips verbatim, so persistence is free.
 nlohmann::ordered_json runNotes(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runChar(const eval::ParsedCommand& parsed, SessionState& session);
 
 // ---- AER scope 2, bundle K1 (datamgmt/variable_bulk_rename.cpp, datamgmt/variable_move.cpp) ------------------------
 // `tolower [varlist]` -- lowercase variable NAMES. NOT atomic: it renames until
@@ -129,6 +148,12 @@ nlohmann::ordered_json runFindname(const eval::ParsedCommand& parsed, SessionSta
 
 // `fvunab lmacname : varlist` -- operator prefixes kept, canonical case.
 nlohmann::ordered_json runFvunab(const eval::ParsedCommand& parsed, SessionState& session);
+// datamgmt/list_parsing_commands.cpp: `numlist "numlist" [, options]` (r(numlist)),
+// `tsunab lmacname : varlist` (a local), `fvexpand [varlist] [if] [in]`
+// (r(varlist), r(fvops), r(tsops)).
+nlohmann::ordered_json runNumlist(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runTsunab(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runFvexpand(const eval::ParsedCommand& parsed, SessionState& session);
 // `numlabel [lblnames], add|remove [mask() force]`.
 nlohmann::ordered_json runNumlabel(const eval::ParsedCommand& parsed, SessionState& session);
 // `labvars varlist "label" ... [, remove]` (Klein).

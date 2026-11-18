@@ -1163,6 +1163,8 @@ std::optional<std::string> resolveVarName(const std::string& name, SessionState&
     ds = session.datastore();
     if (ds != nullptr && ds->has(name)) return name;
   }
+  // `set varabbrev off`: no abbreviation (vs-stata bank 4184077aff8cce56).
+  if (varAbbreviationOff(session)) return std::nullopt;
   std::optional<std::string> hit;
   bool many = false;
   const auto consider = [&](const std::string& v) {

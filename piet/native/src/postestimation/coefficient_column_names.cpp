@@ -220,7 +220,7 @@ struct FvAtom {
   std::string spelling;  // as typed
   std::string var;
   bool factor = false;
-  int baseRule = 0;  // 0 the lowest level, 1 `ib#.`'s level, 2 the highest level
+  int baseRule = 0;  // 0 the lowest level, 1 `ib#.`'s level, 2 the highest level, 3 none (`ibn.`)
   double base = 0;
 };
 
@@ -242,6 +242,10 @@ bool parseFvAtom(const std::string& s, FvAtom& a) {
   if (op == "i" || op == "ib(first)") return true;
   if (op == "ib(last)") {
     a.baseRule = 2;
+    return true;
+  }
+  if (op == "ibn") {
+    a.baseRule = 3;
     return true;
   }
   if (op.size() < 3 || op.compare(0, 2, "ib") != 0) return false;
@@ -335,14 +339,27 @@ bool stataColumns(SessionState& session, const LastModel& lm, const ojson& ct,
         std::any_of(s.begin(), s.end(), [](const FvAtom& a) { return a.factor; });
     return modelKeys.insert(termKey(s)).second || !anyFactor;
   };
+  // A regressor typed with the omit operator (`o.x`): the fit leaves it out and
+  // Stata keeps its column, `o.x`, at its place in the varlist (bank 66ec62b7
+  // `regress price mpg o.weight`: e(b) `mpg o.weight _cons`, a 3 x 3 e(V) with
+  // zeros). factor_vars_of reads `o.` as a factor operator; this is a variable.
+  const auto plainOmit = [](const std::string& t) {
+    return t.size() > 2 && t.compare(0, 2, "o.") == 0 && t.find_first_of(".#", 2) == std::string::npos;
+  };
   for (const auto& term : lm.x) {
+    if (plainOmit(term)) {
+      items.push_back({term, {}});
+      continue;
+    }
     if (term.find('#') == std::string::npos) {
       FvAtom fa;
       // `c.x` alone is the column `x`
       const bool cont = term.compare(0, 2, "c.") == 0 && term.find('.', 2) == std::string::npos;
       const std::string col = cont ? term.substr(2) : term;
       const std::vector<std::string> fv = cecon::postest::factor_vars_of({term});
-      if (term.find('.') != std::string::npos && parseFvAtom(term, fa) && fa.factor) {
+      // (`ibn.v` alone keeps its own path below: the noBase naming, not deduplicated)
+      if (term.find('.') != std::string::npos && parseFvAtom(term, fa) && fa.factor &&
+          fa.baseRule != 3) {
         if (!first({fa})) continue;
         items.push_back({col, {}});
       } else {
@@ -361,6 +378,12 @@ bool stataColumns(SessionState& session, const LastModel& lm, const ojson& ct,
     std::vector<std::vector<FvAtom>> subs;
     if (!expandFvTerm(term, subs)) return false;
     for (auto& s : subs) {
+      // A factor repeated inside one interaction is that factor once
+      // (`i.foreign#i.foreign` is `i.foreign`; a continuous `c.x#c.x` stays x^2).
+      for (size_t a = 0; a < s.size(); ++a)
+        for (size_t b = a + 1; b < s.size();)
+          if (s[a].factor && s[b].factor && s[a].var == s[b].var) s.erase(s.begin() + static_cast<long>(b));
+          else ++b;
       if (s.size() == 1 && !s[0].factor) {
         // a factorial's continuous main effect
         const bool seen = modelKeys.count(termKey(s)) != 0;
@@ -391,11 +414,23 @@ bool stataColumns(SessionState& session, const LastModel& lm, const ojson& ct,
       for (const auto& a : item.atoms) (a.factor ? fac : con).push_back(&a);
       std::vector<const std::vector<double>*> lv;
       std::vector<double> base;
+      // `ibn.g` interacted with continuous variables only: every level is a cell and
+      // none is a base; Stata marks the first level `bn` (bank 0d53e090 `regress price
+      // ibn.foreign#c.mpg, noconstant`: `0bn.foreign#c.mpg 1.foreign#c.mpg`). With
+      // another factor in the cell the spelling is not measured: no stripe.
+      const bool noBaseCell = fac.size() == 1 && fac[0]->baseRule == 3 && !con.empty();
+      for (const FvAtom* a : fac)
+        if (a->baseRule == 3 && !noBaseCell) return false;
       for (const FvAtom* a : fac) {
         const auto f = levels.find(a->var);
         if (f == levels.end() || f->second.empty()) return false;
         for (double v : f->second)
           if (v < 0 || v != std::floor(v)) return false;  // not a legal factor level
+        if (a->baseRule == 3) {
+          lv.push_back(&f->second);
+          base.push_back(std::numeric_limits<double>::quiet_NaN());
+          continue;
+        }
         const double b = a->baseRule == 0 ? f->second.front()
                          : a->baseRule == 2 ? f->second.back()
                                             : a->base;
@@ -415,6 +450,9 @@ bool stataColumns(SessionState& session, const LastModel& lm, const ojson& ct,
           if (v == base[k]) {
             at.insert(at.find('.'), "b");
             anyBase = true;
+          } else if (noBaseCell && pos[k] == 0) {
+            at.insert(at.find('.'), "bn");
+            rest.push_back(*fac[k]);
           } else {
             rest.push_back(*fac[k]);
           }
@@ -463,6 +501,10 @@ bool stataColumns(SessionState& session, const LastModel& lm, const ojson& ct,
       continue;
     }
     const std::string& term = item.term;
+    if (plainOmit(term)) {
+      cols.push_back({term, nullptr});
+      continue;
+    }
     const std::vector<std::string> fv = cecon::postest::factor_vars_of({term});
     if (fv.empty()) {
       bool found = false;
@@ -472,6 +514,18 @@ bool stataColumns(SessionState& session, const LastModel& lm, const ojson& ct,
         cols.push_back({term, &ct[i]});
         found = true;
         break;
+      }
+      // An engine that names the omitted regressor's row as Stata names the
+      // column (qreg: `o.w2`, b 0, se 0; bank 2c169e60 `qreg price mpg weight w2`:
+      // r(table) `mpg weight o.w2 _cons`).
+      for (size_t i = 0; !found && i < ct.size(); ++i) {
+        if (used[i] || rowName(i) != "o." + term) continue;
+        if (!(rowNum(ct[i], "b") == 0.0 &&
+              (rowNum(ct[i], "se") == 0.0 || std::isnan(rowNum(ct[i], "se")))))
+          return false;
+        used[i] = true;
+        cols.push_back({"o." + term, &ct[i]});
+        found = true;
       }
       if (!found) {
         // An omitted continuous regressor with no row: Stata's `o.x` column
@@ -484,20 +538,156 @@ bool stataColumns(SessionState& session, const LastModel& lm, const ojson& ct,
       continue;
     }
     const std::string& v = fv.front();
-    if (term.compare(0, 4, "ibn.") == 0) return false;
+    const bool noBase = term.compare(0, 4, "ibn.") == 0;
     std::map<double, size_t> rowsByLevel;
+    std::map<size_t, std::string> selfCell;  // a `L.v#L.v` row: the column `L.v`
     for (size_t i = 0; i < ct.size(); ++i) {
       if (used[i]) continue;
       double lv = 0;
       std::string var;
-      if (cecon::postest::parse_level_ref(rowName(i), lv, var) && var == v) rowsByLevel[lv] = i;
+      if (cecon::postest::parse_level_ref(rowName(i), lv, var) && var == v) {
+        rowsByLevel[lv] = i;
+        continue;
+      }
+      // A factor interacted with itself is the factor (Stata's fvexpand: `regress
+      // price i.foreign#i.foreign` posts `0b.foreign 1.foreign _cons`, bank
+      // 12299eb3); the engine names its cells `L.v#M.v`. The cell L == M is the
+      // level's column; L != M cannot occur and must be an empty (zero) row.
+      const std::string nm = rowName(i);
+      if (nm.find('#') == std::string::npos) continue;
+      bool same = true, allV = true;
+      double l0 = 0;
+      size_t start = 0;
+      for (bool firstPart = true;; firstPart = false) {
+        const size_t h = nm.find('#', start);
+        double l1 = 0;
+        std::string v1;
+        if (!cecon::postest::parse_level_ref(nm.substr(start, h == std::string::npos ? std::string::npos : h - start), l1, v1) ||
+            v1 != v) {
+          allV = false;
+          break;
+        }
+        if (firstPart) l0 = l1;
+        else if (l1 != l0) same = false;
+        if (h == std::string::npos) break;
+        start = h + 1;
+      }
+      if (!allV) continue;
+      if (same) {
+        rowsByLevel[l0] = i;
+        selfCell[i] = cecon::postest::level_name(l0, v);
+      } else if (rowNum(ct[i], "b") == 0.0 &&
+                 (rowNum(ct[i], "se") == 0.0 || std::isnan(rowNum(ct[i], "se")))) {
+        used[i] = true;
+      } else {
+        return false;
+      }
     }
+    const auto facRowName = [&](size_t i) {
+      const auto a = selfCell.find(i);
+      return a != selfCell.end() ? a->second : rowName(i);
+    };
     auto it = levels.find(v);
     if (it == levels.end()) return false;
+    if (noBase) {
+      // `ibn.v`: every level is a column and none is the base; beside the constant
+      // the fit omits one of them (the engine's dropped level). Stata names the first
+      // level `Lbn.v`, the omitted one `Lo.v`, the rest `L.v` (bank e5e0afb4 `regress
+      // price ibn.rep78`: `1bn.rep78 2.rep78 3.rep78 4.rep78 5o.rep78 _cons`; 9075b99d
+      // `ibn.foreign`: `0bn.foreign 1o.foreign _cons`).
+      // Only the shape measured is named: the LAST level omitted beside the constant
+      // (e5e0afb4, 9075b99d), or none (noconstant). An earlier level omitted (`regress
+      // price r1 ibn.rep78`, r1 = 1.rep78) has no measured spelling (`1o.` or
+      // `1bno.`?), so no stripe is posted and the readers keep their refusal.
+      const std::vector<double>& all = it->second;
+      for (double lv : all)
+        if (lv < 0 || lv != std::floor(lv)) return false;
+      const auto isOmitted = [&](double lv) {
+        const auto r = rowsByLevel.find(lv);
+        if (r == rowsByLevel.end()) return true;
+        const ojson& row = ct[r->second];
+        return rowNum(row, "b") == 0.0 &&
+               (rowNum(row, "se") == 0.0 || std::isnan(rowNum(row, "se")));
+      };
+      for (size_t i = 0; i + 1 < all.size(); ++i)
+        if (isOmitted(all[i])) return false;
+      size_t k = 0;
+      for (double lv : all) {
+        std::string nm = cecon::postest::level_name(lv, v);
+        const auto r = rowsByLevel.find(lv);
+        const ojson* row = r == rowsByLevel.end() ? nullptr : &ct[r->second];
+        if (r != rowsByLevel.end()) used[r->second] = true;
+        const bool omitted = isOmitted(lv);
+        if (omitted) nm.insert(nm.find('.'), "o");
+        else if (k == 0) nm.insert(nm.find('.'), "bn");
+        cols.push_back({nm, row});
+        ++k;
+      }
+      continue;
+    }
+    {
+      // `ib#.v` whose base level # has no observation in the sample: Stata keeps
+      // the base as an empty column at its place among the levels, and every
+      // observed level enters the fit, the one collinear with the constant omitted
+      // (bank c3e8b865 `regress price ib7.rep78`: `1.rep78 ... 4.rep78 5o.rep78
+      // 7b.rep78 _cons`; 0028355d `ib2.rep78 if rep78!=2`: `1.rep78 2b.rep78 3.rep78
+      // 4.rep78 5o.rep78 _cons`).
+      static const std::regex reIb(R"(^ib(\d+)\.)");
+      std::smatch mb;
+      if (std::regex_search(term, mb, reIb)) {
+        const double declared = std::strtod(mb.str(1).c_str(), nullptr);
+        std::vector<double> all = it->second;
+        if (!std::binary_search(all.begin(), all.end(), declared)) {
+          for (double lv : all)
+            if (lv < 0 || lv != std::floor(lv)) return false;
+          all.insert(std::upper_bound(all.begin(), all.end(), declared), declared);
+          for (double lv : all) {
+            std::string nm = cecon::postest::level_name(lv, v);
+            if (lv == declared) {
+              nm.insert(nm.find('.'), "b");
+              cols.push_back({nm, nullptr});
+              continue;
+            }
+            const auto r = rowsByLevel.find(lv);
+            if (r != rowsByLevel.end()) {
+              used[r->second] = true;
+              cols.push_back({facRowName(r->second), &ct[r->second]});
+            } else {
+              nm.insert(nm.find('.'), "o");
+              cols.push_back({nm, nullptr});
+            }
+          }
+          continue;
+        }
+      }
+    }
     std::vector<double> missing;
     for (double lv : it->second) {
       if (lv < 0 || lv != std::floor(lv)) return false;  // not a legal factor level
       if (!rowsByLevel.count(lv)) missing.push_back(lv);
+    }
+    if (missing.empty()) {
+      // An engine that keeps the base level as a row of its own, named as Stata
+      // names the column (qreg: `0b.foreign`, b 0, se 0; bank 02464d3e `qreg
+      // price mpg i.foreign`: r(table) `mpg 0b.foreign 1.foreign _cons`): that
+      // level is the base. Only one such row, holding zeros, qualifies.
+      double baseLv = 0;
+      int nBase = 0;
+      for (const auto& [lv, i] : rowsByLevel) {
+        const std::string nm = rowName(i);
+        const size_t dot = nm.find('.');
+        if (dot == std::string::npos || dot == 0 || nm[dot - 1] != 'b') continue;
+        if (!(rowNum(ct[i], "b") == 0.0 &&
+              (rowNum(ct[i], "se") == 0.0 || std::isnan(rowNum(ct[i], "se")))))
+          return false;
+        baseLv = lv;
+        ++nBase;
+      }
+      if (nBase == 1) {
+        used[rowsByLevel[baseLv]] = true;
+        rowsByLevel.erase(baseLv);
+        missing.push_back(baseLv);
+      }
     }
     if (missing.size() != 1 || rowsByLevel.empty()) return false;
     std::vector<double> all = it->second;
@@ -511,7 +701,7 @@ bool stataColumns(SessionState& session, const LastModel& lm, const ojson& ct,
       } else {
         const size_t i = rowsByLevel[lv];
         used[i] = true;
-        cols.push_back({rowName(i), &ct[i]});
+        cols.push_back({facRowName(i), &ct[i]});
       }
     }
   }
@@ -587,6 +777,61 @@ void annotateEbStripe(SessionState& session) {
     for (const auto& e : stripe) mine.push_back(e.value("src", std::string()));
     special = engine != mine;
   }
+  if (special && blk.contains("beta_std")) {
+    // e(beta) of a column the fit has no row for (a base level, an empty or an
+    // interaction cell the stripe places): its b is 0, so its standardized
+    // coefficient is 0 -- unless the column does not vary over e(sample), when
+    // Stata's e(beta) is missing (bank 04d54ce9 `regress price i.foreign##i.rep78`:
+    // the empty cells 1o.foreign#1b.rep78 and 1o.foreign#2o.rep78 are `.`, the base
+    // and 0b.foreign#2o.rep78 0). The column is the product of its atoms over the
+    // fit's rows: `L.v` (any b/o/bn marks) is v == L, `c.v`/`co.v` is v.
+    const auto rows = est_detail::esampleRowsM4(session, *lmOpt);
+    static const std::regex reFactor(R"(^(-?\d+(?:\.\d+)?)(?:bn|bo|ob|b|o|n)?\.([A-Za-z_][A-Za-z0-9_]*)$)");
+    static const std::regex reCont(R"(^c?o?\.([A-Za-z_][A-Za-z0-9_]*)$)");
+    if (rows.has_value() && !rows->empty()) {
+      for (auto& e : stripe) {
+        if (!e.value("src", std::string()).empty()) continue;
+        const std::string nm = e.value("name", std::string());
+        std::vector<std::pair<const double*, double>> atoms;  // (column, level) ; NaN level = value
+        bool ok = true;
+        size_t start = 0;
+        while (ok) {
+          const size_t hash = nm.find('#', start);
+          const std::string atom = nm.substr(start, hash == std::string::npos ? std::string::npos : hash - start);
+          std::smatch mm;
+          if (std::regex_match(atom, mm, reFactor)) {
+            const double* col = est_detail::f64ColumnM4(session, mm.str(2));
+            ok = col != nullptr;
+            atoms.emplace_back(col, std::strtod(mm.str(1).c_str(), nullptr));
+          } else if (std::regex_match(atom, mm, reCont)) {
+            const double* col = est_detail::f64ColumnM4(session, mm.str(1));
+            ok = col != nullptr;
+            atoms.emplace_back(col, std::numeric_limits<double>::quiet_NaN());
+          } else {
+            ok = false;
+          }
+          if (hash == std::string::npos) break;
+          start = hash + 1;
+        }
+        if (!ok || atoms.empty()) continue;
+        bool constant = true, first = true;
+        double v0 = 0;
+        for (const int64_t r : *rows) {
+          double v = 1.0;
+          for (const auto& [col, lvl] : atoms)
+            v *= std::isnan(lvl) ? col[r] : (col[r] == lvl ? 1.0 : 0.0);
+          if (first) {
+            v0 = v;
+            first = false;
+          } else if (v != v0) {
+            constant = false;
+            break;
+          }
+        }
+        if (constant) e["novar"] = true;
+      }
+    }
+  }
   if (special) {
     // The engine's covariance names only the independent columns. Omitted
     // columns are exact zero rows/columns, so retain them on the same fitted
@@ -605,7 +850,276 @@ void annotateEbStripe(SessionState& session) {
         }
       }
     }
+    // e(k) of logit/probit is the number of e(b) columns, base and omitted columns
+    // included (bank 3d02bbfd `logit foreign i.rep78, asis`: k 6 against the 5
+    // estimated; aebefa4c/a5efb737/308eb878: 7 against 6). The reply's `k` counted
+    // the engine's columns (binary_estimation.cpp); cloglog's the same (bank 21336c67:
+    // 7 against 6).
+    if ((lmOpt->cobraCmd == "logit" || lmOpt->cobraCmd == "probit" || lmOpt->cobraCmd == "cloglog") &&
+        lmOpt->result.has_value() &&
+        lmOpt->result->is_object() && lmOpt->result->contains("k"))
+      session.patchLastModelResult("k", static_cast<double>(stripe.size()));
+    // nbreg's e(b) carries /lnalpha after the equation's columns (bank d93bc657
+    // `nbreg fatal beertax i.year`: k 10 = 8 + base 1982 + /lnalpha); xtpoisson,fe
+    // has the equation alone (bank 057cf53a `... i.year, fe`: k 9 with the base).
+    if ((lmOpt->cobraCmd == "nbreg" || lmOpt->cobraCmd == "xtpois") && lmOpt->result.has_value() &&
+        lmOpt->result->is_object() && lmOpt->result->contains("k"))
+      session.patchLastModelResult(
+          "k", static_cast<double>(stripe.size() + (lmOpt->cobraCmd == "nbreg" ? 1 : 0)));
     blk["eb_stripe"] = std::move(stripe);
+  }
+}
+
+namespace {
+
+// One `#`-atom of a coefficient-table column name, as the table note reads it.
+struct NoteAtom {
+  bool factor = false;  // `<level><flags>.var`
+  double level = 0;
+  std::string var;
+  bool base = false;     // a `b` flag that is not `bn`
+  bool omitted = false;  // an `o` flag (`2o.g`, `1bno.g`, `co.x`, `o.x`, `oL.x`)
+  bool tsop = false;     // a time-series operator on a factor (`1L.g`): no sample check
+};
+
+bool parseNoteAtom(const std::string& s, NoteAtom& a) {
+  const size_t dot = s.find('.');
+  if (dot == std::string::npos) return true;  // a plain variable, `_cons`
+  const std::string op = s.substr(0, dot);
+  a.var = s.substr(dot + 1);
+  size_t i = 0;
+  while (i < op.size() && std::isdigit(static_cast<unsigned char>(op[i]))) ++i;
+  const std::string flags = op.substr(i);
+  if (i > 0) {
+    a.factor = true;
+    a.level = std::strtod(op.substr(0, i).c_str(), nullptr);
+    for (size_t j = 0; j < flags.size(); ++j) {
+      const char c = flags[j];
+      if (c == 'b' && !(j + 1 < flags.size() && flags[j + 1] == 'n')) a.base = true;
+      else if (c == 'o') a.omitted = true;
+      else if (std::isupper(static_cast<unsigned char>(c)) || std::isdigit(static_cast<unsigned char>(c)))
+        a.tsop = true;
+    }
+    if (a.var.find('.') != std::string::npos) a.tsop = true;
+    return true;
+  }
+  a.omitted = flags.find('o') != std::string::npos;
+  return true;
+}
+
+// The fit's sample when the engine did not record e(sample): the rows on which
+// every model variable is non-missing -- accepted only when there are exactly
+// e(N) of them and the fit ran without weights or an if/in restriction, so that
+// they ARE the sample. nullopt otherwise (the caller then posts no note that
+// needs the sample).
+template <class ColumnFn>
+std::optional<std::vector<int64_t>> completeCaseRows(SessionState& session, const LastModel& lm,
+                                                     ColumnFn& column) {
+  if (!lm.fitWeight.empty() || !lm.fitKeepif.empty() || !lm.fitDataPath.empty())
+    return std::nullopt;
+  if (!session.lastEstBlock.has_value() || !session.lastEstBlock->is_object()) return std::nullopt;
+  const ojson& blk = *session.lastEstBlock;
+  if (!blk.contains("n_obs") || !blk["n_obs"].is_number()) return std::nullopt;
+  const double nObs = blk["n_obs"].get<double>();
+  std::vector<std::string> vars;
+  bool ok = true;
+  const auto add = [&](const std::string& v) {
+    if (v.empty()) return;
+    for (const char c : v)
+      if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) {
+        ok = false;
+        return;
+      }
+    if (std::find(vars.begin(), vars.end(), v) == vars.end()) vars.push_back(v);
+  };
+  add(lm.y);
+  for (const auto& term : lm.x) {
+    size_t start = 0;
+    for (;;) {
+      const size_t h = term.find('#', start);
+      std::string atom = term.substr(start, h == std::string::npos ? std::string::npos : h - start);
+      const size_t dot = atom.rfind('.');
+      add(dot == std::string::npos ? atom : atom.substr(dot + 1));
+      if (h == std::string::npos) break;
+      start = h + 1;
+      while (start < term.size() && term[start] == '#') ++start;
+    }
+  }
+  for (const auto& f : lm.fe) add(f);
+  for (const auto& c : lm.cluster) add(c);
+  if (!ok || vars.empty()) return std::nullopt;
+  std::vector<const std::vector<double>*> cols;
+  for (const auto& v : vars) {
+    const std::vector<double>* c = column(v);
+    if (c == nullptr) return std::nullopt;
+    cols.push_back(c);
+  }
+  std::vector<int64_t> rows;
+  const size_t n = cols.front()->size();
+  for (size_t i = 0; i < n; ++i) {
+    bool keep = true;
+    for (const auto* c : cols)
+      if (i >= c->size() || std::isnan((*c)[i]) || (*c)[i] >= eval::kStataMissingSentinel) {
+        keep = false;
+        break;
+      }
+    if (keep) rows.push_back(static_cast<int64_t>(i));
+  }
+  if (static_cast<double>(rows.size()) != nObs) return std::nullopt;
+  return rows;
+}
+
+}  // namespace
+
+// r(label#) beside an estimation's r(table): Stata's coefficient table stores, as
+// hidden r() macros, the note it prints in place of the statistics of column #
+// (vs-stata truth bank, every estimation with a factor variable or an omitted
+// column: `regress price mpg i.rep78 c.weight##c.weight` stores r(label2)
+// `(base)`; `logit foreign mpg i.rep78` -- levels 1 and 2 leave the sample by
+// perfect prediction -- stores label2/label3 `(empty)` and label6 `(omitted)`).
+// The note of a column is decided in this order:
+//   1. a factor-variable column flagged base or omitted whose cell has no
+//      observation in e(sample) is `(empty)`;
+//   2. otherwise any atom at its base level (`0b.a`, `1o.a#0b.b`, `0b.g#co.x`)
+//      makes a column whose coefficient is 0 `(base)` (an estimated
+//      `0b.foreign#c.mpg` has no note), and any omitted atom (`2o.g`, `o.x`,
+//      `co.x`) `(omitted)`;
+//   3. a column whose standard error is missing is `(omitted)` when its
+//      coefficient is 0 and has no note yet (`2.race`, a dropped `mpg`), and loses
+//      an `(omitted)` note when its coefficient is not 0.
+// An omitted column of an ancillary `/name` equation reads `(constrained)`.
+// Only these notes are posted; the ones that come from information this table
+// does not carry (constraints on an estimated column, margins' error codes) are
+// not, and a column whose emptiness cannot be read from the data posts nothing.
+std::vector<std::optional<std::string>> coefficientNotes(SessionState& session,
+                                                        const std::vector<std::string>& names,
+                                                        const std::vector<double>& bv,
+                                                        const std::vector<double>& sev,
+                                                        const std::vector<bool>& eformv) {
+  const size_t k = names.size();
+  std::vector<std::optional<std::string>> notes(k);
+  if (bv.size() != k || sev.size() != k || eformv.size() != k) return notes;
+  bool rowsTried = false;
+  std::optional<std::vector<int64_t>> rows;
+  std::map<std::string, std::vector<double>> cache;
+  std::map<std::string, bool> cacheOk;
+  const auto column = [&](const std::string& v) -> const std::vector<double>* {
+    const auto it = cacheOk.find(v);
+    if (it != cacheOk.end()) return it->second ? &cache[v] : nullptr;
+    Datastore* ds = nullptr;
+    try {
+      ds = session.datastore();
+    } catch (const std::exception&) {
+      ds = nullptr;
+    }
+    std::string err;
+    std::vector<double> buf;
+    const bool ok = ds != nullptr && ds->has(v) && numericColumn(*ds, v, &buf, &err);
+    cacheOk[v] = ok;
+    if (!ok) return nullptr;
+    cache[v] = std::move(buf);
+    return &cache[v];
+  };
+  for (size_t i = 0; i < k; ++i) {
+    std::string full = names[i];
+    const size_t colon = full.rfind(':');
+    const std::string eq = colon == std::string::npos ? std::string() : full.substr(0, colon);
+    const std::string name = colon == std::string::npos ? full : full.substr(colon + 1);
+    if (name.find('@') != std::string::npos) continue;  // a margins-style name: unknown
+    std::vector<NoteAtom> atoms;
+    size_t start = 0;
+    for (;;) {
+      const size_t h = name.find('#', start);
+      NoteAtom a;
+      parseNoteAtom(name.substr(start, h == std::string::npos ? std::string::npos : h - start), a);
+      atoms.push_back(std::move(a));
+      if (h == std::string::npos) break;
+      start = h + 1;
+    }
+    bool anyBase = false, anyOmit = false, anyFactor = false, anyTs = false;
+    for (const auto& a : atoms) {
+      anyBase = anyBase || a.base;
+      anyOmit = anyOmit || a.omitted;
+      anyFactor = anyFactor || a.factor;
+      anyTs = anyTs || a.tsop;
+    }
+    const double b = bv[i];
+    const double se = sev[i];
+    const bool eform = eformv[i];
+    const bool bZero = eform ? b == 1.0 : b == 0.0;
+    const bool seMissing = std::isnan(se);
+    std::string label;
+    if ((anyBase || anyOmit) && anyFactor && bZero && seMissing) {
+      if (anyTs) continue;
+      if (!rowsTried) {
+        rowsTried = true;
+        const auto& lm = session.lastModel();
+        if (lm.has_value()) rows = est_detail::esampleRowsM4(session, *lm);
+        if (lm.has_value() && !rows.has_value()) rows = completeCaseRows(session, *lm, column);
+      }
+      if (!rows.has_value()) continue;
+      std::vector<std::pair<const std::vector<double>*, double>> cell;
+      bool ok = true;
+      for (const auto& a : atoms) {
+        if (!a.factor) continue;
+        const std::vector<double>* c = column(a.var);
+        if (c == nullptr) {
+          ok = false;
+          break;
+        }
+        cell.emplace_back(c, a.level);
+      }
+      if (!ok) continue;
+      bool seen = false;
+      for (const int64_t r : *rows) {
+        bool all = true;
+        for (const auto& [c, lv] : cell)
+          if (static_cast<size_t>(r) >= c->size() || (*c)[static_cast<size_t>(r)] != lv) {
+            all = false;
+            break;
+          }
+        if (all) {
+          seen = true;
+          break;
+        }
+      }
+      if (!seen) label = "(empty)";
+    }
+    // A `b` flag makes a base note only on a column held at 0: an interaction
+    // with a base level of one factor and a continuous variable is estimated
+    // (vs-stata bank f9a2c12a `regress price i.foreign#c.mpg i.rep78`:
+    // `0b.foreign#c.mpg` b -329.86 is shown as a coefficient and carries no
+    // r(label1); estat vce keeps its row and column).
+    if (label.empty()) {
+      if (anyBase && bZero) label = "(base)";
+      else if (anyOmit) label = "(omitted)";
+    }
+    if (seMissing) {
+      if (bZero) {
+        if (label.empty()) label = "(omitted)";
+      } else if (label == "(omitted)") {
+        label.clear();
+      }
+    }
+    if (label == "(omitted)" && !eq.empty() && eq[0] == '/') label = "(constrained)";
+    notes[i] = label;
+  }
+  return notes;
+}
+
+void postCoefficientLabels(SessionState& session, const eval::EvalMatrix& tbl, bool baseOnly) {
+  if (tbl.data.size() < 9) return;
+  const size_t k = tbl.colnames.size();
+  if (tbl.data[0].size() != k || tbl.data[1].size() != k || tbl.data[8].size() != k) return;
+  std::vector<bool> eform;
+  for (const double e : tbl.data[8]) eform.push_back(e == 1.0);
+  const auto notes = coefficientNotes(session, tbl.colnames, tbl.data[0], tbl.data[1], eform);
+  for (size_t i = 0; i < k; ++i) {
+    if (!notes[i].has_value() || notes[i]->empty()) continue;
+    if (baseOnly && *notes[i] != "(base)") continue;
+    const std::string key = "label" + std::to_string(i + 1);
+    session.eval.rStrings.set(key, *notes[i]);
+    session.eval.markRMacroHidden(key);
   }
 }
 

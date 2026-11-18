@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <limits>
@@ -483,7 +484,8 @@ bool concatFormatUsable(const std::string& format) {
 // concat() with punct()/format(): as the engine's (a separator after every field, the last
 // one dropped, blanks trimmed), and rows outside the sample are "". The str# is sized by
 // the longest text before that drop and trim, the width the variable reached being built.
-ojson computeConcat(const ComputedEgen& call, const std::string& punct, const std::string* format) {
+ojson computeConcat(const ComputedEgen& call, const std::string& punct, const std::string* format,
+                    bool decode, size_t maxLength) {
   SessionState& session = call.session;
   std::vector<char> inside;
   if (auto refusal = flagQualifiedRows(call, &inside)) return *refusal;
@@ -506,8 +508,35 @@ ojson computeConcat(const ComputedEgen& call, const std::string& punct, const st
           const int32_t code = source.codes()[row];
           if (code >= 0) text += source.levels[static_cast<size_t>(code)];
         } else {
+          const double value = source.f64()[row];
+          if (decode) {
+            // decode, then string() for what decode leaves empty: a variable with no usable
+            // value label, a code the label does not name, a noninteger value.
+            auto attached = session.varLblname.find(call.vars[j]);
+            auto defined = attached == session.varLblname.end()
+                               ? session.labelDefs.end()
+                               : session.labelDefs.find(attached->second);
+            auto labels = session.valueLabels.find(call.vars[j]);
+            if (defined != session.labelDefs.end() && labels != session.valueLabels.end() &&
+                !std::isnan(value) && value == std::floor(value)) {
+              auto hit = labels->second.find(static_cast<int>(value));
+              if (hit != labels->second.end() && !hit->second.empty()) {
+                std::string label = hit->second;
+                if (label.size() > maxLength) {
+                  size_t cut = maxLength;
+                  while (cut > 0 && (static_cast<unsigned char>(label[cut]) & 0xC0) == 0x80) --cut;
+                  label.resize(cut);
+                }
+                if (!label.empty()) {
+                  text += label;
+                  text += punct;
+                  continue;
+                }
+              }
+            }
+          }
           try {
-            text += numberAsText(source.f64()[row], format);
+            text += numberAsText(value, format);
           } catch (const eval::PyExc&) {
             return egenRcError("Invalid format", 120);
           }
@@ -563,7 +592,11 @@ std::optional<ojson> runEgenAdoFunction(const std::string& fn, const std::string
   // A bare cut(x) or concat(a b) is the engine path's.
   if (isCut && atOpt == nullptr && groupOpt == nullptr && !wantIndex && !wantLabel)
     return std::nullopt;
-  if (isConcat && punctOpt == nullptr && formatOpt == nullptr) return std::nullopt;
+  const bool decodeOpt = optionNamed(opts, vocab, "decode") != nullptr;
+  const eval::OptValue* maxLengthOpt = optionNamed(opts, vocab, "maxlength");
+  if (isConcat && punctOpt == nullptr && formatOpt == nullptr && !decodeOpt &&
+      maxLengthOpt == nullptr)
+    return std::nullopt;
 
   // Stata reads the argument first, then the options, then the by-list.
   const std::string arg = trim(argText);
@@ -635,7 +668,15 @@ std::optional<ojson> runEgenAdoFunction(const std::string& fn, const std::string
       punct = punct.substr(1, punct.size() - 2);
     const std::string format = formatOpt != nullptr ? trim(formatOpt->strValue) : std::string();
     if (!concatFormatUsable(format)) return egenRcError("Invalid format", 120);
-    return computeConcat(call, punct, format.empty() ? nullptr : &format);
+    // maxlength(#): an integer from 1 to c(maxvlabellen); read even without decode.
+    size_t maxLength = 32000;
+    if (maxLengthOpt != nullptr && !maxLengthOpt->isBool && !trim(maxLengthOpt->strValue).empty()) {
+      const std::optional<double> n = eval::pythonFloat(trim(maxLengthOpt->strValue));
+      if (!n.has_value() || std::isnan(*n) || *n != std::floor(*n) || *n < 1 || *n > 32000)
+        return egenRcError("invalid maxlength( )", 198);
+      maxLength = static_cast<size_t>(*n);
+    }
+    return computeConcat(call, punct, format.empty() ? nullptr : &format, decodeOpt, maxLength);
   }
 
   std::vector<double> computedArg;
@@ -669,5 +710,91 @@ std::optional<ojson> runEgenAdoFunction(const std::string& fn, const std::string
 }
 
 }  // namespace egen_detail
+
+void gtoolsPublishGroups(SessionState& session, const std::vector<std::string>& groupVars,
+                         const std::optional<std::string>& ifExpr,
+                         const std::optional<std::string>& inRange, bool dropMissingKeys,
+                         bool postN, const char* command) {
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return;
+  try {
+    const std::string none;
+    const std::vector<std::string> noVars;
+    const ComputedEgen sample{none, noVars, ifExpr, inRange, none, session};
+    std::vector<char> inside;
+    if (flagQualifiedRows(sample, &inside)) return;
+    ds = session.datastore();
+    std::vector<const cecon::Column*> cols;
+    for (const std::string& v : groupVars) {
+      if (!ds->has(v)) return;
+      cols.push_back(&ds->col(v));
+    }
+    std::map<std::vector<uint64_t>, int64_t> sizes;
+    int64_t used = 0;
+    for (size_t row = 0; row < inside.size(); ++row) {
+      if (!inside[row]) continue;
+      std::vector<uint64_t> key;
+      bool missingKey = false;
+      for (const cecon::Column* c : cols) {
+        if (c->dtype == cecon::DType::Factor) {
+          const int32_t code = c->codes()[row];
+          if (code < 0 || c->levels[static_cast<size_t>(code)].empty()) missingKey = true;
+          key.push_back(static_cast<uint64_t>(static_cast<int64_t>(code)));
+        } else {
+          double v = c->f64()[row];
+          if (std::isnan(v)) missingKey = true;
+          if (v == 0.0) v = 0.0;  // -0 and 0 are one group
+          uint64_t bits = 0;
+          std::memcpy(&bits, &v, sizeof bits);
+          key.push_back(bits);
+        }
+      }
+      if (missingKey && dropMissingKeys) continue;
+      ++used;
+      ++sizes[key];
+    }
+    int64_t lo = 0, hi = 0;
+    for (const auto& kv : sizes) {
+      lo = lo == 0 ? kv.second : std::min(lo, kv.second);
+      hi = std::max(hi, kv.second);
+    }
+    if (postN) session.eval.rValues.set("N", static_cast<double>(used));
+    session.eval.rValues.set("J", static_cast<double>(sizes.size()));
+    session.eval.rValues.set("minJ", static_cast<double>(lo));
+    session.eval.rValues.set("maxJ", static_cast<double>(hi));
+    if (postN) eval::declareRPosted(session.eval, command, {"N", "J", "minJ", "maxJ"});
+    else eval::declareRPosted(session.eval, command, {"J", "minJ", "maxJ"});
+  } catch (const std::exception&) {
+  }
+}
+
+void gtoolsPublishExtremes(SessionState& session, const std::string& var,
+                           const std::optional<std::string>& ifExpr,
+                           const std::optional<std::string>& inRange) {
+  Datastore* ds = session.datastore();
+  if (ds == nullptr || !ds->has(var) || ds->dtype(var) != "f64") return;
+  const std::string none;
+  const std::vector<std::string> noVars;
+  const ComputedEgen sample{none, noVars, ifExpr, inRange, none, session};
+  std::vector<char> inside;
+  if (flagQualifiedRows(sample, &inside)) return;
+  ds = session.datastore();
+  const double* x = ds->col(var).f64();
+  std::vector<double> values;
+  for (size_t row = 0; row < inside.size(); ++row)
+    if (inside[row] && !std::isnan(x[row])) values.push_back(x[row]);
+  std::sort(values.begin(), values.end());
+  const double miss = std::numeric_limits<double>::quiet_NaN();
+  std::vector<std::string> names;
+  for (int k = 1; k <= 4; ++k) {
+    const size_t i = static_cast<size_t>(k - 1);
+    const std::string lo = "smallest" + std::to_string(k), hi = "largest" + std::to_string(k);
+    session.eval.rValues.set(lo, i < values.size() ? values[i] : miss);
+    session.eval.rValues.set(hi, i < values.size() ? values[values.size() - 1 - i] : miss);
+    names.push_back(lo);
+    names.push_back(hi);
+  }
+  eval::declareRPosted(session.eval, "gstats", names);
+}
 
 }  // namespace piet::handlers

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 M.K. Kim
 // Count estimation.
 #include "piet/handlers/estimation.h"
+#include "estimation_families_internal.h"  // fit_detail::fewClustersRankM4
 #include "piet/handlers/vce_types.h"
 #include <algorithm>
 #include <cmath>
@@ -30,6 +31,9 @@
 #include "piet/scratch_seq.h"
 #include "piet/stata_format.h"
 #include "estimation_internal.h"
+#include "core/distributions.h"  // z_critical: poisson level(#)
+#include "estimator_command_support.h"  // e3::setEScalarOnFit / setEStringOnFit
+#include "postestimation/rtable_internal.h"  // stataColumns: a factor fit's e(b) columns
 #include "estimators/posthest.h"  // cecon::margins_parse_at (header-inline)
 
 #include "extended_estimation_internal.h"
@@ -250,9 +254,13 @@ std::string ppmlhdfeSaveDM4b(SessionState& session, const ojson& raw, const std:
 bool esampleInstallMlMask(SessionState& session, LastModel& lm, ojson& raw,
                           std::string* ontoFrame) {
   // tobit, nbreg and mlogit admit rows the same way and screen none out
-  // (BUG-1214: StataBE's `estimates store` writes their _est_NAME).
+  // (BUG-1214: StataBE's `estimates store` writes their _est_NAME); so does fracreg
+  // (bank 2bef1615 `fracreg logit fr weight length`: e(sample) 74 rows), and so do
+  // ologit and oprobit (load_glm, cmds_oglm.cpp; vs-stata bank d8de89e3 `ologit rep78
+  // mpg weight`: count if e(sample) 69 = e(N)).
   static const std::set<std::string> kMl = {"logit", "probit", "poisson", "tobit", "nbreg",
-                                            "mlogit", "fepois"};
+                                            "mlogit", "fepois", "fracreg", "ologit", "oprobit",
+                                            "xtpois_re", "xtlogit"};
   if (kMl.count(lm.cobraCmd) == 0) return false;
   if (!lm.fe.empty() && lm.cobraCmd != "fepois") return false;
   if (!lm.fitDataPath.empty() || lm.cluster.size() > 1) return false;
@@ -481,13 +489,16 @@ ojson runPoisson(const std::string& stataCmd, const eval::ParsedCommand& parsed,
     argv.push_back("--offset");
     argv.push_back(*offsetVar);
   }
+  // exposure(varname): the offset ln(varname) (the engine's --exposure; StataBE
+  // 19.5 bank e62ba9a9 `poisson fatal beertax unemp, exposure(pop)`, e(offset)
+  // "ln(pop)").
   for (const auto& [k, v] : parsed.opts) {
-    if (k == "exposure" && !v.isBool) {
-      return engineErrorBlockM4(
-          "Option `exposure()` is a valid Stata option that this version of PIET does not yet "
-          "implement for `" + stataCmd + "` (no oracle coverage and no engine CLI equivalent — "
-          "use offset() with a pre-computed ln(exposure) variable instead).",
-          "unsupported_option");
+    if (k == "exposure" && !v.isBool && !trimM4(v.strValue).empty()) {
+      if (offsetVar.has_value() && !offsetVar->empty())
+        return engineErrorBlockM4("only one of offset() or exposure() can be specified",
+                                  "syntax_error");
+      argv.push_back("--exposure");
+      argv.push_back(trimM4(v.strValue));
     }
   }
 
@@ -529,7 +540,7 @@ ojson runPoisson(const std::string& stataCmd, const eval::ParsedCommand& parsed,
           "forwarded).",
           "unsupported_option");
     }
-    if (k == "level" && !v.isBool) {
+    if (k == "level" && !v.isBool && stataCmd != "poisson") {
       return engineErrorBlockM4(
           "Option `level` is a valid Stata option that this version of PIET does not yet "
           "implement for `" + stataCmd + "` (same stdout/exit-code masking gap as noconstant "
@@ -537,10 +548,43 @@ ojson runPoisson(const std::string& stataCmd, const eval::ParsedCommand& parsed,
           "unsupported_option");
     }
   }
+  // poisson's level(#), iterate(#) and irr (bank e140142b `poisson ..., level(90)`,
+  // 2ca6271a `iterate(0)`, 990889c5 `irr`). level(#) and irr set how the table is
+  // reported (the engine is never given --level, above); iterate(#) is ml's.
+  std::optional<double> poissonLevel;
+  std::optional<int> poissonIterate;
+  bool poissonIrr = false;
+  if (stataCmd == "poisson") {
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "level" && !v.isBool) {
+        const std::string val = trimM4(v.strValue);
+        char* end = nullptr;
+        const double d = std::strtod(val.c_str(), &end);
+        if (val.empty() || end == nullptr || *end != '\0' || !(d >= 10.0 && d <= 99.99))
+          return ojson(eval::errorBlock("engine_error", "level() must be between 10 and 99.99 inclusive",
+                                        std::nullopt, std::nullopt, std::nullopt, std::string("r(198)")));
+        poissonLevel = d;
+      }
+      if (k == "iterate") {
+        const std::string val = trimM4(v.isBool ? std::string() : v.strValue);
+        char* end = nullptr;
+        const double d = std::strtod(val.c_str(), &end);
+        if (val.empty() || end == nullptr || *end != '\0' || !(d >= 0 && d <= 16000) || d != std::floor(d))
+          return engineErrorBlockM4("option iterate() must be an integer from 0 to 16000 in this build "
+                                    "(got `" + val + "`)",
+                                    "unsupported_option");
+        poissonIterate = static_cast<int>(d);
+      }
+      if (k == "irr" && v.isBool && v.boolValue) poissonIrr = true;
+    }
+    if (poissonIterate.has_value() && sawAbsorb) poissonIterate.reset();
+  }
 
   // kVocabPpmlD is ppmlhdfe's own slot: the shared count-model set plus `d`.
   const std::unordered_set<std::string>& known =
-      (stataCmd == "ppmlhdfe") ? kVocabPpmlD.known : kVocabPoisson.known;
+      (stataCmd == "ppmlhdfe") ? kVocabPpmlD.known
+      : (stataCmd == "poisson") ? kVocabPoissonLog.known  // poisson's slot: + nolog / log
+                                : kVocabPoisson.known;
   if (auto err = eval::rejectUnknownOptions(parsed.opts, known)) {
     return *err;
   }
@@ -565,6 +609,13 @@ ojson runPoisson(const std::string& stataCmd, const eval::ParsedCommand& parsed,
     // recovered _cons and its full covariance are retained on absorbed fits too.
     std::vector<std::string> fitArgs = argv;
     fitArgs.push_back("--emit-v");
+    // Stata `poisson` posts ml's iterate from its own starting values, with e(ic),
+    // e(ilog) and e(gradient) (fepois.cpp ModelData::stata_ml); ppmlhdfe is not ml.
+    if (stataCmd == "poisson" && !sawAbsorb) fitArgs.push_back("--stata-ml");
+    if (poissonIterate.has_value()) {
+      fitArgs.push_back("--iterate");
+      fitArgs.push_back(std::to_string(*poissonIterate));
+    }
     if (engineD) {
       engineDPath = nextPathM4(session.workdir(), "ppmlhdfe_d");
       fitArgs.push_back("--d-out");
@@ -602,6 +653,9 @@ ojson runPoisson(const std::string& stataCmd, const eval::ParsedCommand& parsed,
     if (dPath.empty()) return err;
   }
 
+  // An iterate(#) fit's e(b) is ml's iterate there: the post-estimation refits,
+  // which run to ml's convergence, refuse it (postestRefitMatchesFitM4).
+  if (poissonIterate.has_value() && raw.is_object()) raw["ml_iterate"] = *poissonIterate;
   ojson block = cobraToEstimationM4(raw, "fepois", &session);
   block["estimator"] = stataCmd;  // literal Stata command word typed, not cobra's internal name.
   block["depvar"] = y;
@@ -628,6 +682,72 @@ ojson runPoisson(const std::string& stataCmd, const eval::ParsedCommand& parsed,
   captureFitFilterM4(lm, argv);
   lm.dataPath = *session.currentHbin();
   lm.result = raw;
+  // `poisson [pweight=]`: a pseudolikelihood has no constant-only comparison in
+  // Stata's poisson, so e(ll_0) is not posted and e(r2_p) is missing (bank fd85b1f8
+  // `poisson grade wage hours [pweight=w]` and 03ca3e32: r2_p ., no ll_0; the fweight
+  // f2ea5635 posts both). Cached reply only.
+  // vce(cluster c) is the same: no constant-only comparison, e(r2_p) missing (bank
+  // 4c264835 `poisson fatal beertax unemp, cluster(sid)`: r2_p ., no ll_0, Wald chi2;
+  // vce(robust) keeps both, bank 7ba9b3d0 r2_p .0148665728).
+  // Only the cluster() option itself does so: under vce(cluster c) poisson fits the
+  // constant-only model and posts e(ll_0) and e(r2_p) (bank 59b00740 `poisson fatal
+  // beertax unemp, vce(cluster sid)`: ll_0 present; 4c264835 cluster(sid): none).
+  bool clusterOption = false;
+  for (const auto& [k, v] : parsed.opts)
+    if (k == "cluster" && !v.isBool) clusterOption = true;
+  const bool pseudoNoNull =
+      (parsed.weightType.has_value() &&
+       (lowerM4(*parsed.weightType) == "pw" || lowerM4(*parsed.weightType) == "pweight")) ||
+      (lm.vcov == "cluster" && clusterOption);
+  if (!sawAbsorb && stataCmd == "poisson" && pseudoNoNull && lm.result->is_object()) {
+    ojson& rr = *lm.result;
+    for (const char* key : {"r2_p", "ll_0", "r2_pseudo"})
+      if (rr.contains(key)) rr[key] = nullptr;
+  }
+  // `poisson ..., vce(cluster c)` with fewer clusters than coefficients (G - 1 < k):
+  // e(rank) G - 1, e(df_m) that rank less the constant, no model chi2 (bank 03ca3e32
+  // `poisson rep78 mpg weight [pw=w], vce(cluster foreign)`: rank 1, df_m 0, chi2 .,
+  // p .; fit_detail::fewClustersRankM4). Cached reply and block only.
+  if (!sawAbsorb && stataCmd == "poisson" && lm.vcov == "cluster" && lm.cluster.size() == 1 &&
+      lm.result->is_object() && lm.result->contains("n_clusters") &&
+      (*lm.result)["n_clusters"].is_number() && lm.result->contains("k_vars") &&
+      (*lm.result)["k_vars"].is_number()) {
+    ojson& rr = *lm.result;
+    if (const auto rk = fit_detail::fewClustersRankM4(rr, rr["n_clusters"].get<double>(),
+                                                      rr["k_vars"].get<double>())) {
+      rr["k_vars"] = *rk;
+      rr["df_m"] = std::max(0.0, *rk - 1.0);
+      for (const char* key : {"chi2", "p_chi2", "p_F", "p"}) {
+        if (rr.contains(key)) rr[key] = nullptr;
+        if (block.contains(key)) block[key] = nullptr;
+      }
+    }
+  }
+  // ppmlhdfe's e(ll_0) is the intercept-only null without the offset, and e(r2_p)
+  // 1 - ll/ll_0 against it (bank 2f9a91bc `ppmlhdfe fatal beertax unemp, absorb(sid)
+  // offset(lpop)`: ll_0 -119412.988171009, r2_p .98319695800772); the engine's `ll_0`
+  // is poisson's, which keeps the offset. Cached reply only.
+  if (stataCmd == "ppmlhdfe" && lm.result->is_object() &&
+      lm.result->contains("ll_0_nooffset") && (*lm.result)["ll_0_nooffset"].is_number() &&
+      lm.result->contains("ll") && (*lm.result)["ll"].is_number()) {
+    ojson& rr = *lm.result;
+    const double ll0 = rr["ll_0_nooffset"].get<double>();
+    rr["ll_0"] = ll0;
+    if (ll0 != 0.0 && rr.contains("r2_p")) rr["r2_p"] = 1.0 - rr["ll"].get<double>() / ll0;
+  }
+  // ppmlhdfe without absorb() absorbs the constant itself (e(N_hdfe) 1, e(df_a) 1):
+  // e(rank) counts the slopes only, while e(b) still carries the recovered _cons (bank
+  // 456255c9 `ppmlhdfe fatal beertax unemp`: rank 2, e(b) 1 x 3). Cached reply only.
+  if (!sawAbsorb && stataCmd == "ppmlhdfe" && lm.result->is_object() &&
+      lm.result->contains("k_vars") && (*lm.result)["k_vars"].is_number() &&
+      (*lm.result)["k_vars"].get<double>() >= 1.0) {
+    // the reply's `coef` is keyed by name
+    bool hasIntercept = false;
+    if (lm.result->contains("coef") && (*lm.result)["coef"].is_object())
+      hasIntercept = (*lm.result)["coef"].contains("(intercept)") ||
+                     (*lm.result)["coef"].contains("_cons");
+    if (hasIntercept) (*lm.result)["k_vars"] = (*lm.result)["k_vars"].get<double>() - 1.0;
+  }
   // e(sample) T4 (w2_esample.log:1928 H7): plain poisson, and ppmlhdfe/fepois with
   // absorb() (BUG-1197). BUG-518 order: the mask, then setLastModel. With d the mask
   // goes onto the d frame, the head once e() is posted.
@@ -693,6 +813,34 @@ ojson runPoisson(const std::string& stataCmd, const eval::ParsedCommand& parsed,
       *dMutationOut = mutationResult(session, "gen", added, {}, rewritten);
     }
   }
+  // (after e(b) is cached from the block above: the table only)
+  // level(#): the interval b -/+ invnormal(1 - (1 - level/100)/2) se; irr: exp() of
+  // b, se scaled by exp(b), and of the interval (z and p unchanged), the row marked
+  // eform so r(table) carries eform 1. e(b) stays in the coefficient metric.
+  if ((poissonLevel.has_value() || poissonIrr) && block.contains("coeftable") &&
+      block["coeftable"].is_array()) {
+    const double zc = poissonLevel.has_value() ? cecon::z_critical(1.0 - *poissonLevel / 100.0) : 0.0;
+    for (auto& row : block["coeftable"]) {
+      if (!row.is_object() || !row.contains("b") || !row["b"].is_number()) continue;
+      const double b = row["b"].get<double>();
+      const double se = row.contains("se") && row["se"].is_number() ? row["se"].get<double>() : 0.0;
+      if (poissonLevel.has_value() && se > 0) {
+        row["ci_lo"] = b - zc * se;
+        row["ci_hi"] = b + zc * se;
+      }
+      if (poissonIrr) {  // an omitted column too: exp(0) = 1, se 0 (logistic's rule)
+        const double e = std::exp(b);
+        row["b"] = e;
+        row["se"] = e * se;
+        if (row.contains("ci_lo") && row["ci_lo"].is_number()) row["ci_lo"] = std::exp(row["ci_lo"].get<double>());
+        if (row.contains("ci_hi") && row["ci_hi"].is_number()) row["ci_hi"] = std::exp(row["ci_hi"].get<double>());
+        row["eform"] = true;
+      }
+    }
+    // the whole table is in the IRR metric: a base column too is 1 with eform 1
+    // (bank a7d4526c `poisson ... i.year, vce(cluster sid) irr`)
+    if (poissonIrr) block["coef_metric"] = "irr";
+  }
   return block;
 }
 
@@ -722,6 +870,201 @@ ojson runPoisson(const std::string& stataCmd, const eval::ParsedCommand& parsed,
 // not Stata-oracle-pinned) AND separately oracle-pins the D3e leg's own
 // exact call (`nbreg cnt beertax unemp`) against its Stata coefficients,
 // ll, and the alpha=0 boundary (selftest.cpp).
+// nbreg's ml record and model statistics, from a fit whose reply carries the ml
+// path (apps/cmds/cmds_panel.cpp cmd_nbreg; none at the alpha -> 0 boundary).
+// StataBE 19.5 bank, every default-dispersion nbreg fit (dba6710a `nbreg fatal
+// beertax unemp`: e(ic) 2, e(ll_0) -2622.763 the constant-only fit, e(rank0) 2,
+// e(chi2) 5.3988445 = 2(ll - ll_0) LR, e(p) .06724435 on e(df_m) 2, e(r2_p)
+// 1 - ll/ll_0, e(ll_c) -117906.88 the Poisson fit, e(chi2_c) 2(ll - ll_c),
+// e(b_pclass) 0 ... 0 2, e(k_eq) 2, e(k_aux) 1). Under vce(robust)/vce(cluster)
+// or a pweight the model test is the Wald test of the slopes on e(V), there is no
+// comparison Poisson test, and e(V_modelbased) is the inverse information.
+static void postNbregMlContractM4(SessionState& session, const ojson& raw, const std::vector<std::string>& argv,
+                           bool consOnly, bool noConstant, const std::string& offsetVar) {
+  if (!raw.is_object() || !raw.contains("ilog") || !raw["ilog"].is_array() || raw["ilog"].empty() ||
+      !raw.contains("e_gradient") || !raw["e_gradient"].is_object())
+    return;
+  const auto eb = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
+  const auto eV = session.eval.resolveEMatrixFor("V", eval::EvalSession::EReader::kCopy);
+  if (!eb.matrix.has_value() || !eV.matrix.has_value() || eb.matrix->data.size() != 1) return;
+  const std::vector<std::string>& cols = eb.matrix->colnames;
+  const size_t K = cols.size();
+  if (K < 2 || cols.back() != "/lnalpha" || eV.matrix->data.size() != K) return;
+  // engine index of each e(b) column (-1: a base or omitted level, a structural 0)
+  const ojson& gn = raw["e_gradient"]["names"];
+  const ojson& gv = raw["e_gradient"]["values"];
+  if (!gn.is_array() || !gv.is_array() || gn.size() != gv.size()) return;
+  std::vector<long> at(K, -1);
+  for (size_t j = 0; j < K; ++j) {
+    const size_t colon = cols[j].find(':');
+    const std::string bare = (cols[j] == "/lnalpha" || colon == std::string::npos) ? cols[j]
+                                                                                 : cols[j].substr(colon + 1);
+    for (size_t e = 0; e < gn.size(); ++e)
+      if (gn[e].is_string() && gn[e].get<std::string>() == bare) at[j] = static_cast<long>(e);
+    if (at[j] < 0) {
+      // only a marked level may be absent from the engine's columns
+      const size_t dot = bare.find('.');
+      const std::string op = dot == std::string::npos ? std::string() : bare.substr(0, dot);
+      if (op.find('b') == std::string::npos && op.find('o') == std::string::npos) return;
+    }
+  }
+  const auto rowVec = [&](const std::vector<double>& v, const char* row) {
+    eval::EvalMatrix m;
+    m.rownames = {row};
+    m.colnames = cols;
+    m.data = {v};
+    return m;
+  };
+  const auto putE = [&session](const std::string& name, eval::EvalMatrix m) {
+    auto& store = session.eval.eMatrices;
+    store.erase(std::remove_if(store.begin(), store.end(), [&name](const auto& q) { return q.first == name; }),
+                store.end());
+    store.emplace_back(name, std::move(m));
+    session.noteEOnFit(name);
+  };
+  std::vector<double> grad(K, 0.0), pclass(K, 0.0);
+  for (size_t j = 0; j < K; ++j)
+    if (at[j] >= 0 && gv[static_cast<size_t>(at[j])].is_number()) grad[j] = gv[static_cast<size_t>(at[j])].get<double>();
+  pclass[K - 1] = 2.0;
+  putE("gradient", rowVec(grad, "r1"));
+  putE("b_pclass", rowVec(pclass, "y1"));
+  {
+    eval::EvalMatrix m;
+    m.rownames = {"r1"};
+    m.data.assign(1, std::vector<double>(20, 0.0));
+    for (int c = 1; c <= 20; ++c) m.colnames.push_back("c" + std::to_string(c));
+    size_t i = 0;
+    for (const auto& v : raw["ilog"]) {
+      if (i >= 20) break;
+      if (v.is_number()) m.data[0][i] = v.get<double>();
+      ++i;
+    }
+    putE("ilog", std::move(m));
+  }
+  if (raw.contains("e_Vmb") && raw["e_Vmb"].is_object() && raw["e_Vmb"].contains("matrix") &&
+      raw["e_Vmb"]["matrix"].is_array() && raw["e_Vmb"]["matrix"].size() == gn.size()) {
+    const ojson& M = raw["e_Vmb"]["matrix"];
+    eval::EvalMatrix m;
+    m.rownames = cols;
+    m.colnames = cols;
+    m.data.assign(K, std::vector<double>(K, 0.0));
+    for (size_t a = 0; a < K; ++a)
+      for (size_t c = 0; c < K; ++c)
+        if (at[a] >= 0 && at[c] >= 0 && M[static_cast<size_t>(at[a])].is_array() &&
+            M[static_cast<size_t>(at[a])][static_cast<size_t>(at[c])].is_number())
+          m.data[a][c] = M[static_cast<size_t>(at[a])][static_cast<size_t>(at[c])].get<double>();
+    putE("V_modelbased", std::move(m));
+  }
+  // the fit's VCE and weights, as forwarded
+  std::string vce = "iid", wtype;
+  for (size_t i = 0; i + 1 < argv.size(); ++i) {
+    if (argv[i] == "--vce") vce = argv[i + 1];
+    if (argv[i] == "--wtype") wtype = argv[i + 1];
+  }
+  const bool sandwich = vce != "iid" || wtype == "pw";
+  const auto num = [&raw](const char* k) -> std::optional<double> {
+    if (!raw.contains(k) || !raw[k].is_number()) return std::nullopt;
+    return raw[k].get<double>();
+  };
+  const auto ll = num("loglik");
+  const auto ll0 = num("ll_0");
+  const auto llc = num("ll_c");
+  double autoCns = 0.0;
+  for (size_t j = 0; j + 1 < K; ++j) autoCns += at[j] < 0 ? 1.0 : 0.0;
+  // the slopes: estimated equation columns other than the constant
+  std::vector<size_t> slope;
+  for (size_t j = 0; j + 1 < K; ++j) {
+    const size_t colon = cols[j].find(':');
+    const std::string bare = colon == std::string::npos ? cols[j] : cols[j].substr(colon + 1);
+    if (at[j] >= 0 && bare != "_cons" && eV.matrix->data[j][j] > 0) slope.push_back(j);
+  }
+  const double dfm = static_cast<double>(slope.size());
+  const auto setS = [&session](const char* n, double v) { e3::setEScalarOnFit(session, n, v); };
+  const auto setM = [&session](const char* n, const std::string& v) { e3::setEStringOnFit(session, n, v); };
+  setS("k_eq", 2.0);
+  setS("k_eq_model", 1.0);
+  setS("k_dv", 1.0);
+  setS("k_aux", 1.0);
+  setS("noconstant", noConstant ? 1.0 : 0.0);
+  setS("consonly", consOnly ? 1.0 : 0.0);
+  setS("rc", 0.0);
+  setS("k_autoCns", autoCns);
+  setS("df_m", dfm);
+  if (ll0 && ll) {
+    setS("rank0", 2.0);
+    setS("r2_p", 1.0 - *ll / *ll0);
+  }
+  std::optional<double> chi2;
+  if (!sandwich && !noConstant && ll0 && ll) {
+    chi2 = 2.0 * (*ll - *ll0);
+    setM("chi2type", "LR");
+  } else if (!slope.empty()) {
+    // Wald test of the slopes on e(V)
+    const size_t q = slope.size();
+    std::vector<std::vector<double>> A(q, std::vector<double>(q));
+    std::vector<double> bvec(q);
+    for (size_t a = 0; a < q; ++a) {
+      bvec[a] = eb.matrix->data[0][slope[a]];
+      for (size_t c = 0; c < q; ++c) A[a][c] = eV.matrix->data[slope[a]][slope[c]];
+    }
+    // Cholesky solve
+    bool ok = true;
+    std::vector<std::vector<double>> L(q, std::vector<double>(q, 0.0));
+    for (size_t i = 0; i < q && ok; ++i)
+      for (size_t j = 0; j <= i && ok; ++j) {
+        double sum = A[i][j];
+        for (size_t k2 = 0; k2 < j; ++k2) sum -= L[i][k2] * L[j][k2];
+        if (i == j) {
+          if (!(sum > 0)) ok = false;
+          else L[i][i] = std::sqrt(sum);
+        } else {
+          L[i][j] = sum / L[j][j];
+        }
+      }
+    if (ok) {
+      double w = 0.0;
+      std::vector<double> yv(q);
+      for (size_t i = 0; i < q; ++i) {
+        double sum = bvec[i];
+        for (size_t k2 = 0; k2 < i; ++k2) sum -= L[i][k2] * yv[k2];
+        yv[i] = sum / L[i][i];
+        w += yv[i] * yv[i];
+      }
+      chi2 = w;
+      setM("chi2type", "Wald");
+    }
+  }
+  if (chi2 && std::isfinite(*chi2)) {
+    setS("chi2", *chi2);
+    if (dfm > 0) setS("p", est_detail::chi2UpperTailM4(dfm, *chi2));
+  }
+  if (!sandwich && llc && ll) {
+    setS("ll_c", *llc);
+    setS("chi2_c", 2.0 * (*ll - *llc));
+    setM("chi2_ct", "LR");
+  }
+  setM("crittype", sandwich ? "log pseudolikelihood" : "log likelihood");
+  setM("deriv_useminbound", "off");
+  setM("diparm1", "lnalpha, exp label(\"alpha\")");
+  setM("diparm_opt2", "noprob");
+  setM("dispers", "mean");
+  setM("ml_method", "e2");
+  setM("opt", "moptimize");
+  setM("singularHmethod", "m-marquardt");
+  setM("technique", "nr");
+  setM("user", "nbreg_lf");
+  setM("which", "max");
+  if (vce == "iid" && session.eval.eStrings.get("vce") == "iid") session.eval.setEString("vce", "oim");
+  if (sandwich) setM("vcetype", "Robust");
+  if (vce == "cluster")
+    if (const auto g = num("n_clusters")) setS("N_clust", *g);
+  // e(offset): offset(lpop) "lpop", exposure(pop) "ln(pop)" (bank cf4e2c5d)
+  for (size_t i = 0; i + 1 < argv.size(); ++i) {
+    if (argv[i] == "--exposure") setM("offset", "ln(" + argv[i + 1] + ")");
+  }
+  if (!offsetVar.empty()) setM("offset", strutil::trim(offsetVar));
+}
+
 ojson runNbreg(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   if (parsed.varlist.size() < 2) {
@@ -756,12 +1099,14 @@ ojson runNbreg(const eval::ParsedCommand& parsed, SessionState& session) {
     argv.push_back(*offsetVar);
   }
   for (const auto& [k, v] : parsed.opts) {
-    if (k == "exposure" && !v.isBool) {
-      return engineErrorBlockM4(
-          "Option `exposure()` is a valid Stata option that this version of PIET does not yet "
-          "implement for `nbreg` (no oracle coverage and no engine CLI equivalent — use offset() "
-          "with a pre-computed ln(exposure) variable instead).",
-          "unsupported_option");
+    // exposure(varname): the offset ln(varname), as poisson's (the engine's --exposure)
+    if (k == "exposure" && !v.isBool && !trimM4(v.strValue).empty()) {
+      if (offsetVar.has_value() && !offsetVar->empty())
+        return engineErrorBlockM4("only one of offset() or exposure() can be specified",
+                                  "syntax_error");
+      argv.push_back("--exposure");
+      argv.push_back(trimM4(v.strValue));
+      continue;
     }
     if (k == "dispersion" && !v.isBool) {
       return engineErrorBlockM4(
@@ -814,7 +1159,7 @@ ojson runNbreg(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
   // BUG-1537: nbreg's fweights, iweights and pweights (the engine fits them; its
-  // aweight is Stata's r(101), the tokenizer's kStataLegalWeights row). A pweight
+  // aweight is Stata's r(101), the registry's kStataQualifiers row). A pweight
   // implies vce(robust), the buildEstimationArgvM4 rule (BUG-536; StataBE 19.5
   // `nbreg cnt x z [pw=wf]` e(vce) robust, _se[x] .4424215353885973).
   if (parsed.weightType.has_value() && parsed.weightVar.has_value() &&
@@ -851,6 +1196,26 @@ ojson runNbreg(const eval::ParsedCommand& parsed, SessionState& session) {
       continue;
     }
   }
+  // iterate(#): ml's limit for the constant-only and the full fit (bank f4609cb1
+  // `nbreg fatal beertax unemp, iterate(2)`: constant-only "convergence not
+  // achieved" at e(ll_0) -2622.763092231246, full fit e(ic) 2); irr: incidence-rate
+  // ratios for the equation's rows (bank d6cad8e6: r(table) eform 1 there, 0 on
+  // /lnalpha and alpha).
+  bool nbIrr = false;
+  for (const auto& [k, v] : parsed.opts) {
+    if (k == "iterate") {
+      const std::string val = trimM4(v.isBool ? std::string() : v.strValue);
+      char* end = nullptr;
+      const double d = std::strtod(val.c_str(), &end);
+      if (val.empty() || end == nullptr || *end != '\0' || !(d >= 0 && d <= 16000) || d != std::floor(d))
+        return engineErrorBlockM4("option iterate() must be an integer from 0 to 16000 in this build "
+                                  "(got `" + val + "`)",
+                                  "unsupported_option");
+      argv.push_back("--iterate");
+      argv.push_back(std::to_string(static_cast<int>(d)));
+    }
+    if (k == "irr" && v.isBool && v.boolValue) nbIrr = true;
+  }
 
   const std::unordered_set<std::string>& known = kVocabNbreg.known;
   if (auto err = eval::rejectUnknownOptions(parsed.opts, known)) {
@@ -880,6 +1245,32 @@ ojson runNbreg(const eval::ParsedCommand& parsed, SessionState& session) {
   // ll: cobra emits `loglik`; the block key is `ll` like every other MLE block
   // (logit/probit) — was omitted here, leaving nbreg the odd one out.
   if (raw.contains("loglik")) block["ll"] = raw["loglik"];
+  // e(ll) reads the reply's `ll` (macro_results.cpp eScalarKey); nbreg names it `loglik`,
+  // so e(ll) read missing after every fit (bank dba6710a e(ll) -2620.0636081397306).
+  if (raw.contains("loglik") && !raw.contains("ll")) raw["ll"] = raw["loglik"];
+  // e(k) is the number of e(b) columns: the depvar equation's coefficients and
+  // /lnalpha (bank dba6710a `nbreg fatal beertax unemp`: 4). The engine's `k`
+  // counts the equation alone. Base levels of a factor term are added when the
+  // e(b) stripe is recorded (coefficient_column_names.cpp annotateEbStripe).
+  if (raw.contains("coefs") && raw["coefs"].is_array())
+    raw["k"] = static_cast<double>(raw["coefs"].size() + 1);
+  // e(rank) (read through `k_vars`) is the number of estimated parameters: the
+  // equation's coefficients the fit kept and /lnalpha (bank d93bc657 `nbreg fatal
+  // beertax i.year`: rank 9 = beertax + 6 years + _cons + /lnalpha). A collinear
+  // regressor the engine omitted (b = se = 0) is not counted, nor is a base level
+  // (the engine does not send one). lrtest takes its df from e(rank): without it a
+  // fit with factor terms (no e(V) posted) read as rank 0, and `lrtest a c` swapped
+  // the nesting and returned a negative LR at rc 0.
+  if (raw.contains("coefs") && raw["coefs"].is_array()) {
+    double rank = 1.0;  // /lnalpha
+    for (const auto& c : raw["coefs"]) {
+      const bool omitted = c.is_object() && c.contains("beta") && c["beta"].is_number() &&
+                           c["beta"].get<double>() == 0.0 && c.contains("se_iid") &&
+                           c["se_iid"].is_number() && c["se_iid"].get<double>() == 0.0;
+      if (!omitted) rank += 1.0;
+    }
+    raw["k_vars"] = rank;
+  }
 
   LastModel lm;
   lm.cobraCmd = "nbreg";
@@ -903,6 +1294,28 @@ ojson runNbreg(const eval::ParsedCommand& parsed, SessionState& session) {
     if (depvarEqColsM4(y, raw["coefs"], "beta", cols)) {
       cols.push_back({"/lnalpha", "/lnalpha", raw["lnalpha"].get<double>()});
       (void)postAncillaryEbM4(session, raw, cols);
+    }
+  }
+  postNbregMlContractM4(session, raw, argv, xs.empty(), noConstant,
+                        offsetVar.has_value() && !offsetVar->empty() ? *offsetVar : std::string());
+  // irr: the table only, after e(b) is posted
+  if (nbIrr && block.contains("coeftable") && block["coeftable"].is_array()) {
+    block["eq_eform"] = true;  // r(table): a base column the coeftable lacks is eform too
+    for (auto& row : block["coeftable"]) {
+      if (!row.is_object() || !row.contains("b") || !row["b"].is_number()) continue;
+      const std::string nm = row.value("name", std::string());
+      if (nm == "/lnalpha" || nm == "lnalpha" || nm == "alpha") continue;
+      const double b = row["b"].get<double>();
+      const double se = row.contains("se") && row["se"].is_number() ? row["se"].get<double>() : 0.0;
+      // A base or omitted column too: exp(0) = 1 with se 0 and eform 1, as poisson's
+      // (bank 3589963928edcb2f `nbreg ... i.year, vce(cluster sid) irr`: the base
+      // column's b 1 and eform 1).
+      const double e = std::exp(b);
+      row["b"] = e;
+      row["se"] = e * se;
+      if (row.contains("ci_lo") && row["ci_lo"].is_number()) row["ci_lo"] = std::exp(row["ci_lo"].get<double>());
+      if (row.contains("ci_hi") && row["ci_hi"].is_number()) row["ci_hi"] = std::exp(row["ci_hi"].get<double>());
+      row["eform"] = true;
     }
   }
   return block;
@@ -931,6 +1344,188 @@ ojson runNbreg(const eval::ParsedCommand& parsed, SessionState& session) {
 // silently claim a clustered SE the engine never computed. noconstant/
 // level() are NEVER forwarded on either CLI (same stdout/exit-code
 // masking-bug shape as BS-073/074 above, live-verified on both).
+
+// xtpoisson's random-effects (gamma) model, Stata's default and `, re` (engine
+// `xtpois --re`, estimators/xtpoisre.h): the comparison Poisson fit and the full
+// model by Stata's ml rules from the Poisson b and ln alpha 0 (vs-stata bank
+// f8d5160a `xtpoisson fatal beertax unemp`: e(ll) -2178.6746, iteration 0
+// -3931.0015, /lnalpha -.2757715). offset() / exposure(), noconstant, irr (an
+// eform table, e(b) unchanged), level(), and vce(robust) / robust / vce(cluster
+// panelvar) -- the sandwich over the panel scores (bank 8c1f9870, bee652c3: the
+// same e(V) under both). `normal` (Gauss-Hermite quadrature) and a cluster
+// variable other than the panel variable are refused by name; pa and fe have
+// their own arms.
+ojson runXtPoissonReM4(const eval::ParsedCommand& parsed, SessionState& session) {
+  const std::string y = parsed.varlist[0];
+  const std::vector<std::string> xs(parsed.varlist.begin() + 1, parsed.varlist.end());
+  std::vector<std::string> argv = {"xtpois", "--re", "--y", y, "--x", joinCommaM4(xs), "--ivar",
+                                   *session.panelvar};
+  if (parsed.ifExpr.has_value()) {
+    argv.push_back("--keepif");
+    argv.push_back(*parsed.ifExpr);
+  }
+  static const std::regex rePlainVar(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
+  bool irr = false, robust = false;
+  std::string clusterVar;
+  for (const auto& [k, v] : parsed.opts) {
+    const std::string val = v.isBool ? std::string() : trimM4(v.strValue);
+    if (k == "re" || k == "nolog" || k == "log") continue;
+    if (k == "irr") {
+      irr = true;
+      continue;
+    }
+    if (k == "noconstant" || k == "nocons") {
+      argv.push_back("--no-intercept");
+      continue;
+    }
+    if (k == "offset" || k == "exposure") {
+      if (!std::regex_match(val, rePlainVar))
+        return engineErrorBlockM4(k + "(" + val + ") must name one variable in this version of PIET",
+                                  "unsupported_option");
+      argv.push_back(k == "offset" ? "--offset" : "--exposure");
+      argv.push_back(val);
+      continue;
+    }
+    if (k == "level" && !v.isBool) {
+      argv.push_back("--level");
+      argv.push_back(val);
+      continue;
+    }
+    if (k == "robust" && v.isBool) {
+      robust = true;
+      continue;
+    }
+    // vcov() is not an xtpoisson option: Stata's r(198) "option vcov() not allowed"
+    // (vs-stata bank 3212c705 `xtpoisson fatal beertax unemp, vcov(robust)`)
+    if (k == "vcov")
+      return ojson(eval::errorBlock("engine_error", "option vcov() not allowed", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(198)"));
+    if (k == "vce" && !v.isBool) {
+      const std::string t = lowerM4(val);
+      if (t == "oim") continue;
+      if (t == "r" || t.rfind("rob", 0) == 0) {
+        robust = true;
+        continue;
+      }
+      if (t.rfind("cl", 0) == 0) {
+        std::istringstream is(val);
+        std::string w, cv, extra;
+        is >> w >> cv >> extra;
+        if (!cv.empty() && extra.empty() && cv == *session.panelvar) {
+          robust = true;
+          clusterVar = cv;
+          continue;
+        }
+      }
+      return engineErrorBlockM4("Option `vce(" + val + ")` is a valid Stata option that this version "
+                                "of PIET does not implement for `xtpoisson, re`.",
+                                "unsupported_option");
+    }
+    if (k == "normal")
+      return engineErrorBlockM4("Option `normal` (normally distributed random effects, fitted by "
+                                "quadrature) is a valid Stata option that this version of PIET does "
+                                "not implement for `xtpoisson`.",
+                                "unsupported_option");
+    return engineErrorBlockM4("Option `" + k + "` is a valid Stata option that this version of PIET "
+                              "does not implement for `xtpoisson, re`.",
+                              "unsupported_option");
+  }
+  // vce(robust) / robust / vce(cluster panelvar): xtpoisson.ado's own robust VCE
+  // (XTPOISSON_FE_ROBUST, re; the engine's xtpoisson_re_stata_robust).
+  if (robust) {
+    argv.push_back("--vce");
+    argv.push_back(clusterVar.empty() ? "robust" : "cluster");
+  }
+  argv.push_back("--emit-v");
+  ojson raw;
+  ojson block = runP7MleAsM4("xtpois_re", argv, session, &raw, "xtpoisson");
+  if (!raw.is_object() || block.value("type", std::string()) == "error") return block;
+  block["estimator"] = "xtpoisson_re";
+  block["depvar"] = y;
+  // e(b): the depvar equation, then /lnalpha (bank f8d5160a `fatal:beertax ...
+  // fatal:_cons /lnalpha`); a factor fit's columns as r(table) lays them out.
+  if (raw.contains("e_V") && raw.contains("coefs") && raw.contains("lnalpha")) {
+    std::vector<AncillaryEbColM4> cols;
+    bool ok = depvarEqColsM4(y, raw["coefs"], "b", cols);
+    if (!ok && session.lastModel().has_value() && block.contains("coeftable")) {
+      std::vector<rtable_detail::RtCol> rc;
+      bool placed = false;
+      try {
+        placed = rtable_detail::stataColumns(session, *session.lastModel(), block["coeftable"], rc);
+      } catch (const std::exception&) {
+        placed = false;
+      }
+      if (placed) {
+        ok = true;
+        cols.clear();
+        for (const auto& c : rc) {
+          if (c.row == nullptr) {
+            cols.push_back({y + ":" + c.name, std::string(), 0.0});
+            continue;
+          }
+          std::string en = c.row->value("name", std::string());
+          const ojson& bv = c.row->contains("b") ? (*c.row)["b"] : ojson();
+          const ojson& sv = c.row->contains("se") ? (*c.row)["se"] : ojson();
+          if (en.empty() || !bv.is_number() ||
+              (bv.get<double>() == 0.0 && sv.is_number() && sv.get<double>() == 0.0)) {
+            ok = false;
+            break;
+          }
+          if (en == "_cons") en = "(intercept)";
+          cols.push_back({y + ":" + c.name, en, bv.get<double>()});
+        }
+      }
+    }
+    if (ok) {
+      cols.push_back({"/lnalpha", "/lnalpha", raw["lnalpha"].value("b", 0.0)});
+      (void)postAncillaryEbM4(session, raw, cols);
+    }
+  }
+  // /lnalpha, then the alpha row (Stata's diparm, `_diparm1:alpha` in r(table)):
+  // no test statistic for either.
+  if (!block.contains("coeftable") || !block["coeftable"].is_array()) block["coeftable"] = ojson::array();
+  for (const char* key : {"lnalpha", "alpha"}) {
+    if (!raw.contains(key) || !raw[key].is_object()) continue;
+    const ojson& a = raw[key];
+    ojson row;
+    row["name"] = std::string(key) == "lnalpha" ? "/lnalpha" : "_diparm1:alpha";
+    // A bound the engine could not represent (exp of a large lnalpha limit: alpha's
+    // upper limit when the fit is at the alpha -> 0 boundary) is missing, as Stata
+    // shows it.
+    auto num = [&a](const char* f) {
+      return a.contains(f) && a[f].is_number() ? a[f] : ojson(nullptr);
+    };
+    row["b"] = num("b");
+    row["se"] = num("se");
+    row["t"] = nullptr;
+    row["p"] = nullptr;
+    row["ci_lo"] = num("ci_lo");
+    row["ci_hi"] = num("ci_hi");
+    block["coeftable"].push_back(row);
+  }
+  // e()'s block keeps the coefficient metric: _b[] / _se[] read it, and they are
+  // e(b) / e(V)'s whatever the display option.
+  if (session.lastEstBlock.has_value() && session.lastEstBlock->is_object())
+    (*session.lastEstBlock)["coeftable"] = block["coeftable"];
+  // irr: incidence-rate ratios for the depvar equation's rows of the returned block
+  // only, the table shown and r(table) (bank cc7fb098: r(table) eform 1 on `fatal:`,
+  // 0 on /lnalpha and alpha). A display metric: e(b), _b[] and _se[] are untouched.
+  if (irr)
+    for (auto& row : block["coeftable"]) {
+      if (!row.is_object() || !row.contains("b") || !row["b"].is_number()) continue;
+      const std::string nm = row.value("name", std::string());
+      if (nm == "/lnalpha" || nm == "_diparm1:alpha") continue;
+      const double b = row["b"].get<double>();
+      const double e = std::exp(b);
+      row["b"] = e;
+      if (row.contains("se") && row["se"].is_number()) row["se"] = e * row["se"].get<double>();
+      if (row.contains("ci_lo") && row["ci_lo"].is_number()) row["ci_lo"] = std::exp(row["ci_lo"].get<double>());
+      if (row.contains("ci_hi") && row["ci_hi"].is_number()) row["ci_hi"] = std::exp(row["ci_hi"].get<double>());
+      row["eform"] = true;
+    }
+  return block;
+}
+
 ojson runXtPoissonLogit(const std::string& cobraCmd, const std::string& stataCmd,
                          const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
@@ -946,6 +1541,76 @@ ojson runXtPoissonLogit(const std::string& cobraCmd, const std::string& stataCmd
     if (k == "pa") paPresent = true;
   }
   bool isFe = fePresent && feVal.isBool && feVal.boolValue;
+  // BUG-657: xtlogit.ado / xtpoisson.ado call `_xt, i()` before any model is
+  // fitted, whose refusal is "must specify panelvar; use xtset" r(459), the
+  // default (random-effects) model included (vs-stata bank b1d131f5 `xtlogit hi
+  // beertax unemp`, 4e2bb7cc `xtpoisson fatal beertax unemp`).
+  if (!session.panelvar.has_value() || session.panelvar->empty()) {
+    return ojson(eval::errorBlock("engine_error", "must specify panelvar; use xtset", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(459)"));
+  }
+  // xtpoisson's count outcome: a negative value in the estimation sample is
+  // Stata's r(459) "<depvar> must be greater than or equal to zero", whatever the
+  // model (vs-stata bank d5fe8ada `xtpoisson nf beertax unemp`). Checked when the
+  // regressors are plain variables (the sample is then y, x and the panel variable
+  // nonmissing under `if`).
+  if (cobraCmd == "xtpois" && parsed.varlist.size() >= 2) {
+    static const std::regex rePlainV(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
+    std::vector<std::string> vars(parsed.varlist.begin(), parsed.varlist.end());
+    vars.push_back(*session.panelvar);
+    bool plain = true;
+    for (const auto& v : vars) plain = plain && std::regex_match(v, rePlainV);
+    if (plain) {
+      ojson filterErr;
+      const std::string basePath = *session.currentHbin();
+      const auto filtered = applyIfFilterM4(session, basePath, parsed.ifExpr, filterErr);
+      if (filtered.has_value()) {
+        const bool madeTemp = *filtered != basePath;
+        std::optional<Datastore> tempDs;
+        Datastore* ds = nullptr;
+        try {
+          if (madeTemp) {
+            tempDs.emplace(*filtered);
+            ds = &*tempDs;
+          } else {
+            ds = session.datastore();
+          }
+        } catch (const std::exception&) {
+          ds = nullptr;
+        }
+        bool negative = false;
+        if (ds != nullptr) {
+          std::vector<const double*> cols;
+          for (const auto& v : vars) {
+            if (!ds->has(v) || ds->dtype(v) != "f64") {
+              cols.clear();
+              break;
+            }
+            cols.push_back(ds->col(v).f64());
+          }
+          if (cols.size() == vars.size()) {
+            const int64_t n = ds->nRows();
+            for (int64_t i = 0; i < n && !negative; ++i) {
+              bool complete = true;
+              for (const double* c : cols)
+                complete = complete && !std::isnan(c[i]) && c[i] < eval::kStataMissingSentinel;
+              if (complete && cols[0][i] < 0) negative = true;
+            }
+          }
+        }
+        if (madeTemp) {
+          tempDs.reset();
+          cecon::native_unlink(*filtered);
+        }
+        if (negative)
+          return ojson(eval::errorBlock("engine_error",
+                                        parsed.varlist[0] + " must be greater than or equal to zero",
+                                        std::nullopt, std::nullopt, std::nullopt, "r(459)"));
+      }
+    }
+  }
+  if (!isFe && cobraCmd == "xtpois" && !paPresent && !fePresent && parsed.varlist.size() >= 2)
+    return runXtPoissonReM4(parsed, session);
   if (!isFe) {
     std::string which = rePresent ? ",re" : (paPresent ? ",pa" : "the default (random-effects)");
     return engineErrorBlockM4(

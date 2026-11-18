@@ -60,8 +60,16 @@ std::optional<ojson> nameCollision(SessionState& session, const std::string& nam
   return refusal("graph " + g.name + " already exists", 110);
 }
 
+namespace {
+thread_local int g_suppressRegistration = 0;
+}  // namespace
+
+SuppressGraphRegistration::SuppressGraphRegistration() { ++g_suppressRegistration; }
+SuppressGraphRegistration::~SuppressGraphRegistration() { --g_suppressRegistration; }
+
 void registerGraph(SessionState& session, ojson& block, const std::string& nameOpt,
                    std::vector<Serset> sets, const ojson* meta) {
+  if (g_suppressRegistration > 0) return;
   const GraphName g = parseNameOption(nameOpt);
   const std::string nm = g.name.empty() ? std::string("Graph") : g.name;
   session.sersets.dropOwner(nm);

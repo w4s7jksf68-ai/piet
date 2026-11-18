@@ -41,6 +41,12 @@ using ojson = nlohmann::ordered_json;
 // construct the Datastore (SessionState::datastore() is non-const).
 ojson handleDisplay(const std::string& rawArgs, SessionState& session);
 
+// The text a display line shows: its SMCL directives drawn as plain text, as a
+// Stata text log shows them ({bf:x} is x, {hline 5} -----, {col 20} pads to
+// column 20, {c TLC} +, a tab runs to the next multiple of 8), for a line of
+// `linesize` columns. A directive SMCL does not know stays as typed.
+std::string renderSmclText(const std::string& text, int linesize);
+
 // Stata's DEFAULT numeric display format, `%9.0g` — the nine-character rule
 // measured against the answerbook's own Stata 19.5 log (see the definition in
 // language/display_number_format.cpp for the worked examples). Exported at the P6 wave

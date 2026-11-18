@@ -102,7 +102,14 @@ ojson runSdid(const eval::ParsedCommand& parsed, SessionState& session) {
       }();
 
   EngineCall call = callEngine(argv);
-  if (!call.ok) return ojson::array({call.error});
+  if (!call.ok) {
+    // the engine's refusal of a treatment that is not 0/1 is Stata's r(450)
+    static const std::string kNonBinary = "Treatment variable takes values distinct from 0 and 1.";
+    if (call.error.value("message", std::string()).find(kNonBinary) != std::string::npos)
+      return ojson::array({ojson(eval::errorBlock("syntax_error", kNonBinary, std::nullopt,
+                                                  std::nullopt, std::nullopt, "r(450)"))});
+    return ojson::array({call.error});
+  }
   const ojson& r = call.raw;
 
   const std::string vceUsed = str(r, "vce", vceKind);

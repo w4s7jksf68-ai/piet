@@ -201,6 +201,10 @@ ojson newVarGuard(SessionState& session, const std::string& verb, const std::str
 std::optional<ojson> assertRowCount(SessionState& session, const std::string& verb,
                                     int64_t expected);
 std::optional<ojson> refuseQualifiers(const eval::ParsedCommand& parsed, const std::string& verb);
+// The if/in sample as a 0/1 row mask (1 = in the sample; no qualifier = every row),
+// evaluated by the one qualifier evaluator (a dispatched `generate`).
+std::optional<ojson> ifInMask(SessionState& session, const eval::ParsedCommand& parsed,
+                              std::vector<char>* mask);
 
 }  // namespace dataset_shape_detail
 

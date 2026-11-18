@@ -73,6 +73,7 @@ piet/fixtures/api/varlist.json
 piet/fixtures/contract_test.py
 piet/fixtures/dom/coefplot_fe_graph.json
 piet/fixtures/dom/coefplot_ols_graph.json
+piet/fixtures/dom/display_continue_blocks.json
 piet/fixtures/dom/joinby_missing_file_error.json
 piet/fixtures/dom/kdensity_graph.json
 piet/fixtures/dom/kdensity_twoway_graph.json
@@ -93,6 +94,10 @@ piet/fixtures/dom/scatter_multiy_graph.json
 piet/fixtures/dom/scatter_title_note.json
 piet/fixtures/dom/tabstat_by_estimation.json
 piet/fixtures/dom/tabstat_estimation.json
+piet/fixtures/dom/tabulate_summarize_aw_oneway.json
+piet/fixtures/dom/tabulate_summarize_obs_oneway.json
+piet/fixtures/dom/test_mtest_bonferroni.json
+piet/fixtures/dom/test_notest.json
 piet/fixtures/dom/twoway_lfit_graph.json
 piet/fixtures/dom/twoway_pipe_lfit_graph.json
 piet/fixtures/dom/twoway_qfit_graph.json
@@ -172,6 +177,7 @@ piet/native/include/piet/eval/gettoken.h
 piet/native/include/piet/eval/macros.h
 piet/native/include/piet/eval/pyeval.h
 piet/native/include/piet/eval/pyvalue.h
+piet/native/include/piet/eval/result_order.h
 piet/native/include/piet/eval/session.h
 piet/native/include/piet/eval/stata_datemask.h
 piet/native/include/piet/eval/stata_strfns.h
@@ -298,6 +304,7 @@ piet/native/src/datamgmt/input_data_block.cpp
 piet/native/src/datamgmt/insobs.cpp
 piet/native/src/datamgmt/integ.cpp
 piet/native/src/datamgmt/label_metadata.cpp
+piet/native/src/datamgmt/list_parsing_commands.cpp
 piet/native/src/datamgmt/mvdecode.cpp
 piet/native/src/datamgmt/mvencode.cpp
 piet/native/src/datamgmt/observation_selection.cpp
@@ -422,6 +429,7 @@ piet/native/src/environment/package_availability.cpp
 piet/native/src/environment/package_requirements.cpp
 piet/native/src/environment/shell_translation.cpp
 piet/native/src/environment/sleep_and_error_commands.cpp
+piet/native/src/environment/stata_settings.cpp
 piet/native/src/environment/timer_commands.cpp
 piet/native/src/environment/type_and_dir_commands.cpp
 piet/native/src/environment/workspace_commands.cpp
@@ -519,11 +527,16 @@ piet/native/src/eval/pyeval.cpp
 piet/native/src/eval/pyvalue.cpp
 piet/native/src/eval/tokenizer.cpp
 piet/native/src/fileio/README.md
+piet/native/src/fileio/charset_guess.cpp
+piet/native/src/fileio/charset_guess.h
 piet/native/src/fileio/dataset_save.cpp
 piet/native/src/fileio/dataset_use.cpp
+piet/native/src/fileio/deflate.cpp
+piet/native/src/fileio/deflate.h
 piet/native/src/fileio/delimited_export.cpp
 piet/native/src/fileio/delimited_import.cpp
 piet/native/src/fileio/delimited_io.cpp
+piet/native/src/fileio/dta_version.cpp
 piet/native/src/fileio/file_command_support.cpp
 piet/native/src/fileio/file_command_support.h
 piet/native/src/fileio/file_copy.cpp
@@ -546,6 +559,7 @@ piet/native/src/fileio/xlsx.cpp
 piet/native/src/fileio/xlsx.h
 piet/native/src/fileio/zip_commands.cpp
 piet/native/src/fileio/zip_io.h
+piet/native/src/generated/opt_abbrev_bank20261110.inc
 piet/native/src/generated/opt_minimums_bug264.inc
 piet/native/src/graph/README.md
 piet/native/src/graph/binscatter.cpp
@@ -819,6 +833,7 @@ piet/native/src/utility/filelist.cpp
 piet/native/src/utility/geodesic_distance.cpp
 piet/native/src/utility/labels.cpp
 piet/native/src/utility/missingness.cpp
+piet/native/src/utility/misstable.cpp
 piet/native/src/utility/rolling.cpp
 piet/native/src/utility/sample.cpp
 piet/native/src/utility/series.cpp
@@ -856,6 +871,8 @@ piet/packaging/licenses/68-mat2txt-GPL-3.0.txt
 piet/packaging/licenses/69-acreg-GPL-3.0.txt
 piet/packaging/licenses/70-qreg2-GPL-3.0.txt
 piet/packaging/licenses/71-ritest-GPL-3.0.txt
+piet/packaging/licenses/72-icu-charset-data-Unicode-3.0.txt
+piet/packaging/licenses/73-zlib-Zlib.txt
 piet/packaging/licenses/README.md
 piet/packaging/licenses/staged/gcc-runtime-exception.txt
 piet/packaging/licenses/staged/mingw-winpthreads.txt
@@ -997,6 +1014,7 @@ src/estimators/xtlogit.cpp
 src/estimators/xtlogit.h
 src/estimators/xtpois.cpp
 src/estimators/xtpois.h
+src/estimators/xtpoisre.h
 src/estimators/xtreg.cpp
 src/estimators/xtreg.h
 src/estimators/zicount.cpp

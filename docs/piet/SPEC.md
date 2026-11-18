@@ -309,6 +309,11 @@ scratch budget). Both display modes (De Stijl/Boring) and both themes inherit ev
     exists), `compute_cores`/`memory_budget_mb` → env. Auto releases only a value PIET itself
     set (BUG-386); a pin the launcher placed — a gate's, or a parent `parallel` worker's share —
     survives, exactly as `$PIET_WORKDIR` does.
+    Table size limits (User ruling 2026-11-12): four number boxes for `tabulate`'s r(134) limits
+    (one-way rows, two-way rows, two-way columns, summarize() cells). Empty = Stata's limit, that
+    of Stata/SE and MP (12,000; 1,200 × 80; 375); a whole number replaces it, up to a ceiling of
+    1,000,000 cells per table (200,000 with summarize()) that bounds memory. Read lazily by
+    `tabulate` and republished by `settings.set`, so a change applies to the next command.
   - **Display** (persisted in **localStorage**, applied live) — the **strengthened set** kept
     minimal per smallest-change law: **editor/results font size** (drives the `--fs-*` tokens via
     `<html data-fontsize>`; `medium` = no attribute so the default DOM is byte-unchanged) and a
