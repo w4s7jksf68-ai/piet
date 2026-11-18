@@ -711,6 +711,11 @@ add_executable(piet_selftest src/selftest.cpp
   $<TARGET_OBJECTS:piet_core>)
 target_link_libraries(piet_native PRIVATE piet_settings)
 target_link_libraries(piet_selftest PRIVATE piet_settings)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(piet_linux_dialog_smoke
+    ../../tests/linux_dialog_smoke.cpp $<TARGET_OBJECTS:piet_core>)
+  target_link_libraries(piet_linux_dialog_smoke PRIVATE piet_settings)
+endif()
 
 target_include_directories(piet_settings INTERFACE
   include

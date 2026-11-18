@@ -27,6 +27,8 @@ jobs:
         run: sh scripts/build-linux.sh
       - name: Package Linux downloads
         run: sh scripts/package-linux.sh
+      - name: Exercise the native GTK file pickers
+        run: dbus-run-session -- xvfb-run -a piet/native/build/piet_linux_dialog_smoke
       - name: Run the packaged app in a desktop session
         run: |
           test_dir=$(mktemp -d)
