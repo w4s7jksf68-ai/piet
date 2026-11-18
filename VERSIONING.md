@@ -6,7 +6,8 @@ PIET (the application) and CoBrA (the engine) carry separate version strings.
   (2026-11-05) is the first official release; `A.0.1` (2026-11-06) is its first
   patch cut, `A.0.2` adds the Windows build, and `A.1.0` (2026-11-18) is the
   first minor release of the line (new capability; nothing removed). Patch cuts
-  are `A.y.z`, minor releases `A.y.0`.
+  are `A.y.z`, minor releases `A.y.0`. `A.1.1` adds Linux downloads; the
+  engine remains CoBrA `1.1.0` and both contracts are unchanged.
   Earlier `B.y.z` versions were beta cuts and `2.y.z` the MVP line.
 - **CoBrA** uses ordinary semantic versions (`1.0.0` at PIET A.0.0, `1.0.1` at A.0.1, `1.0.2` at A.0.2, `1.1.0` at A.1.0).
 - `piet_native --version` prints the compiled PIET version; About shows the

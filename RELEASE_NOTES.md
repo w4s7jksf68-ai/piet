@@ -1,3 +1,39 @@
+# PIET A.1.1 / CoBrA 1.1.0 — Linux desktop release
+
+PIET A.1.1 adds Linux downloads alongside macOS and Windows. The computation
+engine remains CoBrA 1.1.0; contracts A 1.27.0 and B 2.11.0 are unchanged.
+Corresponding source: this repository at tag `A.1.1`.
+
+**Linux downloads**
+
+- Ubuntu 24.04 LTS or newer, x86-64 with SSE4.2 (roughly 2009 onward).
+- `PIET-A.1.1-linux-x64.deb`: install with
+  `sudo apt install ./PIET-A.1.1-linux-x64.deb`, then launch PIET from the
+  application menu or run `piet`.
+- `PIET-A.1.1-linux-x64.tar.xz`: extract the entire folder and run `./PIET`.
+  Install its dependencies first with
+  `sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libopenblas0 liblapacke`.
+- Both include the engine, frontend, sample dataset, teaching examples and
+  licence notices. Each download has a SHA-256 file beside it.
+
+The GTK desktop backend now opens and saves files through native dialogs,
+loads the bundled interface's JavaScript modules and resolves its resources
+from the executable's location. The x86-64 engine launcher selects OpenBLAS's
+fixed Nehalem arithmetic path so CPU dispatch does not change the last step of
+a nearly converged probit. Package dependencies enforce the tested Ubuntu
+24.04 runtime floor; Ubuntu 22.04 is not supported.
+
+Statistical algorithms, reference values and test tolerances are unchanged
+from A.1.0. Its capabilities and known gaps remain as documented below.
+
+**Validation of the Linux port:** 67 self-contained engine tests passed;
+45 tests requiring unshipped private fixtures were skipped. The public smoke
+test checked OLS against an independent solve, a .dta roundtrip and Hangul
+paths/text. Native file-picker checks passed, and both extracted and installed
+packages passed all 25 GUI-journey steps. macOS and Windows CI also passed.
+The release workflow rebuilds the downloads from this tag and checks them
+before publishing.
+
 # PIET A.1.0 / CoBrA 1.1.0 — checked against 39,290 Stata 19.5 cells: 32,148 now match
 
 The app reports PIET `A.1.0`, the engine CoBrA `1.1.0`; the engine contract moves to 1.27.0 and the

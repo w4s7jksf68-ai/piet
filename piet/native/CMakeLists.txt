@@ -775,7 +775,7 @@ target_link_libraries(piet_settings INTERFACE Iconv::Iconv)
 # — the RC strings, the manifest assemblyIdentity, and the Inno installer's
 # AppVersion all trace back to PIET_VERSION_VALUE here. Editing these three
 # lines is still the one and only version bump.
-set(PIET_VERSION_VALUE    "A.1.0")
+set(PIET_VERSION_VALUE    "A.1.1")
 set(PIET_CONTRACT_A_VALUE "1.27.0")
 set(PIET_CONTRACT_B_VALUE "2.11.0")
 target_compile_definitions(piet_settings INTERFACE
