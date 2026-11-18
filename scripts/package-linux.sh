@@ -25,7 +25,17 @@ staged="$out/$name"
 rm -rf "$staged" "$out/deb-root" "$out/debian"
 mkdir -p "$staged/resources/frontend" "$staged/resources/sample" "$staged/demo"
 strip -o "$staged/PIET" "$app"
-strip -o "$staged/resources/cobra" "$engine"
+strip -o "$staged/resources/cobra.bin" "$engine"
+# OpenBLAS reads CORETYPE before main(), so choose the fixed SSE4.2 kernel
+# before exec rather than changing the environment inside the engine.
+cat > "$staged/resources/cobra" <<'EOF'
+#!/bin/sh
+case "$(uname -m)" in
+  x86_64) export OPENBLAS_CORETYPE=NEHALEM ;;
+esac
+exec "$(dirname "$(readlink -f "$0")")/cobra.bin" "$@"
+EOF
+chmod 755 "$staged/resources/cobra"
 cp piet/frontend/index.html "$staged/resources/frontend/"
 cp -R piet/frontend/css piet/frontend/js "$staged/resources/frontend/"
 cp piet/packaging/sample/fatalities.csv "$staged/resources/sample/"
@@ -50,7 +60,7 @@ Package: piet
 Architecture: any
 Description: Offline econometrics desktop application
 EOF
-deps=$(cd "$out" && dpkg-shlibdeps -O -e"$staged/PIET" -e"$staged/resources/cobra" | sed -n 's/^shlibs:Depends=//p')
+deps=$(cd "$out" && dpkg-shlibdeps -O -e"$staged/PIET" -e"$staged/resources/cobra.bin" | sed -n 's/^shlibs:Depends=//p')
 test -n "$deps"
 # Symbol versions alone allow Jammy's older math libraries, which fail the
 # tight-probit gates. Keep the ELF bounds AND the tested Noble runtime floor.

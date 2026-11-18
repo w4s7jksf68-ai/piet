@@ -7,6 +7,11 @@ set -eu
 cd "$(dirname "$0")/.."
 test "$(uname -s)" = Linux || { echo 'Run this script on Linux.' >&2; exit 1; }
 source_root=$(pwd -P)
+# Match the packaged engine launcher: dynamic OpenBLAS kernels otherwise move
+# a nearly converged probit's final Newton step across the frozen oracle bound.
+case "$(uname -m)" in
+  x86_64) export OPENBLAS_CORETYPE=NEHALEM ;;
+esac
 python3 tools/lint_source_layout.py
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCECON_X86_ARCH=x86-64-v2 "-DCMAKE_CXX_FLAGS=-ffile-prefix-map=$source_root=."

@@ -96,6 +96,12 @@ is needed for the interface; the command-line modes also work without one.
 The build script can also build natively on arm64 Linux; the automated release
 job produces x86-64 downloads.
 
+The x86-64 engine launcher uses OpenBLAS's fixed Nehalem kernel, so CPU dispatch
+does not change a nearly converged model's final iteration. The Linux build
+script runs the numerical gates with that same configuration. When running a
+raw development `build/cobra` or `ctest` directly, set
+`OPENBLAS_CORETYPE=NEHALEM` as well; packaged applications do this themselves.
+
 ## Developer's note
 
 Hi, I'm Mun Kyung! I started this because I wanted anyone, regardless of
