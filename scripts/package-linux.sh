@@ -52,6 +52,9 @@ Description: Offline econometrics desktop application
 EOF
 deps=$(cd "$out" && dpkg-shlibdeps -O -e"$staged/PIET" -e"$staged/resources/cobra" | sed -n 's/^shlibs:Depends=//p')
 test -n "$deps"
+# Symbol versions alone allow Jammy's older math libraries, which fail the
+# tight-probit gates. Keep the ELF bounds AND the tested Noble runtime floor.
+deps="$deps, libc6 (>= 2.39), libopenblas0 (>= 0.3.26), liblapacke (>= 3.12.0)"
 cat > "$staged/README-LINUX.txt" <<EOF
 PIET $version / Linux $label
 
