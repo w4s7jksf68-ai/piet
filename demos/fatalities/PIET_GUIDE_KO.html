@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="ko" xml:lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.10" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>PIET 사용 설명서</title>
+  <style>
+:root{color-scheme:light;--ink:#162b35;--accent:#11604e;--paper:#fffefa}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0 auto;padding:3.5rem 2rem 5rem;max-width:64rem;background:var(--paper);color:var(--ink);font:17px/1.8 "Apple SD Gothic Neo","Malgun Gothic","Noto Sans CJK KR",sans-serif;overflow-wrap:break-word;word-break:keep-all}
+header{border-top:6px solid var(--accent);padding-top:1.5rem}header h1{font-size:clamp(2.4rem,5vw,4.5rem);border:0;margin:0;line-height:1.2;letter-spacing:-.065em}header p{font-size:1.22rem;color:#43616c;margin:.5rem 0 1.7rem}
+nav{padding:1rem 1.3rem;background:#edf3ee;border-radius:8px;margin-top:1.4rem}nav:before{content:"차례";font-weight:700}nav ul{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.25rem 1.5rem;margin:.4rem 0;padding-left:1.3rem}nav a{font-size:.95rem}
+h1:not(.title){margin:3.8rem 0 .8rem;border-top:2px solid #1c6555;padding-top:1rem;font-size:2rem;letter-spacing:-.055em;line-height:1.35}h2{font-size:1.38rem;color:#194d41;line-height:1.45;margin:2.1rem 0 .6rem;letter-spacing:-.035em}p{margin:.8rem 0}a{color:#115b4b;text-underline-offset:.16em}strong{font-weight:720}table{width:100%;border-collapse:collapse;font-size:.94rem;line-height:1.58;margin:1rem 0 1.4rem}th,td{text-align:left;padding:.62rem .75rem;border-bottom:1px solid #d9e1dd;vertical-align:top}th{background:#e8f0eb;color:#224538}tr:nth-child(even) td{background:#f6f8f5}tbody td:first-child{font-weight:620}pre{padding:1rem 1.25rem;background:#182d32;color:#f6fbfb;border-radius:.4rem;overflow:auto;line-height:1.55}code{font-family:"SFMono-Regular",Consolas,monospace;font-size:.89em}p code,td code{background:#eaf0ec;border-radius:3px;padding:.08em .27em;display:inline-block}pre code span{color:inherit!important}li{padding-left:.15rem;margin:.22rem 0}.figures{display:grid;grid-template-columns:1fr 1fr;gap:1.1rem}figure{margin:0;padding:.6rem;background:white;border:1px solid #d7ded8;border-radius:4px}figure img{display:block;width:100%;height:auto}figcaption{padding:.4rem .5rem;font-size:.89rem;line-height:1.6}
+@media(max-width:660px){body{padding:1.25rem .85rem 3rem;font-size:16px}th,td{padding:.45rem .38rem;word-break:normal;overflow-wrap:anywhere}.figures{grid-template-columns:1fr}h1:not(.title){font-size:1.65rem}}
+@media(max-width:660px){p code,li code,td code{max-width:100%;overflow-wrap:anywhere;word-break:break-word}table{table-layout:fixed}.sourceCode{max-width:100%;overflow-x:auto}}
+@media print{body{max-width:none;padding:0;font-size:10pt;color:black}nav{display:none}h1:not(.title){break-before:page}h1,h2{break-after:avoid}tr,figure,pre{break-inside:avoid}a{color:inherit}pre{color:black;background:#f4f4f4}}
+
+html[lang=en] body{word-break:normal;font-family:system-ui,sans-serif}html[lang=en] nav:before{content:"Contents"} .doclinks{display:flex;gap:1.2rem;flex-wrap:wrap;border-bottom:1px solid #d9e1dd;padding:.6rem 0;font-size:.94rem}.figures{grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr))}.sourceCode pre{white-space:pre;word-break:normal}.sourceCode code{display:inline}.subtitle{line-height:1.5}</style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">PIET 사용 설명서</h1>
+<p class="subtitle">화면 조작부터 병렬 실행까지</p>
+</header>
+<div class="doclinks"><a href="PIET_LAB_KO.html">실습 가이드</a><a href="PIET_GUIDE_EN.html">English</a></div>
+
+<p><strong>PIET A.1.1 · CoBrA 1.1.0</strong></p>
+<p>처음이라면 내장 자료를 열고 명령 네 줄을 실행해 보세요. 이미 분석 중이라면 차례에서 필요한 버튼, 설정 또는 명령어를 바로 찾을 수 있습니다.</p>
+<p><a href="https://github.com/w4s7jksf68-ai/piet/releases/tag/A.1.1">PIET A.1.1 다운로드</a></p>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#설치와-첫-실행" id="toc-설치와-첫-실행">설치와 첫 실행</a></li>
+<li><a href="#화면과-버튼" id="toc-화면과-버튼">화면과 버튼</a></li>
+<li><a href="#설정과-병렬-실행" id="toc-설정과-병렬-실행">설정과 병렬 실행</a></li>
+<li><a href="#지원-명령과-알려진-제약" id="toc-지원-명령과-알려진-제약">지원 명령과 알려진 제약</a></li>
+<li><a href="#결과-보관과-막혔을-때" id="toc-결과-보관과-막혔을-때">결과 보관과 막혔을 때</a></li>
+</ul>
+</nav>
+<h1 id="설치와-첫-실행">설치와 첫 실행</h1>
+<table>
+
+<thead>
+<tr>
+<th>환경</th>
+<th>설치와 예제 위치</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Apple Silicon Mac · macOS 13.3 이상</td>
+<td>릴리스의 arm64 DMG를 열고 PIET.app을 Applications로 옮긴다. A.1.1 DMG에는 표본 CSV가 들어 있다. 실습 .do는 별도 실습 가이드에서 받을 수 있다.</td>
+</tr>
+<tr>
+<td>Windows 10/11 · x64</td>
+<td>설치판은 시작 메뉴에 PIET를 추가하고 예제를 문서 폴더의 PIET에 복사한다. 포터블 ZIP은 전체를 푼 뒤 PIET.exe를 연다. 예제는 demo 폴더에 있고 WebView2가 필요하다.</td>
+</tr>
+<tr>
+<td>Ubuntu 24.04 이상 · x86-64</td>
+<td>.deb 설치 후 앱 메뉴에서 PIET를 연다. 예제는 /opt/piet/demo에 있다. .tar.xz는 전체를 풀고 ./PIET를 실행한다. demo 폴더를 쓰기 가능한 곳에 복사한다.</td>
+</tr>
+</tbody>
+</table>
+<p><a href="https://github.com/w4s7jksf68-ai/piet/blob/A.1.1/README.md">배포본별 설치 안내</a> · <a href="https://raw.githubusercontent.com/w4s7jksf68-ai/piet/A.1.1/demos/fatalities/fatalities_tour.do">A.1.1 원본 투어 .do</a></p>
+<h2 id="처음-열어서-결과-하나-얻기">처음 열어서 결과 하나 얻기</h2>
+<p><strong>5분 실습.</strong> 빈 세션에서 <strong>File ▾ → Open sample dataset</strong>을 누른다. 아래 명령을 화면 아래 입력란에 한 줄씩 넣고 <strong>Enter</strong>를 누른다. 여러 줄을 한꺼번에 붙여 넣어 편집기가 열리면 <strong>▶ Run</strong>을 누른다.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode stata"><code class="sourceCode stata"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">count</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">generate</span> frate = fatal / pop * 10000</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">summarize</span> frate</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">regress</span> frate beertax</span></code></pre></div>
+<p>첫 줄은 <strong>336</strong>을 돌려준다. 자료 한 줄은 한 주의 한 해다. 앨라배마의 1982년 사망자는 839명, 인구는 약 394만 명이다. 두 번째 줄은 839 ÷ 3,942,002 × 10,000 ≈ <strong>2.13명</strong>을 만든다. 이렇게 인구 규모를 맞춰야 큰 주와 작은 주를 같은 단위로 비교할 수 있다. 세 번째 줄의 평균은 <strong>2.040명</strong>, 마지막 표의 <code>beertax</code> 계수는 <strong>+0.3646</strong>이다.</p>
+<h1 id="화면과-버튼">화면과 버튼</h1>
+<table>
+
+<thead>
+<tr>
+<th>보이는 이름</th>
+<th>언제 누르는가</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Results · 아래쪽 Run</td>
+<td>한 줄을 입력하고 Enter 또는 Run으로 실행한다. 실행한 명령 바로 아래에 표·그림·오류가 쌓인다. 위쪽 내용을 읽다 최신 출력으로 가려면 ↓ latest를 누른다.</td>
+</tr>
+<tr>
+<td>File ▾ · Recent</td>
+<td>Open Data…는 데이터, Open do-file…은 편집할 스크립트, Open sample dataset은 내장 원자료를 연다. Recent에서 이전 파일을 다시 열 수 있다.</td>
+</tr>
+<tr>
+<td>Run .do · Do-file Editor</td>
+<td>상단 Run .do는 디스크에서 파일을 골라 즉시 실행한다. 편집기 ▶ Run은 현재 편집 내용 전체를 실행한다. ▶ Run selection은 선택한 범위를 실행하며 선택이 비어 있으면 전체를 실행한다. Clear는 편집 내용을 비운다.</td>
+</tr>
+<tr>
+<td>Data ▾</td>
+<td>Data Browser는 행과 열을 훑는 화면, Data Editor는 값을 직접 수정하는 화면이다. 수정 내역을 반복해서 적용하려면 .do에 replace 명령을 적는다.</td>
+</tr>
+<tr>
+<td>Variables · History</td>
+<td>변수명·레이블을 검색하거나 변수 카드를 열어 자료형을 본다. 이력 한 줄을 누르면 명령줄로 가져온다. 이력의 → Do-file은 편집기로 보낸다.</td>
+</tr>
+<tr>
+<td>Graphics</td>
+<td>작은 그림을 눌러 확대한다. Prev / Next로 앞뒤 그림을 보고 Back to gallery로 돌아간다. 파일이 필요하면 결과 그림의 PNG 내보내기 또는 graph export를 사용한다.</td>
+</tr>
+<tr>
+<td>Split · Stack · Reset layout</td>
+<td>Split으로 결과 옆에 편집기나 그림 탭을 붙인다. 편집기와 그림을 모두 붙였을 때 Stack으로 두 보조 화면을 위아래로 배치한다. Reset layout은 처음의 탭 배치로 돌아간다.</td>
+</tr>
+<tr>
+<td>Save Results… · × clear</td>
+<td>Save Results…로 현재 콘솔 내용을 텍스트 로그로 남긴다. × clear는 콘솔을 비운다. 자료는 별도로 save 명령을 써서 저장한다.</td>
+</tr>
+<tr>
+<td>Cancel · Submit</td>
+<td>긴 do-file은 진행 표시줄의 Cancel로 중단한다. 입력 대화상자가 나타나면 값을 적고 Submit을 누르거나 Cancel run으로 끝낸다. 중단 전 실행된 줄은 이미 적용됐을 수 있다.</td>
+</tr>
+<tr>
+<td>About · Settings · 스타일·명암 버튼</td>
+<td>About에서 버전과 고지를 확인한다. Settings는 계산·폴더·표시 설정을 연다. 스타일 버튼은 Boring/De Stijl, 명암 버튼은 Light/Dark를 바꾼다.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>손에 익힐 키.</strong> macOS에서는 ⌘, Windows/Linux에서는 Ctrl을 쓴다. ⌘/Ctrl+Enter는 편집기 전체 실행, ⌘/Ctrl+Shift+D는 선택 실행, ⌘/Ctrl+F는 현재 결과 또는 편집기에서 찾기다. 편집기에서는 바꾸기도 된다. 명령줄의 ↑/↓로 이전 명령을 불러오고 Esc로 열린 패널을 닫는다.</p>
+<h1 id="설정과-병렬-실행">설정과 병렬 실행</h1>
+<table>
+
+<thead>
+<tr>
+<th>Settings 항목</th>
+<th>맞추는 기준</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scratch directory</td>
+<td>명령이 쓰는 임시 데이터의 위치다. 큰 자료는 여유 공간이 있는 로컬 디스크를 지정한다. Apply 후 앱을 재시작한다.</td>
+</tr>
+<tr>
+<td>Default working directory</td>
+<td>상대경로로 자료를 읽고 쓰는 기준 폴더다. Apply 후 재시작한다. 현재 세션만 바꿀 때는 pwd로 위치를 보고 cd “폴더 경로”를 실행한다.</td>
+</tr>
+<tr>
+<td>Open do-files in their own folder</td>
+<td>켜면 다음에 여는 .do 폴더가 작업 폴더가 된다. 직접 cd를 실행했거나 기본 작업 폴더를 골랐다면 그 선택이 우선한다.</td>
+</tr>
+<tr>
+<td>Export folder</td>
+<td>Save Results와 GUI의 PNG 내보내기 위치다. 비우면 저장 때 물어본다. 스크립트의 graph export는 명령에 적은 경로를 따른다.</td>
+</tr>
+<tr>
+<td>Compute cores · Memory budget</td>
+<td>전자는 엔진 계산과 BLAS의 총 코어 예산이다. Auto 또는 숫자를 고르고 Apply하면 다음 명령에 적용된다. 메모리 예산은 병렬 작업의 임시 데이터, 콘솔 이력과 그림 보관량, 자동 worker 수에 쓰인다.</td>
+</tr>
+<tr>
+<td>Provenance hash</td>
+<td>입력 자료의 해시를 결과에 기록한다. 같은 파일로 재현했는지 확인하고 싶을 때 켠다. 기본은 꺼짐이다.</td>
+</tr>
+<tr>
+<td>External-library compatibility names</td>
+<td>기존 .do의 reghdfe, csdid, boottest 같은 이름을 인식하게 한다. 첫 실행 화면이나 Settings에서 지속 설정한다. 한국어 투어의 set extcompat on은 현재 세션에 적용된다.</td>
+</tr>
+<tr>
+<td>Table size limits</td>
+<td>빈칸의 기본값은 일원표 12,000행, 이원표 1,200행 × 80열, summarize() 표 375셀이다. 필요할 때 개별 한도를 올린다. 전체 상한은 보통 100만 셀, summarize()는 20만 셀이다.</td>
+</tr>
+<tr>
+<td>Editor &amp; results font size</td>
+<td>편집기·결과·데이터 브라우저의 글씨 크기를 바꾼다.</td>
+</tr>
+<tr>
+<td>Run pasted blocks immediately</td>
+<td>켜면 여러 줄을 붙여 넣자마자 실행한다. 꺼 두면 편집기에서 내용을 읽고 실행할 수 있다.</td>
+</tr>
+<tr>
+<td>Auto-summarize on load</td>
+<td>자료를 열 때 summarize를 실행해 변수 카드의 요약값을 채운다. 기본은 꺼짐이다.</td>
+</tr>
+<tr>
+<td>Follow system appearance</td>
+<td>운영체제의 밝은/어두운 모드를 따른다. 도구막대에서 명암을 직접 바꾸면 수동으로 전환한다.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="두-작업을-실제로-나눠-보기">두 작업을 실제로 나눠 보기</h2>
+<p><strong>Settings → Compute cores</strong>에서 2개 이상 또는 Auto를 고르고 <strong>Apply</strong>한다. 다음을 편집기에 넣고 전체 실행한다. 하나는 맥주세를, 다른 하나는 실업률을 요약한다. 두 작업 모두 처음에 열린 같은 자료만 읽는다.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode stata"><code class="sourceCode stata"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">sysuse</span> fatalities, <span class="kw">clear</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>parallel, workers(2) {</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">summarize</span> beertax</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">summarize</span> unemp</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div>
+<p>결과는 코드 순서대로 평균 <strong>0.5133달러</strong>, <strong>7.3467%</strong>가 나온다. <code>workers(1)</code>로 직렬 결과와 비교할 수 있다. <code>parallel {</code>로 열면 작업 수·코어·메모리·임시 디스크 여유를 고려해 개수를 정한다. 코어는 계산 자원이고 worker는 별도 프로세스다. 같은 블록에서 앞줄이 만든 변수나 추정치를 뒷줄이 쓰는 작업은 순서대로 실행한다. 예컨대 회귀와 이어지는 <code>boottest</code>는 블록 밖에 함께 둔다. 파일을 병렬로 쓸 때는 작업마다 다른 출력 이름을 쓴다.</p>
+<p>macOS 배포본의 명령줄에서 위 예제는 표준 오류에 <strong>2 tasks / 2 workers</strong>를 기록했다. 실행 예시는 <code>"/Applications/PIET.app/Contents/MacOS/piet_native" --do parallel.do</code>이다. 두 개의 작은 요약에서는 프로세스 시작 비용이 커서 시간 단축을 기대하기 어렵다. A.1.1의 Windows에서는 이 블록을 직렬로 실행한다. 엔진 내부의 계산 스레드는 별도로 Compute cores 설정을 따른다. <code>set processors</code>는 이 버전에서 코어 예산을 설정하는 명령으로 쓸 수 없다.</p>
+<h1 id="지원-명령과-알려진-제약">지원 명령과 알려진 제약</h1>
+<p>처음에는 아래 표에서 할 일을 찾고, 직접 실행할 때는 실습 파일에서 해당 명령을 찾는다. 명령은 보통 <code>명령어 변수목록 if 조건, 옵션</code> 순서로 적는다. 예를 들어 완성 데이터에서 <code>summarize frate if year == 1988</code>은 1988년만 요약한다. 쉼표 뒤 <code>vce(cluster statenum)</code>은 오차를 어느 단위로 묶을지 지정한다.</p>
+<table>
+
+<thead>
+<tr>
+<th>할 일</th>
+<th>자주 쓰는 명령과 사용 예</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>열기·저장·점검</td>
+<td>sysuse, use, import delimited, import excel, save, export, describe, codebook, count, list, browse, summarize, tabulate</td>
+</tr>
+<tr>
+<td>만들기·정리·결합</td>
+<td>generate, replace, egen, label variable, keep, drop, sort, collapse, merge, append, reshape, preserve, restore</td>
+</tr>
+<tr>
+<td>회귀·패널·도구변수</td>
+<td>regress, xtset, xtreg, reghdfe, ivregress, ivreg2, ivreghdfe. 예를 들어 xtreg의 fe는 주 안의 변화를 사용한다.</td>
+</tr>
+<tr>
+<td>이산·제한 종속변수</td>
+<td>logit, probit, poisson, nbreg, xtpoisson, tobit, heckman. 종속변수의 단위와 모형에 맞는 predict 옵션을 고른다.</td>
+</tr>
+<tr>
+<td>정책평가·시계열</td>
+<td>csdid, drdid, rdrobust, sdid, newey, prais. csdid의 집단·연도·최초 처치 시점은 각각 ivar(), time(), gvar()로 전달한다.</td>
+</tr>
+<tr>
+<td>추정 뒤 검정·표·그림</td>
+<td>predict, test, lincom, nlcom, estat, estimates, eststo, esttab, twoway, coefplot, graph export. 먼저 적용 대상 모형을 실행한다.</td>
+</tr>
+<tr>
+<td>반복·재표집</td>
+<td>foreach, forvalues, local, global, program define, bootstrap, jackknife, permute, boottest, parallel. 줄 단위 명령 외에 접두사와 중괄호 블록도 있다.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="고치는-항목을-읽는-법">고치는 항목을 읽는 법</h2>
+<p>공개 릴리스가 밝힌 <strong>남은 결함</strong>과 <strong>플랫폼·문법 제약</strong>은 다음과 같다. 2026년 11월 18일 기준 공개 자료에서 개별 항목의 현재 작업자나 수정 예정 버전은 확인되지 않았다. 실습할 때 참고할 수 있도록 영향을 받는 형태와 확인 방법을 적었다.</p>
+<table>
+
+<thead>
+<tr>
+<th>상태</th>
+<th>명령·조합</th>
+<th>사용자에게 보이는 차이와 대처</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>등록된 결함</td>
+<td>reshape wide 뒤 label list</td>
+<td>값 레이블의 나열 순서가 기준 출력과 다를 수 있다. 코드와 뜻의 대응을 확인한다.</td>
+</tr>
+<tr>
+<td>등록된 결함</td>
+<td>tabulate a b, summarize(x)</td>
+<td>요약값을 계산해도 표가 화면에 그려지지 않는다. 조합별 평균이 목적이면 preserve, collapse (mean) x, by(a b), list, restore를 차례로 실행한다.</td>
+</tr>
+<tr>
+<td>투어에서 확인한 제약</td>
+<td>absorb(statenum year) 직후 boottest</td>
+<td>두 고정효과 흡수에 관한 안내를 돌려준다. 실습 가이드 4절의 연도 더미 명세에서 검정 결과를 확인했다.</td>
+</tr>
+<tr>
+<td>플랫폼 차이</td>
+<td>Windows의 ustrregexm(), ustrregexra() · sdid, vce(bootstrap)</td>
+<td>일부 이모지처럼 U+FFFF를 넘는 문자는 해당 정규식 함수가 거절한다. sdid 부트스트랩 표준오차는 운영체제에 따라 네 번째 유효숫자 부근에서 달라질 수 있다.</td>
+</tr>
+<tr>
+<td>예제 자료의 범위</td>
+<td>sysuse auto 등</td>
+<td>PIET가 함께 배포하는 예제 이름은 fatalities다. 다른 자료는 본인이 보유한 파일 경로로 연다.</td>
+</tr>
+</tbody>
+</table>
+<p>A.1.1은 A.1.0의 계산 엔진을 사용한다. 공개 검증은 Stata 19.5와 명령·옵션·오류·저장 결과를 조합한 39,290개 사례 중 32,148개가 일치했다고 보고한다. 3,872개는 Stata에서 실행되지만 PIET가 해당 형태를 미구현으로 응답했고, 1,596개는 PIET에 없는 명령을 사용했다. 한 명령에서 여러 사례가 나오므로 이 수치를 명령어 개수로 읽으면 안 된다. <a href="https://github.com/w4s7jksf68-ai/piet/blob/A.1.1/RELEASE_NOTES.md">버전별 검증 결과와 잔여 결함</a></p>
+<h2 id="a.1.1-명령-이름-찾아보기">A.1.1 명령 이름 찾아보기</h2>
+<p>아래는 실제 macOS 배포 파일의 <code>--dump-registry</code>에서 읽은 등록 이름을 분야별로 정리한 색인이다. 등록은 구문을 판별할 수 있다는 뜻이며, 옵션별 지원 범위는 다르다. <code>feols</code>에는 호환 이름 <code>reghdfe</code>가 있다. <code>do</code>, <code>foreach</code>, <code>forvalues</code>, <code>if</code>, <code>while</code>, <code>local</code>, <code>global</code>, <code>program</code>, <code>quietly</code>, <code>capture</code>, <code>by</code>, <code>bootstrap</code>, <code>jackknife</code>, <code>permute</code>처럼 별도 실행 단계에서 처리하는 구문도 있다. 브라우저 찾기(Ctrl/⌘+F)로 찾을 수 있다.</p>
+<p><strong>자료 관리·기술통계 (113)</strong></p>
+<p><code>_pctile</code> <code>append</code> <code>assert</code> <code>astile</code> <code>bcal</code> <code>browse</code> <code>bsample</code> <code>carryforward</code> <code>centile</code> <code>clear</code> <code>clonevar</code> <code>collapse</code> <code>contract</code> <code>count</code> <code>cross</code> <code>cumul</code> <code>decode</code> <code>destring</code> <code>distinct</code> <code>drawnorm</code> <code>drop</code> <code>ds</code> <code>duplicates</code> <code>egen</code> <code>encode</code> <code>expand</code> <code>fcollapse</code> <code>fillin</code> <code>fillmissing</code> <code>findname</code> <code>fmerge</code> <code>frame</code> <code>frames</code> <code>frget</code> <code>frlink</code> <code>gcollapse</code> <code>gduplicates</code> <code>gegen</code> <code>generate</code> <code>geodist</code> <code>geonear</code> <code>getmata</code> <code>gisid</code> <code>glevelsof</code> <code>gquantiles</code> <code>greshape</code> <code>gsort</code> <code>gstats</code> <code>gunique</code> <code>ihstrans</code> <code>insobs</code> <code>inspect</code> <code>integ</code> <code>ipolate</code> <code>isid</code> <code>joinby</code> <code>keep</code> <code>levelsof</code> <code>list</code> <code>lookfor</code> <code>markout</code> <code>mata</code> <code>mdesc</code> <code>merge</code> <code>mi</code> <code>missings</code> <code>misstable</code> <code>mkspline</code> <code>move</code> <code>mvdecode</code> <code>mvencode</code> <code>order</code> <code>pctile</code> <code>rangestat</code> <code>recode</code> <code>rename</code> <code>renpfix</code> <code>replace</code> <code>reshape</code> <code>sample</code> <code>sctorezone</code> <code>sencode</code> <code>separate</code> <code>sort</code> <code>split</code> <code>splitsample</code> <code>stack</code> <code>strdist</code> <code>stset</code> <code>summarize</code> <code>svmat</code> <code>tab1</code> <code>tab2</code> <code>table</code> <code>tabulate</code> <code>tostring</code> <code>tset</code> <code>tsfill</code> <code>tsfilter</code> <code>tsset</code> <code>tssmooth</code> <code>tsspell</code> <code>unab</code> <code>unique</code> <code>winsor</code> <code>winsor2</code> <code>xi</code> <code>xpose</code> <code>xtdescribe</code> <code>xtile</code> <code>xtset</code> <code>xtsum</code> <code>xttab</code></p>
+<p><strong>추정·검정·추정 후 명령 (103)</strong></p>
+<p><code>acreg</code> <code>areg</code> <code>boottest</code> <code>chow</code> <code>cloglog</code> <code>corr</code> <code>csdid</code> <code>dfuller</code> <code>did_imputation</code> <code>drdid</code> <code>erepost</code> <code>ereturn</code> <code>estadd</code> <code>estat</code> <code>estimates</code> <code>estout</code> <code>estpost</code> <code>eststo</code> <code>esttab</code> <code>eventstudyinteract</code> <code>feols</code> <code>fepois</code> <code>fracreg</code> <code>frmttable</code> <code>glm</code> <code>gmm</code> <code>hausman</code> <code>heckman</code> <code>honestdid</code> <code>irf</code> <code>ivprobit</code> <code>ivreg</code> <code>ivreg2</code> <code>ivreghdfe</code> <code>ivregress</code> <code>ivtobit</code> <code>lasso</code> <code>lassocoef</code> <code>leebounds</code> <code>lincom</code> <code>logistic</code> <code>logit</code> <code>lrtest</code> <code>margins</code> <code>mean</code> <code>mediate</code> <code>mixed</code> <code>ml</code> <code>mlogit</code> <code>nbreg</code> <code>newey</code> <code>nl</code> <code>nlcom</code> <code>oaxaca</code> <code>ologit</code> <code>oprobit</code> <code>outreg2</code> <code>parmest</code> <code>pca</code> <code>poisson</code> <code>pperron</code> <code>ppmlhdfe</code> <code>prais</code> <code>predict</code> <code>probit</code> <code>proportion</code> <code>pwcorr</code> <code>qreg</code> <code>qreg2</code> <code>rddensity</code> <code>rdrobust</code> <code>reg3</code> <code>regress</code> <code>regsave</code> <code>ritest</code> <code>rlasso</code> <code>sdid</code> <code>sdtest</code> <code>signrank</code> <code>sktest</code> <code>spearman</code> <code>stcox</code> <code>streg</code> <code>suest</code> <code>sureg</code> <code>swindex</code> <code>tabout</code> <code>tabstat</code> <code>teffects</code> <code>test</code> <code>testparm</code> <code>tobit</code> <code>ttest</code> <code>var</code> <code>vargranger</code> <code>wntestq</code> <code>xtabond</code> <code>xtivreg2</code> <code>xtlogit</code> <code>xtpoisson</code> <code>xtreg</code> <code>zinb</code> <code>zip</code></p>
+<p><strong>그래프 (20)</strong></p>
+<p><code>binscatter</code> <code>cdfplot</code> <code>coefplot</code> <code>event_plot</code> <code>graph</code> <code>grc1leg</code> <code>grc1leg2</code> <code>histogram</code> <code>kdensity</code> <code>line</code> <code>lowess</code> <code>lpoly</code> <code>marginsplot</code> <code>rdplot</code> <code>scatter</code> <code>serset</code> <code>tsline</code> <code>twoway</code> <code>twoway__histogram_gen</code> <code>xtline</code></p>
+<p><strong>파일·입출력·환경 경로 (53)</strong></p>
+<p><code>ado</code> <code>adopath</code> <code>cd</code> <code>cf</code> <code>confirm</code> <code>copy</code> <code>dir</code> <code>dtaversion</code> <code>erase</code> <code>export</code> <code>file</code> <code>filefilter</code> <code>filelist</code> <code>findfile</code> <code>import</code> <code>infile</code> <code>infix</code> <code>input</code> <code>insheet</code> <code>log</code> <code>ls</code> <code>mat2txt</code> <code>mkdir</code> <code>net</code> <code>odbc</code> <code>outfile</code> <code>outsheet</code> <code>post</code> <code>postclose</code> <code>postfile</code> <code>postutil</code> <code>putexcel</code> <code>pwd</code> <code>rm</code> <code>rmdir</code> <code>save</code> <code>saveold</code> <code>shell</code> <code>spshape2dta</code> <code>ssc</code> <code>sysdir</code> <code>sysuse</code> <code>tex</code> <code>texdoc</code> <code>texsave</code> <code>type</code> <code>unzipfile</code> <code>use</code> <code>which</code> <code>winexec</code> <code>zipfile</code> <code>zipsave</code> <code>zipuse</code></p>
+<p><strong>세션·설정·메타데이터 (35)</strong></p>
+<p><code>_dots</code> <code>char</code> <code>cls</code> <code>codebook</code> <code>compare</code> <code>compress</code> <code>datasignature</code> <code>describe</code> <code>display</code> <code>error</code> <code>exit</code> <code>format</code> <code>gr_edit</code> <code>grstyle</code> <code>label</code> <code>labelbook</code> <code>labmask</code> <code>labvars</code> <code>notes</code> <code>numlabel</code> <code>parallel</code> <code>pause</code> <code>preserve</code> <code>recast</code> <code>renvarlab</code> <code>renvars</code> <code>require</code> <code>restore</code> <code>set</code> <code>sleep</code> <code>splitvallabels</code> <code>svyset</code> <code>timer</code> <code>tolower</code> <code>version</code></p>
+<p><strong>매크로·행렬·반환값 (15)</strong></p>
+<p><code>fvexpand</code> <code>fvunab</code> <code>macro</code> <code>marksample</code> <code>matlist</code> <code>matrix</code> <code>matselrc</code> <code>matsort</code> <code>mkmat</code> <code>numlist</code> <code>return</code> <code>scalar</code> <code>sreturn</code> <code>tempvar</code> <code>tsunab</code></p>
+<h1 id="결과-보관과-막혔을-때">결과 보관과 막혔을 때</h1>
+<p><strong>세 파일을 구별하면 과제를 다시 열기 쉽다.</strong> .do에는 계산 순서, .dta에는 자료값과 한글 레이블, .log에는 읽을 수 있는 결과표가 들어간다. 그래프 SVG는 별도 파일이다. 제출하거나 공유할 때는 앱·엔진 버전, 사용한 .do, 데이터 출처, 군집 단위, 시드까지 같이 남긴다. CSV에는 PIET 변수 레이블을 담을 자리가 없으므로 편집한 자료는 새 이름의 .dta로 저장한다.</p>
+<table>
+
+<thead>
+<tr>
+<th>상황</th>
+<th>먼저 확인할 것</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>그림을 저장했는데 보이지 않는다</td>
+<td>명령줄에서 pwd를 실행한다. graph export로 만든 파일은 이 폴더에 있다. GUI로 내보낸 PNG와 로그는 Settings → Export folder도 본다.</td>
+</tr>
+<tr>
+<td>variable frate already defined</td>
+<td>같은 생성 구간을 두 번 실행했다. 새로 시작하려면 기존 작업을 저장한 뒤 투어를 처음부터 실행한다. 중간에서 이어갈 때는 이미 만든 변수의 generate 줄을 건너뛴다.</td>
+</tr>
+<tr>
+<td>no observations / variable not found</td>
+<td>count와 describe로 현재 표본을 본다. 변수명이 맞는지, 해당 변수를 만드는 앞 절이 실행됐는지, collapse 뒤 restore를 실행했는지 확인한다.</td>
+</tr>
+<tr>
+<td>명령 이름이나 옵션을 거절한다</td>
+<td>첫 오류 줄과 바로 앞 추정 명령을 함께 본다. 호환 이름 설정과 쉼표 위치를 확인한다. 실습 코드에서는 첫 오류를 고친 후 해당 절의 선행 명령부터 다시 실행한다.</td>
+</tr>
+<tr>
+<td>숫자가 책과 다르다</td>
+<td>표본 336행(시차 회귀는 288행), 세금 단위, 고정효과, 군집 48개, seed(42)를 순서대로 맞춘다. 입력 자료는 내장 sysuse와 CSV의 자료형이 달라질 수 있다.</td>
+</tr>
+<tr>
+<td>재현 가능한 오류를 제보하고 싶다</td>
+<td>About의 버전, OS, 공개 예제에서 오류가 나는 최소 명령, 기대한 값과 나온 값을 붙인다. <a href="https://github.com/w4s7jksf68-ai/piet/issues">PIET 이슈</a></td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>

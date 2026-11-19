@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.10" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Beer Taxes and Traffic Fatalities</title>
+  <style>
+:root{color-scheme:light;--ink:#162b35;--accent:#11604e;--paper:#fffefa}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0 auto;padding:3.5rem 2rem 5rem;max-width:64rem;background:var(--paper);color:var(--ink);font:17px/1.8 "Apple SD Gothic Neo","Malgun Gothic","Noto Sans CJK KR",sans-serif;overflow-wrap:break-word;word-break:keep-all}
+header{border-top:6px solid var(--accent);padding-top:1.5rem}header h1{font-size:clamp(2.4rem,5vw,4.5rem);border:0;margin:0;line-height:1.2;letter-spacing:-.065em}header p{font-size:1.22rem;color:#43616c;margin:.5rem 0 1.7rem}
+nav{padding:1rem 1.3rem;background:#edf3ee;border-radius:8px;margin-top:1.4rem}nav:before{content:"차례";font-weight:700}nav ul{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.25rem 1.5rem;margin:.4rem 0;padding-left:1.3rem}nav a{font-size:.95rem}
+h1:not(.title){margin:3.8rem 0 .8rem;border-top:2px solid #1c6555;padding-top:1rem;font-size:2rem;letter-spacing:-.055em;line-height:1.35}h2{font-size:1.38rem;color:#194d41;line-height:1.45;margin:2.1rem 0 .6rem;letter-spacing:-.035em}p{margin:.8rem 0}a{color:#115b4b;text-underline-offset:.16em}strong{font-weight:720}table{width:100%;border-collapse:collapse;font-size:.94rem;line-height:1.58;margin:1rem 0 1.4rem}th,td{text-align:left;padding:.62rem .75rem;border-bottom:1px solid #d9e1dd;vertical-align:top}th{background:#e8f0eb;color:#224538}tr:nth-child(even) td{background:#f6f8f5}tbody td:first-child{font-weight:620}pre{padding:1rem 1.25rem;background:#182d32;color:#f6fbfb;border-radius:.4rem;overflow:auto;line-height:1.55}code{font-family:"SFMono-Regular",Consolas,monospace;font-size:.89em}p code,td code{background:#eaf0ec;border-radius:3px;padding:.08em .27em;display:inline-block}pre code span{color:inherit!important}li{padding-left:.15rem;margin:.22rem 0}.figures{display:grid;grid-template-columns:1fr 1fr;gap:1.1rem}figure{margin:0;padding:.6rem;background:white;border:1px solid #d7ded8;border-radius:4px}figure img{display:block;width:100%;height:auto}figcaption{padding:.4rem .5rem;font-size:.89rem;line-height:1.6}
+@media(max-width:660px){body{padding:1.25rem .85rem 3rem;font-size:16px}th,td{padding:.45rem .38rem;word-break:normal;overflow-wrap:anywhere}.figures{grid-template-columns:1fr}h1:not(.title){font-size:1.65rem}}
+@media(max-width:660px){p code,li code,td code{max-width:100%;overflow-wrap:anywhere;word-break:break-word}table{table-layout:fixed}.sourceCode{max-width:100%;overflow-x:auto}}
+@media print{body{max-width:none;padding:0;font-size:10pt;color:black}nav{display:none}h1:not(.title){break-before:page}h1,h2{break-after:avoid}tr,figure,pre{break-inside:avoid}a{color:inherit}pre{color:black;background:#f4f4f4}}
+
+html[lang=en] body{word-break:normal;font-family:system-ui,sans-serif}html[lang=en] nav:before{content:"Contents"} .doclinks{display:flex;gap:1.2rem;flex-wrap:wrap;border-bottom:1px solid #d9e1dd;padding:.6rem 0;font-size:.94rem}.figures{grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr))}.sourceCode pre{white-space:pre;word-break:normal}.sourceCode code{display:inline}.subtitle{line-height:1.5}</style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Beer Taxes and Traffic Fatalities</h1>
+<p class="subtitle">Hands-on lab · US state panel, 1982–1988</p>
+</header>
+<div class="doclinks"><a href="PIET_GUIDE_EN.html">User manual</a><a href="PIET_LAB_KO.html">한국어</a></div>
+
+<p><strong>PIET A.1.1 · CoBrA 1.1.0</strong></p>
+<p>States with higher beer taxes had higher traffic death rates in the pooled data. The slope turns negative when we compare changes within states and account for common year effects. Reproduce both estimates, then decide what the evidence says about a tax increase.</p>
+<p>Download the <a download href="fatalities_tour_en.do">lab script</a> and the <a download href="fatalities_labeled_en.dta">labeled dataset</a>.</p>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#open-the-lab-and-run-it-once" id="toc-open-the-lab-and-run-it-once">Open the lab and run it once</a></li>
+<li><a href="#construct-a-comparable-death-rate" id="toc-construct-a-comparable-death-rate">1. Construct a comparable death rate</a></li>
+<li><a href="#compare-states-then-compare-years-within-states" id="toc-compare-states-then-compare-years-within-states">2–3. Compare states, then compare years within states</a></li>
+<li><a href="#change-the-standard-error-and-run-9999-bootstrap-draws" id="toc-change-the-standard-error-and-run-9999-bootstrap-draws">4. Change the standard error and run 9,999 bootstrap draws</a></li>
+<li><a href="#investigate-an-instrumental-variable" id="toc-investigate-an-instrumental-variable">5. Investigate an instrumental variable</a></li>
+<li><a href="#change-the-outcome-to-log-deaths" id="toc-change-the-outcome-to-log-deaths">6. Change the outcome to log deaths</a></li>
+<li><a href="#study-adoption-of-a-breath-test-law" id="toc-study-adoption-of-a-breath-test-law">7. Study adoption of a breath-test law</a></li>
+<li><a href="#read-the-three-plots" id="toc-read-the-three-plots">8. Read the three plots</a></li>
+<li><a href="#use-lags-and-differences" id="toc-use-lags-and-differences">9. Use lags and differences</a></li>
+<li><a href="#variable-dictionary" id="toc-variable-dictionary">Variable dictionary</a></li>
+<li><a href="#check-your-interpretation" id="toc-check-your-interpretation">Check your interpretation</a></li>
+</ul>
+</nav>
+<h1 id="open-the-lab-and-run-it-once">Open the lab and run it once</h1>
+<p>The unit of observation is <strong>one US state in one year</strong>. The panel follows the 48 contiguous states from 1982 through 1988. The first question is whether a change in beer tax is associated with a change in traffic deaths. In section 7 the policy changes to a preliminary breath-test law.</p>
+<ol type="1">
+<li>Extract the kit to a writable folder. Start PIET A.1.1 and save any work already in memory. The script starts with <code>clear all</code>. It loads the built-in sample with <code>sysuse fatalities, clear</code>; no separate CSV import is needed.</li>
+<li>Choose <strong>File ▾ → Open do-file…</strong> and select <strong>fatalities_tour_en.do</strong>. Select <strong>▶ Run</strong> inside the editor to run the entire script. To work through it slowly, start at the first line, highlight one complete numbered section at a time and choose <strong>▶ Run selection</strong>. The later sections use variables made in the earlier ones.</li>
+<li>In <strong>Results</strong>, find the final <code>describe</code>. Expect <strong>336 rows and 45 variables</strong>. In <strong>Graphics</strong>, expect three plots. The script also writes <strong>tour_en_scatter.svg</strong> and <strong>tour_en_did.svg</strong> to the working directory, replacing those two files when rerun. Enter <code>pwd</code> to see that directory.</li>
+<li>To inspect the finished dataset directly, use <strong>File ▾ → Open Data…</strong> and choose <strong>fatalities_labeled_en.dta</strong>. All 45 variables have English labels. To keep the console output, select <strong>Save Results…</strong>. <a href="https://raw.githubusercontent.com/w4s7jksf68-ai/piet/A.1.1/demos/fatalities/fatalities_tour.do">Original A.1.1 tour</a></li>
+</ol>
+<h1 id="construct-a-comparable-death-rate">1. Construct a comparable death rate</h1>
+<p><strong>Find in the script</strong>　<code>gen frate   = fatal/pop*10000</code></p>
+<p>Read the <code>frate</code> line in section 1. It divides the number of deaths by the state population, then multiplies by 10,000. Alabama had 839 deaths among about 3.94 million residents in 1982, or <strong>2.13 deaths per 10,000</strong>. The mean of <code>frate</code> is <strong>2.040</strong>. Each state-year gets equal weight. To calculate a national population-weighted rate, you would instead divide total deaths by total population.</p>
+<p><code>xtset statenum year</code> identifies the state and calendar year so PIET can locate the previous observation for that state. Of the 336 state-years, 155 have a preliminary breath-test law in force and 181 do not.</p>
+<h1 id="compare-states-then-compare-years-within-states">2–3. Compare states, then compare years within states</h1>
+<p><strong>Find in the script</strong>　<code>regress frate beertax</code></p>
+<p>In Results, find <code>beertax</code> in each regression table. Its coefficient gives the difference in deaths per 10,000 associated with one additional dollar of real tax per case of beer. The rows use the same panel.</p>
+<table>
+
+<thead>
+<tr>
+<th>Comparison</th>
+<th style="text-align: right;">Beer-tax coefficient</th>
+<th style="text-align: right;">Standard error</th>
+<th style="text-align: right;">p-value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>All state-years, tax only</td>
+<td style="text-align: right;">+0.3646</td>
+<td style="text-align: right;">0.0622</td>
+<td style="text-align: right;">&lt;0.001</td>
+</tr>
+<tr>
+<td>Same regression, heteroskedasticity-robust errors</td>
+<td style="text-align: right;">+0.3646</td>
+<td style="text-align: right;">0.0529</td>
+<td style="text-align: right;">&lt;0.001</td>
+</tr>
+<tr>
+<td>Add unemployment and log income</td>
+<td style="text-align: right;">+0.1103</td>
+<td style="text-align: right;">0.0627</td>
+<td style="text-align: right;">0.080</td>
+</tr>
+<tr>
+<td>Add state fixed effects, cluster by state</td>
+<td style="text-align: right;">−0.3696</td>
+<td style="text-align: right;">0.2665</td>
+<td style="text-align: right;">0.172</td>
+</tr>
+<tr>
+<td>State and year fixed effects, same controls and clustering</td>
+<td style="text-align: right;"><strong>−0.4604</strong></td>
+<td style="text-align: right;"><strong>0.3081</strong></td>
+<td style="text-align: right;"><strong>0.142</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The first row mixes persistent differences between high- and low-tax states with tax changes over time. State fixed effects remove each state’s stable characteristics, such as geography. Year effects absorb shocks shared across states. The last row associates <strong>a 10-cent increase per case with 0.046 fewer traffic deaths per 10,000 residents</strong>, conditional on income, unemployment and those fixed effects. For a one-dollar increase the 95% interval runs from <strong>−1.080 to +0.159</strong>. Concurrent state-level enforcement changes, or taxes raised in response to accidents, could still confound a causal reading.</p>
+<p>In the pooled regression, <code>estat hettest</code> rejects constant error variance (χ²=17.18). With the two controls, VIFs are 1.27–1.85 and the RESET test gives p=0.486. These address collinearity and functional form. Whether a tax change is exogenous requires separate evidence. The random-effects estimate is +0.0550. It relies on the additional assumption that unobserved state effects are uncorrelated with the regressors.</p>
+<h1 id="change-the-standard-error-and-run-9999-bootstrap-draws">4. Change the standard error and run 9,999 bootstrap draws</h1>
+<p>The two-way fixed-effects slope stays at −0.4604. Its conventional standard error is <strong>0.1633</strong> (p=0.005), the heteroskedasticity-robust one is <strong>0.2250</strong> (p=0.042), and the state-clustered one is <strong>0.3081</strong> (p=0.142). State policy and driving conditions can persist across years. Clustering allows errors in a given state to be correlated across observations. The joint test of all three slopes gives F(3,47)=21.36. That test can reject even when the beer-tax coefficient alone is imprecise.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode stata"><code class="sourceCode stata"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>reghdfe frate beertax unemp lincome i.<span class="fu">year</span>, absorb(statenum) <span class="kw">vce</span>(<span class="kw">cluster</span> statenum)</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>boottest beertax, reps(9999) <span class="dv">seed</span>(42)</span></code></pre></div>
+<p>Under the null of a zero tax coefficient, the wild cluster bootstrap gives observations within a state the same random sign. Look for <strong>48 clusters, 9,999 repetitions and Rademacher weights</strong>. The symmetric two-sided p-value is <strong>0.1834</strong> and the equal-tail p-value is <strong>0.1824</strong>. The fixed seed reproduces the draws. This version needs the year indicators entered explicitly for this test. The resulting tax coefficient and t statistic (−1.4942) match the specification absorbing both state and year.</p>
+<p><strong>How long did it take?</strong> On an Apple M1 with 8 GiB RAM running macOS 26.6.2, the A.1.1 binary took <strong>1.01 seconds</strong> on the first run of the benchmark and a <strong>median of 0.265 seconds</strong> on the next five (range 0.263–0.277). Each measurement started a new process, loaded the built-in sample, constructed variables, fitted the model and printed the 9,999-draw test. This timing covers the short benchmark on this panel.</p>
+<h1 id="investigate-an-instrumental-variable">5. Investigate an instrumental variable</h1>
+<p><strong>Find in the script</strong>　<code>test baptist</code></p>
+<p>Read the three pooled regressions controlling for unemployment and log income. One percentage point more Southern Baptists is associated with <strong>$0.02771</strong> more beer tax per case (first-stage F=146.33). The reduced-form slope for the death rate on the same instrument is <strong>0.01459</strong>. With one instrument for one endogenous variable, the IV slope is their ratio, about <strong>+0.527 deaths per 10,000 per dollar</strong>. As a comparison, the share living in dry counties has a first-stage F of only <strong>0.75</strong>. Both F statistics here use conventional OLS errors.</p>
+<p>The first instrument predicts taxes well. Religious composition could also affect drinking or driving habits through other channels. In that case the exclusion restriction fails. The numerical strength of the first stage gives no assurance that +0.527 measures the causal effect of taxation.</p>
+<h1 id="change-the-outcome-to-log-deaths">6. Change the outcome to log deaths</h1>
+<p><strong>Find in the script</strong>　<code>reghdfe lfatal beertax unemp lincome lpop, absorb(statenum year) vce(cluster statenum)</code></p>
+<p>The regression uses log fatality counts and includes log population. Holding population and the other regressors fixed, the beer-tax coefficient of <strong>−0.1324</strong> gives a ratio of exp(−0.1324) ≈ 0.876 for a one-dollar difference. That is about <strong>12.4% lower</strong> on the exponentiated log scale (p=0.276). Log population has coefficient 0.594 with a 95% interval from −0.142 to 1.330. That interval includes the unit elasticity implied by a specification that fixes population exposure proportionally.</p>
+<h1 id="study-adoption-of-a-breath-test-law">7. Study adoption of a breath-test law</h1>
+<p><strong>Find in the script</strong>　<code>csdid frate unemp lincome, ivar(statenum) time(year) gvar(gvar) method(dripw)</code></p>
+<p>Identify the comparison groups in <code>tabulate gvar</code>. <strong>22 states</strong> had no law in force during the panel. <strong>18</strong> had one in the first year. The remaining first-adoption groups contain five states in 1983 and one each in 1984, 1986 and 1987. A frequency of 35 for the 1983 cohort means <strong>35 state-years</strong>, or five states observed seven times. Indiana and Louisiana had the law in the first year and later switched to “no.” The cohort variable records first observed exposure. Use <code>drinkd</code> for the actual status in a given year. The first-year cohort has no observed pre-adoption period to identify an adoption effect.</p>
+<table>
+
+<thead>
+<tr>
+<th>Output</th>
+<th>Question</th>
+<th>Result in deaths per 10,000</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>estat simple</td>
+<td>What is the average effect among adopters?</td>
+<td>ATT −0.0741, SE 0.1180, 95% interval [−0.3054, +0.1573], p=0.530</td>
+</tr>
+<tr>
+<td>estat event</td>
+<td>How do estimates vary with time to adoption?</td>
+<td>Pre-adoption average +0.0271 (p=0.479), adoption year +0.0133, post-adoption average −0.0815</td>
+</tr>
+<tr>
+<td>estat calendar</td>
+<td>How do effects vary by calendar year?</td>
+<td>−0.1587 in 1986 and −0.0784 in 1988</td>
+</tr>
+<tr>
+<td>estat group</td>
+<td>How do effects vary by adoption cohort?</td>
+<td>1983 −0.0836, 1984 −0.0775, 1986 −0.0323, 1987 +0.0148</td>
+</tr>
+</tbody>
+</table>
+<p>ATT compares adopters to how they would have fared without adopting. The design uses never-treated states to infer that unobserved path. It relies on parallel trends conditional on the controls and on the absence of anticipatory effects. The short panel gives limited power to detect pre-trends. The 1984 cohort’s p-value of 0.037 comes from a cohort of just one adopting state.</p>
+<h1 id="read-the-three-plots">8. Read the three plots</h1>
+<p><strong>Find in the script</strong>　<code>coefplot m_fe, keep(beertax)</code></p>
+<div class="figures">
+<figure>
+<img alt="Each point is one state-year. The horizontal axis is dollars of tax per case of beer. The vertical axis is deaths per 10,000 residents. The pooled fitted line slopes upward." src="data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgNTIwIDM2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8dGV4dCB4PSIyNjAuMCIgeT0iMjAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTMiIGZvbnQtd2VpZ2h0PSJib2xkIiBmaWxsPSIjMTExIj48L3RleHQ+CiAgPHJlY3QgeD0iNjIiIHk9IjM0IiB3aWR0aD0iNDQwIiBoZWlnaHQ9IjI3OCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjYWFhIiBzdHJva2Utd2lkdGg9IjEiLz4KICA8bGluZSB4MT0iNzEuNyIgeTE9IjMxMiIgeDI9IjcxLjciIHkyPSIzMTciIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iNzEuNyIgeT0iMzMwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4wPC90ZXh0PgogIDxsaW5lIHgxPSIxNDcuOCIgeTE9IjMxMiIgeDI9IjE0Ny44IiB5Mj0iMzE3IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjE0Ny44IiB5PSIzMzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPjAuNTwvdGV4dD4KICA8bGluZSB4MT0iMjIzLjkiIHkxPSIzMTIiIHgyPSIyMjMuOSIgeTI9IjMxNyIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSIyMjMuOSIgeT0iMzMwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4xPC90ZXh0PgogIDxsaW5lIHgxPSIyOTkuOSIgeTE9IjMxMiIgeDI9IjI5OS45IiB5Mj0iMzE3IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjI5OS45IiB5PSIzMzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPjEuNTwvdGV4dD4KICA8bGluZSB4MT0iMzc2LjAiIHkxPSIzMTIiIHgyPSIzNzYuMCIgeTI9IjMxNyIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSIzNzYuMCIgeT0iMzMwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4yPC90ZXh0PgogIDxsaW5lIHgxPSI0NTIuMSIgeTE9IjMxMiIgeDI9IjQ1Mi4xIiB5Mj0iMzE3IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjQ1Mi4xIiB5PSIzMzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPjIuNTwvdGV4dD4KICA8bGluZSB4MT0iNTciIHkxPSIyODguMiIgeDI9IjYyIiB5Mj0iMjg4LjIiIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iNTMiIHk9IjI5MS43IiB0ZXh0LWFuY2hvcj0iZW5kIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4xPC90ZXh0PgogIDxsaW5lIHgxPSI1NyIgeTE9IjIxMi40IiB4Mj0iNjIiIHkyPSIyMTIuNCIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSI1MyIgeT0iMjE1LjkiIHRleHQtYW5jaG9yPSJlbmQiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPjI8L3RleHQ+CiAgPGxpbmUgeDE9IjU3IiB5MT0iMTM2LjYiIHgyPSI2MiIgeTI9IjEzNi42IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjUzIiB5PSIxNDAuMSIgdGV4dC1hbmNob3I9ImVuZCIgZm9udC1zaXplPSIxMCIgZmlsbD0iIzQ0NCI+MzwvdGV4dD4KICA8bGluZSB4MT0iNTciIHkxPSI2MC44IiB4Mj0iNjIiIHkyPSI2MC44IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjUzIiB5PSI2NC4zIiB0ZXh0LWFuY2hvcj0iZW5kIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij40PC90ZXh0PgogIDx0ZXh0IHg9IjI4Mi4wIiB5PSIzNTAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTEiIGZpbGw9IiMzMzMiPlJlYWwgYmVlciB0YXggcGVyIGNhc2UgKGRvbGxhcnMpPC90ZXh0PgogIDx0ZXh0IHg9IjE0IiB5PSIxNzMuMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxMSIgZmlsbD0iIzMzMyIgdHJhbnNmb3JtPSJyb3RhdGUoLTkwIDE0IDE3My4wKSI+RGVhdGhzIHBlciAxMCwwMDAgcmVzaWRlbnRzPC90ZXh0PgogIDxjbGlwUGF0aCBpZD0idHctY2xpcCI+PHJlY3QgeD0iNjIiIHk9IjM0IiB3aWR0aD0iNDQwIiBoZWlnaHQ9IjI3OCIvPjwvY2xpcFBhdGg+CiAgPGcgY2xpcC1wYXRoPSJ1cmwoI3R3LWNsaXApIj4KICAgIDxjaXJjbGUgY3g9IjMwNS45NCIgY3k9IjIwMi42NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIzNDMuOTIiIGN5PSIxODUuOTYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMzMyLjU2IiBjeT0iMTg2Ljg4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjMyMy4xNiIgY3k9IjE5Ny43MSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIzMTYuNjciIGN5PSIxNjEuNjYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMzA5LjA4IiBjeT0iMTU3LjkxIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjMwMC4xNyIgY3k9IjE3NC45NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNzAuNjciIGN5PSIxODMuMjciIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTc0LjQ5IiBjeT0iMTgyLjM4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE2Mi44NCIgY3k9IjE5NC4zNSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNTkuNTUiIGN5PSIxOTIuMzkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTU3LjI5IiBjeT0iMTcxLjIwIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE1NC42MyIgY3k9IjE2MS4xNSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNTEuNTIiIGN5PSIxNzAuOTIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA0LjM5IiBjeT0iMTc0LjU0IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwMy4xMiIgY3k9IjE5Mi4xMSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMTYuODUiIGN5PSIxNDkuNTYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI5LjczIiBjeT0iMTUxLjU5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyOC4yNCIgY3k9IjEzMS4yMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjYuNDgiIGN5PSIxNTQuMjIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI0LjQzIiBjeT0iMTU4Ljg5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijg4LjA1IiBjeT0iMjIyLjgzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijg3LjQxIiBjeT0iMjI3LjAyIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijg2Ljc2IiBjeT0iMjE2LjQ2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijg2LjIxIiBjeT0iMjIxLjM3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijg1Ljg0IiBjeT0iMjE2LjUwIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijg1LjQwIiBjeT0iMjEzLjE1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijg0Ljg5IiBjeT0iMjE5LjY3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwNC4zOSIgY3k9IjE5OS4xNSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDMuMTIiIGN5PSIyMDguNDciIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTAxLjgwIiBjeT0iMjE5LjUwIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwMC43MiIgY3k9IjIyOC4xMyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5OS45NyIgY3k9IjIyNC4wMiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5OS4xMCIgY3k9IjIyOC4wNSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5OC4wNyIgY3k9IjI0OS44NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDUuODQiIGN5PSIyMzkuMTMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA3LjI1IiBjeT0iMjU4LjIzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwOS40NCIgY3k9IjI1MS4yOCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDguMDgiIGN5PSIyNTYuOTciIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA3LjE1IiBjeT0iMjU3LjEzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwNi4wNSIgY3k9IjI1Ny45NyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDQuNzYiIGN5PSIyNTAuNDkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iOTguMDMiIGN5PSIyMDkuODUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iOTcuMDEiIGN5PSIyMjYuMzgiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iOTUuOTUiIGN5PSIyMDMuNDgiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iOTUuMDgiIGN5PSIyMzcuMjMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iOTQuNDgiIGN5PSIyMDEuMTIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iOTMuNzciIGN5PSIxOTIuMTMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iOTIuOTQiIGN5PSIxODAuMjIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjM1LjEzIiBjeT0iMTcyLjA2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjI0OS44MCIgY3k9IjE3NC42NiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyNTIuMjkiIGN5PSIxNzAuOTUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjQ1Ljc5IiBjeT0iMTc1LjExIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjI0MS4zMCIgY3k9IjE4MC41NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyMzYuMDQiIGN5PSIxODQuOTkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjI5Ljg3IiBjeT0iMTc0LjgzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjQ4NS43MCIgY3k9IjE5OS4xMiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI0NjkuNTYiIGN5PSIxOTIuNjIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iNDUyLjk1IiBjeT0iMTgxLjAzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjQzOS4yMiIgY3k9IjE5MS4zNSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI0MjkuNzMiIGN5PSIxNzMuODYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iNDE4LjY0IiBjeT0iMTY5LjE4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjQwNS42MSIgY3k9IjE2Ni40MSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjguOTAiIGN5PSIyMzguODEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI2LjY3IiBjeT0iMjI5LjgwIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyNC4zOCIgY3k9IjI1NC4zMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjIuNDgiIGN5PSIyMzkuMzgiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTMwLjAwIiBjeT0iMjQ2LjY3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzNi43NiIgY3k9IjIzMi42NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNDUuNDkiIGN5PSIyMTQuOTkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTMyLjk5IiBjeT0iMTY1LjU3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzMC42MCIgY3k9IjE2Mi4yMSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjguMTQiIGN5PSIxODAuMzYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI2LjExIiBjeT0iMTcxLjY1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyNC43MCIgY3k9IjE2OC44MSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjMuMDYiIGN5PSIxNjQuOTkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTIxLjEzIiBjeT0iMTY5Ljc2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwMC40MCIgY3k9IjI1NC45MyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5OS4yOCIgY3k9IjI2My4zMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5OC4xMyIgY3k9IjI2Mi4xOSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5Ny4xNyIgY3k9IjI2My4xNiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5Ni41MiIgY3k9IjI1OS4yMyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5NS43NSIgY3k9IjI1NS4zMiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5NC44NSIgY3k9IjI0NC4wNyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMTguNzQiIGN5PSIyMzEuMTEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTE2LjkxIiBjeT0iMjIzLjI4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExNS4wMiIgY3k9IjIzNi4zMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMTMuNDYiIGN5PSIyMjkuNzEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTEyLjM5IiBjeT0iMjIwLjk5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExMS4xMiIgY3k9IjIxOS4zOSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDkuNjQiIGN5PSIyMTMuNzYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTQ1LjM1IiBjeT0iMjA3LjIxIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE0Mi40OCIgY3k9IjIzNS42MCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMzkuNTMiIGN5PSIyMDUuNTQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTM3LjA4IiBjeT0iMjEzLjYxIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzNS40MCIgY3k9IjIwOS44NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMzMuNDIiIGN5PSIyMTMuNjYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTMxLjExIiBjeT0iMjE3LjIzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwNC41NyIgY3k9IjE5NS4zMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDMuMjkiIGN5PSIyMDUuMTkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTAxLjk3IiBjeT0iMjEwLjMzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwMC44OCIgY3k9IjIxOS4xMiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDAuMTMiIGN5PSIyMDAuMjEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iOTkuMjUiIGN5PSIxOTIuMzIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iOTguMjEiIGN5PSIxOTMuNTQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjAzLjUzIiBjeT0iMTc1LjMwIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE5OC4zOSIgY3k9IjIwNC43MyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxOTMuMTAiIGN5PSIyMDAuNjgiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTg4LjczIiBjeT0iMjA2LjQ5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE4NS43MSIgY3k9IjIwNi45NSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxODIuMTgiIGN5PSIyMjMuNDUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTc4LjAzIiBjeT0iMjA0LjkxIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExNS4yOCIgY3k9IjI3Ny4wNCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMTMuNTkiIGN5PSIyNzguMzgiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTExLjg0IiBjeT0iMjc2Ljg5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExMC4zOSIgY3k9IjI2Ny4zNSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDkuMzkiIGN5PSIyNjYuMjUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA4LjIyIiBjeT0iMjc0Ljc2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwNi44NSIgY3k9IjI3MC42NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDguMzgiIGN5PSIyNTAuNDMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA2Ljk1IiBjeT0iMjQ4LjM1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwNS40OCIgY3k9IjI1MS44OSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDQuMjciIGN5PSIyMzguMTUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTAzLjQzIiBjeT0iMjMwLjc1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwMi40NCIgY3k9IjIyNy45MSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDEuMjkiIGN5PSIyMzUuNzIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTk0LjI3IiBjeT0iMjUzLjIwIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE4OS40OSIgY3k9IjIxNS42OCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxODQuNTciIGN5PSIyMTEuODUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTgwLjUxIiBjeT0iMjI5LjgyIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE4NS44MCIgY3k9IjIyNS41NiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxOTEuNTMiIGN5PSIyMTUuODIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTg3LjA0IiBjeT0iMjAzLjU3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE1NC43MyIgY3k9IjI0OC4yMyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNTEuNTAiIGN5PSIyNTMuOTUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTQ4LjE2IiBjeT0iMjM1Ljg1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE0NS40MSIgY3k9IjIzNS4xMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNDMuNTEiIGN5PSIyMzAuODUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTQxLjI4IiBjeT0iMjMyLjM5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzOC42NyIgY3k9IjIyNC4xOCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjQuMzYiIGN5PSIyNTkuMjQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTIyLjMxIiBjeT0iMjYyLjQ3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyMC4yMCIgY3k9IjI1Ny45OSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMTguNDUiIGN5PSIyNTQuMDUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTE3LjI0IiBjeT0iMjYxLjIzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExOS44MyIgY3k9IjI2OS4zNCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjAuNTUiIGN5PSIyNTYuMjUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI0LjQ1IiBjeT0iMjI3LjQ2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyMi4zOSIgY3k9IjIyNC44MyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjAuMjciIGN5PSIyMTcuNDAiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTE4LjUzIiBjeT0iMjIzLjY0IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExNy4zMiIgY3k9IjE5NC45OCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMTUuOTAiIGN5PSIyMDguOTAiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTE0LjI0IiBjeT0iMjAxLjM0IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjI0Ni4wOCIgY3k9IjE0OC40MyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyMzkuMjgiIGN5PSIxNTQuMTYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjMyLjI4IiBjeT0iMTY1Ljg3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjIzNS41MyIgY3k9IjE3MS45NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyMzMuODIiIGN5PSIxNDEuMjciIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjE3LjgzIiBjeT0iMTQ1LjY4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjIxMi4zNCIgY3k9IjE1NS4xMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjQuNDIiIGN5PSIxMjQuODIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTIyLjM3IiBjeT0iOTguMzMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTIwLjI1IiBjeT0iMTQ0Ljc4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyMC4yNiIgY3k9IjE1OS4zNCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjAuNzEiIGN5PSIxNTguMDIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTIwLjk4IiBjeT0iMTQ0Ljc0IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyMC44NCIgY3k9IjE3Ny41NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyODkuNjAiIGN5PSIxOTkuODAiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjgxLjEwIiBjeT0iMjEwLjA1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjI3Mi4zNiIgY3k9IjE4NS43MyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyNjUuMTMiIGN5PSIxODQuMzgiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjYwLjE0IiBjeT0iMTY2Ljc5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjI1NC4zMCIgY3k9IjE3Ni43NSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyNDcuNDUiIGN5PSIxODAuMjMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTM3LjA3IiBjeT0iMTk3LjAzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzNC41MyIgY3k9IjIzNC44NSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMzEuOTAiIGN5PSIyNTMuNjMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI5LjczIiBjeT0iMjY0LjM3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyOC4yNCIgY3k9IjI1Mi4zMyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjYuNDgiIGN5PSIyNTAuMDQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI0LjQzIiBjeT0iMjQ1Ljc3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyOC45MCIgY3k9IjIzOS41NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjYuNjciIGN5PSIyNDIuODYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI0LjM4IiBjeT0iMjI5LjM3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyNy45MiIgY3k9IjI1Mi4xMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNDIuMzciIGN5PSIyMjYuNDEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTQyLjc1IiBjeT0iMjIyLjc0IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE0Ny40OSIgY3k9IjI0MC40NyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNDUuMjUiIGN5PSIyMjUuNjQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTU4LjA4IiBjeT0iMjEzLjAwIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE4NC41NyIgY3k9IjIxNS4xNiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxODAuNTEiIGN5PSIyMTguOTAiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTc3LjcwIiBjeT0iMjM3LjAyIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE3NC40MiIgY3k9IjIzNS42MCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNzAuNTYiIGN5PSIyNDcuOTkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iODUuMzIiIGN5PSIyNTUuNzIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iODQuNzkiIGN5PSIyNjkuMzYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iODQuMjUiIGN5PSIyNzAuOTkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iODMuODAiIGN5PSIyNjcuMzMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iODMuNDgiIGN5PSIyNjAuNjciIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iODMuMTIiIGN5PSIyNjIuODkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iODIuNjkiIGN5PSIyNjAuNzgiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA4LjQ4IiBjeT0iNDQuMzAiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI0LjcxIiBjeT0iNzYuOTEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTM5LjQzIiBjeT0iOTkuODEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTM2Ljk5IiBjeT0iODQuMzIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTM1LjMwIiBjeT0iMTA4LjI1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzMy4zMyIgY3k9Ijc2Ljk3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzMS4wMiIgY3k9IjExOS4wNCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5Ni4yMiIgY3k9IjEyMi4yNiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDIuMTMiIGN5PSIxNTAuMTkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA1LjU3IiBjeT0iMTU4LjE2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwNC4zNSIgY3k9IjE1NC4yNCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDMuNTAiIGN5PSIxODEuMzQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTAyLjUyIiBjeT0iMTY2Ljc3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwMS4zNiIgY3k9IjE1OC4zMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI4OS44NiIgY3k9IjI3MC43OCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5MS45MiIgY3k9IjI3NC45MyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5Mi40MCIgY3k9IjI3NS45NyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5MS42NSIgY3k9IjI3OC40NSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5MS4xNCIgY3k9IjI3My41NyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5MC41NCIgY3k9IjI2NC43NSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI4OS44MyIgY3k9IjI2OC41MiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMzcuMDciIGN5PSIyNTAuOTAiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTM0LjUzIiBjeT0iMjUyLjI5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzMS45MCIgY3k9IjI0Ny43OSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjkuNzMiIGN5PSIyNDcuODQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI4LjI0IiBjeT0iMjQ1Ljk4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyNi40OCIgY3k9IjIzOS40MSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjQuNDMiIGN5PSIyNDAuODYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjAzLjUzIiBjeT0iMTE2LjcyIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE5OC4zOSIgY3k9IjE2OS44NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyMTUuODYiIGN5PSIxODEuNDYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjE3Ljk4IiBjeT0iMTkzLjEzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjIxNC4yMSIgY3k9IjIwMy43MSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyMDkuNzkiIGN5PSIyMjUuNjciIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjA0LjYxIiBjeT0iMjE1Ljc0IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwNS45NyIgY3k9IjIxNi44NiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDQuNjQiIGN5PSIyMDcuMjQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTAzLjI2IiBjeT0iMjAxLjk1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwMi4xMiIgY3k9IjIwNi4yOCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDEuMzQiIGN5PSIxOTAuMzMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTAwLjQyIiBjeT0iMTkxLjQ1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijk5LjM0IiBjeT0iMTc4LjUyIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExNS4yOCIgY3k9IjI0Ny44OSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMTMuNTkiIGN5PSIyNTQuMjYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTExLjg0IiBjeT0iMjUzLjg0IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExMC4zOSIgY3k9IjI1MC43MSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDkuMzkiIGN5PSIyNDMuMjYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA4LjIyIiBjeT0iMjM3Ljc4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwNi44NSIgY3k9IjI0Mi4wMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5OC4yMiIgY3k9IjI4MC41MyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5Ny4xOCIgY3k9IjI4NC42NyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5Ni4xMiIgY3k9IjMwMS43MCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5NS4yNCIgY3k9IjI3OC42MCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5NC42MyIgY3k9IjI2Ny41NiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5My45MiIgY3k9IjI3Ny4wOSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI5My4wOSIgY3k9IjI2OC41NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIzODUuNDciIGN5PSIxOTIuNDUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMzczLjI0IiBjeT0iMTY3LjYyIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjM2MC42NSIgY3k9IjE1My43MSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIzNTAuMjQiIGN5PSIxNDguNjEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMzQzLjA1IiBjeT0iMTI2LjU3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjMzNC42NCIgY3k9IjEyMy42NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIzMjQuNzciIGN5PSIxMzguMTIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTgxLjAyIiBjeT0iMjAyLjMzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE3Ni43NSIgY3k9IjE3NC4yMSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNzIuMzciIGN5PSIyMTAuMjIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTY4Ljc0IiBjeT0iMjI0Ljc5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE2Ni4yNCIgY3k9IjIyMC41MSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNjQuNDEiIGN5PSIyMjAuNzEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTYxLjk5IiBjeT0iMjA3LjY5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEyMy4xNSIgY3k9IjE5Mi41NSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMjEuMTUiIGN5PSIxOTYuMzQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTE5LjA4IiBjeT0iMTg4LjM1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExNy4zNyIgY3k9IjE4OC43MiIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMTYuMjAiIGN5PSIxNjkuNzQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTE0LjgyIiBjeT0iMTY5LjEzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjExMy4yMCIgY3k9IjE2Ny45NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMzcuNjIiIGN5PSIxNTYuMjciIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTM1LjA1IiBjeT0iMTgwLjc2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzNS40NCIgY3k9IjE3OS42MCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNDEuOTIiIGN5PSIxOTMuNjciIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTQwLjExIiBjeT0iMjAxLjk2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzNy45OSIgY3k9IjIxNi43NCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMzUuNTAiIGN5PSIyMTEuMjUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTI2LjAwIiBjeT0iMjIwLjQ1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE2Ny40NSIgY3k9IjIyOS40OCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIyMDUuMjEiIGN5PSIyMTYuODUiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMjAwLjQwIiBjeT0iMjI0LjM1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE5Ny4wOCIgY3k9IjIyMS4zOSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxOTMuMTkiIGN5PSIyMzAuNDIiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTg4LjYzIiBjeT0iMjMwLjc2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE4Ny4xOSIgY3k9IjI0Mi4zMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxODIuNjkiIGN5PSIyNDEuMTEiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTc4LjA1IiBjeT0iMjI3LjczIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE3NC4yMiIgY3k9IjIzNC4zMSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNzEuNTgiIGN5PSIyMTYuNjkiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTY4LjQ4IiBjeT0iMjMyLjg4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE2NC44NSIgY3k9IjIyOS4wMCIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNzkuOTciIGN5PSIyMDguMDAiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTc1Ljc1IiBjeT0iMjI4LjI1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE3MS40MSIgY3k9IjIwMC45MyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNjcuODEiIGN5PSIyMDEuMDQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTY1LjM0IiBjeT0iMjExLjI1IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE2Mi40MyIgY3k9IjE5OS4zNyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNTkuMDMiIGN5PSIxODguNDMiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA2Ljk3IiBjeT0iMjMxLjQzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwNi45NCIgY3k9IjI0MS4wNyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDUuNDciIGN5PSIyMzMuOTQiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTA0LjI1IiBjeT0iMjM2LjA2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEwMy40MSIgY3k9IjI0NC41NyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMDIuNDMiIGN5PSIyMzMuNjgiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTAxLjI4IiBjeT0iMjM3LjA5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijk4LjAzIiBjeT0iMjQwLjk5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijk3LjAxIiBjeT0iMjQ4LjIwIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijk1Ljk1IiBjeT0iMjMzLjEyIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijk1LjA4IiBjeT0iMjQ1Ljg2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijk0LjQ4IiBjeT0iMjQ1LjU4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjkzLjc3IiBjeT0iMjM4LjI5IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjkyLjk0IiBjeT0iMjM3Ljk3IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjE0NC4xOSIgY3k9IjE5MC4wMyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxNDEuMzYiIGN5PSIxOTkuODYiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTM4LjQ2IiBjeT0iMTkzLjgwIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzNi4wNSIgY3k9IjE5OS41MyIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSIxMzQuMzkiIGN5PSIxOTAuMDAiIHI9IjIuMiIgZmlsbD0iIzE4NTBhOCIgc3Ryb2tlPSIjMTg1MGE4IiBzdHJva2Utd2lkdGg9IjAuMCIvPgogICAgPGNpcmNsZSBjeD0iMTMyLjQ1IiBjeT0iMTc1Ljc4IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9IjEzMC4xNyIgY3k9IjE3OC4xMSIgcj0iMi4yIiBmaWxsPSIjMTg1MGE4IiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMC4wIi8+CiAgICA8Y2lyY2xlIGN4PSI3OS44OCIgY3k9IjY1LjI2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijc5LjU2IiBjeT0iMTA5Ljg2IiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijc5LjIzIiBjeT0iMTMyLjAxIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijc4Ljk2IiBjeT0iMTM3LjYzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijc4Ljc3IiBjeT0iMTEyLjgyIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijc4LjU1IiBjeT0iMTY0LjQzIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxjaXJjbGUgY3g9Ijc4LjMwIiBjeT0iMTE4LjcxIiByPSIyLjIiIGZpbGw9IiMxODUwYTgiIHN0cm9rZT0iIzE4NTBhOCIgc3Ryb2tlLXdpZHRoPSIwLjAiLz4KICAgIDxwYXRoIGQ9Ik03OC4zMCAyMjIuMjkgTDQ4NS43MCAxNDguMzEiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2Q0MmExYyIgc3Ryb2tlLXdpZHRoPSIxLjIiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDwvZz4KPC9zdmc+">
+<figcaption>
+Each point is one state-year. The horizontal axis is dollars of tax per case of beer. The vertical axis is deaths per 10,000 residents. The pooled fitted line slopes upward.
+</figcaption>
+</figure>
+<figure>
+<img alt="The point is the beer-tax slope after controlling for state and year fixed effects. The state-clustered 95% interval crosses the dashed line at zero." src="data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgNTIwIDM2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8dGV4dCB4PSIyNjAuMCIgeT0iMjAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTMiIGZvbnQtd2VpZ2h0PSJib2xkIiBmaWxsPSIjMTExIj5Db2VmZmljaWVudCBwbG90OiBmcmF0ZTwvdGV4dD4KICA8cmVjdCB4PSI2MiIgeT0iMzQiIHdpZHRoPSI0NDAiIGhlaWdodD0iMjc4IiBmaWxsPSJub25lIiBzdHJva2U9IiNhYWEiIHN0cm9rZS13aWR0aD0iMSIvPgogIDxsaW5lIHgxPSI2NS4wIiB5MT0iMzEyIiB4Mj0iNjUuMCIgeTI9IjMxNyIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSI2NS4wIiB5PSIzMzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPi0xLjI8L3RleHQ+CiAgPGxpbmUgeDE9IjEyMy43IiB5MT0iMzEyIiB4Mj0iMTIzLjciIHkyPSIzMTciIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iMTIzLjciIHk9IjMzMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxMCIgZmlsbD0iIzQ0NCI+LTE8L3RleHQ+CiAgPGxpbmUgeDE9IjE4Mi40IiB5MT0iMzEyIiB4Mj0iMTgyLjQiIHkyPSIzMTciIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iMTgyLjQiIHk9IjMzMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxMCIgZmlsbD0iIzQ0NCI+LTAuODwvdGV4dD4KICA8bGluZSB4MT0iMjQxLjAiIHkxPSIzMTIiIHgyPSIyNDEuMCIgeTI9IjMxNyIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSIyNDEuMCIgeT0iMzMwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4tMC42PC90ZXh0PgogIDxsaW5lIHgxPSIyOTkuNyIgeTE9IjMxMiIgeDI9IjI5OS43IiB5Mj0iMzE3IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjI5OS43IiB5PSIzMzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPi0wLjQ8L3RleHQ+CiAgPGxpbmUgeDE9IjM1OC40IiB5MT0iMzEyIiB4Mj0iMzU4LjQiIHkyPSIzMTciIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iMzU4LjQiIHk9IjMzMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxMCIgZmlsbD0iIzQ0NCI+LTAuMjwvdGV4dD4KICA8bGluZSB4MT0iNDE3LjAiIHkxPSIzMTIiIHgyPSI0MTcuMCIgeTI9IjMxNyIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSI0MTcuMCIgeT0iMzMwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4wPC90ZXh0PgogIDxsaW5lIHgxPSI0NzUuNyIgeTE9IjMxMiIgeDI9IjQ3NS43IiB5Mj0iMzE3IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjQ3NS43IiB5PSIzMzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPjAuMjwvdGV4dD4KICA8bGluZSB4MT0iNTciIHkxPSIyNzQuMSIgeDI9IjYyIiB5Mj0iMjc0LjEiIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPGxpbmUgeDE9IjU3IiB5MT0iMjIzLjUiIHgyPSI2MiIgeTI9IjIyMy41IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDxsaW5lIHgxPSI1NyIgeTE9IjE3My4wIiB4Mj0iNjIiIHkyPSIxNzMuMCIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8bGluZSB4MT0iNTciIHkxPSIxMjIuNSIgeDI9IjYyIiB5Mj0iMTIyLjUiIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPGxpbmUgeDE9IjU3IiB5MT0iNzEuOSIgeDI9IjYyIiB5Mj0iNzEuOSIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSIyODIuMCIgeT0iMzUwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjExIiBmaWxsPSIjMzMzIj5Db2VmZmljaWVudCBlc3RpbWF0ZTwvdGV4dD4KICA8dGV4dCB4PSIxNCIgeT0iMTczLjAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTEiIGZpbGw9IiMzMzMiIHRyYW5zZm9ybT0icm90YXRlKC05MCAxNCAxNzMuMCkiPjwvdGV4dD4KICA8bGluZSB4MT0iNDE3LjAiIHkxPSIzNCIgeDI9IjQxNy4wIiB5Mj0iMzEyIiBzdHJva2U9IiM4ODgiIHN0cm9rZS13aWR0aD0iMSIgc3Ryb2tlLWRhc2hhcnJheT0iMyAzIi8+CiAgPHRleHQgeD0iNTMiIHk9IjE3Ni41IiB0ZXh0LWFuY2hvcj0iZW5kIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij5iZWVydGF4PC90ZXh0PgogIDxsaW5lIHgxPSIxMDAuMiIgeTE9IjE3My4wIiB4Mj0iNDYzLjgiIHkyPSIxNzMuMCIgc3Ryb2tlPSIjMWY3N2I0IiBzdHJva2Utd2lkdGg9IjEuMiIvPgogIDxsaW5lIHgxPSIxMDAuMiIgeTE9IjE2OS4wIiB4Mj0iMTAwLjIiIHkyPSIxNzcuMCIgc3Ryb2tlPSIjMWY3N2I0IiBzdHJva2Utd2lkdGg9IjEuMiIvPgogIDxsaW5lIHgxPSI0NjMuOCIgeTE9IjE2OS4wIiB4Mj0iNDYzLjgiIHkyPSIxNzcuMCIgc3Ryb2tlPSIjMWY3N2I0IiBzdHJva2Utd2lkdGg9IjEuMiIvPgogIDxjaXJjbGUgY3g9IjI4Mi4wIiBjeT0iMTczLjAiIHI9IjMiIGZpbGw9IiMxZjc3YjQiLz4KPC9zdmc+">
+<figcaption>
+The point is the beer-tax slope after controlling for state and year fixed effects. The state-clustered 95% interval crosses the dashed line at zero.
+</figcaption>
+</figure>
+<figure>
+<img alt="Blue represents states observed with the breath-test law at least once. Red represents states that never had the law during the panel. The gap between the two raw means combines cohorts with different adoption dates." src="data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgNTIwIDM2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8dGV4dCB4PSIyNjAuMCIgeT0iMjAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTMiIGZvbnQtd2VpZ2h0PSJib2xkIiBmaWxsPSIjMTExIj48L3RleHQ+CiAgPHJlY3QgeD0iNjIiIHk9IjM0IiB3aWR0aD0iNDQwIiBoZWlnaHQ9IjI3OCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjYWFhIiBzdHJva2Utd2lkdGg9IjEiLz4KICA8bGluZSB4MT0iNzguMyIgeTE9IjMxMiIgeDI9Ijc4LjMiIHkyPSIzMTciIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iNzguMyIgeT0iMzMwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4xOTgyPC90ZXh0PgogIDxsaW5lIHgxPSIxNDYuMiIgeTE9IjMxMiIgeDI9IjE0Ni4yIiB5Mj0iMzE3IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjE0Ni4yIiB5PSIzMzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPjE5ODM8L3RleHQ+CiAgPGxpbmUgeDE9IjIxNC4xIiB5MT0iMzEyIiB4Mj0iMjE0LjEiIHkyPSIzMTciIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iMjE0LjEiIHk9IjMzMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxMCIgZmlsbD0iIzQ0NCI+MTk4NDwvdGV4dD4KICA8bGluZSB4MT0iMjgyLjAiIHkxPSIzMTIiIHgyPSIyODIuMCIgeTI9IjMxNyIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSIyODIuMCIgeT0iMzMwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4xOTg1PC90ZXh0PgogIDxsaW5lIHgxPSIzNDkuOSIgeTE9IjMxMiIgeDI9IjM0OS45IiB5Mj0iMzE3IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjM0OS45IiB5PSIzMzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPjE5ODY8L3RleHQ+CiAgPGxpbmUgeDE9IjQxNy44IiB5MT0iMzEyIiB4Mj0iNDE3LjgiIHkyPSIzMTciIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iNDE3LjgiIHk9IjMzMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxMCIgZmlsbD0iIzQ0NCI+MTk4NzwvdGV4dD4KICA8bGluZSB4MT0iNDg1LjciIHkxPSIzMTIiIHgyPSI0ODUuNyIgeTI9IjMxNyIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSI0ODUuNyIgeT0iMzMwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4xOTg4PC90ZXh0PgogIDxsaW5lIHgxPSI1NyIgeTE9IjMwNi41IiB4Mj0iNjIiIHkyPSIzMDYuNSIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSI1MyIgeT0iMzEwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGZvbnQtc2l6ZT0iMTAiIGZpbGw9IiM0NDQiPjEuODwvdGV4dD4KICA8bGluZSB4MT0iNTciIHkxPSIyNTEuNSIgeDI9IjYyIiB5Mj0iMjUxLjUiIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iNTMiIHk9IjI1NS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4xLjk8L3RleHQ+CiAgPGxpbmUgeDE9IjU3IiB5MT0iMTk2LjUiIHgyPSI2MiIgeTI9IjE5Ni41IiBzdHJva2U9IiM1NTUiIHN0cm9rZS13aWR0aD0iMSIvPgogIDx0ZXh0IHg9IjUzIiB5PSIyMDAuMCIgdGV4dC1hbmNob3I9ImVuZCIgZm9udC1zaXplPSIxMCIgZmlsbD0iIzQ0NCI+MjwvdGV4dD4KICA8bGluZSB4MT0iNTciIHkxPSIxNDEuNCIgeDI9IjYyIiB5Mj0iMTQxLjQiIHN0cm9rZT0iIzU1NSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHRleHQgeD0iNTMiIHk9IjE0NC45IiB0ZXh0LWFuY2hvcj0iZW5kIiBmb250LXNpemU9IjEwIiBmaWxsPSIjNDQ0Ij4yLjE8L3RleHQ+CiAgPGxpbmUgeDE9IjU3IiB5MT0iODYuNCIgeDI9IjYyIiB5Mj0iODYuNCIgc3Ryb2tlPSIjNTU1IiBzdHJva2Utd2lkdGg9IjEiLz4KICA8dGV4dCB4PSI1MyIgeT0iODkuOSIgdGV4dC1hbmNob3I9ImVuZCIgZm9udC1zaXplPSIxMCIgZmlsbD0iIzQ0NCI+Mi4yPC90ZXh0PgogIDx0ZXh0IHg9IjI4Mi4wIiB5PSIzNTAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTEiIGZpbGw9IiMzMzMiPlllYXI8L3RleHQ+CiAgPHRleHQgeD0iMTQiIHk9IjE3My4wIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjExIiBmaWxsPSIjMzMzIiB0cmFuc2Zvcm09InJvdGF0ZSgtOTAgMTQgMTczLjApIj5NZWFuIGRlYXRocyBwZXIgMTAsMDAwIHJlc2lkZW50czwvdGV4dD4KICA8Y2xpcFBhdGggaWQ9InR3LWNsaXAiPjxyZWN0IHg9IjYyIiB5PSIzNCIgd2lkdGg9IjQ0MCIgaGVpZ2h0PSIyNzgiLz48L2NsaXBQYXRoPgogIDxnIGNsaXAtcGF0aD0idXJsKCN0dy1jbGlwKSI+CiAgICA8cGF0aCBkPSJNNzguMzAgMjM0LjMxIEwxNDYuMjAgMjg3LjI2IEwyMTQuMTAgMjc4LjE4IEwyODIuMDAgMzAxLjcwIEwzNDkuOTAgMjU5LjExIEw0MTcuODAgMjUwLjY5IEw0ODUuNzAgMjM0LjQ2IiBmaWxsPSJub25lIiBzdHJva2U9IiMxODUwYTgiIHN0cm9rZS13aWR0aD0iMS4yIiBzdHJva2UtbGluZWpvaW49InJvdW5kIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICAgIDxwYXRoIGQ9Ik03OC4zMCA0NC43NSBMMTQ2LjIwIDc5LjczIEwyMTQuMTAgNzkuMzMgTDI4Mi4wMCAxMDMuNzAgTDM0OS45MCA0NC4zMCBMNDE3LjgwIDU5LjUwIEw0ODUuNzAgNjguMDAiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2Q0MmExYyIgc3Ryb2tlLXdpZHRoPSIxLjIiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDwvZz4KPC9zdmc+">
+<figcaption>
+Blue represents states observed with the breath-test law at least once. Red represents states that never had the law during the panel. The gap between the two raw means combines cohorts with different adoption dates.
+</figcaption>
+</figure>
+</div>
+<p>Open <strong>Graphics</strong> and move through the plots in order. For the last plot, the script uses <code>preserve</code>, computes group means with <code>collapse</code>, and then uses <code>restore</code> to recover the 336 observations. That last step matters for the lag regressions.</p>
+<h1 id="use-lags-and-differences">9. Use lags and differences</h1>
+<p><strong>Find in the script</strong>　<code>regress frate L.beertax unemp lincome</code></p>
+<p><code>L.</code> selects the previous year’s value in the same state. <code>D.</code> subtracts it from this year’s value. Each state’s first year drops out, leaving <strong>288 observations</strong>. All four models below are pooled OLS regressions of this year’s fatality rate.</p>
+<table>
+
+<thead>
+<tr>
+<th>Regressors of interest</th>
+<th>How to read the output</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Last year’s tax, controlling for unemployment and log income</td>
+<td>L.beertax +0.1560. State-years with higher taxes the year before have higher current fatality rates in this comparison.</td>
+</tr>
+<tr>
+<td>Current and lagged taxes, same controls</td>
+<td>Current +0.4026, lagged −0.2322. Their standard errors of 0.7186 and 0.6958 show how difficult it is to separate the two slopes.</td>
+</tr>
+<tr>
+<td>Annual tax change, same controls</td>
+<td>D.beertax −0.2836 (p=0.673). The dependent variable is still the level of this year’s rate.</td>
+</tr>
+<tr>
+<td>Lagged death rate and current tax</td>
+<td>L.frate +0.8787. Fatality rates are persistent, and this pooled comparison also includes stable differences across states. The coefficient cannot tell us how long a tax shock lasts.</td>
+</tr>
+</tbody>
+</table>
+<h1 id="variable-dictionary">Variable dictionary</h1>
+<p>Use the name in the first column in your commands. The descriptions are the actual variable labels in <strong>fatalities_labeled_en.dta</strong>. A value of 0.21 for youngdrivers means 21%, while unemp=7 means 7%. The law fields use yes/no. Jail and service each have one missing observation. In the separate CSV, rownames is an export row number. The bundled sample omits it. <a href="https://search.r-project.org/CRAN/refmans/AER/html/Fatalities.html">AER dataset documentation</a></p>
+<h2 id="source-variables-state-policy-and-economy">Source variables · state, policy and economy</h2>
+<table>
+
+<thead>
+<tr>
+<th>Variable</th>
+<th>Label</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>state</code></td>
+<td>US state abbreviation</td>
+</tr>
+<tr>
+<td><code>year</code></td>
+<td>Calendar year</td>
+</tr>
+<tr>
+<td><code>spirits</code></td>
+<td>Spirits consumption</td>
+</tr>
+<tr>
+<td><code>unemp</code></td>
+<td>State unemployment rate (%)</td>
+</tr>
+<tr>
+<td><code>income</code></td>
+<td>Personal income per capita (1987 dollars)</td>
+</tr>
+<tr>
+<td><code>emppop</code></td>
+<td>State employment-to-population ratio (%)</td>
+</tr>
+<tr>
+<td><code>beertax</code></td>
+<td>Real state tax per case of beer (dollars)</td>
+</tr>
+<tr>
+<td><code>baptist</code></td>
+<td>Southern Baptists as a share of the population (%)</td>
+</tr>
+<tr>
+<td><code>mormon</code></td>
+<td>Mormons as a share of the population (%)</td>
+</tr>
+<tr>
+<td><code>drinkage</code></td>
+<td>Minimum legal drinking age (years)</td>
+</tr>
+<tr>
+<td><code>dry</code></td>
+<td>Population living in dry counties (%)</td>
+</tr>
+<tr>
+<td><code>youngdrivers</code></td>
+<td>Share of drivers aged 15-24 (fraction from 0 to 1)</td>
+</tr>
+<tr>
+<td><code>miles</code></td>
+<td>Average miles driven per driver</td>
+</tr>
+<tr>
+<td><code>breath</code></td>
+<td>Preliminary breath-test law in force (yes/no)</td>
+</tr>
+<tr>
+<td><code>jail</code></td>
+<td>Mandatory jail for a first drunk-driving conviction (yes/no)</td>
+</tr>
+<tr>
+<td><code>service</code></td>
+<td>Mandatory community service for a first drunk-driving conviction (yes/no)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="source-variables-deaths-exposure-and-national-indicators">Source variables · deaths, exposure and national indicators</h2>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Label</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fatal</code></td>
+<td>Traffic fatalities (people)</td>
+</tr>
+<tr>
+<td><code>nfatal</code></td>
+<td>Nighttime traffic fatalities (people)</td>
+</tr>
+<tr>
+<td><code>sfatal</code></td>
+<td>Single-vehicle traffic fatalities (people)</td>
+</tr>
+<tr>
+<td><code>fatal1517</code></td>
+<td>Traffic fatalities, ages 15-17 (people)</td>
+</tr>
+<tr>
+<td><code>nfatal1517</code></td>
+<td>Nighttime traffic fatalities, ages 15-17 (people)</td>
+</tr>
+<tr>
+<td><code>fatal1820</code></td>
+<td>Traffic fatalities, ages 18-20 (people)</td>
+</tr>
+<tr>
+<td><code>nfatal1820</code></td>
+<td>Nighttime traffic fatalities, ages 18-20 (people)</td>
+</tr>
+<tr>
+<td><code>fatal2124</code></td>
+<td>Traffic fatalities, ages 21-24 (people)</td>
+</tr>
+<tr>
+<td><code>nfatal2124</code></td>
+<td>Nighttime traffic fatalities, ages 21-24 (people)</td>
+</tr>
+<tr>
+<td><code>afatal</code></td>
+<td>Estimated alcohol-involved traffic fatalities (people)</td>
+</tr>
+<tr>
+<td><code>pop</code></td>
+<td>State population (people)</td>
+</tr>
+<tr>
+<td><code>pop1517</code></td>
+<td>Population ages 15-17 (people)</td>
+</tr>
+<tr>
+<td><code>pop1820</code></td>
+<td>Population ages 18-20 (people)</td>
+</tr>
+<tr>
+<td><code>pop2124</code></td>
+<td>Population ages 21-24 (people)</td>
+</tr>
+<tr>
+<td><code>milestot</code></td>
+<td>Total vehicle miles traveled in the state (millions)</td>
+</tr>
+<tr>
+<td><code>unempus</code></td>
+<td>US unemployment rate (%)</td>
+</tr>
+<tr>
+<td><code>emppopus</code></td>
+<td>US employment-to-population ratio (%)</td>
+</tr>
+<tr>
+<td><code>gsp</code></td>
+<td>Growth rate of gross state product (0.01 means 1%)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="variables-created-by-the-tour">Variables created by the tour</h2>
+<table>
+
+<thead>
+<tr>
+<th>Variable</th>
+<th>Label</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>frate</code></td>
+<td>Traffic deaths per 10,000 residents</td>
+</tr>
+<tr>
+<td><code>lincome</code></td>
+<td>Natural log of real personal income per capita</td>
+</tr>
+<tr>
+<td><code>lfatal</code></td>
+<td>Natural log of traffic fatalities</td>
+</tr>
+<tr>
+<td><code>lpop</code></td>
+<td>Natural log of state population</td>
+</tr>
+<tr>
+<td><code>drinkd</code></td>
+<td>Breath-test law in force this year (1 yes, 0 no)</td>
+</tr>
+<tr>
+<td><code>statenum</code></td>
+<td>Numeric state ID for panel analysis</td>
+</tr>
+<tr>
+<td><code>ols_resid</code></td>
+<td>Pooled OLS residual (observed minus fitted fatality rate)</td>
+</tr>
+<tr>
+<td><code>treatyr</code></td>
+<td>Year of observation when the breath-test law is in force</td>
+</tr>
+<tr>
+<td><code>gvar</code></td>
+<td>First observed year with the law (0 if never observed in force)</td>
+</tr>
+<tr>
+<td><code>evertreat</code></td>
+<td>Law ever observed in force during the panel (1 yes, 0 no)</td>
+</tr>
+<tr>
+<td><code>_est_m_fe</code></td>
+<td>Observation used in the stored two-way FE model (1 included)</td>
+</tr>
+</tbody>
+</table>
+<p>The residual ols_resid belongs to the first tax-only OLS model. Treatyr records every year observed with the law in force. Gvar repeats the earliest such year across observations for the same state. PIET creates _est_m_fe when it stores the model named m_fe. L.beertax and D.beertax are expressions evaluated during estimation and do not add columns to the dataset.</p>
+<h1 id="check-your-interpretation">Check your interpretation</h1>
+<p>Use the two-way fixed-effects model to describe a <strong>25-cent</strong> difference in the beer tax. Multiply both the coefficient and interval endpoints by 0.25. You should get <strong>−0.115 deaths per 10,000 residents</strong>, with a <strong>95% interval from −0.270 to +0.040</strong>. In a report, specify the comparison within states, the tax and outcome units, and the uncertainty around the estimate.</p>
+</body>
+</html>

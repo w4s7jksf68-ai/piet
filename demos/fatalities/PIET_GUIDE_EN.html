@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.10" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>PIET User Manual</title>
+  <style>
+:root{color-scheme:light;--ink:#162b35;--accent:#11604e;--paper:#fffefa}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0 auto;padding:3.5rem 2rem 5rem;max-width:64rem;background:var(--paper);color:var(--ink);font:17px/1.8 "Apple SD Gothic Neo","Malgun Gothic","Noto Sans CJK KR",sans-serif;overflow-wrap:break-word;word-break:keep-all}
+header{border-top:6px solid var(--accent);padding-top:1.5rem}header h1{font-size:clamp(2.4rem,5vw,4.5rem);border:0;margin:0;line-height:1.2;letter-spacing:-.065em}header p{font-size:1.22rem;color:#43616c;margin:.5rem 0 1.7rem}
+nav{padding:1rem 1.3rem;background:#edf3ee;border-radius:8px;margin-top:1.4rem}nav:before{content:"차례";font-weight:700}nav ul{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.25rem 1.5rem;margin:.4rem 0;padding-left:1.3rem}nav a{font-size:.95rem}
+h1:not(.title){margin:3.8rem 0 .8rem;border-top:2px solid #1c6555;padding-top:1rem;font-size:2rem;letter-spacing:-.055em;line-height:1.35}h2{font-size:1.38rem;color:#194d41;line-height:1.45;margin:2.1rem 0 .6rem;letter-spacing:-.035em}p{margin:.8rem 0}a{color:#115b4b;text-underline-offset:.16em}strong{font-weight:720}table{width:100%;border-collapse:collapse;font-size:.94rem;line-height:1.58;margin:1rem 0 1.4rem}th,td{text-align:left;padding:.62rem .75rem;border-bottom:1px solid #d9e1dd;vertical-align:top}th{background:#e8f0eb;color:#224538}tr:nth-child(even) td{background:#f6f8f5}tbody td:first-child{font-weight:620}pre{padding:1rem 1.25rem;background:#182d32;color:#f6fbfb;border-radius:.4rem;overflow:auto;line-height:1.55}code{font-family:"SFMono-Regular",Consolas,monospace;font-size:.89em}p code,td code{background:#eaf0ec;border-radius:3px;padding:.08em .27em;display:inline-block}pre code span{color:inherit!important}li{padding-left:.15rem;margin:.22rem 0}.figures{display:grid;grid-template-columns:1fr 1fr;gap:1.1rem}figure{margin:0;padding:.6rem;background:white;border:1px solid #d7ded8;border-radius:4px}figure img{display:block;width:100%;height:auto}figcaption{padding:.4rem .5rem;font-size:.89rem;line-height:1.6}
+@media(max-width:660px){body{padding:1.25rem .85rem 3rem;font-size:16px}th,td{padding:.45rem .38rem;word-break:normal;overflow-wrap:anywhere}.figures{grid-template-columns:1fr}h1:not(.title){font-size:1.65rem}}
+@media(max-width:660px){p code,li code,td code{max-width:100%;overflow-wrap:anywhere;word-break:break-word}table{table-layout:fixed}.sourceCode{max-width:100%;overflow-x:auto}}
+@media print{body{max-width:none;padding:0;font-size:10pt;color:black}nav{display:none}h1:not(.title){break-before:page}h1,h2{break-after:avoid}tr,figure,pre{break-inside:avoid}a{color:inherit}pre{color:black;background:#f4f4f4}}
+
+html[lang=en] body{word-break:normal;font-family:system-ui,sans-serif}html[lang=en] nav:before{content:"Contents"} .doclinks{display:flex;gap:1.2rem;flex-wrap:wrap;border-bottom:1px solid #d9e1dd;padding:.6rem 0;font-size:.94rem}.figures{grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr))}.sourceCode pre{white-space:pre;word-break:normal}.sourceCode code{display:inline}.subtitle{line-height:1.5}</style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">PIET User Manual</h1>
+<p class="subtitle">Desktop controls, settings and command reference</p>
+</header>
+<div class="doclinks"><a href="PIET_LAB_EN.html">Hands-on lab</a><a href="PIET_GUIDE_KO.html">한국어</a></div>
+
+<p><strong>PIET A.1.1 · CoBrA 1.1.0</strong></p>
+<p>New to PIET? Start with the built-in sample and run four commands. Use the contents below to look up a control, change a setting or check a command later.</p>
+<p><a href="https://github.com/w4s7jksf68-ai/piet/releases/tag/A.1.1">Download PIET A.1.1</a></p>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#install-piet-and-open-a-dataset" id="toc-install-piet-and-open-a-dataset">Install PIET and open a dataset</a></li>
+<li><a href="#screen-controls-and-shortcuts" id="toc-screen-controls-and-shortcuts">Screen controls and shortcuts</a></li>
+<li><a href="#settings-and-parallel-processing" id="toc-settings-and-parallel-processing">Settings and parallel processing</a></li>
+<li><a href="#commands-and-known-limitations" id="toc-commands-and-known-limitations">Commands and known limitations</a></li>
+<li><a href="#save-work-and-recover-from-errors" id="toc-save-work-and-recover-from-errors">Save work and recover from errors</a></li>
+</ul>
+</nav>
+<h1 id="install-piet-and-open-a-dataset">Install PIET and open a dataset</h1>
+<p>Choose the download for your operating system. <a href="https://github.com/w4s7jksf68-ai/piet/releases/tag/A.1.1">PIET A.1.1 release</a></p>
+<table>
+
+<thead>
+<tr>
+<th>Platform</th>
+<th>Installation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Apple Silicon Mac, macOS 13.3 or later</td>
+<td>Open the arm64 DMG and drag PIET.app to Applications. The app includes the sample data.</td>
+</tr>
+<tr>
+<td>Windows 10 or 11, x64</td>
+<td>The installer adds PIET to the Start menu and copies the examples to Documents/PIET. For the portable edition, extract the entire ZIP and open PIET.exe. The examples are in the demo folder. WebView2 is required.</td>
+</tr>
+<tr>
+<td>Ubuntu 24.04 or later, x86-64</td>
+<td>Install the .deb and launch PIET from the applications menu. The examples are in /opt/piet/demo. For the tar.xz edition, extract the entire directory and run ./PIET. Copy the examples to a writable folder before running them.</td>
+</tr>
+</tbody>
+</table>
+<p>Start a fresh session. Choose <strong>File ▾ → Open sample dataset</strong>. Enter the following commands one line at a time in the command box below <strong>Results</strong>. Press <strong>Enter</strong> after each line.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode stata"><code class="sourceCode stata"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">count</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">generate</span> frate = fatal / pop * 10000</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">summarize</span> frate</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">regress</span> frate beertax</span></code></pre></div>
+<p>Expect <strong>336</strong> observations, a mean of <strong>2.040 deaths per 10,000 residents</strong>, and a beer-tax coefficient of <strong>+0.3646</strong>. Each row is one state in one year. In Alabama in 1982, 839 deaths among about 3.94 million residents give a rate of 2.13 per 10,000. To investigate what the slope means, open the <a href="PIET_LAB_EN.html">traffic fatalities lab</a>.</p>
+<h1 id="screen-controls-and-shortcuts">Screen controls and shortcuts</h1>
+<table>
+
+<thead>
+<tr>
+<th>Control</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Results · Run · ↓ latest</td>
+<td>Enter or Run executes the command in the input box. Output appears below the echoed command. Select ↓ latest to return to the newest output.</td>
+</tr>
+<tr>
+<td>File ▾ · Recent</td>
+<td>Open Data… loads a dataset. Open do-file… opens a script in the editor for inspection. Open sample dataset loads the built-in panel. Recent reopens a previously opened file.</td>
+</tr>
+<tr>
+<td>Run .do · Do-file Editor</td>
+<td>The toolbar’s Run .do opens a file picker and runs the chosen file immediately. Inside the editor, ▶ Run executes the entire buffer, including edits. ▶ Run selection executes the highlighted lines, or the entire buffer when nothing is selected. Clear empties the editor.</td>
+</tr>
+<tr>
+<td>Data ▾</td>
+<td>Data Browser displays observations and variables. Data Editor lets you change values. To repeat a correction later, put a replace command in your .do file.</td>
+</tr>
+<tr>
+<td>Variables · History</td>
+<td>Search variable names and labels. Open the variable card to inspect its type and available statistics. Click a history entry to bring it back to the command line, or use → Do-file to send it to the editor.</td>
+</tr>
+<tr>
+<td>Graphics</td>
+<td>Click a thumbnail to enlarge the plot. Use Prev and Next to move between plots and Back to gallery to return. Use the PNG export control or graph export to save a figure.</td>
+</tr>
+<tr>
+<td>Split · Stack · Reset layout</td>
+<td>Split docks the editor or gallery beside Results. With both secondary views docked, Stack arranges them vertically. Reset layout restores the single-view tabs.</td>
+</tr>
+<tr>
+<td>Save Results… · × clear</td>
+<td>Save Results… writes the visible console history to a text log. × clear clears the console. Use save separately to keep the dataset.</td>
+</tr>
+<tr>
+<td>Cancel · Submit</td>
+<td>Cancel stops a running script. Earlier lines may already have changed the data. When a script requests input, enter a value and select Submit or select Cancel run.</td>
+</tr>
+<tr>
+<td>About · Settings · appearance controls</td>
+<td>About shows version and license information. Settings opens the preferences. The style toggle switches between Boring and De Stijl. The theme toggle switches between Light and Dark.</td>
+</tr>
+</tbody>
+</table>
+<p>Use <strong>⌘ on macOS</strong> and <strong>Ctrl on Windows/Linux</strong>. With the editor focused, ⌘/Ctrl+Enter runs the buffer and ⌘/Ctrl+Shift+D runs the selection. ⌘/Ctrl+F searches the active editor or results pane. The editor also supports replacement. In the command box use ↑ and ↓ to recall commands. Esc closes the active overlay.</p>
+<h1 id="settings-and-parallel-processing">Settings and parallel processing</h1>
+<table>
+
+<thead>
+<tr>
+<th>Setting</th>
+<th>How to use it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scratch directory</td>
+<td>Select a local volume with room for temporary datasets. Select Apply, then restart PIET.</td>
+</tr>
+<tr>
+<td>Default working directory</td>
+<td>Sets the base directory for relative file paths after Apply and a restart. In the current session, pwd shows the directory and cd “path” changes it.</td>
+</tr>
+<tr>
+<td>Open do-files in their own folder</td>
+<td>When enabled, opening a script changes the working directory to its folder. An explicit cd or a configured default working directory takes precedence.</td>
+</tr>
+<tr>
+<td>Export folder</td>
+<td>Destination for Save Results and GUI PNG exports. Leave it empty to choose a location each time. Scripted graph export uses the path in the command.</td>
+</tr>
+<tr>
+<td>Compute cores · Memory budget</td>
+<td>Choose Auto or a core count and select Apply. The next command uses this budget for engine and BLAS threads. Memory budget helps size temporary parallel work, console history, graph retention and the automatic worker count.</td>
+</tr>
+<tr>
+<td>Provenance hash</td>
+<td>Includes a hash of the input in the results so an archived analysis can be matched to its data. Off by default.</td>
+</tr>
+<tr>
+<td>External-library compatibility names</td>
+<td>Enables names such as reghdfe, csdid and boottest. Change the persistent choice here or on first launch. The lab uses set extcompat on for its current session.</td>
+</tr>
+<tr>
+<td>Table size limits</td>
+<td>Blank fields use the defaults of 12,000 one-way rows, 1,200 rows × 80 columns for two-way tables, and 375 cells with summarize(). Increase individual limits as needed. The overall caps are 1,000,000 cells or 200,000 with summarize().</td>
+</tr>
+<tr>
+<td>Editor &amp; results font size</td>
+<td>Changes text size in the editor, console and data browser.</td>
+</tr>
+<tr>
+<td>Run pasted blocks immediately</td>
+<td>Enable to execute a multiline paste at once. When disabled, inspect the pasted block in the editor before running it.</td>
+</tr>
+<tr>
+<td>Auto-summarize on load</td>
+<td>Runs summarize when a dataset opens and populates the variable cards. Off by default.</td>
+</tr>
+<tr>
+<td>Follow system appearance</td>
+<td>Tracks the operating system’s light/dark preference. Selecting the toolbar theme manually switches this off.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="run-two-independent-jobs">Run two independent jobs</h2>
+<p>In <strong>Settings → Compute cores</strong>, select Auto or at least two cores, then <strong>Apply</strong>. Put this block in the editor and run it as a whole.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode stata"><code class="sourceCode stata"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">sysuse</span> fatalities, <span class="kw">clear</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>parallel, workers(2) {</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">summarize</span> beertax</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">summarize</span> unemp</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div>
+<p>Read the two means in script order, <strong>0.5133 dollars per case</strong> and <strong>7.3467% unemployment</strong>. A worker is a separate process. A core is part of the compute budget. Use workers(1) for a serial comparison. With the opening line <code>parallel {</code>, PIET chooses a worker count using the task count, cores, memory and scratch space. Give concurrent file-writing jobs distinct output names. Keep a regression and any test that reads its estimates together in ordinary sequential code.</p>
+<p>The macOS release reported <strong>2 tasks / 2 workers</strong> on standard error for this example. To see the message, save the block as parallel.do and run <code>"/Applications/PIET.app/Contents/MacOS/piet_native" --do parallel.do</code> from its folder. For two small summaries, process startup can dominate. The A.1.1 Windows build executes this block serially. Compute cores still governs internal engine threads. This release does not use set processors to configure the budget.</p>
+<h1 id="commands-and-known-limitations">Commands and known limitations</h1>
+<p>The usual pattern is <strong>command, variables, condition, then a comma and options</strong>, written as <code>command varlist if condition, options</code>. For example, <code>summarize beertax if year == 1988</code> summarizes one year’s tax observations. After an estimator, <code>vce(cluster statenum)</code> groups errors by state.</p>
+<table>
+
+<thead>
+<tr>
+<th>Task</th>
+<th>Commands to look up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Open, save and inspect</td>
+<td>sysuse, use, import delimited, import excel, save, export, describe, codebook, count, list, browse, summarize, tabulate</td>
+</tr>
+<tr>
+<td>Construct and combine datasets</td>
+<td>generate, replace, egen, label variable, keep, drop, sort, collapse, merge, append, reshape, preserve, restore</td>
+</tr>
+<tr>
+<td>Regression, panels and IV</td>
+<td>regress, xtset, xtreg, reghdfe, ivregress, ivreg2, ivreghdfe</td>
+</tr>
+<tr>
+<td>Discrete and limited outcomes</td>
+<td>logit, probit, poisson, nbreg, xtpoisson, tobit, heckman</td>
+</tr>
+<tr>
+<td>Policy evaluation and time series</td>
+<td>csdid, drdid, rdrobust, sdid, newey, prais</td>
+</tr>
+<tr>
+<td>Test estimates, build tables and draw graphs</td>
+<td>predict, test, lincom, nlcom, estat, estimates, eststo, esttab, twoway, coefplot, graph export</td>
+</tr>
+<tr>
+<td>Loops, resampling and parallel work</td>
+<td>foreach, forvalues, local, global, program define, bootstrap, jackknife, permute, boottest, parallel</td>
+</tr>
+</tbody>
+</table>
+<h2 id="where-a-familiar-command-can-behave-differently">Where a familiar command can behave differently</h2>
+<table>
+
+<thead>
+<tr>
+<th>Scope</th>
+<th>Command or condition</th>
+<th>What to expect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Documented defect</td>
+<td>label list after reshape wide</td>
+<td>Value labels can appear in a different order. Check the mapping from codes to labels.</td>
+</tr>
+<tr>
+<td>Documented defect</td>
+<td>tabulate a b, summarize(x)</td>
+<td>PIET computes the summary but does not draw the table. For group means, run preserve, then collapse (mean) x, by(a b), then list and restore.</td>
+</tr>
+<tr>
+<td>Confirmed in the lab</td>
+<td>boottest after absorb(statenum year)</td>
+<td>The command reports a restriction after absorbing multiple effects. Keep the state effect in absorb() and enter i.year explicitly. The lab verifies the coefficient and runs the test that way.</td>
+</tr>
+<tr>
+<td>Platform difference</td>
+<td>Unicode regular expressions and sdid on Windows</td>
+<td>ustrregexm() and ustrregexra() refuse characters above U+FFFF, including some emoji. With sdid, vce(bootstrap), standard errors can differ around the fourth significant digit across platforms.</td>
+</tr>
+<tr>
+<td>Built-in datasets</td>
+<td>sysuse auto and other Stata examples</td>
+<td>The bundled PIET example is fatalities. Open your own copy of other datasets by file path.</td>
+</tr>
+</tbody>
+</table>
+<p>A.1.1 retains the A.1.0 computation engine. In the published comparison with Stata 19.5, 32,148 of 39,290 test cases matched. For 3,872 cases PIET reported an unimplemented form that Stata ran. A further 1,596 cases used commands absent from PIET. Each case tests a combination of syntax, options, errors or stored results. The release notes identify remaining defects and do not give individual repair dates. <a href="https://github.com/w4s7jksf68-ai/piet/blob/A.1.1/RELEASE_NOTES.md">Release notes and validation results</a></p>
+<h2 id="command-name-index">Command-name index</h2>
+<p>These names come from the macOS release’s <code>--dump-registry</code>. Option coverage varies by command. The compatibility name reghdfe maps to feols. Constructs handled elsewhere include do, foreach, forvalues, if, while, local, global, program, quietly, capture, by, bootstrap, jackknife and permute. Use your browser’s Find command to locate a name.</p>
+<p><strong>Data management and summaries (113)</strong></p>
+<p><code>_pctile</code> <code>append</code> <code>assert</code> <code>astile</code> <code>bcal</code> <code>browse</code> <code>bsample</code> <code>carryforward</code> <code>centile</code> <code>clear</code> <code>clonevar</code> <code>collapse</code> <code>contract</code> <code>count</code> <code>cross</code> <code>cumul</code> <code>decode</code> <code>destring</code> <code>distinct</code> <code>drawnorm</code> <code>drop</code> <code>ds</code> <code>duplicates</code> <code>egen</code> <code>encode</code> <code>expand</code> <code>fcollapse</code> <code>fillin</code> <code>fillmissing</code> <code>findname</code> <code>fmerge</code> <code>frame</code> <code>frames</code> <code>frget</code> <code>frlink</code> <code>gcollapse</code> <code>gduplicates</code> <code>gegen</code> <code>generate</code> <code>geodist</code> <code>geonear</code> <code>getmata</code> <code>gisid</code> <code>glevelsof</code> <code>gquantiles</code> <code>greshape</code> <code>gsort</code> <code>gstats</code> <code>gunique</code> <code>ihstrans</code> <code>insobs</code> <code>inspect</code> <code>integ</code> <code>ipolate</code> <code>isid</code> <code>joinby</code> <code>keep</code> <code>levelsof</code> <code>list</code> <code>lookfor</code> <code>markout</code> <code>mata</code> <code>mdesc</code> <code>merge</code> <code>mi</code> <code>missings</code> <code>misstable</code> <code>mkspline</code> <code>move</code> <code>mvdecode</code> <code>mvencode</code> <code>order</code> <code>pctile</code> <code>rangestat</code> <code>recode</code> <code>rename</code> <code>renpfix</code> <code>replace</code> <code>reshape</code> <code>sample</code> <code>sctorezone</code> <code>sencode</code> <code>separate</code> <code>sort</code> <code>split</code> <code>splitsample</code> <code>stack</code> <code>strdist</code> <code>stset</code> <code>summarize</code> <code>svmat</code> <code>tab1</code> <code>tab2</code> <code>table</code> <code>tabulate</code> <code>tostring</code> <code>tset</code> <code>tsfill</code> <code>tsfilter</code> <code>tsset</code> <code>tssmooth</code> <code>tsspell</code> <code>unab</code> <code>unique</code> <code>winsor</code> <code>winsor2</code> <code>xi</code> <code>xpose</code> <code>xtdescribe</code> <code>xtile</code> <code>xtset</code> <code>xtsum</code> <code>xttab</code></p>
+<p><strong>Estimation, tests and postestimation (103)</strong></p>
+<p><code>acreg</code> <code>areg</code> <code>boottest</code> <code>chow</code> <code>cloglog</code> <code>corr</code> <code>csdid</code> <code>dfuller</code> <code>did_imputation</code> <code>drdid</code> <code>erepost</code> <code>ereturn</code> <code>estadd</code> <code>estat</code> <code>estimates</code> <code>estout</code> <code>estpost</code> <code>eststo</code> <code>esttab</code> <code>eventstudyinteract</code> <code>feols</code> <code>fepois</code> <code>fracreg</code> <code>frmttable</code> <code>glm</code> <code>gmm</code> <code>hausman</code> <code>heckman</code> <code>honestdid</code> <code>irf</code> <code>ivprobit</code> <code>ivreg</code> <code>ivreg2</code> <code>ivreghdfe</code> <code>ivregress</code> <code>ivtobit</code> <code>lasso</code> <code>lassocoef</code> <code>leebounds</code> <code>lincom</code> <code>logistic</code> <code>logit</code> <code>lrtest</code> <code>margins</code> <code>mean</code> <code>mediate</code> <code>mixed</code> <code>ml</code> <code>mlogit</code> <code>nbreg</code> <code>newey</code> <code>nl</code> <code>nlcom</code> <code>oaxaca</code> <code>ologit</code> <code>oprobit</code> <code>outreg2</code> <code>parmest</code> <code>pca</code> <code>poisson</code> <code>pperron</code> <code>ppmlhdfe</code> <code>prais</code> <code>predict</code> <code>probit</code> <code>proportion</code> <code>pwcorr</code> <code>qreg</code> <code>qreg2</code> <code>rddensity</code> <code>rdrobust</code> <code>reg3</code> <code>regress</code> <code>regsave</code> <code>ritest</code> <code>rlasso</code> <code>sdid</code> <code>sdtest</code> <code>signrank</code> <code>sktest</code> <code>spearman</code> <code>stcox</code> <code>streg</code> <code>suest</code> <code>sureg</code> <code>swindex</code> <code>tabout</code> <code>tabstat</code> <code>teffects</code> <code>test</code> <code>testparm</code> <code>tobit</code> <code>ttest</code> <code>var</code> <code>vargranger</code> <code>wntestq</code> <code>xtabond</code> <code>xtivreg2</code> <code>xtlogit</code> <code>xtpoisson</code> <code>xtreg</code> <code>zinb</code> <code>zip</code></p>
+<p><strong>Graphs (20)</strong></p>
+<p><code>binscatter</code> <code>cdfplot</code> <code>coefplot</code> <code>event_plot</code> <code>graph</code> <code>grc1leg</code> <code>grc1leg2</code> <code>histogram</code> <code>kdensity</code> <code>line</code> <code>lowess</code> <code>lpoly</code> <code>marginsplot</code> <code>rdplot</code> <code>scatter</code> <code>serset</code> <code>tsline</code> <code>twoway</code> <code>twoway__histogram_gen</code> <code>xtline</code></p>
+<p><strong>Files, input/output and paths (53)</strong></p>
+<p><code>ado</code> <code>adopath</code> <code>cd</code> <code>cf</code> <code>confirm</code> <code>copy</code> <code>dir</code> <code>dtaversion</code> <code>erase</code> <code>export</code> <code>file</code> <code>filefilter</code> <code>filelist</code> <code>findfile</code> <code>import</code> <code>infile</code> <code>infix</code> <code>input</code> <code>insheet</code> <code>log</code> <code>ls</code> <code>mat2txt</code> <code>mkdir</code> <code>net</code> <code>odbc</code> <code>outfile</code> <code>outsheet</code> <code>post</code> <code>postclose</code> <code>postfile</code> <code>postutil</code> <code>putexcel</code> <code>pwd</code> <code>rm</code> <code>rmdir</code> <code>save</code> <code>saveold</code> <code>shell</code> <code>spshape2dta</code> <code>ssc</code> <code>sysdir</code> <code>sysuse</code> <code>tex</code> <code>texdoc</code> <code>texsave</code> <code>type</code> <code>unzipfile</code> <code>use</code> <code>which</code> <code>winexec</code> <code>zipfile</code> <code>zipsave</code> <code>zipuse</code></p>
+<p><strong>Session, settings and metadata (35)</strong></p>
+<p><code>_dots</code> <code>char</code> <code>cls</code> <code>codebook</code> <code>compare</code> <code>compress</code> <code>datasignature</code> <code>describe</code> <code>display</code> <code>error</code> <code>exit</code> <code>format</code> <code>gr_edit</code> <code>grstyle</code> <code>label</code> <code>labelbook</code> <code>labmask</code> <code>labvars</code> <code>notes</code> <code>numlabel</code> <code>parallel</code> <code>pause</code> <code>preserve</code> <code>recast</code> <code>renvarlab</code> <code>renvars</code> <code>require</code> <code>restore</code> <code>set</code> <code>sleep</code> <code>splitvallabels</code> <code>svyset</code> <code>timer</code> <code>tolower</code> <code>version</code></p>
+<p><strong>Macros, matrices and returns (15)</strong></p>
+<p><code>fvexpand</code> <code>fvunab</code> <code>macro</code> <code>marksample</code> <code>matlist</code> <code>matrix</code> <code>matselrc</code> <code>matsort</code> <code>mkmat</code> <code>numlist</code> <code>return</code> <code>scalar</code> <code>sreturn</code> <code>tempvar</code> <code>tsunab</code></p>
+<h1 id="save-work-and-recover-from-errors">Save work and recover from errors</h1>
+<p>Keep the <strong>.do</strong> script for the sequence of commands, a <strong>.dta</strong> file for data and variable labels, and a <strong>.log</strong> for the readable results. Save graphs separately. For a reproducible handoff, record the PIET and engine versions, data source, clustering variable and random seed. A CSV export loses variable labels.</p>
+<table>
+
+<thead>
+<tr>
+<th>Symptom</th>
+<th>What to check</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>An exported figure is missing</td>
+<td>Run pwd for the working directory used by graph export. For GUI-created PNGs and logs, also check Settings → Export folder.</td>
+</tr>
+<tr>
+<td>variable frate already defined</td>
+<td>A generate line ran twice. Save anything you need before restarting the script from the top. If resuming mid-script, skip lines that create existing variables.</td>
+</tr>
+<tr>
+<td>no observations or variable not found</td>
+<td>Run count and describe. Check the sample, spelling, any setup steps and whether restore ran after collapse.</td>
+</tr>
+<tr>
+<td>A command or option is rejected</td>
+<td>Inspect the first error and the preceding estimation command. Check the compatibility setting, spelling and comma placement. Rerun the setup and the affected section.</td>
+</tr>
+<tr>
+<td>Results differ from the lab</td>
+<td>Check the 336-row sample (288 for lag regressions), variable units, fixed effects, 48 clusters and seed(42). The lab begins with sysuse fatalities. Importing a CSV can change storage precision.</td>
+</tr>
+<tr>
+<td>Report a reproducible problem</td>
+<td>Include the version from About, operating system, shortest example using public data, expected result and actual result. <a href="https://github.com/w4s7jksf68-ai/piet/issues">PIET issues</a></td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>

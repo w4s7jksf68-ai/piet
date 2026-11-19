@@ -40,9 +40,17 @@ demos/COBRA_ENGINE_CAPABILITIES.md
 demos/PIET_1.8.0_CAPABILITIES.md
 demos/PIET_1.8.x_ROADMAP.md
 demos/README.md
+demos/fatalities/PIET_GUIDE_EN.html
+demos/fatalities/PIET_GUIDE_KO.html
+demos/fatalities/PIET_LAB_EN.html
+demos/fatalities/PIET_LAB_KO.html
 demos/fatalities/HANDBOOK.md
 demos/fatalities/fatalities.csv
+demos/fatalities/fatalities_labeled_en.dta
+demos/fatalities/fatalities_labeled_ko.dta
 demos/fatalities/fatalities_tour.do
+demos/fatalities/fatalities_tour_en.do
+demos/fatalities/fatalities_tour_ko.do
 demos/fatalities/pangram_tour.do
 demos/run_demos.sh
 docker/.dockerignore
@@ -893,6 +901,7 @@ piet/packaging/stage_native_windows.sh
 public/.gitattributes
 public/.github/FUNDING.yml
 public/.github/workflows/build.yml
+public/.github/workflows/pages.yml
 public/.github/workflows/release.yml
 public/.github/workflows/windows.yml
 public/CONTRIBUTING.md

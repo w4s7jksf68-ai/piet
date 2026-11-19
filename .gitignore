@@ -42,6 +42,8 @@ venv/
 # Binary / columnar data anywhere in the tree
 *.hbin
 *.dta
+!demos/fatalities/fatalities_labeled_ko.dta
+!demos/fatalities/fatalities_labeled_en.dta
 *.parquet
 *.sav
 *.arrow

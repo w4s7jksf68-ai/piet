@@ -1,0 +1,45 @@
+name: pages
+
+# Publishes the user manual and the hands-on lab (demos/fatalities/PIET_*.html,
+# with the lab's do-files and labeled datasets) as the repository's GitHub Pages site.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'demos/fatalities/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Assemble the site
+        run: |
+          mkdir _site
+          cd demos/fatalities
+          cp PIET_GUIDE_EN.html PIET_GUIDE_KO.html PIET_LAB_EN.html PIET_LAB_KO.html \
+             fatalities_tour_en.do fatalities_tour_ko.do \
+             fatalities_labeled_en.dta fatalities_labeled_ko.dta ../../_site/
+          cp PIET_GUIDE_EN.html ../../_site/index.html
+          touch ../../_site/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
