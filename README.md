@@ -24,7 +24,7 @@ material (see *Relationship to Stata* below).
 
 PIET is free and will stay free. If it helps you and you would like to support
 its development, donations are very welcome:
-**[bunq.me/Munkyung](https://bunq.me/Munkyung)**. Bank-transfer details are in
+**https://buymeacoffee.com/pietwithcobra**. Bank-transfer details are in
 [DEVELOPER_NOTE.md](DEVELOPER_NOTE.md).
 
 ## Download for macOS
