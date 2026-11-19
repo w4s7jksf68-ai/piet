@@ -20,6 +20,13 @@ syntax without a paid license. It is **not** a copy, port, or clone of Stata,
 and contains no Stata source code, manual text, or other StataCorp-authored
 material (see *Relationship to Stata* below).
 
+## Support the project
+
+PIET is free and will stay free. If it helps you and you would like to support
+its development, donations are very welcome:
+**[bunq.me/Munkyung](https://bunq.me/Munkyung)**. Bank-transfer details are in
+[DEVELOPER_NOTE.md](DEVELOPER_NOTE.md).
+
 ## Download for macOS
 
 A ready-built app for Apple Silicon Macs is attached to each release on the

@@ -40,11 +40,11 @@ demos/COBRA_ENGINE_CAPABILITIES.md
 demos/PIET_1.8.0_CAPABILITIES.md
 demos/PIET_1.8.x_ROADMAP.md
 demos/README.md
+demos/fatalities/HANDBOOK.md
 demos/fatalities/PIET_GUIDE_EN.html
 demos/fatalities/PIET_GUIDE_KO.html
 demos/fatalities/PIET_LAB_EN.html
 demos/fatalities/PIET_LAB_KO.html
-demos/fatalities/HANDBOOK.md
 demos/fatalities/fatalities.csv
 demos/fatalities/fatalities_labeled_en.dta
 demos/fatalities/fatalities_labeled_ko.dta
@@ -57,6 +57,7 @@ docker/.dockerignore
 docker/Dockerfile.linux
 docker/Dockerfile.linux-static
 docker/Dockerfile.linux-webkitgtk-check
+docker/Dockerfile.piet-linux
 docker/Dockerfile.piet-windows
 docker/Dockerfile.windows
 docker/build-windows.sh
@@ -901,6 +902,7 @@ piet/packaging/stage_native_windows.sh
 public/.gitattributes
 public/.github/FUNDING.yml
 public/.github/workflows/build.yml
+public/.github/workflows/linux.yml
 public/.github/workflows/pages.yml
 public/.github/workflows/release.yml
 public/.github/workflows/windows.yml
@@ -909,8 +911,10 @@ public/DEVELOPER_NOTE.md
 public/RELEASE_NOTES.md
 public/SECURITY.md
 public/VERSIONING.md
+public/scripts/build-linux.sh
 public/scripts/build-macos.sh
 public/scripts/build-windows.sh
+public/scripts/package-linux.sh
 public/scripts/package-macos-dmg.sh
 public/scripts/package-windows.sh
 public/tests/public_smoke.py
@@ -1282,6 +1286,7 @@ tests/eval/serve_parity/README.md
 tests/eval/serve_parity/run_serve_parity.py
 tests/eval/serve_session/README.md
 tests/eval/serve_session/run_serve_session.py
+tests/linux_dialog_smoke.cpp
 tests/unit/runners/runner01.cpp
 tests/unit/runners/runner02.cpp
 tests/unit/runners/runner03.cpp
