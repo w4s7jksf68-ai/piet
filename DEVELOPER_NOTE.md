@@ -23,6 +23,9 @@ IBAN: NL89 BUNQ 2115 0358 36
 **Or you can donate directly through bunq:**  
 https://bunq.me/Munkyung
 
+**Or you can buy me a coffee:**  
+https://buymeacoffee.com/pietwithcobra
+
 ---
 
 # 개발자 노트
