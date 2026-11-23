@@ -275,7 +275,8 @@ bool route_io(std::string& cmd,
     if (dsLower != "fatalities") {
       blocks.push_back(ojson(eval::errorBlock(
           "engine_error",
-          "sysuse: dataset `" + dsArg + "` is unavailable in PIET (run `sysuse dir` for PIET samples).",
+          "sysuse: dataset `" + dsArg + "` is unavailable in PIET. "
+              "PIET includes `fatalities` (run `sysuse dir` to list its samples).",
           std::nullopt, std::nullopt, std::nullopt, "r(601)")));
       return true;
     }
