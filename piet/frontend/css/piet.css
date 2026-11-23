@@ -977,6 +977,15 @@ td.vg-cell-editing input {
 .g-zero { stroke: var(--neutral-text-muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .g-treatline { stroke: var(--graph-accent-2); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.6; }
 .g-whisker { stroke: var(--graph-accent-1); stroke-width: 1.2; }
+/* graph bar / hbar / dot / box (renderBarChart): each series paints its own
+   --series-N colour inline, so these classes set no fill or stroke colour. */
+.g-cbar { stroke: var(--neutral-paper); stroke-width: 0.5; }
+.g-cwhisker { stroke-width: 1.2; }
+.g-dotguide { stroke: var(--neutral-text-muted); stroke-width: 1; stroke-dasharray: 1 3; }
+.g-boxmedian { stroke: var(--neutral-paper); stroke-width: 1.6; }
+.g-legend { font-size: 10px; fill: var(--neutral-text); }
+.g-wedge { stroke: var(--neutral-paper); stroke-width: 1; }
+.g-pielabel { font-size: 10px; fill: var(--neutral-paper); }
 .g-caption {
   font-family: var(--font-mono);
   font-size: var(--fs-mono-sm);

@@ -908,7 +908,12 @@ void testAerUtilCounts() {
     check(firstError(r.blocks).is_null(),
           "AER-UTIL/counts (vii): `missings report` runs clean. Got `" +
               errText(firstError(r.blocks)) + "`");
-    const std::string txt = renderText(r.blocks);
+    std::string txt = renderText(r.blocks);
+    // vs-stata stage 4: the per-variable table is list's (missings.ado lists it), so its
+    // cells travel in the browse block's `listing` that the Results pane draws.
+    for (const auto& b : r.blocks)
+      if (b.is_object() && b.contains("listing") && b["listing"].contains("rows"))
+        txt += "\n" + b["listing"]["rows"].dump();
     check(has(txt, "2 observations with missing values"),
           "AER-UTIL/counts (vii): the observation line reads 2 -- rows 3 and 5. 3 is the sum of "
           "the per-variable counts (uv 1 + uw 2), which double-counts row 3, and it is the number "
@@ -1732,16 +1737,15 @@ void testAerUtilRefusals() {
           "AER-UTIL (vi): ...and _Unique holds 2 on each group's first row (N 2, sum 4)");
   }
 
-  // ── (vii) the two options this arm does not implement are refused BY NAME. ─
-  // `unique, detail` and `gunique, replace` change the ANSWER, not its speed --
-  // detail adds a per-group listing and replace overwrites the source column.
-  // Consuming either and carrying on is the accept-note trap this campaign
-  // banned outside the ENV bundle.
+  // ── (vii) gunique's detail and replace RUN (vs-stata stage 4; bank
+  // 0cc6ceac1f3a2e89 `gunique foreign rep78, detail` rc 0 with gunique's own
+  // r(J)/r(N), 047e2f3858befcd5 `gunique rep78, by(foreign) replace` rc 0):
+  // detail summarizes the group sizes, replace lets by()'s variable overwrite.
   {
-    struct Case { const char* cmd; const char* opt; };
+    struct Case { const char* cmd; double J; };
     const std::vector<Case> kCases = {
-        {"unique uv, detail", "detail"},
-        {"gunique uv, replace", "replace"},
+        {"gunique uv, detail", 4.0},
+        {"gunique uv, replace", 4.0},
     };
     for (const auto& c : kCases) {
       piet::SessionState s(workdir);
@@ -1749,14 +1753,25 @@ void testAerUtilRefusals() {
       (void)exec("clear\nset obs 4\ngen uv = _n\n", s);
       auto r = exec(std::string(c.cmd) + "\n", s);
       const nlohmann::ordered_json e = firstError(r.blocks);
-      check(!e.is_null(),
-            std::string("AER-UTIL/refuse (vii): `") + c.cmd +
-                "` is refused rather than quietly accepted");
-      check(has(errText(e), c.opt),
-            std::string("AER-UTIL/refuse (vii): ...and the sentence NAMES the option (`") + c.opt +
-                "`), which is what tells the user which half of their line to drop. Got `" +
-                errText(e) + "`");
+      check(e.is_null(), std::string("AER-UTIL (vii): `") + c.cmd + "` runs (rc 0). Got `" +
+                             errText(e) + "`");
+      const double* j = s.eval.rValues.find("J");
+      check(j != nullptr && *j == c.J,
+            std::string("AER-UTIL (vii): ...and r(J) is gunique's count of groups after `") +
+                c.cmd + "`");
     }
+  }
+
+  // ── (viii) `unique, detail`: rc 0 and unique's own r() (bank 9e9f3bcce8ee0286: the
+  // record counts are summarized, r(unique) r(sum) r(N) are unique's).
+  {
+    piet::SessionState s(workdir);
+    seed(s);
+    (void)exec("clear\nset obs 4\ngen uv = _n\n", s);
+    auto r = exec("unique uv, detail\n", s);
+    check(firstError(r.blocks).is_null(), "AER-UTIL (viii): `unique uv, detail` runs");
+    check(runR(s, "unique uv, detail", "unique") == 4.0 && runR(s, "unique uv, detail", "N") == 4.0,
+          "AER-UTIL (viii): ...and leaves r(unique) 4, r(N) 4");
   }
 
   fs::remove_all(workdir, ec);

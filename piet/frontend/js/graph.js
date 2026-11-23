@@ -629,6 +629,229 @@ function renderCoefplot(block) {
   return svg;
 }
 
+// ─── graph bar / hbar / dot / box ────────────────────────────────────────────
+// Reads GraphResult(kind="bar") with chart = bar | hbar | dot | box | hbox and
+//   bars:[{ value, series, category[, supercategory] }]      (bar, hbar, dot)
+//   boxes:[{ median, p25, p75, adjl, adjh, outside[], series, category[, supercategory] }]
+// in the order of the graph's serset. One slot per (supercategory, category) in
+// order of appearance; a horizontal chart stacks its slots from the bottom up (the
+// serset of a horizontal graph runs in reverse, so the first category is drawn on
+// top, as Stata draws it). Bars rise from 0, one per series in a slot, or as the
+// segments of one column under `stack`; a dot chart draws a dotted guide line per
+// slot and one marker per series at its value; a box draws the box, median, whiskers
+// to the adjacent values and the outside values. A null value draws nothing.
+function renderBarChart(block) {
+  const chart = block.chart || 'bar';
+  const isBox = chart === 'box' || chart === 'hbox';
+  const isDot = chart === 'dot';
+  const horizontal = !!block.horizontal;
+  const stack = !!block.stack && !isBox;
+  const items = (isBox ? block.boxes : block.bars) || [];
+  const slotKeys = [], slotLabels = [], seriesNames = [];
+  const cells = [];
+  for (const it of items) {
+    const sup = it.supercategory ?? '';
+    const cat = it.category ?? '';
+    const key = `${sup}\u001f${cat}`;
+    let slot = slotKeys.indexOf(key);
+    if (slot < 0) {
+      slot = slotKeys.length;
+      slotKeys.push(key);
+      slotLabels.push(sup === '' ? String(cat) : `${sup} ${cat}`.trim());
+    }
+    const ser = it.series ?? '';
+    let si = seriesNames.indexOf(ser);
+    if (si < 0) { si = seriesNames.length; seriesNames.push(ser); }
+    cells.push({ slot, series: si, it });
+  }
+  const svg = newSvg();
+  addTitle(svg, block.title);
+  if (!cells.length) return svg;
+  const nSlots = slotKeys.length;
+  const nSer = Math.max(seriesNames.length, 1);
+
+  // value range: bars and dots include 0; stacked columns use their running tops
+  let vlo = isBox ? Infinity : 0, vhi = isBox ? -Infinity : 0;
+  const run = new Array(nSlots).fill(0);
+  for (const c of cells) {
+    const vals = isBox
+      ? [c.it.adjl, c.it.adjh, c.it.p25, c.it.p75, c.it.median, ...(c.it.outside || [])]
+      : [c.it.value];
+    for (const v0 of vals) {
+      if (typeof v0 !== 'number' || !isFinite(v0)) continue;
+      let v = v0;
+      if (stack) { run[c.slot] += v0; v = run[c.slot]; }
+      vlo = Math.min(vlo, v);
+      vhi = Math.max(vhi, v);
+    }
+  }
+  if (!isFinite(vlo) || !isFinite(vhi)) { vlo = 0; vhi = 1; }
+  const vr = paddedRange(vlo, vhi, isBox ? 0.04 : (vlo < 0 ? 0.04 : 0), 0.06);
+  const sr = [0, nSlots];
+  const valueTitle = block.ytitle ?? '';
+  const { sx, sy } = horizontal
+    ? drawFrameAndAxes(svg, vr, sr, valueTitle, '', { suppressYTickLabels: true })
+    : drawFrameAndAxes(svg, sr, vr, '', valueTitle, { suppressXTickLabels: true });
+  // position along the category axis / along the value axis -> SVG point
+  const at = (a, v) => (horizontal ? [sx(v), sy(a)] : [sx(a), sy(v)]);
+  const colors = readSeriesColors();
+  const colorOf = (i) => colors[i % colors.length];
+
+  // category labels
+  for (let i = 0; i < nSlots; i++) {
+    const mid = i + 0.5;
+    const lab = horizontal
+      ? svgEl('text', { x: M.left - 9, y: sy(mid) + 3.5, class: 'g-ticklabel', 'text-anchor': 'end' })
+      : svgEl('text', { x: sx(mid), y: M.top + PLOT_H + 18, class: 'g-ticklabel', 'text-anchor': 'middle' });
+    lab.textContent = slotLabels[i];
+    svg.appendChild(lab);
+  }
+  // a dot chart's guide line per slot
+  if (isDot) {
+    for (let i = 0; i < nSlots; i++) {
+      const [x1, y1] = at(i + 0.5, vr[0]);
+      const [x2, y2] = at(i + 0.5, vr[1]);
+      svg.appendChild(svgEl('line', { x1, y1, x2, y2, class: 'g-dotguide' }));
+    }
+  }
+
+  const stackRun = new Array(nSlots).fill(0);
+  for (const c of cells) {
+    const color = colorOf(c.series);
+    const w = 0.8 / (stack || isDot ? 1 : nSer);
+    const a0 = c.slot + 0.1 + (stack || isDot ? 0 : w * c.series);
+    const a1 = a0 + (stack || isDot ? 0.8 : w);
+    if (isBox) {
+      const b = c.it;
+      if (![b.p25, b.p75, b.median].every(v => typeof v === 'number' && isFinite(v))) continue;
+      const mid = (a0 + a1) / 2;
+      const [qx0, qy0] = at(a0, b.p25), [qx1, qy1] = at(a1, b.p75);
+      svg.appendChild(svgEl('rect', {
+        x: Math.min(qx0, qx1), y: Math.min(qy0, qy1),
+        width: Math.abs(qx1 - qx0), height: Math.abs(qy1 - qy0),
+        fill: color, 'fill-opacity': 0.75, stroke: color, class: 'g-cbox',
+      }));
+      const [mx0, my0] = at(a0, b.median), [mx1, my1] = at(a1, b.median);
+      svg.appendChild(svgEl('line', { x1: mx0, y1: my0, x2: mx1, y2: my1, class: 'g-boxmedian' }));
+      for (const [from, to] of [[b.p25, b.adjl], [b.p75, b.adjh]]) {
+        if (typeof to !== 'number' || !isFinite(to)) continue;
+        const [wx0, wy0] = at(mid, from), [wx1, wy1] = at(mid, to);
+        svg.appendChild(svgEl('line', { x1: wx0, y1: wy0, x2: wx1, y2: wy1, stroke: color, class: 'g-cwhisker' }));
+        const [cx0, cy0] = at(mid - (a1 - a0) / 4, to), [cx1, cy1] = at(mid + (a1 - a0) / 4, to);
+        svg.appendChild(svgEl('line', { x1: cx0, y1: cy0, x2: cx1, y2: cy1, stroke: color, class: 'g-cwhisker' }));
+      }
+      for (const o of (b.outside || [])) {
+        if (typeof o !== 'number' || !isFinite(o)) continue;
+        const [ox, oy] = at(mid, o);
+        svg.appendChild(svgEl('circle', { cx: ox, cy: oy, r: 2.5, fill: 'none', stroke: color, class: 'g-coutside' }));
+      }
+      continue;
+    }
+    const v = c.it.value;
+    if (typeof v !== 'number' || !isFinite(v)) continue;
+    if (isDot) {
+      const [px, py] = at(c.slot + 0.5, v);
+      const pt = svgEl('circle', { cx: px, cy: py, r: 3.5, fill: color, class: 'g-cdot' });
+      const tip = svgEl('title');
+      tip.textContent = `${slotLabels[c.slot]}: ${seriesNames[c.series]} = ${v}`;
+      pt.appendChild(tip);
+      svg.appendChild(pt);
+      continue;
+    }
+    const base = stack ? stackRun[c.slot] : 0;
+    const top = base + v;
+    if (stack) stackRun[c.slot] = top;
+    const [x0, y0] = at(a0, base), [x1, y1] = at(a1, top);
+    const r = svgEl('rect', {
+      x: Math.min(x0, x1), y: Math.min(y0, y1),
+      width: Math.abs(x1 - x0), height: Math.abs(y1 - y0),
+      fill: color, 'fill-opacity': 0.85, class: 'g-cbar',
+    });
+    const tip = svgEl('title');
+    tip.textContent = `${slotLabels[c.slot]}: ${seriesNames[c.series]} = ${v}`;
+    r.appendChild(tip);
+    svg.appendChild(r);
+  }
+
+  // legend: one key per series when more than one is drawn
+  if (seriesNames.length > 1) {
+    let x = M.left;
+    const y = H - 4;
+    for (let i = 0; i < seriesNames.length; i++) {
+      svg.appendChild(svgEl('rect', { x, y: y - 8, width: 8, height: 8, fill: colorOf(i), class: 'g-legendkey' }));
+      const t = svgEl('text', { x: x + 11, y, class: 'g-legend' });
+      t.textContent = seriesNames[i];
+      svg.appendChild(t);
+      x += 24 + 6 * String(seriesNames[i]).length;
+    }
+  }
+  return svg;
+}
+
+// ─── graph pie ───────────────────────────────────────────────────────────────
+// Reads GraphResult(kind="pie") with slices:[{ label, value, angle, plabel?, explode? }]
+// (angle in degrees, the wedge's share of 360), clockwise and angle0 (the first
+// wedge starts at angle0 degrees, 90 = 12 o'clock, and the wedges run clockwise
+// unless noclockwise). plabel is the wedge label text drawn inside the wedge; an
+// exploded wedge is pulled out from the centre. A legend names the wedges.
+function renderPie(block) {
+  const svg = newSvg();
+  addTitle(svg, block.title);
+  const slices = (block.slices || []).filter(s => typeof s.angle === 'number' && isFinite(s.angle) && s.angle > 0);
+  if (!slices.length) return svg;
+  const colors = readSeriesColors();
+  const cx = W / 2, cy = M.top + PLOT_H / 2 - 6, r = Math.min(PLOT_W, PLOT_H) / 2 - 8;
+  const dir = block.clockwise === false ? 1 : -1;  // SVG y runs down: clockwise is -angle
+  let a = typeof block.angle0 === 'number' ? block.angle0 : 90;
+  const pt = (deg, rad, ox = 0, oy = 0) => [
+    cx + ox + rad * Math.cos(deg * Math.PI / 180),
+    cy + oy - rad * Math.sin(deg * Math.PI / 180),
+  ];
+  const all = block.slices || [];
+  slices.forEach((s) => {
+    const i = all.indexOf(s);
+    const a0 = a, a1 = a + dir * s.angle;
+    a = a1;
+    const mid = (a0 + a1) / 2;
+    const off = s.explode ? r * 0.08 : 0;
+    const ox = off * Math.cos(mid * Math.PI / 180), oy = -off * Math.sin(mid * Math.PI / 180);
+    const color = colors[i % colors.length];
+    let shape;
+    if (s.angle >= 359.999) {
+      shape = svgEl('circle', { cx: cx + ox, cy: cy + oy, r, fill: color, class: 'g-wedge' });
+    } else {
+      const [x0, y0] = pt(a0, r, ox, oy), [x1, y1] = pt(a1, r, ox, oy);
+      const large = s.angle > 180 ? 1 : 0;
+      const sweep = dir < 0 ? 1 : 0;
+      shape = svgEl('path', {
+        d: `M ${cx + ox} ${cy + oy} L ${x0} ${y0} A ${r} ${r} 0 ${large} ${sweep} ${x1} ${y1} Z`,
+        fill: color, class: 'g-wedge',
+      });
+    }
+    const tip = svgEl('title');
+    tip.textContent = `${s.label}: ${s.value}`;
+    shape.appendChild(tip);
+    svg.appendChild(shape);
+    if (s.plabel) {
+      const [lx, ly] = pt(mid, r * 2 / 3, ox, oy);
+      const t = svgEl('text', { x: lx, y: ly + 3.5, class: 'g-pielabel', 'text-anchor': 'middle' });
+      t.textContent = s.plabel;
+      svg.appendChild(t);
+    }
+  });
+  // legend under the pie
+  let x = M.left;
+  const y = H - 6;
+  all.forEach((s, i) => {
+    svg.appendChild(svgEl('rect', { x, y: y - 8, width: 8, height: 8, fill: colors[i % colors.length], class: 'g-legendkey' }));
+    const t = svgEl('text', { x: x + 11, y, class: 'g-legend' });
+    t.textContent = s.label;
+    svg.appendChild(t);
+    x += 24 + 6 * String(s.label).length;
+  });
+  return svg;
+}
+
 // ─── Twoway (multi-layer compositor) ─────────────────────────────────────────
 // Renders a kind:"twoway" block — one SVG, shared scales, z-ordered layers.
 // All layers share ONE coordinate system from block.x_min/x_max/y_min/y_max;
@@ -874,12 +1097,23 @@ function renderCombine(block) {
 
   const panels = block.panels || [];
   for (let i = 0; i < panels.length; i++) {
+    const panel = panels[i];
+    if (panel == null) continue;
     const col = i % cols;
     const row = Math.floor(i / cols);
     const g = svgEl('g', { transform: `translate(${col * PW} ${row * PH})` });
 
+    if (panel.kind === 'matrix_label') {
+      const label = svgEl('text', {
+        x: PW / 2, y: PH / 2, 'text-anchor': 'middle', 'dominant-baseline': 'middle',
+        'font-size': '22', fill: panel.color || 'currentColor',
+      });
+      label.textContent = panel.text;
+      g.appendChild(label);
+      svg.appendChild(g);
+      continue;
+    }
     let panelSvg;
-    const panel = panels[i];
     try {
       if (panel.kind === 'twoway')             panelSvg = renderTwoway(panel);
       else if (panel.kind === 'histogram')     panelSvg = renderHistogram(panel);
@@ -919,8 +1153,10 @@ export function renderGraph(block) {
     else if (block.kind === 'xtline')      svg = renderXtline(block);
     else if (block.kind === 'tsline')      svg = renderXtline(block); // same series[] shape
     else if (block.kind === 'twoway')      svg = renderTwoway(block);  // Stage-4 multi-layer
-    else if (block.kind === 'graph_combine') svg = renderCombine(block); // Stage-4 grid
+    else if (block.kind === 'graph_combine' || block.kind === 'scatter_matrix') svg = renderCombine(block);
     else if (block.kind === 'coefplot')    svg = renderCoefplot(block); // M4a stored-estimate plot
+    else if (block.kind === 'bar')         svg = renderBarChart(block); // graph bar/hbar/dot/box
+    else if (block.kind === 'pie')         svg = renderPie(block);      // graph pie
     else                                   svg = renderScatter(block); // scatter / default
   } catch (err) {
     div.textContent = `(graph render error: ${err.message})`;

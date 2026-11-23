@@ -81,6 +81,28 @@ std::string makeBygenExpr(const std::string& expr, const std::vector<std::string
                           const std::optional<std::vector<std::string>>& sortVars);
 
 // Defined in egen_computed_functions.cpp.
+// skew/kurt/mdev/mad/fill/diff/rowfirst/rowlast/rfirst/rlast/rowmedian/
+// rowpctile/ends, computed from the columns (nullopt: not one of them).
+bool egenMoreFunction(const std::string& fn);
+// gtools gegen's own statistics (nunique, select, cv, first, ..., variance).
+bool gegenOwnFunction(const std::string& fn);
+// One numeric column written to the head (cobra setcol): appended when isNew,
+// replaced in place otherwise, stored as storeType when given.
+std::optional<ojson> egenWriteColumn(SessionState& session, const std::string& var,
+                                     const std::vector<double>& values, bool isNew,
+                                     const std::string& storeType);
+std::optional<ojson> runGegenFunction(const std::string& fn, const std::string& newvar,
+                                      const std::string& argText,
+                                      const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                      const std::optional<std::string>& ifExpr,
+                                      const std::optional<std::string>& inRange,
+                                      const std::string& storeType, SessionState& session);
+std::optional<ojson> runEgenMoreFunction(const std::string& fn, const std::string& newvar,
+                                         const std::string& argText,
+                                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                         const std::optional<std::string>& ifExpr,
+                                         const std::optional<std::string>& inRange,
+                                         const std::string& storeType, SessionState& session);
 std::optional<ojson> runEgenAdoFunction(const std::string& fn, const std::string& newvar,
                                         const std::string& argText,
                                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,

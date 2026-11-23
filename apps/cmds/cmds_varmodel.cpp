@@ -110,8 +110,9 @@ int cmd_var(const std::vector<std::string>& a) {
 
     if (!in_sample.empty() && static_cast<int64_t>(in_sample.size()) != n)
         throw EngineError("internal", "var: the if-mask does not match the data's row count");
+    const bool noconstant = has(a, "--noconstant");
     VarResult r = var_fit(Y.data(), traw, n, vars, lags, steps, ts.delta,
-                          in_sample.empty() ? nullptr : in_sample.data());
+                          in_sample.empty() ? nullptr : in_sample.data(), !noconstant);
     if (!r.ok) {
         switch (r.fail) {
             case VarResult::TOO_FEW:
@@ -227,6 +228,7 @@ int cmd_var(const std::vector<std::string>& a) {
                 {"lags", r.lags},
                 {"n_obs", r.n_obs},
                 {"parms_per_eq", r.m},
+                {"constant", r.constant},
                 {"tvar", ts.timevar},
                 {"t_first", r.t_first},
                 {"t_last", r.t_last},

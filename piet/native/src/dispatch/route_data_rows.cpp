@@ -270,6 +270,13 @@ bool route_data_rows(std::string& cmd,
         parsed.varlist.empty() || parsed.varlist[0] == "using" ||
         !(std::isalpha(static_cast<unsigned char>(parsed.varlist[0][0])) != 0 ||
           parsed.varlist[0][0] == '_' || static_cast<unsigned char>(parsed.varlist[0][0]) >= 0x80);
+    // A leading `-` (gsort's descending sign) is r(198) "- invalid name"
+    // (vs-stata bank cc968117 `sort -price`).
+    if (!parsed.varlist.empty() && parsed.varlist[0][0] == '-') {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "- invalid name", std::nullopt,
+                                              std::nullopt, std::nullopt, "r(198)")));
+      return true;
+    }
     if (noVarlist) {
       blocks.push_back(ojson(eval::errorBlock("syntax_error", "varlist required", std::nullopt,
                                               std::nullopt, std::nullopt, "r(100)")));
@@ -468,8 +475,9 @@ bool route_data_rows(std::string& cmd,
     // check below sees it.
     static const std::unordered_set<std::string> kFcollapseArmOpts = {
         "by", "cw", "fast", "nocompress", "compress", "append", "smart", "verbose"};
+    // gcollapse's labelformat() labels the results (runCollapse reads it).
     static const std::unordered_set<std::string> kGcollapseArmOpts = {"by", "cw", "fast",
-                                                                      "verbose"};
+                                                                      "verbose", "labelformat"};
     const std::unordered_set<std::string>& collapseArmOpts =
         collapseFlavor == "fcollapse"   ? kFcollapseArmOpts
         : collapseFlavor == "gcollapse" ? kGcollapseArmOpts
@@ -487,7 +495,7 @@ bool route_data_rows(std::string& cmd,
     // verbose(1)), is `option ... incorrectly specified` r(198) in all three
     // flavors; by() is no by() at all (rc 0, one observation).
     for (const auto& [k, v] : parsed.opts) {
-      if ((k == "frame" || k == "by") == v.isBool) {
+      if ((k == "frame" || k == "by" || k == "labelformat") == v.isBool) {
         // The option as typed: an abbreviation reached here under its full key,
         // and the alias row rebuilt parsed.raw from the full keys (StataBE 19.5,
         // ftools 2.49.0: fcollapse `v(1)` is `option v() incorrectly specified`).
@@ -561,6 +569,14 @@ bool route_data_rows(std::string& cmd,
         return true;
       }
     }
+    // A dataset with no observations has nothing to collapse: r(2000) "no
+    // observations" (vs-stata bank 6bfc2871de4549b1, 7be0166c70099e29, after
+    // `set obs 0`).
+    if (collapseFlavor == "collapse" && collapseNBefore == 0) {
+      blocks.push_back(ojson(eval::errorBlock("engine_error", "no observations", std::nullopt,
+                                              std::nullopt, std::nullopt, std::string("r(2000)"))));
+      return true;
+    }
     ojson collapseBlk = ojson(handlers::runCollapse(parsed.raw, parsed.ifExpr, session,
                                                     parsed.opts, parsed.weightVar,
                                                     parsed.inRange, collapseFlavor,
@@ -603,6 +619,130 @@ bool route_data_rows(std::string& cmd,
     return true;
   }
 
+
+  // `expandcl [=]exp [if] [in], generate(newvar) cluster(varlist)` ([R]
+  // expandcl): expand each cluster exp times (exp must be constant within a
+  // cluster, else r(198)), the copies numbered as new clusters 1, 2, ... in
+  // generate() ("New cluster ID from expandcl"); the order of the data is kept
+  // as a sortpreserve command keeps it (vs-stata bank 9d7ded1700877074).
+  if (cmd == "expandcl") {
+    if (auto err = eval::rejectUnknownOptions(parsed.opts, {"generate", "cluster"}, {})) {
+      blocks.push_back(ojson(*err));
+      return true;
+    }
+    auto refuse = [&](const std::string& msg, const char* rc) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt,
+                                              std::nullopt, rc)));
+      return true;
+    };
+    std::string gen, clus;
+    // GENerate() and CLuster() abbreviate to gen / cl.
+    auto isAbbrev = [](const std::string& k, const char* full, size_t minLen) {
+      const std::string f(full);
+      return k.size() >= minLen && k.size() <= f.size() && f.compare(0, k.size(), k) == 0;
+    };
+    for (const auto& [k, v] : parsed.opts) {
+      if (isAbbrev(k, "generate", 3) && !v.isBool) gen = strutil::trim(v.strValue);
+      if (isAbbrev(k, "cluster", 2) && !v.isBool) clus = strutil::trim(v.strValue);
+    }
+    if (gen.empty()) return refuse("option generate() required", "r(198)");
+    if (clus.empty()) return refuse("option cluster() required", "r(198)");
+    if (!session.hasData()) {
+      blocks.push_back(ojson(eval::noDataLoaded()));
+      return true;
+    }
+    std::string ex;
+    for (const auto& t : parsed.varlist) ex += (ex.empty() ? "" : " ") + t;
+    ex = strutil::trim(ex);
+    if (!ex.empty() && ex[0] == '=') ex = strutil::trim(ex.substr(1));
+    if (ex.empty()) return refuse("=exp required", "r(100)");
+    if (Datastore* eds = session.datastore())
+      if (eds->has(gen)) return refuse("variable " + gen + " already defined", "r(110)");
+    std::string qual;
+    if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) qual += " if " + *parsed.ifExpr;
+    if (parsed.inRange.has_value() && !parsed.inRange->empty()) qual += " in " + *parsed.inRange;
+    const std::string t = "__expandcl_t", v = "__expandcl_v", o = "__expandcl_o",
+                      e = "__expandcl_e", f = "__expandcl_f", s = "__expandcl_s";
+    auto run = [&](const std::string& line, bool keep) -> bool {
+      ojson r = dispatch(line, session);
+      for (const auto& b : r) {
+        if (!b.is_object()) continue;
+        const std::string ty = b.value("type", std::string());
+        if (ty == "error") {
+          blocks.push_back(b);
+          return false;
+        }
+        if (keep && ty == "display") blocks.push_back(b);
+      }
+      return true;
+    };
+    auto cleanup = [&]() {
+      (void)dispatch("capture drop " + t + " " + v + " " + o + " " + e + " " + f, session);
+      (void)dispatch("capture sort " + s + ", stable", session);
+      (void)dispatch("capture drop " + s, session);
+    };
+    if (!run("quietly generate long " + s + " = _n", false)) return true;
+    const std::vector<std::string> pre = {
+        "quietly generate byte " + t + " = 0",
+        "quietly replace " + t + " = 1" + qual,
+        "quietly generate long " + v + " = " + ex,
+        "quietly sort " + t + " " + clus + ", stable",
+    };
+    for (const auto& line : pre)
+      if (!run(line, false)) {
+        cleanup();
+        return true;
+      }
+    {
+      // exp must be constant within each cluster of the sample.
+      bool bad = !run("quietly by " + t + " " + clus + ": generate byte " + f + " = " + v +
+                          " != " + v + "[1] if " + t,
+                      false);
+      if (!bad) bad = !run("quietly count if " + f + " == 1", false);
+      if (!bad) {
+        const double* nbad = session.eval.rValues.find("N");
+        bad = nbad == nullptr || *nbad != 0;
+        (void)dispatch("quietly drop " + f, session);
+      }
+      if (bad) {
+        cleanup();
+        return refuse("expression is not constant within clusters", "r(198)");
+      }
+    }
+    const std::vector<std::string> body = {
+        "quietly generate long " + o + " = _n",
+        "quietly drop " + v,
+    };
+    for (const auto& line : body)
+      if (!run(line, false)) {
+        cleanup();
+        return true;
+      }
+    if (!run("expand " + ex + " if " + t, true)) {
+      cleanup();
+      return true;
+    }
+    const std::vector<std::string> post = {
+        "quietly sort " + t + " " + clus + " " + o + ", stable",
+        "quietly by " + t + " " + clus + " " + o + ": generate long " + e + " = _n",
+        "quietly sort " + t + " " + clus + " " + e + ", stable",
+        "quietly drop " + o,
+        "quietly by " + t + " " + clus + " " + e + ": generate " + o + " = _n==1 if " + t,
+        "quietly replace " + e + " = sum(" + o + ") if " + t,
+        "quietly rename " + e + " " + gen,
+        "quietly label variable " + gen + " \"New cluster ID from expandcl\"",
+        "quietly drop " + t + " " + o,
+        "quietly sort " + s + ", stable",
+        "quietly drop " + s,
+    };
+    for (const auto& line : post)
+      if (!run(line, false)) {
+        cleanup();
+        return true;
+      }
+    blocks.push_back(ojson(handlers::mutationResult(session, "expandcl")));
+    return true;
+  }
 
   if (cmd == "expand") {
     // AER scope-2 W2: `generate(newvar)` is a real Stata expand option this
@@ -763,13 +903,21 @@ bool route_data_rows(std::string& cmd,
       sortedBefore = !parsed.varlist.empty() && parsed.varlist.size() <= marker.size() &&
                      std::equal(parsed.varlist.begin(), parsed.varlist.end(), marker.begin());
     }
-    ojson r = handlers::runIsid(parsed.varlist, session, missok, sort);
+    const bool isGisid = lower(cmdTyped) == "gisid";
+    const bool qualified = (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
+                           (parsed.inRange.has_value() && !parsed.inRange->empty());
+    ojson r = isGisid && qualified ? handlers::runGisidSample(parsed, session, missok)
+                                   : handlers::runIsid(parsed.varlist, session, missok, sort);
     if (r.is_array()) {
       for (const auto& b : r) blocks.push_back(b);
     } else {
       blocks.push_back(r);
     }
     const bool isidFailed = r.is_object() && r.value("type", std::string()) == "error";
+    if (isGisid) {
+      if (!isidFailed) handlers::gisidPublishResults(parsed, session);
+      return true;
+    }
     if (!isidFailed && (sort || !missok)) {
       eval::replaceRClass(session.eval);
       if (sort) {
@@ -919,7 +1067,7 @@ bool route_data_rows(std::string& cmd,
             std::nullopt, std::nullopt, std::nullopt, std::string("r(622)"))));
         return true;
       }
-      session.discardTopPreserve();
+      session.discardOwnPreserve();
       return true;
     }
     ojson r = handlers::runRestore(session, rearm);
@@ -935,7 +1083,7 @@ bool route_data_rows(std::string& cmd,
     double cutLo = 1.0, cutHi = 99.0;
     std::string suffix = "_w";
     std::string byStr;
-    bool trim = false, replace = false, suffixGiven = false;
+    bool trim = false, replace = false, suffixGiven = false, w2label = false;
     for (const auto& [k, v] : parsed.opts) {
       if (k == "cuts" && !v.isBool) {
         std::istringstream iss(v.strValue);
@@ -977,6 +1125,8 @@ bool route_data_rows(std::string& cmd,
         trim = true;
       } else if (k == "replace" && v.isBool && v.boolValue) {
         replace = true;
+      } else if (k == "label" && v.isBool && v.boolValue) {
+        w2label = true;
       }
     }
     // winsor2.ado: with no suffix() the new variable is <var>_w, or <var>_tr
@@ -1033,52 +1183,159 @@ bool route_data_rows(std::string& cmd,
         }
       }
     }
-    // BUG-373: winsor2 publishes r(r1)/r(r2) — the two CUT VALUES it winsorised
-    // at, i.e. the cutLo/cutHi percentiles of the (last) variable. Verified
-    // against the live StataBE capture on beertax: r(r1) 0.04766949 and r(r2)
-    // 2.41525412, which are exactly its p1 and p99. Computed here, before the
-    // mutation, because afterwards the column has already been clipped to them.
-    std::vector<double> w2cuts;
-    {
-      Datastore* w2ds = session.datastore();
-      if (w2ds != nullptr && w2ds->has(w2vars.back()) &&
-          w2ds->dtype(w2vars.back()) == "f64") {
-        const double* col = w2ds->col(w2vars.back()).f64();
-        const int64_t wn = w2ds->nRows();
-        std::vector<double> v;
-        v.reserve(static_cast<size_t>(wn));
-        for (int64_t i = 0; i < wn; ++i)
-          if (!std::isnan(col[i])) v.push_back(col[i]);
-        std::sort(v.begin(), v.end());
-        // Stata's percentile rule, the same one Frame::xtile and summarize,detail
-        // use: an exact rank boundary averages the two straddling values.
-        auto pct = [&v](double p) {
-          const int64_t n = static_cast<int64_t>(v.size());
-          if (n == 0) return std::numeric_limits<double>::quiet_NaN();
-          if (n == 1) return v[0];
-          const double Pi = static_cast<double>(n) * p / 100.0;
-          const double fl = std::floor(Pi);
-          if (fl == Pi && Pi >= 1 && static_cast<int64_t>(Pi) < n)
-            return (v[static_cast<size_t>(Pi) - 1] + v[static_cast<size_t>(Pi)]) / 2.0;
-          int64_t idx = static_cast<int64_t>(fl) + 1;
-          if (idx > n) idx = n;
-          return v[static_cast<size_t>(idx) - 1];
-        };
-        if (!v.empty()) { w2cuts.push_back(pct(cutLo)); w2cuts.push_back(pct(cutHi)); }
+    // cuts(0 100) is no cut at all: the ado says so and does nothing.
+    if (cutLo == 0 && cutHi == 100) {
+      ojson note;
+      note["type"] = "display";
+      note["text"] = "option cuts(0 100) is incorrect, no action taken.";
+      blocks.push_back(note);
+      return true;
+    }
+    // Each variable's label before it is touched (winsor2 labels its result
+    // `labk`, the source's label or name, and with `label` adds the cut).
+    std::map<std::string, std::string> w2labk;
+    for (const auto& nm : w2vars) {
+      std::string lab = nm;
+      auto it = session.varMeta.find(nm);
+      if (it != session.varMeta.end() && it->second.label.has_value() && !it->second.label->empty())
+        lab = *it->second.label;
+      w2labk[nm] = lab;
+    }
+    // A cut at 0 or 100 takes that bound from `summarize`, whose r() is then what the
+    // command leaves: the last variable's, over every observation, before it is changed
+    // (bank 495cfe130aabe5de `cuts(10 100)`, 6e44ce3717080237 `cuts(0 90) trim`).
+    std::optional<std::vector<std::pair<std::string, double>>> w2sumR;
+    if (cutLo == 0 || cutHi == 100) {
+      ojson sb = dispatch("quietly summarize " + w2vars.back(), session);
+      w2sumR.emplace();
+      for (const char* key : {"N", "sum_w", "mean", "Var", "sd", "min", "max", "sum"}) {
+        const double* val = session.eval.rValues.find(key);
+        w2sumR->emplace_back(key, val != nullptr ? *val : std::nan(""));
       }
     }
-    ojson w2Blk = ojson(handlers::runWinsor2(session, w2vars, cutLo, cutHi, trim, byStr,
-                                             suffix, replace));
-    if (w2Blk.value("type", std::string()) != "error" && w2cuts.size() == 2) {
-      // _pctile's r(r1) r(r2), listed r1 then r2 as Stata lists them (newest
-      // first: r2 is posted before r1; vs-stata truth bank).
-      session.eval.rValues.set("r2", w2cuts[1]);
-      session.eval.rValues.set("r1", w2cuts[0]);
+    ojson w2res;
+    std::optional<double> w2EgenN;
+    if (!byStr.empty()) {
+      // by(): the ado's own steps, per variable -- egen's pctile() (or min()/max() at a 0/100
+      // cut) by the groups, stored in the variable's type, then rowmax/rowmin (winsorize) or
+      // two cond() replaces (trim), over `if` & !missing(k) and `in`.
+      std::string qualIf = parsed.ifExpr.has_value() && !parsed.ifExpr->empty() ? *parsed.ifExpr : "";
+      std::string qualIn = parsed.inRange.has_value() && !parsed.inRange->empty()
+                               ? " in " + *parsed.inRange
+                               : std::string();
+      auto fmtCut = [](double x) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.15g", x);
+        return std::string(buf);
+      };
+      auto run = [&](const std::string& line) -> bool {
+        ojson out = dispatch("quietly " + line, session);
+        for (const auto& b : out)
+          if (b.is_object() && b.value("type", std::string()) == "error") {
+            blocks.push_back(b);
+            return false;
+          }
+        return true;
+      };
+      std::vector<std::string> made;
+      for (const auto& k : w2vars) {
+        const std::string vtype = storage::resolveReplaceType(session, k);
+        const std::string if2 =
+            " if " + (qualIf.empty() ? std::string() : "(" + qualIf + ") & ") + "!missing(" + k + ")";
+        const std::string pL = "__w2pL", pH = "__w2pH", tL = "__w2tL", kw = "__w2kw";
+        const std::string lowE = cutLo == 0 ? "min(" + k + ")" : "pctile(" + k + ")";
+        const std::string highE = cutHi == 100 ? "max(" + k + ")" : "pctile(" + k + ")";
+        const std::string lowP = cutLo == 0 ? "" : ", p(" + fmtCut(cutLo) + ") by(" + byStr + ")";
+        const std::string highP = cutHi == 100 ? "" : ", p(" + fmtCut(cutHi) + ") by(" + byStr + ")";
+        if (!run("egen " + vtype + " " + pL + " = " + lowE + if2 + qualIn +
+                 (lowP.empty() ? ", by(" + byStr + ")" : lowP)))
+          return true;
+        if (!run("egen " + vtype + " " + pH + " = " + highE + if2 + qualIn +
+                 (highP.empty() ? ", by(" + byStr + ")" : highP)))
+          return true;
+        // egen's rowmax()/rowmin() of two variables is max()/min() of them (a missing one
+        // ignored), stored in the type asked for.
+        if (!run("gen " + vtype + " " + tL + " = max(" + pL + ", " + k + ")" + if2 + qualIn))
+          return true;
+        const std::string out = replace ? k : k + suffix;
+        if (!trim) {
+          if (replace) {
+            if (!run("gen " + vtype + " " + kw + " = min(" + pH + ", " + tL + ")" + if2 + qualIn) ||
+                !run("replace " + k + " = " + kw))
+              return true;
+          } else if (!run("gen " + out + " = min(" + pH + ", " + tL + ")" + if2 + qualIn)) {
+            return true;
+          }
+        } else {
+          const std::string first = replace ? "replace " + k + " = cond(" + k + "<" + pL + ",.," + k + ")"
+                                            : "gen " + vtype + " " + out + " = cond(" + k + "<" + pL +
+                                                  ",.," + k + ")";
+          if (!run(first + if2 + qualIn) ||
+              !run("replace " + out + " = cond(" + k + ">" + pH + ",.," + out + ")" + if2 + qualIn))
+            return true;
+        }
+        // egen ends by counting the missing values it generated: r(N) is that count for the
+        // last egen result (rowmin's, or under trim rowmax's; bank 5efb88985f92e9fb r(N) 0).
+        {
+          const std::string lastEgen = trim ? tL : (replace ? kw : out);
+          w2EgenN = 0;
+          if (Datastore* cds = session.datastore())
+            if (cds->has(lastEgen)) {
+              const double* d = cds->col(lastEgen).f64();
+              for (int64_t i = 0; i < cds->nRows(); ++i)
+                if (std::isnan(d[i])) *w2EgenN += 1;
+            }
+        }
+        if (!run("drop " + pL + " " + pH + " " + tL + (replace && !trim ? " " + kw : std::string())))
+          return true;
+        made.push_back(out);
+      }
+      w2res = handlers::mutationResult(session, "winsor2",
+                                       replace ? std::vector<std::string>{} : made);
+    } else {
+      w2res = handlers::runWinsor2(session, w2vars, cutLo, cutHi, trim, byStr, suffix, replace,
+                                   &parsed);
     }
-    blocks.push_back(std::move(w2Blk));
+    if (w2res.is_object() && w2res.value("type", std::string()) != "error") {
+      // labels: `labk`, or with `label` `labk-Winsor(p<lo>,p<hi>)` / `-Trim(...)`, a cut
+      // below 1 written with a leading 0 (the ado prefixes "0" to the macro text).
+      auto macroNum = [](double x) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.15g", x);
+        std::string t = buf;
+        if (t.rfind("0.", 0) == 0) t.erase(0, 1);
+        return t;
+      };
+      std::string lo = macroNum(cutLo);
+      if (cutLo < 1) lo = "0" + lo;
+      const std::string tag = std::string(trim ? "-Trim(p" : "-Winsor(p") + lo + ",p" + macroNum(cutHi) + ")";
+      for (const auto& nm : w2vars) {
+        const std::string out = replace ? nm : nm + suffix;
+        session.setVarLabel(out, w2labk[nm] + (w2label ? tag : std::string()));
+      }
+      if (w2EgenN) {
+        eval::replaceRClass(session.eval);
+        session.eval.rValues.set("N", *w2EgenN);
+        eval::declareRPosted(session.eval, "count", {"N"});
+      } else if (w2sumR) {
+        eval::replaceRClass(session.eval);
+        std::vector<std::string> posted;
+        for (const auto& [key, val] : *w2sumR) {
+          session.eval.rValues.set(key, val);
+          posted.push_back(key);
+        }
+        eval::declareRPosted(session.eval, "summarize", posted);
+      }
+    }
+    blocks.push_back(w2res);
     return true;
   }
 
+
+  if (cmd == "tsreport") {
+    blocks.push_back(ojson(handlers::runTsreport(parsed, session)));
+    return true;
+  }
 
   if (cmd == "tsfill") {
     blocks.push_back(ojson(handlers::runTsfill(parsed, session)));
@@ -1106,7 +1363,7 @@ bool route_data_rows(std::string& cmd,
         blocks.push_back(*err);
         return true;
       }
-      blocks.push_back(ojson(handlers::runMksplineSegments(session, stub, srcVar, parsed.opts, inSample)));
+      pushEnvResult(blocks, handlers::runMksplineSegments(session, stub, srcVar, parsed.opts, inSample));
       return true;
     }
     // The cubic form computes over every observation (see runMkspline), so an `in` range
@@ -1118,8 +1375,7 @@ bool route_data_rows(std::string& cmd,
           "`keep in ...`), then run mkspline.")));
       return true;
     }
-    blocks.push_back(
-        ojson(handlers::runMkspline(stub, srcVar, parsed.opts, parsed.ifExpr, session)));
+    pushEnvResult(blocks, handlers::runMkspline(stub, srcVar, parsed.opts, parsed.ifExpr, session));
     return true;
   }
 

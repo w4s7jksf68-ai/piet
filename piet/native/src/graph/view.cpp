@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
+#include <algorithm>
 #include <cstddef>
 #include <string>
 #include <utility>
@@ -68,7 +69,21 @@ void decimateGraphBlockForView(ojson& block) {
     shown += strideThinPoints(pts, kMaxViewPoints);
   };
 
-  if (block.contains("layers") && block["layers"].is_array()) {
+  if (block.value("kind", std::string()) == "scatter_matrix") {
+    auto& panels = block["panels"];
+    size_t scatterPanels = 0;
+    for (const auto& panel : panels)
+      if (panel.is_object() && panel.contains("layers")) ++scatterPanels;
+    const size_t budget = std::max<size_t>(2, kMaxViewPoints / std::max<size_t>(1, scatterPanels));
+    for (auto& panel : panels) {
+      if (!panel.is_object() || !panel.contains("layers")) continue;
+      for (auto& layer : panel["layers"]) {
+        auto& points = layer["points"];
+        total += points.size();
+        shown += strideThinPoints(points, budget);
+      }
+    }
+  } else if (block.contains("layers") && block["layers"].is_array()) {
     // twoway: real data lives in each rendered layer's own points array.
     for (auto& lyr : block["layers"])
       if (lyr.is_object() && lyr.contains("points")) thinCounted(lyr["points"]);

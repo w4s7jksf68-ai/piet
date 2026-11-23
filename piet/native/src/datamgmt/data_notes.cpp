@@ -531,10 +531,113 @@ ojson runNotes(const eval::ParsedCommand& parsed, SessionState& session) {
     return silent();
   }
 
-  if (verb == "replace" || verb == "search") {
-    return ojson(eval::unsupportedCommand("notes " + verb, std::nullopt, std::nullopt,
-                                          "notes_" + verb,
-                                          eval::UnsupportedCommandKind::kUnknownSubcommand));
+  // `notes search sometext`: every note (of _dta, then each variable in
+  // dataset order) that contains sometext, case-sensitively, listed as `notes
+  // list` lists them; none is "sometext: not found". One word (a quoted text
+  // is one word); none is r(100) "something required", two r(198) ([D] notes;
+  // vs-stata bank d88617448ef00a5a, 6a1048a2d03f0a10, 631393d79e79f7d1).
+  if (verb == "search") {
+    const std::string after = trimOf(rest.substr(words[0].size()));
+    std::vector<std::string> toks;
+    {
+      size_t i = 0;
+      while (i < after.size()) {
+        while (i < after.size() && std::isspace(static_cast<unsigned char>(after[i]))) ++i;
+        if (i >= after.size()) break;
+        std::string t;
+        if (after[i] == '"') {
+          const size_t e = after.find('"', i + 1);
+          t = after.substr(i + 1, (e == std::string::npos ? after.size() : e) - i - 1);
+          i = e == std::string::npos ? after.size() : e + 1;
+        } else {
+          size_t e = i;
+          while (e < after.size() && !std::isspace(static_cast<unsigned char>(after[e]))) ++e;
+          t = after.substr(i, e - i);
+          i = e;
+        }
+        toks.push_back(t);
+      }
+    }
+    if (toks.empty() || toks[0].empty()) return rsErrorRc("something required", 100);
+    if (toks.size() > 1) return rsErrorRc("invalid syntax", 198);
+    const std::string& needle = toks[0];
+    std::ostringstream oss;
+    bool found = false;
+    // r(found) is the last searched target's: each target that has notes is
+    // searched by an r-class step that posts found = 1 on a match and nothing
+    // otherwise (6a1048a2d03f0a10 r(found) 1; d88617448ef00a5a none).
+    bool lastFound = false;
+    for (const auto& tgt : allTargets()) {
+      const int n = noteCount(session, tgt);
+      if (charGet(session, tgt, "note0").empty()) continue;
+      lastFound = false;
+      bool shown = false;
+      for (int i = 1; i <= n; ++i) {
+        const std::string t = charGet(session, tgt, "note" + std::to_string(i));
+        if (t.empty() || t.find(needle) == std::string::npos) continue;
+        if (!shown) oss << (found ? "\n" : "") << "\n" << tgt << ":";
+        shown = true;
+        found = true;
+        lastFound = true;
+        oss << "\n" << renderNote(i, t);
+      }
+    }
+    eval::replaceRClass(session.eval);
+    if (lastFound) {
+      session.eval.rValues.set("found", 1.0);
+      eval::declareRPosted(session.eval, "notes", {"found"});
+    }
+    if (!found) return displayBlock(needle + ": not found");
+    return displayBlock(oss.str());
+  }
+
+  // `notes replace evarname in #: text`: note # of evarname (a variable or
+  // _dta) gets the new text; a missing note, or an empty text, replaces
+  // nothing. Each part out of place is r(198) ([D] notes; vs-stata bank
+  // 554118731486c216, 19c5ed8847381e06, 4dd446101deff984).
+  if (verb == "replace") {
+    std::string tail = trimOf(rest.substr(words[0].size()));
+    auto nextWord = [&](const std::string& delims) {
+      size_t i = 0;
+      while (i < tail.size() && std::isspace(static_cast<unsigned char>(tail[i]))) ++i;
+      size_t e = i;
+      while (e < tail.size() && delims.find(tail[e]) == std::string::npos &&
+             !std::isspace(static_cast<unsigned char>(tail[e])))
+        ++e;
+      if (e == i && e < tail.size() && delims.find(tail[e]) != std::string::npos) ++e;
+      std::string w = tail.substr(i, e - i);
+      tail = tail.substr(e);
+      return w;
+    };
+    const std::string evar = nextWord("");
+    const std::string inWord = nextWord("");
+    const std::string num = nextWord(":");
+    const std::string colon = nextWord(":");
+    if (evar.empty() || inWord != "in" || num.empty() || colon != ":")
+      return rsErrorRc("invalid syntax", 198);
+    long long k = 0;
+    if (!parseStrictInt(num, &k)) return rsErrorRc("invalid syntax", 198);
+    std::string full = evar;
+    if (evar != "_dta") {
+      Datastore* ds = nullptr;
+      try {
+        ds = session.datastore();
+      } catch (const std::exception&) {
+        ds = nullptr;
+      }
+      if (ds != nullptr && !ds->has(evar)) {
+        bool ambiguous = false;
+        std::optional<std::string> hit = resolveVarName(evar, session, &ambiguous);
+        if (hit) full = *hit;
+      }
+      if (ds == nullptr || !ds->has(full))
+        return rsErrorRc("variable " + evar + " not found", 198);
+    }
+    const std::string text = trimOf(tail);
+    if (text.empty() || k < 1 || charGet(session, full, "note" + std::to_string(k)).empty())
+      return displayBlock("  (no note replaced)");
+    charSet(session, full, "note" + std::to_string(k), noteTimestamp(text));
+    return displayBlock("  (note " + std::to_string(k) + " for " + evar + " replaced)");
   }
 
   // `notes varname: text` — the colon may be glued to the name or stand alone.

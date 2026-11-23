@@ -662,14 +662,16 @@ std::optional<nlohmann::ordered_json> SessionState::tryResidentMutationCard(
   // always trusted as n_rows_after (below), now also the card's row count.
   residentRows_ = delta.rows;
 
-  nlohmann::ordered_json out;
+  nlohmann::ordered_json out = nlohmann::ordered_json::object();
+  out.get_ref<nlohmann::ordered_json::object_t&>().reserve(6);  // its keys, below
   out["type"] = "data_mutation";
   out["action"] = action;
   auto vlist = varlistWithMetaFrom(shadowCard_);
   nlohmann::ordered_json varlistAfter = nlohmann::ordered_json::array();
+  varlistAfter.get_ref<nlohmann::ordered_json::array_t&>().reserve(vlist.size());
   for (const auto& v : vlist) varlistAfter.push_back(v.toJson());
   updateNMissCache(vlist);  // keep the C2-F13a cache coherent for a later datastore-path verb.
-  out["varlist_after"] = varlistAfter;
+  out["varlist_after"] = std::move(varlistAfter);
   out["n_rows_after"] = delta.rows;
   if (!newVars.empty()) out["new_vars"] = newVars;
   if (!droppedVars.empty()) out["dropped_vars"] = droppedVars;

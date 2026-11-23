@@ -73,6 +73,8 @@ namespace {
 const eval::OptVocab& kVocabSktest = eval::registerOptVocab({"sktest"}, {{"noadjust"}, {}});
 const eval::OptVocab& kVocabSpearman = eval::registerOptVocab(
     {"spearman"}, {{"stats", "print", "star", "matrix", "pw", "bonferroni", "sidak"}, {"exact"}});
+const eval::OptVocab& kVocabKtau = eval::registerOptVocab(
+    {"ktau"}, {{"stats", "print", "star", "pw", "bonferroni", "sidak"}, {"matrix"}});
 }  // namespace
 
 namespace {
@@ -377,6 +379,439 @@ SpearmanPair spearmanPair(const std::vector<double>& xs, const std::vector<doubl
 // is ignored; fewer than two variables named is r(102) (varlist(min=2),
 // sx_spearman_ref_one); an option Stata does not have is r(198)
 // (sx_spearman_ref_opt; it was accepted and ignored).
+// `ktau VAR1 VAR2 [if] [in] [, stats() print() star() pw bonferroni sidak]`
+// ([R] spearman): Kendall's rank correlation of two variables over the rows
+// where both are nonmissing. S = sum over pairs of sign(dx)*sign(dy); with tie
+// groups of size t in x (u in y), xt2 = sum t(t-1), xt3 = sum t(t-1)(t-2),
+// xt = sum t(t-1)(2t+5) and n2 = n(n-1):
+//   tau_a = 2S/n2, tau_b = 2S/sqrt((n2-xt2)(n2-yt2)),
+//   se(S) = sqrt((n2(2n+5)-xt-yt)/18 + xt3*yt3/(9 n2 (n-2)) + xt2*yt2/(2 n2)),
+//   p = 2(1 - normal((|S|-1)/se)) (continuity corrected), 1 when S = 0
+// (Kendall's tie-corrected variance; Stata's [R] spearman Methods and formulas).
+// Fewer than 3 rows is r(2001). With two variables stats(), print(), star(),
+// pw and the multiple-test adjustments change nothing printed or returned;
+// the matrix form (three or more variables, or `matrix`) is not implemented
+// here and is refused by name.
+ojson runKtau(const eval::ParsedCommand& parsed, SessionState& session) {
+  if (auto e = eval::rejectUnknownOptions(parsed.opts, kVocabKtau.known, kVocabKtau.unimplemented))
+    return ojson(*e);
+  bool bonferroni = false, sidak = false;
+  for (const auto& [k, v] : parsed.opts) {
+    if (k == "bonferroni") bonferroni = true;
+    if (k == "sidak") sidak = true;
+    if ((k == "print" || k == "star") && !v.isBool) {
+      std::istringstream iss(v.strValue);
+      std::string w;
+      std::vector<double> nums;
+      while (iss >> w) {
+        char* end = nullptr;
+        const double d = std::strtod(w.c_str(), &end);
+        if (end == nullptr || *end != '\0')
+          return ojson(eval::errorBlock("syntax_error", k + "() invalid -- invalid number",
+                                        std::nullopt, std::nullopt, std::nullopt, "r(121)"));
+        nums.push_back(d);
+      }
+      if (nums.empty())
+        return ojson(eval::errorBlock("syntax_error",
+                                      k + "() invalid -- invalid numlist has too few elements",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(122)"));
+      if (nums.size() > 1)
+        return ojson(eval::errorBlock("syntax_error",
+                                      k + "() invalid -- invalid numlist has too many elements",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(123)"));
+    }
+  }
+  if (bonferroni && sidak)
+    return ojson(eval::errorBlock("syntax_error",
+                                  "only one of bonferroni and sidak can be specified",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+  for (const auto& [k, v] : parsed.opts) {
+    if ((k == "print" || k == "star") && !v.isBool) {
+      const double d = std::strtod(strutil::trim(v.strValue).c_str(), nullptr);
+      if (!(d > 0 && d < 1))
+        return ojson(eval::errorBlock("syntax_error", k + "() must be between 0 and 1",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    }
+    if (k == "stats" && !v.isBool) {
+      std::istringstream iss(v.strValue);
+      std::string w;
+      while (iss >> w)
+        if (w != "taua" && w != "taub" && w != "score" && w != "se" && w != "obs" && w != "p")
+          return ojson(eval::errorBlock(
+              "syntax_error",
+              "stats() must contain one or more of taua, taub, score, se, obs, and p",
+              std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    }
+  }
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
+  std::vector<std::string> vars = parsed.varlist;
+  if (!vars.empty()) {
+    std::string spec;
+    for (const auto& v : vars) spec += (spec.empty() ? "" : " ") + v;
+    loops::VarlistExpandResult ex = loops::expandVarlist(spec, session);
+    if (ex.isError) return ex.error;
+    vars = ex.tokens;
+    if (auto err = loops::checkKnownVarlist(vars, session)) return *err;
+  }
+  if (vars.size() < 2)
+    return ojson(eval::errorBlock("syntax_error", "too few variables specified", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(102)"));
+  ColumnScope scope(session, parsed, vars, "ktau");
+  if (scope.failed()) return scope.error();
+  Datastore& ds = *scope.get();
+  std::string notes;
+  std::vector<std::string> numeric;
+  for (const auto& v : vars) {
+    if (!ds.has(v)) return aerErrorReason("variable " + v + " not found", 111);
+    if (ds.dtype(v) == "factor") {
+      notes += "note: " + v + " ignored because string variable.\n";
+      continue;
+    }
+    numeric.push_back(v);
+  }
+  if (numeric.size() < 2)
+    return ojson(eval::errorBlock("syntax_error", "too few variables specified", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(102)"));
+  if (numeric.size() > 2)
+    return ojson(eval::unsupportedCommand("ktau", std::nullopt, std::nullopt, "piet_gap",
+                                          eval::UnsupportedCommandKind::kNotImplemented));
+  std::vector<double> xc, yc;
+  std::string err;
+  if (!numericColumn(ds, numeric[0], &xc, &err)) return aerError("ktau: " + err);
+  if (!numericColumn(ds, numeric[1], &yc, &err)) return aerError("ktau: " + err);
+  std::vector<double> x, y;
+  for (size_t i = 0; i < xc.size() && i < yc.size(); ++i) {
+    if (std::isnan(xc[i]) || std::isnan(yc[i])) continue;
+    x.push_back(xc[i]);
+    y.push_back(yc[i]);
+  }
+  const size_t n = x.size();
+  if (n < 3)
+    return ojson(eval::errorBlock("engine_error", "insufficient observations", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(2001)"));
+  double score = 0;
+  for (size_t i = 0; i < n; ++i)
+    for (size_t j = i + 1; j < n; ++j) {
+      const int sx = (x[i] > x[j]) - (x[i] < x[j]);
+      const int sy = (y[i] > y[j]) - (y[i] < y[j]);
+      score += sx * sy;
+    }
+  auto ties = [](std::vector<double> v, double* t1, double* t2, double* t3) {
+    std::sort(v.begin(), v.end());
+    *t1 = *t2 = *t3 = 0;
+    for (size_t i = 0; i < v.size();) {
+      size_t j = i;
+      while (j < v.size() && v[j] == v[i]) ++j;
+      const double t = static_cast<double>(j - i);
+      *t1 += t * (t - 1) * (2 * t + 5);
+      *t2 += t * (t - 1);
+      *t3 += t * (t - 1) * (t - 2);
+      i = j;
+    }
+  };
+  double xt, xt2, xt3, yt, yt2, yt3;
+  ties(x, &xt, &xt2, &xt3);
+  ties(y, &yt, &yt2, &yt3);
+  const double N = static_cast<double>(n);
+  const double NN = N * (N - 1);
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double tauA = 2 * score / NN;
+  const double den = std::sqrt((NN - xt2) * (NN - yt2));
+  const double tauB = den > 0 ? 2 * score / den : nan;
+  const double se = std::sqrt((1.0 / 18) * (NN * (2 * N + 5) - xt - yt) +
+                              xt3 * yt3 / (9 * NN * (N - 2)) + xt2 * yt2 / (2 * NN));
+  double pval;
+  if (score == 0) {
+    pval = 1;
+  } else {
+    const double z = se > 0 ? (std::fabs(score) - 1) / se : nan;
+    pval = std::isnan(z) ? nan : 2 * (1 - cecon::stata_normal(z));
+  }
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("p", pval);
+  session.eval.rValues.set("se_score", se);
+  session.eval.rValues.set("score", score);
+  session.eval.rValues.set("tau_b", tauB);
+  session.eval.rValues.set("tau_a", tauA);
+  session.eval.rValues.set("N", N);
+  eval::declareRPosted(session.eval, "ktau", {"p", "se_score", "score", "tau_b", "tau_a", "N"});
+  auto num = [](const char* fmt, int width, double v) {
+    if (std::isnan(v)) return std::string(static_cast<size_t>(width - 1), ' ') + ".";
+    char b[64];
+    std::snprintf(b, sizeof b, fmt, v);
+    return std::string(b);
+  };
+  std::ostringstream out;
+  out << notes << "\n";
+  out << "  Number of obs = " << num("%7.0f", 7, N) << "\n";
+  out << "Kendall's tau-a = " << num("%12.4f", 12, tauA) << "\n";
+  out << "Kendall's tau-b = " << num("%12.4f", 12, tauB) << "\n";
+  out << "Kendall's score = " << num("%7.0f", 7, score) << "\n";
+  out << "    SE of score = " << num("%11.3f", 11, se);
+  if (xt2 > 0 || yt2 > 0) out << "   (corrected for ties)";
+  out << "\n\n";
+  out << "Test of H0: " << abbrevCp(numeric[0], 20) << " and " << abbrevCp(numeric[1], 20)
+      << " are independent\n";
+  out << "     Prob > |z| = " << num("%12.4f", 12, pval) << "  (continuity corrected)";
+  return displayBlock(out.str());
+}
+
+// `ranksum varname [if] [in], by(groupvar) [porder exact noexact]` ([R]
+// ranksum): the Wilcoxon rank-sum (Mann-Whitney) test of two groups. Ranks are
+// the averaged ranks over the sample (varname and groupvar present); w1 is the
+// rank sum of the group with the smaller value, z = (w1 - n1(n+1)/2)/sqrt(v)
+// with the tie-adjusted variance v = n1 n2 Var(ranks)/n, p = 2 normal(-|z|).
+// With n <= 200 (or `exact`, n <= 1000) the exact permutation distribution of
+// w1 over all n1-subsets of the ranks (doubled when ties make them halves)
+// gives p_l_exact = P(W <= w1), p_u_exact = P(W >= w1) and p_exact = min(1,
+// 2 min(p_l_exact, p_u_exact)). porder = (w1 - n1(n1+1)/2)/(n1 n2) (vs-stata
+// bank ce53fa95acd57f22, 5cfad39c082b8e77).
+ojson runRanksum(const eval::ParsedCommand& parsed, SessionState& session) {
+  auto syn = [](const std::string& m, int rc) {
+    return ojson(eval::errorBlock("syntax_error", m, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(rc) + ")"));
+  };
+  if (auto e = eval::rejectUnknownOptions(parsed.opts, {"by", "porder", "exact", "noexact"}, {}))
+    return ojson(*e);
+  std::string byv;
+  bool porder = false, exactOpt = false, noexact = false;
+  for (const auto& [k, v] : parsed.opts) {
+    if (k == "by" && !v.isBool) byv = strutil::trim(v.strValue);
+    if (k == "porder") porder = true;
+    if (k == "exact") exactOpt = true;
+    if (k == "noexact") noexact = true;
+  }
+  if (byv.empty()) return syn("option by() required", 198);
+  if (exactOpt && noexact) return syn("options exact and noexact may not be combined", 198);
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
+  std::vector<std::string> vars = parsed.varlist;
+  if (vars.empty()) return syn("varlist required", 100);
+  if (vars.size() > 1) return syn("too many variables specified", 103);
+  vars.push_back(byv);
+  if (auto err = loops::checkKnownVarlist(vars, session)) return *err;
+  const std::string xv = vars[0];
+  byv = vars[1];
+  ColumnScope scope(session, parsed, vars, "ranksum");
+  if (scope.failed()) return scope.error();
+  Datastore& ds = *scope.get();
+  if (ds.dtype(xv) == "factor")
+    return syn("string variables not allowed in varlist;\n" + xv + " is a string variable", 109);
+  std::vector<double> x, g;
+  std::string err;
+  if (!numericColumn(ds, xv, &x, &err)) return aerError("ranksum: " + err);
+  const bool strBy = ds.dtype(byv) == "factor";
+  std::vector<std::string> gs;
+  if (strBy) {
+    const cecon::Column& c = ds.col(byv);
+    const size_t nr = static_cast<size_t>(ds.nRows());
+    gs.resize(nr);
+    g.assign(nr, std::numeric_limits<double>::quiet_NaN());
+    for (size_t i = 0; i < nr; ++i) {
+      const int32_t code = c.codes()[i];
+      if (code >= 0 && static_cast<size_t>(code) < c.levels.size() &&
+          !c.levels[static_cast<size_t>(code)].empty())
+        gs[i] = c.levels[static_cast<size_t>(code)];
+    }
+    // encode: the codes 1, 2, ... follow the sorted strings.
+    std::set<std::string> lv;
+    for (const auto& t : gs)
+      if (!t.empty()) lv.insert(t);
+    std::map<std::string, double> codeOf;
+    double k = 1;
+    for (const auto& t : lv) codeOf[t] = k++;
+    for (size_t i = 0; i < nr; ++i)
+      if (!gs[i].empty()) g[i] = codeOf[gs[i]];
+  } else if (!numericColumn(ds, byv, &g, &err)) {
+    return aerError("ranksum: " + err);
+  }
+  std::vector<size_t> rows;
+  for (size_t i = 0; i < x.size() && i < g.size(); ++i)
+    if (!std::isnan(x[i]) && !std::isnan(g[i])) rows.push_back(i);
+  const size_t n = rows.size();
+  if (n == 0) return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt,
+                                            std::nullopt, std::nullopt, "r(2000)"));
+  double g1 = g[rows[0]], g2 = g[rows[0]];
+  for (size_t i : rows) {
+    g1 = std::min(g1, g[i]);
+    g2 = std::max(g2, g[i]);
+  }
+  if (g1 == g2) return syn("1 group found, 2 required", 499);
+  for (size_t i : rows)
+    if (g[i] != g1 && g[i] != g2) return syn("more than 2 groups found, only 2 allowed", 499);
+  const bool exact = exactOpt || (n <= 200 && !noexact);
+  if (exactOpt && n > 1000) return syn("number of observations must be <= 1,000 for exact option", 459);
+  // Averaged ranks over the sample.
+  std::vector<size_t> ord(n);
+  for (size_t i = 0; i < n; ++i) ord[i] = i;
+  std::sort(ord.begin(), ord.end(),
+            [&](size_t a, size_t b) { return x[rows[a]] < x[rows[b]]; });
+  std::vector<double> rank(n);
+  for (size_t i = 0; i < n;) {
+    size_t j = i;
+    while (j < n && x[rows[ord[j]]] == x[rows[ord[i]]]) ++j;
+    const double r = (static_cast<double>(i + 1) + static_cast<double>(j)) / 2.0;
+    for (size_t k = i; k < j; ++k) rank[ord[k]] = r;
+    i = j;
+  }
+  double w1 = 0, rsum = 0;
+  size_t n1 = 0;
+  for (size_t i = 0; i < n; ++i) {
+    rsum += rank[i];
+    if (g[rows[i]] == g1) {
+      w1 += rank[i];
+      ++n1;
+    }
+  }
+  const size_t n2 = n - n1;
+  const double N = static_cast<double>(n), N1 = static_cast<double>(n1),
+               N2 = static_cast<double>(n2);
+  double rmean = rsum / N, ss = 0;
+  for (double r : rank) ss += (r - rmean) * (r - rmean);
+  const double varR = n > 1 ? ss / (N - 1) : std::numeric_limits<double>::quiet_NaN();
+  const double v = N1 * N2 * varR / N;
+  const double unv = N1 * N2 * (N + 1) / 12;
+  const double z = (w1 - N1 * (N + 1) / 2) / std::sqrt(v);
+  const double p = 2 * cecon::stata_normal(-std::fabs(z));
+  const double pl = cecon::stata_normal(z), pu = cecon::stata_normal(-z);
+  double pEx = 0, plEx = 0, puEx = 0;
+  if (exact) {
+    // Integer ranks (doubled when any is a half), then the count of n1-subsets
+    // by their sum: cnt[k][s] over the ranks seen so far.
+    bool half = false;
+    for (double r : rank) half = half || r != std::floor(r);
+    std::vector<int64_t> ir(n);
+    int64_t total = 0;
+    for (size_t i = 0; i < n; ++i) {
+      ir[i] = static_cast<int64_t>(std::llround(half ? 2 * rank[i] : rank[i]));
+      total += ir[i];
+    }
+    int64_t obs = 0;
+    for (size_t i = 0; i < n; ++i)
+      if (g[rows[i]] == g1) obs += ir[i];
+    const size_t S = static_cast<size_t>(total) + 1;
+    std::vector<std::vector<long double>> cnt(n1 + 1, std::vector<long double>(S, 0.0L));
+    cnt[0][0] = 1.0L;
+    for (size_t i = 0; i < n; ++i) {
+      const size_t ri = static_cast<size_t>(ir[i]);
+      for (size_t k = std::min(n1, i + 1); k >= 1; --k)
+        for (size_t s2 = S - 1; s2 >= ri; --s2) {
+          cnt[k][s2] += cnt[k - 1][s2 - ri];
+          if (s2 == ri) break;
+        }
+    }
+    long double all = 0, le = 0, ge = 0;
+    for (size_t s2 = 0; s2 < S; ++s2) {
+      all += cnt[n1][s2];
+      if (static_cast<int64_t>(s2) <= obs) le += cnt[n1][s2];
+      if (static_cast<int64_t>(s2) >= obs) ge += cnt[n1][s2];
+    }
+    plEx = static_cast<double>(le / all);
+    puEx = static_cast<double>(ge / all);
+    pEx = std::min(1.0, 2 * std::min(plEx, puEx));
+  }
+  const double porderV = (w1 - N1 * (N1 + 1) / 2) / (N1 * N2);
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted;
+  auto setS = [&](const std::string& k, double val) {
+    session.eval.rValues.set(k, val);
+    posted.push_back(k);
+  };
+  if (exact) {
+    setS("p_u_exact", puEx);
+    setS("p_l_exact", plEx);
+    setS("p_exact", pEx);
+  }
+  setS("p_u", pu);
+  setS("p_l", pl);
+  setS("p", p);
+  setS("z", z);
+  setS("Var_a", v);
+  setS("sum_exp", N1 * (N + 1) / 2);
+  setS("sum_obs", w1);
+  setS("group1", strBy ? 1.0 : g1);
+  setS("N_2", N2);
+  setS("N_1", N1);
+  setS("N", N);
+  if (porder) setS("porder", porderV);
+  eval::declareRPosted(session.eval, "ranksum", std::move(posted));
+  // The printed test.
+  auto label = [&](double code) {
+    if (strBy) {
+      for (size_t i : rows)
+        if (g[i] == code) return gs[i];
+      return std::string();
+    }
+    auto it = session.varLblname.find(byv);
+    if (it != session.varLblname.end()) {
+      auto d = session.labelDefs.find(it->second);
+      if (d != session.labelDefs.end()) {
+        auto t = d->second.find(eval::applyStataFmt(code, "%12.0g"));
+        if (t == d->second.end()) {
+          char b[64];
+          std::snprintf(b, sizeof b, "%.0f", code);
+          t = d->second.find(b);
+        }
+        if (t != d->second.end()) return t->second;
+      }
+    }
+    return strutil::trim(eval::applyStataFmt(code, "%9.0g"));
+  };
+  auto pad = [](std::string s, size_t w, bool left) {
+    if (s.size() >= w) return s;
+    return left ? s + std::string(w - s.size(), ' ') : std::string(w - s.size(), ' ') + s;
+  };
+  auto col = [](std::string* line, size_t c) {
+    if (line->size() < c - 1) line->append(c - 1 - line->size(), ' ');
+  };
+  auto fmtN = [&](double val, const char* f, size_t w) {
+    return pad(strutil::trim(eval::applyStataFmt(val, f)), w, false);
+  };
+  auto row = [&](std::string lab, double a, double b, double c) {
+    if (lab.size() > 12) lab = lab.substr(0, 12);
+    std::string line = pad(lab, 12, false) + " |";
+    col(&line, 17);
+    line += fmtN(a, "%7.0g", 7);
+    col(&line, 26);
+    line += fmtN(b, "%10.0g", 10);
+    col(&line, 38);
+    line += fmtN(c, "%10.0g", 10);
+    return line;
+  };
+  const std::string l1 = label(g1), l2 = label(g2);
+  std::ostringstream out;
+  out << "\nTwo-sample Wilcoxon rank-sum (Mann\xe2\x80\x93Whitney) test\n\n";
+  out << pad(abbrevCp(byv, 12), 12, false) << " |      Obs    Rank sum    Expected\n";
+  out << std::string(13, '-') << "+" << std::string(33, '-') << "\n";
+  out << row(l1, N1, w1, N1 * (N + 1) / 2) << "\n";
+  out << row(l2, N2, N * (N + 1) / 2 - w1, N2 * (N + 1) / 2) << "\n";
+  out << std::string(13, '-') << "+" << std::string(33, '-') << "\n";
+  out << row("Combined", N, N * (N + 1) / 2, N * (N + 1) / 2) << "\n";
+  const char* vf = unv < 1e7 ? "%10.2f" : "%10.0g";
+  auto vline = [&](const std::string& t, double val) {
+    std::string line = t;
+    col(&line, 22);
+    return line + fmtN(val, vf, 10);
+  };
+  out << "\n" << vline("Unadjusted variance", unv) << "\n";
+  out << vline("Adjustment for ties", v - unv) << "\n";
+  out << std::string(21, ' ') << "----------\n";
+  out << vline("Adjusted variance", v) << "\n\n";
+  const std::string xab = abbrevCp(xv, 8), byab = abbrevCp(byv, 8);
+  out << "H0: " << xab << "(" << byab << "==" << l1 << ") = " << xab << "(" << byab << "=="
+      << l2 << ")\n";
+  const std::string diz = strutil::trim(eval::applyStataFmt(z, "%7.3f"));
+  const std::string dip = strutil::trim(eval::applyStataFmt(p, "%8.4f"));
+  const size_t maxlen = std::max<size_t>(diz.size(), 6);
+  out << std::string(9, ' ') << "z = " << pad(diz, maxlen, false) << "\n";
+  out << "Prob > |z| = " << pad(dip, maxlen, false);
+  if (exact)
+    out << "\nExact prob = " << pad(strutil::trim(eval::applyStataFmt(pEx, "%8.4f")), maxlen, false);
+  if (porder)
+    out << "\n\nP{" << xab << "(" << byab << "==" << l1 << ") > " << xab << "(" << byab << "=="
+        << l2 << ")} = " << strutil::trim(eval::applyStataFmt(porderV, "%4.3f"));
+  return displayBlock(out.str());
+}
+
 ojson runSpearman(const eval::ParsedCommand& parsed, SessionState& session) {
   // stats()/print()/star() choose what the table prints; matrix forces the
   // matrix form. exact, pw, bonferroni and sidak change the numbers and are not
@@ -1061,7 +1496,12 @@ ojson runSignrank(const eval::ParsedCommand& parsed, SessionState& session) {
   // doubled when a tie made any rank a half-integer; each nonzero rank's sign is
   // + or - with probability 1/2.
   double pExact = std::numeric_limits<double>::quiet_NaN(), pLExact = pExact, pUExact = pExact;
-  if (exact) {
+  if (exact && n == 1) {
+    // Stata's single-observation exact signed-rank result has three unit
+    // probabilities (bank db00cd0e1a49f34c). The normal approximation above
+    // still uses the signed rank and its variance.
+    pExact = pLExact = pUExact = 1.0;
+  } else if (exact) {
     bool integral = true;
     for (size_t i = 0; i < n; ++i) integral = integral && r[i] == std::floor(r[i]);
     std::vector<long long> xs(n);

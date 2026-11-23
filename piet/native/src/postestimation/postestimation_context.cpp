@@ -117,6 +117,13 @@ std::vector<std::string> fitConventionFlagsM4(const LastModel& lm) {
       lm.cluster.empty() &&
       !(lm.result.has_value() && lm.result->is_object() && lm.result->contains("svy")))
     flags.push_back("--regress-exact-fit");
+  // The fit was the builtin `regress` under an aweight (runRegress pushes
+  // --aw-negative-drops on the same condition), so the refit drops the
+  // negative-weight rows the fit dropped (vs-stata bank bf3a397b1ed2f096).
+  if ((lm.stataCmd == "regress" || lm.stataCmd == "reg") && lm.fe.empty() &&
+      (lm.fitWtype == "aw" || lm.fitWtype == "aweight") &&
+      !(lm.result.has_value() && lm.result->is_object() && lm.result->contains("svy")))
+    flags.push_back("--aw-negative-drops");
   return flags;
 }
 

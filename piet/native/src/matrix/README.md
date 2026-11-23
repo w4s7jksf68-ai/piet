@@ -15,6 +15,7 @@ Entry points are declared in `piet/handlers/results.h` and `piet/mata_subset.h`.
 | `svmat` (matrix columns to variables, `names()`), `getmata` (Mata vectors/matrices to variables) | `matrix_to_variables.cpp` |
 | `mkmat` (variables to a matrix: `matrix()`, `rownames()`, `nomissing`, `obs`, `rowprefix`) | `variables_to_matrix.cpp` |
 | `matsort`, `matselrc` row/column selection and sorting over the stored matrix | `matrix_sort_select.cpp` |
+| `matrix dir`, `matrix rename`, `matrix roweq`/`coleq` entry, `matrix symeigen` (tred2/tql2), `matrix eigenvalues` (balance/Hessenberg/QR), `matrix svd` (Golub-Reinsch), `matrix score`/`vecaccum`/`opaccum`/`glsaccum`, `matrix dissimilarity`, `matrix rowjoinbyname`/`coljoinbyname`, `matname` | `matrix_subcommands.cpp` |
 | `mata:` statements and `mata: ... end` blocks, block folding, `invsym()` in the Mata subset, Mata-namespace matrices | `mata_subset.cpp` |
 | Eigen-decomposition bits (`symeigensystem()`, `ml` `difficult` step, clustered-V rank) | `lapack_dsyevr.cpp`, `lapack_dsyevr.h`, `lapack_dlaruv_mm.inc` |
 | Shared error helpers for `matlist`, `svmat`, `getmata`, `mkmat` | `matrix_command_errors.h` |
@@ -24,7 +25,7 @@ Entry points are declared in `piet/handlers/results.h` and `piet/mata_subset.h`.
 `reason`, because the generic message-to-rc mapping would otherwise answer 1). Only
 `matlist.cpp`, `matrix_to_variables.cpp` and `variables_to_matrix.cpp` include it.
 `matrix_expression_internal.h` is the interface between `matrix_expression.cpp`
-(definitions) and `matrix_commands.cpp` (the only other includer); do not include
+(definitions) and `matrix_commands.cpp` and `matrix_subcommands.cpp` (the only other includers); do not include
 it from outside this directory. `lapack_dsyevr.h` is the one public header: it
 declares `piet::lapack::dsyevrVAL`, called by estimation code and one selftest. The
 `.inc` file is the DLARUV multiplier table, included once inside

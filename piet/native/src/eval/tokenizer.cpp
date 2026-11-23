@@ -13,6 +13,7 @@
 #include "piet/eval/errors.h"
 #include "piet/eval/macros.h"
 #include "piet/strutil.h"
+#include "piet/regex_scans.h"
 #include "core/ident.h"  // Unicode names: the shared identifier rule
 #include "dispatch/registry.h"
 
@@ -44,11 +45,9 @@ std::string rstrip(const std::string& s) {
 std::string strip(const std::string& s) { return lstrip(rstrip(s)); }
 
 std::vector<std::string> splitWs(const std::string& s) {
-  std::vector<std::string> out;
-  std::istringstream iss(s);
-  std::string tok;
-  while (iss >> tok) out.push_back(tok);
-  return out;
+  // The words `std::istringstream >> std::string` reads, split by hand
+  // (piet/regex_scans.h; the stream cost more than the tokenizer around it).
+  return rx::splitWords(s);
 }
 
 // A5-04: forwards to the shared strutil copy (piet/strutil.h) — kept as a
@@ -408,11 +407,31 @@ constexpr DefaultWeightRow kDefaultWeight[] = {
 };
 
 // Python: re.split(r'\s+if\s+', pre, maxsplit=1, flags=re.IGNORECASE)
-const std::regex& reSplitIf() {
-  // `if` then blanks, or `if` glued to its parenthesised condition: StataBE
-  // 19.5 `summarize price if(foreign)` is the qualifier (rc 0).
-  static const std::regex r(R"(\s+if(?:\s+|(?=\()))", std::regex::icase);
-  return r;
+// `if` then blanks, or `if` glued to its parenthesised condition: StataBE 19.5
+// `summarize price if(foreign)` is the qualifier (rc 0). The pattern is
+// std::regex(R"(\s+if(?:\s+|(?=\()))", std::regex::icase), matched by hand
+// (rx::nextSplitIf, piet/regex_scans.h; every dispatched line with an `if` ran it).
+// This is searchUnquoted(s, that regex, m): the first match that touches no
+// quoted span, as position and length.
+bool searchUnquotedSplitIf(const std::string& s, size_t* pos, size_t* len) {
+  size_t p = 0, l = 0;
+  if (!rx::nextSplitIf(s, 0, &p, &l)) return false;
+  const std::vector<bool> mask = quotedSpanMask(s);  // only once there is a match, as there
+  do {
+    bool touchesQuote = false;
+    for (size_t k = p; k < p + l && k < mask.size(); ++k) {
+      if (mask[k]) {
+        touchesQuote = true;
+        break;
+      }
+    }
+    if (!touchesQuote) {
+      *pos = p;
+      *len = l;
+      return true;
+    }
+  } while (rx::nextSplitIf(s, p + l, &p, &l));
+  return false;
 }
 
 struct Qualifiers {
@@ -456,7 +475,47 @@ Qualifiers extractQualifiers(std::string pre) {
     q.weightType = m[1].str();
     q.weightVar = strip(m[2].str());
     q.weightExp = lstrip(m[2].str());
-    pre = pre.substr(0, m.position(0)) + pre.substr(m.position(0) + m.length(0));
+    const size_t firstWeightAt = static_cast<size_t>(m.position(0));
+    pre = pre.substr(0, firstWeightAt) + pre.substr(firstWeightAt + m.length(0));
+    // A second weight clause in the same command is Stata's r(198) "too many
+    // weights" (vs-stata bank af6f459401425fff `summarize price [aw=wfrac]
+    // [fw=wint]`). A graph's layers are separate plot commands, each with its own
+    // weight: parenthesized (`twoway (scatter y x [aw=w]) (lfit y x [aw=w])`,
+    // BUG-1319) or separated by `||` (`scatter y x [aw=w] || lfit y x [aw=w]`).
+    // So the two clauses are one command's only when no `||` and no closing of the
+    // first clause's parenthesis lies between them; a parenthesized expression
+    // between them (`[aw=w] if (x>1) [fw=f]`) opens and closes inside the span.
+    std::smatch m2;
+    if (pre.find('[') != std::string::npos && searchUnquoted(pre, reWeight(), m2)) {
+      const size_t secondWeightAt = static_cast<size_t>(m2.position(0));
+      bool sameCommand = true;
+      int depth = 0;
+      char quote = 0;
+      for (size_t i = firstWeightAt; i < secondWeightAt && i < pre.size(); ++i) {
+        const char ch = pre[i];
+        if (quote) {
+          if (ch == quote) quote = 0;
+        } else if (ch == '"') {
+          quote = ch;
+        } else if (ch == '(') {
+          ++depth;
+        } else if (ch == ')') {
+          if (--depth < 0) {
+            sameCommand = false;
+            break;
+          }
+        } else if (ch == '|' && depth == 0 && i + 1 < secondWeightAt && pre[i + 1] == '|') {
+          sameCommand = false;
+          break;
+        }
+      }
+      // A second clause inside a parenthesis still open at it (`scatter y x [aw=w]
+      // (lfit y x [aw=w])`) belongs to another layer too.
+      if (sameCommand && depth != 0) sameCommand = false;
+      if (sameCommand)
+        throw TokenizerError(errorBlock("syntax_error", "too many weights", std::nullopt,
+                                        std::nullopt, std::nullopt, "r(198)"));
+    }
   }
 
   // in range
@@ -470,9 +529,10 @@ Qualifiers extractQualifiers(std::string pre) {
   // the left half becomes the cleaned pre (rstripped), the right half the
   // if-expression (rstripped). BUG-115: `display "if you see this"` must not
   // split on the `if` embedded in the quoted literal.
-  if (ciContains(pre, "if", 2) && searchUnquoted(pre, reSplitIf(), m)) {
-    std::string head = pre.substr(0, static_cast<size_t>(m.position(0)));
-    std::string tail = pre.substr(static_cast<size_t>(m.position(0)) + m.length(0));
+  size_t ifPos = 0, ifLen = 0;
+  if (ciContains(pre, "if", 2) && searchUnquotedSplitIf(pre, &ifPos, &ifLen)) {
+    std::string head = pre.substr(0, ifPos);
+    std::string tail = pre.substr(ifPos + ifLen);
     pre = rstrip(head);
     q.ifExpr = rstrip(tail);
     // `in` written before `if`: Stata takes the two in either order
@@ -927,6 +987,20 @@ bool compoundLiteralCommand(const std::vector<std::string>& toks) {
 bool isMatrixAccumWord(const std::string& word) {
   const std::string w = toLower(word);
   return w.size() >= 2 && std::string("accum").compare(0, w.size(), w) == 0;
+}
+
+// The other `matrix` subcommands that select their own rows ([P] matrix accum:
+// vecaccum and glsaccum take [if] [in] [weight], opaccum [if] [in]; [P] matrix
+// score and dissimilarity [if] [in]), down to each word's shortest spelling.
+// `weighted` asks whether the word also takes a weight.
+bool isMatrixRowSubcommand(const std::string& word, bool weighted) {
+  const std::string w = toLower(word);
+  const auto abbrev = [&w](const char* full, size_t shortest) {
+    const std::string f(full);
+    return w.size() >= shortest && w.size() <= f.size() && f.compare(0, w.size(), w) == 0;
+  };
+  if (isMatrixAccumWord(w) || abbrev("vecaccum", 4) || abbrev("glsaccum", 4)) return true;
+  return !weighted && (abbrev("opaccum", 7) || abbrev("score", 3) || abbrev("dissimilarity", 3));
 }
 
 // BUG-352: generate/replace (after the same prefixes). Their expression goes to
@@ -1503,7 +1577,7 @@ ParsedCommand tokenize(const std::string& line) {
     // accum: aw/fw/iw/pw; w2_glm_lifecycle.do:68 `matrix accum Hd = x1 x2
     // [iw=h_d]`); runMatrixAccum reads the weight from the line.
     if (weightSpec != nullptr && weightSpec->canonical == "matrix" && !varlist.empty() &&
-        isMatrixAccumWord(varlist[0]))
+        isMatrixRowSubcommand(varlist[0], /*weighted=*/true))
       policy = registry::WeightPolicy::AllWeights;
     bool allowed = false;
     switch (policy) {
@@ -1609,7 +1683,7 @@ ParsedCommand tokenize(const std::string& line) {
     // as for its weight above (BUG-1408: `matrix accum D = x1 x2 in 2/11, dev
     // nocons` is rc 0 in StataBE).
     if (inSpec != nullptr && inSpec->canonical == "matrix" && !varlist.empty() &&
-        isMatrixAccumWord(varlist[0]))
+        isMatrixRowSubcommand(varlist[0], /*weighted=*/false))
       cmdAllowsInRange = true;
     if (!cmdAllowsInRange) {
       // BUG-105 secondary ② (the finding's named anchor): `l price in 1/5`

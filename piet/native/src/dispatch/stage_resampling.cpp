@@ -6,6 +6,7 @@
 #include "options.h"
 #include "handler_declarations.h"
 #include "piet/handlers/resampling.h"
+#include "piet/regex_scans.h"
 namespace piet::dispatch_detail {
 bool interceptResampling(SessionState& session,
     ojson& blocks,
@@ -28,7 +29,14 @@ bool interceptResampling(SessionState& session,
     static const std::regex reResamplePrefix(
         R"(^\s*(bootstrap|jackknife|permute|rolling|statsby)\b(.*)$)", std::regex::icase);
     std::smatch rm;
-    if (std::regex_match(rawCmd, rm, reResamplePrefix)) {
+    // The regex runs only on a line that starts with one of its words (every
+    // dispatched command came through here; piet/regex_scans.h).
+    const bool mayResample = rx::mayStartWithWordCI(rawCmd, "bootstrap") ||
+                             rx::mayStartWithWordCI(rawCmd, "jackknife") ||
+                             rx::mayStartWithWordCI(rawCmd, "permute") ||
+                             rx::mayStartWithWordCI(rawCmd, "rolling") ||
+                             rx::mayStartWithWordCI(rawCmd, "statsby");
+    if (mayResample && std::regex_match(rawCmd, rm, reResamplePrefix)) {
       const std::string method = lower(trimWs(rm.str(1)));
       std::string rest = rm.str(2);
       // The prefix colon is the first one outside quotes AND outside brackets:
@@ -120,7 +128,7 @@ bool interceptRandomization(SessionState& session,
   {
     static const std::regex reRitest(R"(^\s*ritest(\s.*)?$)", std::regex::icase);
     std::smatch rm;
-    if (std::regex_match(rawCmd, rm, reRitest)) {
+    if (rx::mayStartWithWordCI(rawCmd, "ritest") && std::regex_match(rawCmd, rm, reRitest)) {
       ojson res = handlers::runRitestLine(rm[1].matched ? rm.str(1) : std::string(), session);
       for (const auto& b : res) blocks.push_back(b);
       return true;

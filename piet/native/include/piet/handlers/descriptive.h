@@ -99,6 +99,64 @@ nlohmann::ordered_json runList(const std::optional<std::vector<std::string>>& va
                                 const std::optional<std::string>& inRange, SessionState& session,
                                 bool noLabel = false);
 
+// Stata `list`'s layout options ([D] list), parsed once for `list` and for
+// `duplicates list|examples` (which hand their options to list). The frontend's
+// listing renderer (piet/frontend/js/list-format.js) draws the table from the
+// `listing` object buildListing() attaches; this struct is what it is told.
+struct ListLayout {
+  bool noobs = false, clean = false, divider = false, compress = false, nocompress = false;
+  bool table = false, display = false, header = false, noheader = false, footer = false;
+  bool nolabel = false, notrim = false, nodotz = false, subvarname = false;
+  bool absolute = false, relative = false, doubleSpace = false;
+  long long separator = 5;  // 0 = none
+  long long headerEvery = 0;
+  long long abbreviate = -1, stringWidth = -1, linesize = -1;
+  std::vector<std::string> sepby;
+  // mean/sum/N: absent = not asked, empty = every listed numeric variable.
+  std::optional<std::vector<std::string>> mean, sum, count;
+  std::optional<std::string> labvar;
+  std::optional<std::vector<std::string>> constant;  // empty = every listed variable
+};
+
+// Parses list's options (already abbreviation-resolved, as in kVocabList) into
+// *out; `raw` is the command line as typed (the N option is case-sensitive).
+// Returns Stata's refusal for a malformed one.
+std::optional<nlohmann::ordered_json> parseListLayout(
+    const std::vector<std::pair<std::string, eval::OptValue>>& opts, const std::string& raw,
+    ListLayout* out);
+
+// A computed column listed before the variables (duplicates list's Group and Obs,
+// examples' #): its header and one value per listed row.
+struct ListLeadCol {
+  std::string head;
+  std::vector<double> values;
+  long long fmtw = 9;  // the width of its display format (nocompress draws it that wide)
+  std::vector<std::string> texts;  // a string column: these cells instead of `values`
+  std::string format = "%9.0g";    // a numeric column's display format
+  bool trailing = false;           // listed after the variables instead of before them
+};
+
+// The `listing` object for `rows` (0-based rows of `ds`, listed in that order and
+// numbered `obs`) of `vars`: every cell as Stata shows it under the variable's
+// display format and value label, the column headers, the mean/sum/N lines, the
+// sepby() breaks and the constant() split. On a refusal *err is set and the
+// return value is null.
+nlohmann::ordered_json buildListing(SessionState& session, const Datastore& ds,
+                                    const std::vector<int64_t>& rows,
+                                    const std::vector<int64_t>& obs,
+                                    const std::vector<std::string>& vars, const ListLayout& lo,
+                                    nlohmann::ordered_json* err,
+                                    const std::vector<ListLeadCol>& lead = {});
+
+// A number as `display %fmt` shows it, without the field's padding (list's cells,
+// summarize's `format`).
+std::string listDisplayNumber(double v, const std::string& fmt);
+
+// `list` with Stata's layout: runList's browse block plus the `listing` object.
+nlohmann::ordered_json runListStata(const std::vector<std::string>& vars,
+                                    const eval::ParsedCommand& parsed, SessionState& session,
+                                    const ListLayout& lo);
+
 // `levelsof VAR [, local(NAME) clean]` — distinct sorted values; numeric
 // vertical slice (factor/string levelsof is M3b).
 nlohmann::ordered_json runLevelsof(const std::string& varname,
@@ -119,6 +177,12 @@ struct LevelsofRequest {
   bool gtools = false;  // glevelsof
   std::optional<std::string> separate;
   std::optional<std::string> colseparate;
+  // glevelsof (vs-stata stage 4): numfmt(%fmt) spells numeric levels in that
+  // C printf format (gtools'); nolocalvar stores no levels; desc[j] sorts variable j descending
+  // (`-var` in the varlist).
+  std::optional<std::string> numfmt;
+  bool noLocalvar = false;
+  std::vector<bool> desc;
 };
 nlohmann::ordered_json runLevelsofCommand(const LevelsofRequest& req, SessionState& session);
 
@@ -281,6 +345,8 @@ nlohmann::ordered_json runCorr(const std::vector<std::string>& varlist, bool pai
 // `ttest VAR [== MU] [, by(G) unequal level(#)]` / `ttest V1 == V2 [, paired]`
 // — C++ port of translate.py's build_ttest_argv.
 nlohmann::ordered_json runTtest(const eval::ParsedCommand& parsed, SessionState& session);
+// ttesti (descriptive/descriptive_statistics.cpp): ttest from summary statistics.
+nlohmann::ordered_json runTtesti(const eval::ParsedCommand& parsed, SessionState& session);
 
 // `xtdescribe [if] [in] [, patterns()]` -- r() are summarize, detail of T_i.
 nlohmann::ordered_json runXtdescribe(const eval::ParsedCommand& parsed, SessionState& session);

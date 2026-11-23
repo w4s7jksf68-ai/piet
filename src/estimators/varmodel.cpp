@@ -135,7 +135,7 @@ constexpr double kPi = 3.14159265358979323846;
 
 VarResult var_fit(const double* Y, const double* time, int64_t n,
                   const std::vector<std::string>& names, int lags, int irf_steps, double delta,
-                  const char* in_sample) {
+                  const char* in_sample, bool constant) {
     VarResult r;
     const int K = static_cast<int>(names.size());
     r.K = K;
@@ -144,8 +144,9 @@ VarResult var_fit(const double* Y, const double* time, int64_t n,
         r.fail = VarResult::BAD_SPEC;
         return r;
     }
-    const int p = lags, Kp = K * p, m = Kp + 1;
+    const int p = lags, Kp = K * p, m = Kp + (constant ? 1 : 0);
     r.m = m;
+    r.constant = constant;
 
     // ---- estimation sample -------------------------------------------------
     // tsset semantics: a row enters when its own values AND the values at
@@ -202,7 +203,7 @@ VarResult var_fit(const double* Y, const double* time, int64_t n,
     for (int j = 1; j <= p; ++j)
         for (int c = 0; c < K; ++c)
             r.rnames.push_back("L" + std::to_string(j) + "." + names[static_cast<size_t>(c)]);
-    r.rnames.push_back("_cons");
+    if (constant) r.rnames.push_back("_cons");
 
     std::vector<double> X(static_cast<size_t>(T) * m);  // column-major for la::
     for (int j = 1; j <= p; ++j)
@@ -213,7 +214,8 @@ VarResult var_fit(const double* Y, const double* time, int64_t n,
                 col[q] = Y[static_cast<int64_t>(c) * n +
                            lagrow[static_cast<size_t>(q) * static_cast<size_t>(p) + static_cast<size_t>(j - 1)]];
         }
-    for (int64_t q = 0; q < T; ++q) X[static_cast<int64_t>(Kp) * T + q] = 1.0;
+    if (constant)
+        for (int64_t q = 0; q < T; ++q) X[static_cast<int64_t>(Kp) * T + q] = 1.0;
 
     std::vector<std::vector<double>> yd(static_cast<size_t>(K));
     for (int c = 0; c < K; ++c) {
@@ -287,6 +289,9 @@ VarResult var_fit(const double* Y, const double* time, int64_t n,
         double mean = 0;
         for (int64_t q = 0; q < T; ++q) mean += yd[static_cast<size_t>(a)][static_cast<size_t>(q)];
         mean /= static_cast<double>(T);
+        // noconstant: R-squared about zero (bank e21e2db0 `var close volume,
+        // noconstant` e(r2_1) .9998373964983829).
+        if (!constant) mean = 0;
         double tss = 0, rss = 0;
         for (int64_t q = 0; q < T; ++q) {
             const double dv = yd[static_cast<size_t>(a)][static_cast<size_t>(q)] - mean;

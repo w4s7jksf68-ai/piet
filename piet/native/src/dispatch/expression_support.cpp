@@ -1013,7 +1013,9 @@ std::string substituteRowExprRefs(const std::string& in, SessionState& session,
         lc.find("rowsof") != std::string::npos || lc.find("colnumb") != std::string::npos ||
         lc.find("rownumb") != std::string::npos || lc.find("mreldif") != std::string::npos ||
         lc.find("el(") != std::string::npos || lc.find("det(") != std::string::npos ||
-        lc.find("trace(") != std::string::npos) {
+        lc.find("trace(") != std::string::npos ||
+        lc.find("issymmetric(") != std::string::npos || lc.find("diag0cnt(") != std::string::npos ||
+        lc.find("matmissing(") != std::string::npos) {
       e = eval::substituteMatrixRefs(e, session.eval);
     }
   }

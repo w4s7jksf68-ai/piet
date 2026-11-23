@@ -446,6 +446,7 @@ bool route_session(std::string& cmd,
                                                 "r(" + bad->rc + ")")));
         return true;
       }
+      if (setName == "linesize") return true;
       ojson keptNote;
       keptNote["type"] = "echo";
       keptNote["text"] = "(set " + parsed.varlist[0] + ": not applicable to PIET — ignored)";

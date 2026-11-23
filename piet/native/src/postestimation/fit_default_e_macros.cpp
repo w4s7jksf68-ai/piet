@@ -499,6 +499,37 @@ std::optional<eval::EvalMatrix> modelBasedVOnEbStripe(SessionState& session, con
   return a.matrix;
 }
 
+// e(Cns) of a constraints() fit: the engine's kept rows [R | r] over the
+// estimated parameters, laid on e(b)'s columns (`cols`) plus `_Cns:_r`. The
+// engine's parameters are e(b)'s columns that are not a factor base or omitted
+// level, in order; each such level is one automatic constraint row, first, as
+// makecns orders them (e(k_autoCns)). Posted only when the counts match.
+void postCnsMatrixM4(SessionState& session, const std::vector<std::string>& cols, const ojson& rows) {
+  std::vector<size_t> free;
+  std::vector<size_t> autoCols;
+  for (size_t j = 0; j < cols.size(); ++j) (isAutoCnsColumn(cols[j]) ? autoCols : free).push_back(j);
+  eval::EvalMatrix C;
+  C.colnames = cols;
+  C.colnames.push_back("_Cns:_r");
+  for (size_t j : autoCols) {
+    std::vector<double> line(cols.size() + 1, 0.0);
+    line[j] = 1.0;
+    C.data.push_back(std::move(line));
+  }
+  for (const auto& r : rows) {
+    if (!r.is_array() || r.size() != free.size() + 1) return;
+    std::vector<double> line(cols.size() + 1, 0.0);
+    for (size_t q = 0; q <= free.size(); ++q) {
+      if (!r[q].is_number()) return;
+      line[q < free.size() ? free[q] : cols.size()] = r[q].get<double>();
+    }
+    C.data.push_back(std::move(line));
+  }
+  if (C.data.size() == autoCols.size()) return;
+  for (size_t i = 0; i < C.data.size(); ++i) C.rownames.push_back("r" + std::to_string(i + 1));
+  putEMatrix(session, "Cns", std::move(C));
+}
+
 // ologit / oprobit (ologit.ado, oprobit.ado and ml's posting; vs-stata bank
 // d8de89e3 `ologit rep78 mpg weight`, 310b9f30 `oprobit rep78 mpg weight`,
 // 8127bef1 / 3f3d419e `, vce(robust)`, 9375308e `, iterate(2)`): the ml settings
@@ -585,6 +616,13 @@ void postOrderedEContract(SessionState& session, const LastModel& lm, const ojso
   fillN("consonly", 0.0);
   fillN("version", 3.0);
   fillN("k_autoCns", static_cast<double>(nAuto));
+  // constraints(): the engine's count of free parameters (bank eae58c67 e(rank) 5
+  // of 6 with mpg fixed), and e(Cns), one row [R | r] per kept constraint over
+  // e(b)'s columns and `_Cns:_r`.
+  if (raw.contains("cns") && raw["cns"].is_array() && raw.contains("rank") && raw["rank"].is_number()) {
+    fillN("rank", raw["rank"].get<double>());
+    postCnsMatrixM4(session, cols, raw["cns"]);
+  }
   fillN("rank", static_cast<double>(k - nAuto));
   if (const auto it = num("iters")) fillN("ic", *it);
   bool conv = raw.contains("converged") && raw["converged"].is_boolean() &&
@@ -738,8 +776,100 @@ void postMlogitEContract(SessionState& session, const ojson& raw, const LastMode
     const size_t colon = c.find(':');
     return c.compare(colon == std::string::npos ? 0 : colon + 1, 2, "o.") == 0;
   };
-  size_t nFree = 0;
-  for (const auto& c : cols) nFree += isO(c) ? 0 : 1;
+  // The base outcome's equation (its columns all `o.`-marked or base levels) and,
+  // in the others, the factor base levels -- e(k_autoCns) -- carry no free
+  // parameter (bank 6b328e96 `mlogit race age i.collgrad`: 12 columns, e(k) 8 =
+  // the two non-base equations, e(k_autoCns) 2, e(rank) 6). e(k) counts the
+  // non-base equations' columns.
+  std::vector<char> inBase(cols.size(), 0), isAuto(cols.size(), 0);
+  size_t nCols = 0, nAuto = 0;
+  if (K > 0 && cols.size() % K == 0) {
+    const size_t m = cols.size() / K;
+    for (size_t j = 0; j < cols.size(); ++j) inBase[j] = isO(cols[j]) ? 1 : 0;
+    if (const auto bv = num("base_outcome")) {
+      size_t bi = 0;
+      for (size_t q = 0; q < K; ++q)
+        if (cv[q].is_number() && cv[q].get<double>() == *bv) bi = q;
+      for (size_t j = 0; j < cols.size(); ++j) inBase[j] = (j / m == bi) ? 1 : 0;
+    }
+  } else {
+    for (size_t j = 0; j < cols.size(); ++j) inBase[j] = isO(cols[j]) ? 1 : 0;
+  }
+  // constraints(): a coefficient the user's constraints hold at 0 is `o.`-marked
+  // in e(b) as ml's findomitted marks it, but it is not an automatic constraint
+  // (bank 908e6dce `mlogit race age grade wage, c(1)` with [2]age = 0:
+  // `Black:o.age`, e(k_autoCns) 0, e(rank) 7). Column j of a non-base equation is
+  // the engine's coefficient j % m of that outcome's equation without factor
+  // terms; with them, the engine's coefficient r(table) lays at column j (a base
+  // level has none: it is an automatic constraint, not an engine parameter).
+  std::vector<char> userFixed(cols.size(), 0);
+  std::vector<long> thetaOf(cols.size(), -1);  // e(b) column -> engine θ index
+  bool cnsFit = raw.contains("cns") && raw["cns"].is_array() && raw.contains("rank") &&
+                raw["rank"].is_number() && raw.contains("equations") && raw["equations"].is_array() &&
+                raw["equations"].size() == K && K > 0 && cols.size() % K == 0;
+  if (cnsFit) {
+    const size_t m = cols.size() / K;
+    // the engine coefficient at each column of an equation (-1: a base level)
+    std::vector<long> engAt(m, -1);
+    ojson ct = ojson::array();
+    for (const auto& eq : raw["equations"])
+      if (eq.is_object() && !eq.value("base", false) && eq.contains("coefs") && eq["coefs"].is_array()) {
+        ct = eq["coefs"];
+        break;
+      }
+    const size_t gk = ct.size();
+    if (gk == m) {
+      for (size_t c = 0; c < m; ++c) engAt[c] = static_cast<long>(c);
+    } else if (gk > 0 && gk < m) {
+      std::vector<rtable_detail::RtCol> rc;
+      bool placed = false;
+      try {
+        placed = rtable_detail::stataColumns(session, lm, ct, rc);
+      } catch (const std::exception&) {
+        placed = false;
+      }
+      if (placed && rc.size() == m)
+        for (size_t j = 0; j < m; ++j)
+          for (size_t c = 0; c < gk && rc[j].row != nullptr; ++c)
+            if (rc[j].row == &ct[c]) engAt[j] = static_cast<long>(c);
+      size_t found = 0;
+      for (const long x : engAt) found += x >= 0 ? 1 : 0;
+      if (found != gk) cnsFit = false;
+    } else {
+      cnsFit = false;
+    }
+    long e = 0;
+    for (size_t q = 0; q < K && cnsFit; ++q) {
+      const ojson& eq = raw["equations"][q];
+      if (!eq.is_object() || eq.value("base", false)) continue;
+      const ojson cf = eq.value("coefs", ojson::array());
+      if (cf.size() != gk) {
+        cnsFit = false;
+        break;
+      }
+      for (size_t j = 0; j < m; ++j) {
+        if (engAt[j] < 0) continue;
+        const size_t c = static_cast<size_t>(engAt[j]);
+        thetaOf[q * m + j] = e * static_cast<long>(gk) + static_cast<long>(c);
+        if (cf[c].is_object() && cf[c].value("constrained", false)) userFixed[q * m + j] = 1;
+      }
+      ++e;
+    }
+    if (!cnsFit) {
+      std::fill(thetaOf.begin(), thetaOf.end(), -1);
+      std::fill(userFixed.begin(), userFixed.end(), 0);
+    }
+  }
+  for (size_t j = 0; j < cols.size(); ++j) {
+    if (inBase[j]) continue;
+    ++nCols;
+    if (isAutoCnsColumn(cols[j]) && !userFixed[j]) {
+      isAuto[j] = 1;
+      ++nAuto;
+    }
+  }
+  const size_t nFree = nCols - nAuto;
+  const auto structural = [&inBase, &isAuto](size_t j) { return inBase[j] != 0 || isAuto[j] != 0; };
 
   std::string outcomes, mdflt;
   eval::EvalMatrix out;
@@ -778,7 +908,43 @@ void postMlogitEContract(SessionState& session, const ojson& raw, const LastMode
   fillS("k_eq_model_skip", std::to_string(ibase));
   if (session.eval.findClassMatrix('e', "out") == nullptr) putEMatrix(session, "out", std::move(out));
 
-  fillN("k", static_cast<double>(nFree));
+  fillN("k", static_cast<double>(nCols));
+  // constraints(): the free parameters (the engine's, which leave out the
+  // factor base levels too), and e(Cns) laid on e(b)'s columns (the base
+  // outcome's columns 0): the automatic base-level rows first, then one row per
+  // kept constraint, as makecns orders them (makecns.sthlp: e(Cns) carries both).
+  if (cnsFit) {
+    fillN("rank", raw["rank"].get<double>());
+    eval::EvalMatrix cns;
+    cns.colnames = cols;
+    cns.colnames.push_back("_Cns:_r");
+    for (size_t j = 0; j < cols.size(); ++j) {
+      if (!isAuto[j]) continue;
+      cns.rownames.push_back("r" + std::to_string(cns.rownames.size() + 1));
+      std::vector<double> row(cols.size() + 1, 0.0);
+      row[j] = 1.0;
+      cns.data.push_back(std::move(row));
+    }
+    bool ok = true;
+    for (const auto& r : raw["cns"]) {
+      if (!r.is_array() || r.empty()) { ok = false; break; }
+      const size_t np = r.size() - 1;
+      std::vector<double> row(cols.size() + 1, 0.0);
+      for (size_t j = 0; j < cols.size(); ++j) {
+        if (thetaOf[j] < 0) continue;
+        if (static_cast<size_t>(thetaOf[j]) >= np || !r[static_cast<size_t>(thetaOf[j])].is_number()) {
+          ok = false;
+          break;
+        }
+        row[j] = r[static_cast<size_t>(thetaOf[j])].get<double>();
+      }
+      if (!ok || !r[np].is_number()) { ok = false; break; }
+      row[cols.size()] = r[np].get<double>();
+      cns.rownames.push_back("r" + std::to_string(cns.rownames.size() + 1));
+      cns.data.push_back(std::move(row));
+    }
+    if (ok && cns.data.size() > nAuto) putEMatrix(session, "Cns", std::move(cns));
+  }
   fillN("rank", static_cast<double>(nFree));
   fillN("k_eq", static_cast<double>(K));
   fillN("k_eq_model", static_cast<double>(K));
@@ -788,7 +954,20 @@ void postMlogitEContract(SessionState& session, const ojson& raw, const LastMode
   fillN("ibaseout", static_cast<double>(ibase));
   fillN("baseout", *baseVal);
   fillN("k_dv", 1.0);
-  fillN("k_autoCns", 0.0);
+  fillN("k_autoCns", static_cast<double>(nAuto));
+  if (nAuto > 0 && !cnsFit && session.eval.findClassMatrix('e', "Cns") == nullptr) {
+    eval::EvalMatrix cns;
+    cns.colnames = cols;
+    cns.colnames.push_back("_Cns:_r");
+    for (size_t j = 0; j < cols.size(); ++j) {
+      if (!isAuto[j]) continue;
+      cns.rownames.push_back("r" + std::to_string(cns.rownames.size() + 1));
+      std::vector<double> row(cols.size() + 1, 0.0);
+      row[j] = 1.0;
+      cns.data.push_back(std::move(row));
+    }
+    putEMatrix(session, "Cns", std::move(cns));
+  }
   fillN("noconstant", noconstant ? 1.0 : 0.0);
   fillN("consonly", 0.0);
   if (const auto it = num("iters")) fillN("ic", *it);
@@ -827,8 +1006,8 @@ void postMlogitEContract(SessionState& session, const ojson& raw, const LastMode
     m.data.assign(1, {});
     size_t g = 0;
     bool ok = true;
-    for (const auto& c : cols) {
-      if (isO(c)) {
+    for (size_t j = 0; j < cols.size(); ++j) {
+      if (structural(j)) {
         m.data[0].push_back(0.0);
         continue;
       }
@@ -844,7 +1023,7 @@ void postMlogitEContract(SessionState& session, const ojson& raw, const LastMode
     if (vm.is_array() && vm.size() == nFree) {
       std::vector<long> at;
       long next = 0;
-      for (const auto& c : cols) at.push_back(isO(c) ? -1 : next++);
+      for (size_t j = 0; j < cols.size(); ++j) at.push_back(structural(j) ? -1 : next++);
       const size_t k = cols.size();
       // Its stripe has no equations and no `o.` marks (bank 0c684b5b: rows and
       // columns `age grade _cons age grade _cons ...`).
@@ -1163,6 +1342,147 @@ void postXtlogitFeEContract(SessionState& session, const ojson& raw, bool iterat
       m.data[0].push_back(v.is_number() ? v.get<double>() : 0.0);
     }
     putEMatrix(session, "gradient", std::move(m));
+  }
+  if (nAuto > 0 && session.eval.findClassMatrix('e', "Cns") == nullptr) {
+    eval::EvalMatrix cns;
+    cns.colnames = cols;
+    cns.colnames.push_back("_Cns:_r");
+    for (size_t j = 0; j < k; ++j) {
+      if (!isAutoCnsColumn(cols[j])) continue;
+      cns.rownames.push_back("r" + std::to_string(cns.rownames.size() + 1));
+      std::vector<double> row(k + 1, 0.0);
+      row[j] = 1.0;
+      cns.data.push_back(std::move(row));
+    }
+    putEMatrix(session, "Cns", std::move(cns));
+  }
+}
+
+
+// xtpoisson, fe (xtpoisson.ado's `ml model d2 xtps_fe`; vs-stata bank 8e730ee7
+// `xtpoisson fatal beertax unemp, fe`, 057cf53a `... i.year, fe`, 4301ca89 `, fe
+// vce(robust)`): the ml settings (d2, hybrid -- xtpoisson's default `difficult`),
+// the model macros, the Wald test of the free columns (chi2type Wald), e(ll),
+// e(ic), e(rank) = e(df_m), e(k_autoCns) and e(Cns) for base levels, e(ilog) and
+// e(gradient) from the engine's ml iteration.
+void postXtpoisFeEContract(SessionState& session, const ojson& raw, bool robustLike, bool iterate) {
+  const auto ebNames = ebColumnNames(session);
+  if (!ebNames.has_value() || ebNames->empty()) return;
+  const auto evm = session.eval.resolveEMatrixFor("V", eval::EvalSession::EReader::kCopy);
+  const auto ebm = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
+  if (!evm.matrix.has_value() || !ebm.matrix.has_value()) return;
+  const auto fillS = [&session](const char* name, const std::string& v) {
+    if (v.empty() || session.eval.eStrings.find(name) != nullptr) return;
+    session.eval.setEString(name, v);
+    session.noteEOnFit(name);
+  };
+  const auto fillN = [&session](const char* name, double v) {
+    if (session.eval.eScalars.find(name) != nullptr) return;
+    session.eval.setEScalar(name, v);
+    session.noteEOnFit(name);
+  };
+  const auto num = [&raw](const char* key) -> std::optional<double> {
+    if (!raw.contains(key) || !raw[key].is_number()) return std::nullopt;
+    return raw[key].get<double>();
+  };
+  const auto ll = num("loglik");
+  if (!ll.has_value()) return;
+  const std::vector<std::string>& cols = *ebNames;
+  const size_t k = cols.size();
+  if (ebm.matrix->data.size() != 1 || ebm.matrix->data[0].size() != k || evm.matrix->data.size() != k)
+    return;
+  std::vector<size_t> freeIdx;
+  for (size_t j = 0; j < k; ++j)
+    if (!isAutoCnsColumn(cols[j])) freeIdx.push_back(j);
+  const size_t nAuto = k - freeIdx.size();
+  const std::string ivar = session.eval.eStrings.get("ivar").empty() && session.panelvar.has_value()
+                               ? *session.panelvar
+                               : session.eval.eStrings.get("ivar");
+  fillS("ivar", ivar);
+  fillS("model", "fe");
+  fillS("method", "ml");
+  fillS("_coef_table_props", "pushtitle");
+  fillS("marginsprop", "addcons");
+  fillS("ml_method", "d2");
+  fillS("chi2type", "Wald");
+  fillS("deriv_useminbound", "off");
+  fillS("opt", "moptimize");
+  fillS("user", "xtps_fe");
+  fillS("crittype", robustLike ? "log pseudolikelihood" : "log likelihood");
+  fillS("singularHmethod", "hybrid");
+  fillS("technique", "nr");
+  fillS("which", "max");
+  const double rank = static_cast<double>(freeIdx.size());
+  fillN("rank", rank);
+  fillN("k_eq", 1.0);
+  fillN("k_eq_model", 1.0);
+  fillN("k_dv", 1.0);
+  fillN("noconstant", 1.0);
+  fillN("consonly", 0.0);
+  fillN("k_autoCns", static_cast<double>(nAuto));
+  if (const auto it = num("iters")) fillN("ic", *it);
+  const bool conv = raw.contains("converged") && raw["converged"].is_boolean() &&
+                    raw["converged"].get<bool>();
+  if (conv || iterate) fillN("rc", 0.0);
+  fillN("ll", *ll);
+  // Wald chi2 = b' inv(V) b over the free columns (Gauss-Jordan on the small block)
+  {
+    const size_t m = freeIdx.size();
+    std::vector<std::vector<double>> A(m, std::vector<double>(m + 1, 0.0));
+    for (size_t a = 0; a < m; ++a) {
+      for (size_t c = 0; c < m; ++c) A[a][c] = evm.matrix->data[freeIdx[a]][freeIdx[c]];
+      A[a][m] = ebm.matrix->data[0][freeIdx[a]];
+    }
+    bool ok = m > 0;
+    for (size_t c = 0; c < m && ok; ++c) {
+      size_t piv = c;
+      for (size_t r = c + 1; r < m; ++r)
+        if (std::fabs(A[r][c]) > std::fabs(A[piv][c])) piv = r;
+      if (!(std::fabs(A[piv][c]) > 0)) {
+        ok = false;
+        break;
+      }
+      std::swap(A[c], A[piv]);
+      for (size_t r = 0; r < m; ++r) {
+        if (r == c) continue;
+        const double f = A[r][c] / A[c][c];
+        for (size_t q = c; q <= m; ++q) A[r][q] -= f * A[c][q];
+      }
+    }
+    if (ok) {
+      double chi2 = 0;
+      for (size_t a = 0; a < m; ++a) chi2 += ebm.matrix->data[0][freeIdx[a]] * A[a][m] / A[a][a];
+      fillN("chi2", chi2);
+      fillN("df_m", rank);
+      fillN("p", chi2Upper(rank, chi2));
+    }
+  }
+  if (raw.contains("ilog") && raw["ilog"].is_array() && !raw["ilog"].empty() &&
+      raw["ilog"].size() <= 20 && session.eval.findClassMatrix('e', "ilog") == nullptr) {
+    eval::EvalMatrix mm;
+    mm.rownames = {"r1"};
+    mm.data.assign(1, std::vector<double>(20, 0.0));
+    size_t i = 0;
+    for (const auto& v : raw["ilog"]) mm.data[0][i++] = v.is_number() ? v.get<double>() : 0.0;
+    for (int c = 1; c <= 20; ++c) mm.colnames.push_back("c" + std::to_string(c));
+    putEMatrix(session, "ilog", std::move(mm));
+  }
+  if (raw.contains("gradient") && raw["gradient"].is_array() &&
+      raw["gradient"].size() == freeIdx.size() && session.eval.findClassMatrix('e', "gradient") == nullptr) {
+    eval::EvalMatrix mm;
+    mm.rownames = {"r1"};
+    mm.colnames = cols;
+    mm.data.assign(1, {});
+    size_t g = 0;
+    for (const auto& c : cols) {
+      if (isAutoCnsColumn(c)) {
+        mm.data[0].push_back(0.0);
+        continue;
+      }
+      const ojson& v = raw["gradient"][g++];
+      mm.data[0].push_back(v.is_number() ? v.get<double>() : 0.0);
+    }
+    putEMatrix(session, "gradient", std::move(mm));
   }
   if (nAuto > 0 && session.eval.findClassMatrix('e', "Cns") == nullptr) {
     eval::EvalMatrix cns;
@@ -1647,6 +1967,196 @@ void postHeckmanTwostepEContract(SessionState& session, const LastModel& lm, con
   }
 }
 
+// areg's classic path: one absorbed variable and the default, robust or
+// cluster-on-the-absorbed-variable VCE, where Stata runs its built-in regression
+// with absorb() and the ado then adds its own results (areg Estimate). Any other
+// cluster variable, or two or more, sends Stata to the method of alternating
+// projections (e(estmethod) MAP; estimation_results.cpp posts that path). The
+// stored results (vs-stata bank, every areg fit; 1f4cdf7f plain, 3f9dcaf0
+// vce(robust), 68cbf0a8 vce(cluster rep78), 43c6ded8 [aw], 08464637 [pw],
+// a38f5aa2 [fw] cluster):
+//   e(ll), e(ll_0): the Gaussian log likelihoods over e(rss) and over the
+//     within (absorbed-mean) total sum of squares, an [aw] fit adding
+//     0.5 * sum(ln(w_i N / sum w)) as regress does; e(sum_w) the weight total;
+//   e(k_absorb) = e(df_a) + 1, e(ar2) = e(r2_a), e(rc) 0;
+//   default VCE only: e(r2_c) the R-squared of the regression without the
+//     absorbed indicators (same weights and sample), e(F_absorb) =
+//     ((r2 - r2_c)/df_a) / ((1 - r2)/df_r) and e(p_absorb) its upper F tail;
+//   robust/cluster: e(V_modelbased), the conventional bread;
+//   macros: model ols, absvar, title2, estmethod areg, footnote, marginsnotok,
+//     marginsprop, and e(datasignaturevars) -- the depvar and the regressors'
+//     variables with operators removed (plain, c. and time-series operated first
+//     in order, then factor variables), then absvar, then the cluster variable
+//     (bank b7bd7719 `mpg i.foreign c.weight#c.weight` -> "price mpg weight
+//     foreign rep78"; e61e8200 cluster sid -> "... year sid sid"). e(datasignature)
+//     itself is Stata's own checksum and is not posted.
+// Nothing is posted for an option this list does not cover.
+void postAregClassicEContract(SessionState& session, const LastModel& lm, const ojson& raw) {
+  if (lm.fe.size() != 1) return;
+  eval::ParsedCommand p;
+  try {
+    p = eval::tokenize(session.leafCmdExpanded);
+  } catch (...) {
+    return;
+  }
+  for (const auto& [k0, v] : p.opts) {
+    std::string k = k0;
+    for (auto& c : k) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (!(optIs(k, "absorb", 1) || optIs(k, "vce", 3) || optIs(k, "robust", 1) ||
+          optIs(k, "cluster", 2) || optIs(k, "level", 1) || optIs(k, "noheader", 4) ||
+          optIs(k, "notable", 5)))
+      return;
+    (void)v;
+  }
+  const std::string& absvar = lm.fe[0];
+  const bool ols = lm.vcov == "iid";
+  const bool clusterOnAbsvar = lm.vcov == "cluster" && lm.cluster.size() == 1 &&
+                               lm.cluster[0] == absvar;
+  if (!(ols || lm.vcov == "hc1" || clusterOnAbsvar)) return;
+  const std::string wt = lm.fitWeight.empty() ? std::string() : lm.fitWtype;
+  if (!(wt.empty() || wt == "aw" || wt == "fw" || wt == "pw")) return;
+  auto num = [&raw](const char* key) -> std::optional<double> {
+    if (!raw.is_object() || !raw.contains(key) || !raw[key].is_number()) return std::nullopt;
+    return raw[key].get<double>();
+  };
+  // a posted e() scalar, else the reply's value the e() reader answers with (e(df_a))
+  auto eNum = [&session, &num](const char* key) -> std::optional<double> {
+    const auto* v = session.eval.eScalars.find(key);
+    if (v == nullptr) return num(key);
+    if (!std::isfinite(*v)) return std::nullopt;
+    return *v;
+  };
+  const auto N = num("n_obs"), rss = num("rss"), tssW = num("tss_within");
+  const auto dfA = eNum("df_a"), dfR = eNum("df_r"), r2 = eNum("r2");
+  const auto r2a = eNum("r2_a") ? eNum("r2_a") : num("adj_r2");
+  if (!N || !rss || !tssW || !dfA || !dfR || !r2 || *N <= 0) return;
+  const auto setN = [&session](const char* name, double v) {
+    session.eval.setEScalar(name, v);
+    session.noteEOnFit(name);
+  };
+  const auto setS = [&session](const char* name, const std::string& v) {
+    session.eval.setEString(name, v);
+    session.noteEOnFit(name);
+  };
+  double sumW = *N, llShift = 0.0;
+  if (!wt.empty()) {
+    if (!raw.contains("weight") || !raw["weight"].is_object() || !raw["weight"].contains("sum_w") ||
+        !raw["weight"]["sum_w"].is_number())
+      return;
+    sumW = raw["weight"]["sum_w"].get<double>();
+    if (!(sumW > 0)) return;
+    if (wt == "aw") {
+      llShift = std::numeric_limits<double>::quiet_NaN();
+      const auto rows = est_detail::esampleRowsM4(session, lm);
+      const double* wv = est_detail::f64ColumnM4(session, lm.fitWeight);
+      if (rows.has_value() && wv != nullptr && static_cast<double>(rows->size()) == *N) {
+        double s = 0.0;
+        for (const int64_t i : *rows) s += std::log(wv[i] * *N / sumW);
+        if (std::isfinite(s)) llShift = 0.5 * s;
+      }
+    }
+  }
+  const auto gauss = [&N](double ss) {
+    return -0.5 * *N * (1.0 + std::log(2.0 * 3.14159265358979323846) + std::log(ss / *N));
+  };
+  setN("sum_w", sumW);
+  if (!std::isnan(llShift)) {
+    if (*rss > 0) setN("ll", gauss(*rss) + llShift);
+    if (*tssW > 0) setN("ll_0", gauss(*tssW) + llShift);
+  }
+  setN("k_absorb", *dfA + 1.0);
+  if (r2a) setN("ar2", *r2a);
+  setN("rc", 0.0);
+  if (ols) {
+    if (const auto r2c = num("r2_c")) {
+      setN("r2_c", *r2c);
+      if (*dfA > 0 && *dfR > 0 && *r2 < 1.0) {
+        const double f = ((*r2 - *r2c) / *dfA) / ((1.0 - *r2) / *dfR);
+        setN("F_absorb", f);
+        setN("p_absorb", f <= 0 ? 1.0 : cecon::betai(*dfR / 2.0, *dfA / 2.0, *dfR / (*dfR + *dfA * f)));
+      }
+    }
+  } else if (raw.contains("e_Vmb") && raw["e_Vmb"].is_object() && !raw["e_Vmb"].empty() &&
+             session.lastEstBlock.has_value() && session.lastEstBlock->is_object()) {
+    (*session.lastEstBlock)["e_Vmb"] = raw["e_Vmb"];
+  }
+  setS("model", "ols");
+  setS("absvar", absvar);
+  setS("title2", "Absorbed variable: " + absvar);
+  setS("estmethod", "areg");
+  setS("footnote", "areg_footnote");
+  setS("marginsnotok", "Residuals SCore D XBD");
+  setS("marginsprop", "nolinearize");
+  // e(datasignaturevars)
+  std::vector<std::string> head, tail;
+  const auto add = [](std::vector<std::string>& to, const std::string& v) {
+    if (std::find(to.begin(), to.end(), v) == to.end()) to.push_back(v);
+  };
+  const auto factorOp = [](const std::string& op) {
+    // i., ib#., ibn., b#., bn. (one factor operator, no time-series part)
+    if (op.empty()) return false;
+    size_t i = 0;
+    if (op[0] == 'i') i = 1;
+    if (i < op.size() && op[i] == 'b') {
+      ++i;
+      if (op.compare(i, std::string::npos, "n") == 0) return true;
+      while (i < op.size() && std::isdigit(static_cast<unsigned char>(op[i]))) ++i;
+      return i == op.size() && op.size() > 1;
+    }
+    return i == op.size() && i == 1;
+  };
+  const auto tsOp = [](const std::string& op) {
+    if (op.empty()) return false;
+    for (char c : op) {
+      const char u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      if (!(u == 'L' || u == 'F' || u == 'D' || u == 'S' || std::isdigit(static_cast<unsigned char>(c))))
+        return false;
+    }
+    return !std::isdigit(static_cast<unsigned char>(op[0]));
+  };
+  bool plain = !p.varlist.empty();
+  for (size_t i = 0; i < p.varlist.size() && plain; ++i) {
+    const std::string& term = p.varlist[i];
+    std::vector<std::string> parts;
+    for (size_t a = 0; a <= term.size();) {
+      size_t b = term.find('#', a);
+      if (b == std::string::npos) b = term.size();
+      if (b > a) parts.push_back(term.substr(a, b - a));
+      a = b + 1;
+    }
+    if (parts.empty()) plain = false;
+    for (const auto& part : parts) {
+      const size_t dot = part.find('.');
+      std::string op = dot == std::string::npos ? std::string() : part.substr(0, dot);
+      std::string v = dot == std::string::npos ? part : part.substr(dot + 1);
+      std::string lop = op;
+      for (auto& c : lop) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      const bool factor = factorOp(lop);
+      if (!(op.empty() || lop == "c" || factor || tsOp(op)) || v.empty() ||
+          v.find_first_of(".()*?~-") != std::string::npos || (factor && i == 0)) {
+        plain = false;
+        break;
+      }
+      const std::optional<std::string> full = resolveVarName(v, session);
+      if (!full.has_value()) {
+        plain = false;
+        break;
+      }
+      if (i == 0) head.push_back(*full);
+      else add(factor ? tail : head, *full);
+    }
+  }
+  if (plain) {
+    std::string out;
+    for (const auto& v : head) out += (out.empty() ? "" : " ") + v;
+    for (const auto& v : tail)
+      if (std::find(head.begin(), head.end(), v) == head.end()) out += " " + v;
+    out += " " + absvar;
+    if (clusterOnAbsvar) out += " " + lm.cluster[0];
+    setS("datasignaturevars", out);
+  }
+}
+
 }  // namespace
 
 void postStataEContract(SessionState& session) {
@@ -1856,10 +2366,11 @@ void postStataEContract(SessionState& session) {
       if (session.eval.eStrings.get("vce") == "iid") session.eval.setEString("vce", "conventional");
       if (model == "re") {
         fillS("chi2type", "Wald");
-        // the Wald model test's df and p-value, as the reply carries them
+        // the Wald model test's df and p-value, as the reply carries them (under a
+        // cluster-robust VCE the test on that V: bank 812f8494 `re vce(robust)` df_m 2,
+        // p 2.71e-08)
         if (raw != nullptr && raw->contains("df_chi2") && (*raw)["df_chi2"].is_number() &&
-            raw->contains("p_chi2") && (*raw)["p_chi2"].is_number() &&
-            !raw->contains("n_clusters")) {
+            raw->contains("p_chi2") && (*raw)["p_chi2"].is_number()) {
           fillN("df_m", (*raw)["df_chi2"].get<double>());
           fillN("p", (*raw)["p_chi2"].get<double>());
         }
@@ -1909,6 +2420,99 @@ void postStataEContract(SessionState& session) {
           m.data = {{(*raw)["absorbed"][ivar].get<double>()}};
           putEMatrix(session, "kabsorb", std::move(m));
         }
+      }
+    }
+    // fe under a one-way robust or cluster VCE (vce(robust) is cluster(panelvar)):
+    // Stata's absorb step keeps the model-based results beside the sandwich (vs-stata
+    // bank 703ff91a `fe r`, a48d15e5 `fe vce(robust)`, 91b927a0 `vce(cluster rg)`):
+    // e(rank_mb) the fitted columns (_cons included), e(V_modelbased) the conventional
+    // bread, e(df_r_mb) the conventional residual dof -- N - N_g - (rank_mb - 1) when
+    // the cluster is the panel variable, N - rank_mb when it is another variable (the
+    // panels nest in it, xtreg's own check, and Stata takes the projection path:
+    // e(estmethod) MAP with e(apm)/e(map_method) projection, e(adjdf)/e(df_ax) 0,
+    // e(tss_w) = e(tss_xt) the within total and e(mss_w) = tss_w - rss, and the
+    // absorbed-variable matrices e(dfabsorb)/e(ksingle)/e(kabsorb) on rows
+    // df/singletons/absvar). e(vceline) is the vce() option as typed in full,
+    // `vce(robust)` / `vce(cluster <var>)`; the legacy robust / cluster() spellings
+    // post none.
+    if (fe && fo.parsed && !ivar.empty() && raw != nullptr && lmo->vcov == "cluster" &&
+        lmo->cluster.size() == 1 && lmo->cluster[0].find(',') == std::string::npos) {
+      const std::string clv = lmo->cluster[0];
+      const bool map = clv != ivar;
+      const auto n = rawNum("n_obs"), ng = rawNum("N_g");
+      double rankMb = -1.0;
+      if (raw->contains("e_V") && (*raw)["e_V"].is_object() && (*raw)["e_V"].contains("names") &&
+          (*raw)["e_V"]["names"].is_array())
+        rankMb = static_cast<double>((*raw)["e_V"]["names"].size());
+      if (n && ng && rankMb > 0) {
+        fillN("rank_mb", rankMb);
+        fillN("df_r_mb", map ? *n - rankMb : *n - *ng - (rankMb - 1.0));
+        if (raw->contains("e_Vmb") && (*raw)["e_Vmb"].is_object() && !(*raw)["e_Vmb"].empty() &&
+            session.lastEstBlock.has_value() && session.lastEstBlock->is_object() &&
+            !session.lastEstBlock->contains("e_Vmb")) {
+          ojson rec = (*raw)["e_Vmb"];
+          // The projection path first rescales aweights and pweights to mean 1, so its
+          // e(V_modelbased) is the bread on those normalised weights; the engine's
+          // one-way bread is on the raw weights (the classic path's): times sum(w)/N.
+          // A frequency weight is not rescaled.
+          const std::string wt = lmo->fitWeight.empty() ? std::string() : lmo->fitWtype;
+          bool post = true;
+          if (map && (wt == "aw" || wt == "pw")) {
+            const auto sw = raw->contains("weight") && (*raw)["weight"].is_object() &&
+                                    (*raw)["weight"].contains("sum_w") &&
+                                    (*raw)["weight"]["sum_w"].is_number()
+                                ? std::optional<double>((*raw)["weight"]["sum_w"].get<double>())
+                                : std::nullopt;
+            post = sw.has_value() && *sw > 0.0 && rec.contains("matrix") &&
+                   rec["matrix"].is_array();
+            if (post)
+              for (auto& row : rec["matrix"])
+                for (auto& v : row)
+                  if (v.is_number()) v = v.get<double>() * *sw / *n;
+          }
+          if (post) (*session.lastEstBlock)["e_Vmb"] = std::move(rec);
+        }
+      }
+      for (const auto& [k, v] : eval::tokenize(session.leafCmdExpanded).opts) {
+        if (!optIs(k, "vce", 3) || v.isBool) continue;
+        std::string t = v.strValue;
+        const size_t b0 = t.find_first_not_of(" \t");
+        t = b0 == std::string::npos ? std::string() : t.substr(b0, t.find_last_not_of(" \t") - b0 + 1);
+        std::string word = t.substr(0, t.find_first_of(" \t"));
+        std::string rest = word.size() < t.size() ? t.substr(word.size()) : std::string();
+        const size_t r0 = rest.find_first_not_of(" \t");
+        rest = r0 == std::string::npos ? std::string() : rest.substr(r0);
+        if (word == "robust" && rest.empty()) fillS("vceline", "vce(robust)");
+        else if (word == "cluster" && rest == clv) fillS("vceline", "vce(cluster " + clv + ")");
+      }
+      const auto rss = rawNum("rss"), tssW = rawNum("tss_within");
+      if (map && rss && tssW && raw->contains("absorbed") && (*raw)["absorbed"].is_object() &&
+          (*raw)["absorbed"].contains(ivar) && (*raw)["absorbed"][ivar].is_number()) {
+        const double levels = (*raw)["absorbed"][ivar].get<double>();
+        session.eval.setEString("estmethod", "MAP");
+        session.noteEOnFit("estmethod");
+        fillS("apm", "projection");
+        fillS("map_method", "projection");
+        fillN("adjdf", 0.0);
+        fillN("df_ax", 0.0);
+        fillN("tss_w", *tssW);
+        fillN("tss_xt", *tssW);
+        fillN("mss_w", *tssW - *rss);
+        const auto one = [&ivar](const char* row, double val) {
+          eval::EvalMatrix m;
+          m.rownames = {row};
+          m.colnames = {ivar};
+          m.data = {{val}};
+          return m;
+        };
+        const bool noSingletons = raw->contains("fe_group_sizes") &&
+                                  (*raw)["fe_group_sizes"].is_object() &&
+                                  (*raw)["fe_group_sizes"].contains("min") &&
+                                  (*raw)["fe_group_sizes"]["min"].is_number() &&
+                                  (*raw)["fe_group_sizes"]["min"].get<double>() > 1.0;
+        if (noSingletons) putEMatrix(session, "ksingle", one("singletons", 0.0));
+        putEMatrix(session, "dfabsorb", one("df", levels - 1.0));
+        putEMatrix(session, "kabsorb", one("absvar", levels));
       }
     }
     if (fe && fo.parsed && !ivar.empty()) {
@@ -1965,6 +2569,7 @@ void postStataEContract(SessionState& session) {
     }
   }
 
+  if (cmd == "areg" && fo.parsed && raw != nullptr) postAregClassicEContract(session, *lmo, *raw);
   // fracreg's ml record, model test, e(mns) and macros (bank 2bef1615, 952f78c4)
   if (cmd == "fracreg") {
     if (raw != nullptr) est_detail::postFracregContractM4(session, *raw);
@@ -1972,9 +2577,10 @@ void postStataEContract(SessionState& session) {
   }
   // ologit / oprobit: the rest of the ado's posting (ologit.ado / oprobit.ado
   // Estimate, then ml's own e()). Only for the forms the handler fits and posts
-  // e(b) for (no technique(), constraints(), offset(), resampling VCE).
+  // e(b) for (no technique(), offset(), resampling VCE). constraints() is fitted
+  // by the engine (`--cns`; bank eae58c67 `ologit rep78 mpg weight, const(1)`).
   if ((cmd == "ologit" || cmd == "oprobit") && raw != nullptr && fo.parsed && !fo.technique &&
-      !fo.resampling && !fo.constraints && !fo.exposure) {
+      !fo.resampling && !fo.exposure) {
     // e(offset): the variable offset() named (bank 13941585 "off")
     if (fo.offset && raw->contains("offset") && (*raw)["offset"].is_string())
       fillS("offset", (*raw)["offset"].get<std::string>());
@@ -1986,6 +2592,11 @@ void postStataEContract(SessionState& session) {
     const bool clusterGiven = lmo->vcov == "cluster" || !lmo->cluster.empty();
     postXtpoisReEContract(session, *lmo, *raw, fo.robustLike, clusterGiven, fo.iterate,
                           fo.noconstant);
+  }
+  if (cmd == "xtpoisson" && raw != nullptr && raw->value("estimator", std::string()) == "xtpoisson_fe" &&
+      fo.parsed && !fo.technique && !fo.resampling && !fo.constraints && !fo.offset && !fo.exposure) {
+    if (session.eval.eStrings.get("vce") == "iid") session.eval.setEString("vce", "oim");
+    postXtpoisFeEContract(session, *raw, fo.robustLike, fo.iterate);
   }
   if (cmd == "clogit" && raw != nullptr && raw->value("estimator", std::string()) == "xtlogit_fe" &&
       fo.parsed && !fo.technique && !fo.resampling && !fo.constraints && !fo.vceGiven) {
@@ -2003,10 +2614,19 @@ void postStataEContract(SessionState& session) {
   if (cmd == "tobit" && raw != nullptr && fo.parsed && !fo.technique && !fo.resampling &&
       !fo.constraints && !fo.offset)
     postTobitEContract(session, *lmo, *raw, fo.robustLike, fo.iterate);
-  if (cmd == "mlogit" && raw != nullptr && fo.parsed && !fo.technique && !fo.resampling &&
-      !fo.constraints) {
+  if (cmd == "mlogit" && raw != nullptr && fo.parsed && !fo.technique && !fo.resampling) {
     postMlogitEContract(session, *raw, *lmo, fo.vceGiven || fo.score, fo.robustLike, fo.iterate,
                         fo.difficult, fo.noconstant);
+  }
+
+  // nbreg's e(offset): the offset() variable, or `ln(var)` for exposure(var), as
+  // the ado posts it (its predictor adds it to xb: n = exp(xb + offset)); a blank
+  // or compound spelling is not posted.
+  if (cmd == "nbreg" && fo.parsed && (fo.offset || fo.exposure)) {
+    std::string nbOff = fo.offsetMacro;
+    nbOff.erase(0, nbOff.find_first_not_of(" \t"));
+    nbOff.erase(nbOff.find_last_not_of(" \t") + 1);
+    if (!nbOff.empty() && nbOff.find_first_of(" ,") == std::string::npos) fillS("offset", nbOff);
   }
 
   // The `ml` settings and scalars of the four maximum-likelihood fits.

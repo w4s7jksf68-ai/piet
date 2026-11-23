@@ -166,6 +166,9 @@ class CobraSession {
   // §38: a column subset of the resident frame, written to `out` as a real .hbin.
   // Does not touch the frames_ capability state — see the definition.
   CobraRunResult frameGetcols(const std::vector<std::string>& cols, const std::string& out);
+  // One cell of the resident frame, inline on stdout (cecon_cli.cpp `getcell`).
+  // Same capability discipline as frameGetcols: a refusal is a per-request miss.
+  CobraRunResult frameGetcell(const std::string& col, long long row);
   CobraRunResult frameSnapshot(const std::string& path);
   CobraRunResult frameDrop();
   // W0 (P2PERF §W0): read the worker's own mechanism counters (patch-vs-full

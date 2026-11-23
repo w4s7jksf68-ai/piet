@@ -2,6 +2,7 @@
 // Copyright (C) 2026 M.K. Kim
 // SessionState: `log using/close/off/on`, log queries, and the per-frame transcript tee (text and SMCL writers).
 #include "piet/session_state.h"
+#include "core/ident.h"
 #ifndef _WIN32
 #include <execinfo.h>
 #include <dlfcn.h>
@@ -618,7 +619,28 @@ void SessionState::logTee(const nlohmann::ordered_json& blocks, int depth) {
         // the first line of a `quietly log using` log is that blank).
         const std::string t = b.value("text", std::string());
         if (type == "echo" && !t.empty() && t[0] == '.') log->stream << "\n";
-        log->stream << t << "\n";
+        const int width = b.value("linesize", 0);
+        if (type == "display" && width > 2) {
+          size_t col = 0;
+          for (size_t i = 0; i < t.size();) {
+            char32_t cp = 0;
+            const size_t bytes = std::max<size_t>(1, cecon::ident::decodeUtf8(t, i, &cp));
+            if (t[i] == '\n') {
+              col = 0;
+            } else {
+              if (col == static_cast<size_t>(width)) {
+                log->stream << "\n> ";
+                col = 2;
+              }
+              ++col;
+            }
+            log->stream.write(t.data() + i, static_cast<std::streamsize>(bytes));
+            i += bytes;
+          }
+          log->stream << "\n";
+        } else {
+          log->stream << t << "\n";
+        }
       } else if (type == "estimation" && b.value("estimator", std::string()) == "tabstat" &&
                  !pendingTabstatLogText.empty()) {
         log->stream << pendingTabstatLogText;

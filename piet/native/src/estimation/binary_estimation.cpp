@@ -121,6 +121,20 @@ ojson runLogitProbit(const std::string& cobraCmd, const eval::ParsedCommand& par
     return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
   }
   ojson block = cobraToEstimationM4(raw, cobraCmd, &session);
+  // noheader: the table alone; notable: the header alone; nocoef: neither (bank
+  // bae7906b, c7fe3d70, 46cd0f47). Without the coefficient table Stata's r() is
+  // the header routine's, r(is_svysum) 0, and no r(table).
+  for (const auto& [k, v] : parsed.opts) {
+    if (!(v.isBool && v.boolValue)) continue;
+    if (k == "noheader") block["noheader"] = true;
+    if (k == "notable") block["notable"] = true;
+    if (k == "nocoef") {
+      block["notable"] = true;
+      block["noheader"] = true;
+    }
+  }
+  if (block.value("notable", false))
+    block["r_after_fit"] = {{"scalars", {{"is_svysum", 0.0}}}, {"no_rtable", true}};
   // FU-471: the reply's `df_m` is e(df_m), read from the cached reply (macros.cpp
   // eScalarKey). The block never carried it for logit/probit, and the shared
   // kOls allowlist would copy it onto every logit/probit block (25 freeze

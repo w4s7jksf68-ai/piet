@@ -8,7 +8,7 @@ reaches these handlers, and the entry points are declared in
 
 | Command or symptom | Owner |
 |---|---|
-| `scatter`, `graph line`, `xtline`, `tsline`, `marginsplot` blocks | `commands.cpp` |
+| `scatter`, `graph matrix`, `graph line`, `xtline`, `tsline`, `marginsplot` blocks | `commands.cpp` |
 | Parenthesised `twoway (...) (...)`: layers, fits, functions, `scatteri`, legend block | `twoway.cpp` |
 | Splitting `twoway` text into layers, global options, `if`, `in` | `twoway_parse.cpp` |
 | Stata option to style translation: colors, line width/pattern, marker symbol/size | `twoway_opts.cpp` |

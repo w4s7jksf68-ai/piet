@@ -104,6 +104,8 @@
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
 #include "piet/strutil.h"
+#include "estimation/estimator_command_support.h"  // coeftableFromPosting (ereturn display)
+#include "eval/macro_results_internal.h"  // resolveEScalar (ereturn display)
 
 namespace piet::handlers {
 
@@ -604,6 +606,130 @@ void noteEContractName(SessionState& session, const std::string& name, char kind
   }
 }
 
+// `ereturn display [, eform(string)]`: the coefficient table of the live e(b) /
+// e(V) -- t(e(df_r)) when a residual dof is posted, else the normal -- and its
+// r(table) (b se z|t pvalue ll ul df crit eform over e(b)'s columns). e() is left
+// alone. StataBE 19.5: bank c7bdd997 after `ereturn post b V` (z; r(mcmethod)
+// "noadjust"), 38b63ecb `ereturn post b V, dof(10)` (t(10)), 10698eae after
+// `regress` (t(71), no r(mcmethod)), 88509ffa after `logit`, `eform(OR)`
+// (exp(b), exp(b)*se, the exponentiated interval; z and p unchanged; eform row 1).
+// No e(b) is r(301) "last estimates not found". Other options are refused by name.
+ojson runDisplay(const eval::ParsedCommand& parsed, SessionState& session) {
+  std::optional<std::string> eformLabel;
+  for (const auto& [k0, v] : parsed.opts) {
+    const std::string k = strutil::lower(k0);
+    if (k.size() >= 2 && std::string("eform").compare(0, k.size(), k) == 0) {
+      eformLabel = v.isBool ? std::string("exp(b)") : dequoteOnce(strutil::trim(v.strValue));
+      if (eformLabel->empty()) eformLabel = "exp(b)";
+      continue;
+    }
+    return ojson(eval::errorBlock("unsupported_option",
+                                  "ereturn display: option " + k0 +
+                                      " is not implemented in this version of PIET; nothing was displayed.",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+  }
+  if (parsed.varlist.size() > 1) return rcError("invalid syntax", 198, "syntax_error");
+  using Reader = eval::EvalSession::EReader;
+  const auto eb = session.eval.resolveEMatrixFor("b", Reader::kCopy);
+  if (!eb.matrix.has_value() || eb.matrix->data.size() != 1 || eb.matrix->colnames.empty())
+    return rcError("last estimates not found", 301);
+  const auto ev = session.eval.resolveEMatrixFor("V", Reader::kCopy);
+  const std::vector<std::string>& names = eb.matrix->colnames;
+  const size_t k = names.size();
+  std::vector<std::vector<double>> V(k, std::vector<double>(k, std::numeric_limits<double>::quiet_NaN()));
+  if (ev.matrix.has_value() && ev.matrix->data.size() == k)
+    for (size_t i = 0; i < k; ++i)
+      if (ev.matrix->data[i].size() == k) V[i] = ev.matrix->data[i];
+  double dfR = std::numeric_limits<double>::quiet_NaN();
+  {
+    const std::string t = strutil::trim(eval::macro_detail::resolveEScalar("df_r", session.eval));
+    char* end = nullptr;
+    const double v = std::strtod(t.c_str(), &end);
+    if (!t.empty() && t[0] != '.' && end != nullptr && *end == '\0' && std::isfinite(v) && v > 0) dfR = v;
+  }
+  ojson block;
+  block["type"] = "estimation";
+  block["estimator"] = "ereturn_display";
+  block["noheader"] = true;  // the table alone: no title, no header statistics
+  const std::string* dep = session.eval.eStrings.find("depvar");
+  block["depvar"] = dep != nullptr ? *dep : std::string();
+  block["coeftable"] = e3::coeftableFromPosting(names, eb.matrix->data[0], V, dfR);
+  if (std::isfinite(dfR)) block["df_r"] = dfR;
+  const double level = static_cast<double>(session.level);
+  block["level"] = level;
+  if (level != 95.0) {  // the interval at c(level), as r(table) builds it
+    const double alpha = 1.0 - level / 100.0;
+    const double crit = std::isfinite(dfR) ? cecon::t_critical(alpha, dfR) : cecon::z_critical(alpha);
+    for (auto& row : block["coeftable"]) {
+      if (!row.is_object() || !row["b"].is_number() || !row["se"].is_number() || !row["t"].is_number()) continue;
+      const double b = row["b"].get<double>(), se = row["se"].get<double>();
+      row["ci_lo"] = b - crit * se;
+      row["ci_hi"] = b + crit * se;
+    }
+  }
+  // eform() exponentiates the first e(k_eform) equations of e(b) (1 when the fit
+  // posts none); e(k_eform) 0 turns it off. Ancillary parameters (`/cut1`,
+  // `/athrho`, the `/:` equation) and later equations stay in the coefficient
+  // metric with an eform row of 0 (bank 57b46533 `ologit rep78 mpg weight, or`:
+  // r(table) eform 1 1 0 0 0 0, the cutpoints unexponentiated).
+  std::vector<bool> expCol(k, false);
+  if (eformLabel.has_value()) {
+    double kEform = 1.0;
+    {
+      const std::string t = strutil::trim(eval::macro_detail::resolveEScalar("k_eform", session.eval));
+      char* end = nullptr;
+      const double v = std::strtod(t.c_str(), &end);
+      if (!t.empty() && t[0] != '.' && end != nullptr && *end == '\0' && std::isfinite(v)) kEform = v;
+    }
+    if (kEform == 0.0) eformLabel.reset();
+    std::vector<std::string> eqOrder;
+    for (size_t j = 0; j < k && eformLabel.has_value(); ++j) {
+      const std::string& c = names[j];
+      const size_t colon = c.find(':');
+      const std::string eq = colon != std::string::npos ? c.substr(0, colon)
+                             : (!c.empty() && c[0] == '/') ? c
+                                                           : std::string();
+      auto it = std::find(eqOrder.begin(), eqOrder.end(), eq);
+      if (it == eqOrder.end()) it = eqOrder.insert(eqOrder.end(), eq);
+      const bool ancillary = !eq.empty() && eq[0] == '/';
+      expCol[j] = !ancillary && static_cast<double>(it - eqOrder.begin()) < kEform;
+    }
+  }
+  if (eformLabel.has_value()) {
+    // exp() past the double range is missing, as Stata stores it.
+    const auto fin = [](double x) { return std::isfinite(x) ? x : std::numeric_limits<double>::quiet_NaN(); };
+    ojson cols = ojson::array();
+    size_t j = 0;
+    for (auto& row : block["coeftable"]) {
+      const bool ex = j < k && expCol[j];
+      ++j;
+      cols.push_back(ex);
+      if (!ex || !row.is_object() || !row.contains("b") || !row["b"].is_number()) continue;
+      const double ebj = std::exp(row["b"].get<double>());
+      row["b"] = fin(ebj);
+      if (row.contains("se") && row["se"].is_number()) row["se"] = fin(ebj * row["se"].get<double>());
+      for (const char* key : {"ci_lo", "ci_hi"})
+        if (row.contains(key) && row[key].is_number()) row[key] = fin(std::exp(row[key].get<double>()));
+      row["eform"] = true;
+    }
+    block["eform_label"] = *eformLabel;
+    block["rtable_eform"] = true;
+    block["rtable_eform_cols"] = cols;
+  }
+  if (std::isfinite(dfR)) block["var_small_df_r"] = dfR;
+  // A posting with no e(cmd) (`ereturn post`) leaves its multiple-comparison method.
+  const std::string* ecmd = session.eval.eStrings.find("cmd");
+  if (ecmd == nullptr || ecmd->empty()) block["rtable_mcmethod"] = "noadjust";
+  eval::replaceRClass(session.eval);
+  if (!postRTableFromBlock(session, block, level))
+    return rcError("ereturn display: the coefficient table could not be built from e(b) and e(V)", 198);
+  // _coef_table's own r() beside the table (bank c7bdd997 / 10698eae: r(k_eform) 1,
+  // r(citype) "normal").
+  session.eval.rValues.set("k_eform", 1.0);
+  session.eval.rStrings.set("citype", "normal");
+  return block;
+}
+
 ojson runEreturn(const eval::ParsedCommand& parsed, SessionState& session) {
   if (parsed.varlist.empty()) {
     return rcError("ereturn: a subcommand is required (list, clear, post or local)", 198,
@@ -621,6 +747,9 @@ ojson runEreturn(const eval::ParsedCommand& parsed, SessionState& session) {
   if (sub == "post") return runPost(parsed, session);
   if (sub == "local") return runLocal(parsed, session);
   if (sub == "matrix") return runMatrix(parsed, session);
+  // `ereturn di` .. `ereturn display` (Stata's minimum abbreviation is `di`).
+  if (sub.size() >= 2 && std::string("display").compare(0, sub.size(), sub) == 0)
+    return runDisplay(parsed, session);
   // `ereturn repost` sets e() too, so outside an eclass program it is r(152)
   // (before and after a fit, at the top level and in an rclass program); inside
   // one a bare `ereturn repost` changes nothing at rc 0, or is r(301) with no
@@ -649,8 +778,9 @@ ojson runEreturn(const eval::ParsedCommand& parsed, SessionState& session) {
                                           "refused:not_implemented_sub",
                                           eval::UnsupportedCommandKind::kNotImplemented));
   }
-  return ojson(eval::unsupportedCommand("ereturn " + sub, std::nullopt, std::nullopt, "piet_gap",
-                                        eval::UnsupportedCommandKind::kUnknownSubcommand));
+  // Any other word is not an ereturn subcommand: Stata's r(198) "invalid
+  // syntax" (bank bde9c3705b3267f3 `ereturn zzz`).
+  return rcError("invalid syntax", 198, "syntax_error");
 }
 
 }  // namespace piet::handlers

@@ -288,7 +288,8 @@ std::string collapseLabelStat(const std::string& stat, const std::string& flavor
 std::vector<CollapseResultMeta> collapseResultMeta(const std::vector<CollapseItem>& items,
                                                    const std::vector<std::string>& byVars,
                                                    const std::string& flavor, const std::string& wkind,
-                                                   bool clabel, SessionState& session);
+                                                   bool clabel, SessionState& session,
+                                                   const std::string& labelFormat = "");
 
 
 // fcollapse_main.mata compress_type, applied unless `nocompress`: the

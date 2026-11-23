@@ -4,6 +4,7 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/regex_scans.h"
 namespace piet::dispatch_detail {
 bool interceptDoRun(SessionState& session,
     ojson& echo,
@@ -33,7 +34,7 @@ bool interceptDoRun(SessionState& session,
       out.push_back(echo);
       out.push_back(ojson(eval::errorBlock("syntax_error", "include: a filename is required",
                                            std::string("include"))));
-      { blocks = out; return true; }
+      { blocks = std::move(out); return true; }
     }
     if ((firstTokLower == "do" || firstTokLower == "run" || isInclude) &&
         sp != std::string::npos) {
@@ -73,7 +74,7 @@ bool interceptDoRun(SessionState& session,
           ojson out = ojson::array();
           out.push_back(echo);
           out.push_back(er.error);
-          { blocks = out; return true; }
+          { blocks = std::move(out); return true; }
         }
         remainder = trimWs(er.line);
       }
@@ -108,7 +109,7 @@ bool interceptDoRun(SessionState& session,
           ojson out = ojson::array();
           out.push_back(echo);
           out.push_back(ojson(*err));
-          { blocks = out; return true; }
+          { blocks = std::move(out); return true; }
         }
       }
       auto [fnRaw, argsRest] = eval::scanOneToken(argsAndFileTail, /*bind=*/true);
@@ -128,7 +129,7 @@ bool interceptDoRun(SessionState& session,
         out.push_back(echo);
         out.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax",
                                              std::string("include"))));
-        { blocks = out; return true; }
+        { blocks = std::move(out); return true; }
       }
       if (!fnRaw.empty()) {
         doexec::ExecuteFileResult fres;
@@ -184,9 +185,9 @@ bool interceptDoRun(SessionState& session,
         // Reuses the SAME block-filtering idiom the quietly/noisily prefix
         // handling above already applies (`b.value("type","") != "echo"`).
         bool suppressEcho = (firstTokLower == "run");
-        for (const auto& b : fres.result.blocks) {
+        for (auto& b : fres.result.blocks) {  // moved: fres is not read for its blocks again
           if (suppressEcho && b.is_object() && b.value("type", std::string()) == "echo") continue;
-          out.push_back(b);
+          out.push_back(std::move(b));
         }
         for (auto& b : levelRestoreBlocks) out.push_back(std::move(b));
         // W2 doinclude (BUG-531): `exit N` (N != 0) inside the file ends it AND
@@ -214,7 +215,7 @@ bool interceptDoRun(SessionState& session,
           stopNotice["text"] = "do-file stopped" + linepart + " — " + *fres.result.stoppedAtReason;
           out.push_back(stopNotice);
         }
-        { blocks = out; return true; }
+        { blocks = std::move(out); return true; }
       }
     }
   }
@@ -247,7 +248,7 @@ bool interceptShellEscape(SessionState& session,
   {
     static const std::regex reBangShell(R"(^\s*!\s*(\S.*)$)");
     std::smatch bm;
-    if (std::regex_match(rawCmd, bm, reBangShell)) {
+    if (rx::mayStartWithWordCI(rawCmd, "!") && std::regex_match(rawCmd, bm, reBangShell)) {
       { blocks = piet::dispatch("shell " + bm[1].str(), session); return true; }
     }
   }

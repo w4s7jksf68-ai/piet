@@ -159,15 +159,33 @@ void testAerB2Oaxaca() {
     }
   }
   {
-    // The threefold DEFAULT is a different table; a named refusal, never the
+    // The threefold DEFAULT is its own table (endowments / coefficients /
+    // interaction), computed since stage 4 of the vs-stata campaign (StataBE 19.5
+    // bank 299759b7 `oaxaca lw grade ttl_exp tenure, by(south)`: e(threefold)
+    // "threefold", k_eq 4, overall: group_1 group_2 difference endowments
+    // coefficients interaction). Here: its identities and labels, never the
     // twofold numbers under a different name.
     auto out = piet::dispatch("oaxaca y x1 x2, by(g)", s);
-    check(reasonOf(out) == "refused:oaxaca_threefold_default",
-          "B2 oaxaca: without `pooled` the refusal names the threefold default -- got `" +
-              reasonOf(out) + "`");
+    check(!anyError(out) && s.eval.eStrings.get("threefold", "") == "threefold",
+          "B2 oaxaca: the threefold default runs and posts e(threefold) -- got `" + reasonOf(out) + "`");
+    {
+      const auto* b = s.eval.findClassMatrix('e', "b");
+      const bool ok = b != nullptr && b->colnames.size() >= 6 && b->colnames[3] == "overall:endowments" &&
+                      b->colnames[4] == "overall:coefficients" && b->colnames[5] == "overall:interaction";
+      check(ok, "B2 oaxaca: threefold e(b) names overall:endowments/coefficients/interaction (bank 299759b7)");
+      if (ok) {
+        const auto& r = b->data[0];
+        check(close(r[2], r[3] + r[4] + r[5], 1e-12) && close(r[0], 1.8743234881610429, 1e-9),
+              "B2 oaxaca: threefold difference == endowments + coefficients + interaction; group_1 as pooled");
+      }
+    }
+    // swap: group 1 is the HIGHER by value (bank 25b0e76f `..., by(south) swap`:
+    // e(group_1) 1); the pooled table's group means trade places.
     auto out2 = piet::dispatch("oaxaca y x1 x2, by(g) pooled swap", s);
-    check(firstError(out2).value("code", std::string()) == "unsupported_option",
-          "B2 oaxaca: `swap` is a real option this build does not implement -> option-refuse");
+    check(!anyError(out2) && s.eval.eStrings.get("group_1", "") == "1" &&
+              close(scalarOf("_b[overall:group_2]"), 1.8743234881610429, 1e-9) &&
+              close(scalarOf("_b[overall:difference]"), 0.22631857932513788, 1e-9),
+          "B2 oaxaca: `swap` makes the higher group group 1 (group_2 and the sign of difference swap)");
     auto out3 = piet::dispatch("oaxaca y x1 x2, pooled", s);
     check(reasonOf(out3) == "r(198)", "B2 oaxaca: by() is required, r(198) -- got `" + reasonOf(out3) + "`");
   }
@@ -695,15 +713,20 @@ void testAerB2Nnmatch() {
     // inference, and each says so under its OWN name -- not the shared
     // `e3_deferred` (which now means "not routed at all") and not a wrong
     // number under a name the user typed.
-    static const char* kSubs[] = {"ra", "ipw", "ipwra", "aipw", "psmatch"};
+    // `ra` left this list in stage 4 of the vs-stata campaign (linear outcome
+    // models; StataBE 19.5 bank 2b9789b5 `teffects ra (wage age grade ttl_exp)
+    // (union)`): it must no longer answer the unimplemented refusal.
+    static const char* kSubs[] = {"ipw", "ipwra", "aipw", "psmatch"};
     int named = 0;
     for (const char* sub : kSubs) {
       auto out = piet::dispatch(std::string("teffects ") + sub + " (y a) (t b)", s);
       if (reasonOf(out) == std::string("refused:teffects_") + sub + "_unimplemented") ++named;
     }
-    check(named == 5,
-          "B2-4 nnmatch: ra/ipw/ipwra/aipw/psmatch each refuse under their OWN name "
-          "(`refused:teffects_<sub>_unimplemented') -- got " + std::to_string(named) + "/5");
+    check(named == 4,
+          "B2-4 nnmatch: ipw/ipwra/aipw/psmatch each refuse under their OWN name "
+          "(`refused:teffects_<sub>_unimplemented') -- got " + std::to_string(named) + "/4");
+    check(reasonOf(piet::dispatch("teffects ra (y a) (t b)", s)) != "refused:teffects_ra_unimplemented",
+          "teffects ra is implemented (bank 2b9789b5): no `refused:teffects_ra_unimplemented'");
     auto out = piet::dispatch("teffects", s);
     check(firstError(out).value("code", std::string()) == "syntax_error",
           "B2-4 nnmatch: a bare `teffects' is a syntax error naming the estimators, not a crash");

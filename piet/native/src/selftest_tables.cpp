@@ -395,6 +395,18 @@ void testAerTables() {
               "`");
   }
 
+  {
+    piet::SessionState s(workdir);
+    auto r = exec(kMake30 + "eststo m1: quietly regress y x1\nesttab m1, keep(x1)\n", s);
+    nlohmann::ordered_json table;
+    for (const auto& b : r.blocks)
+      if (b.is_object() && b.value("type", std::string()) == "estimates_table") table = b;
+    check(firstError(r.blocks).is_null() && table.is_object() &&
+              table["coef_rows"].size() == 1 && table["coef_rows"][0].value("name", "") == "x1" &&
+              has(table.value("csv", ""), "\nx1,") && !has(table.value("csv", ""), "\n_cons,"),
+          "BUG-1991: esttab keep(x1) limits both screen and clipboard CSV to x1");
+  }
+
   // ── (v-b) esttab stores r(coefs) as estout does (vs-stata bank: StataBE
   // `esttab m1 m2 using t.tex` after `eststo m1: regress price mpg weight` and
   // `eststo m2: regress price mpg weight i.foreign`, cell 835e0b79c59d1305): one

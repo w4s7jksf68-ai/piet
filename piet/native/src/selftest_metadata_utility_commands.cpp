@@ -308,10 +308,13 @@ void testW2T1Meta() {
     w2check(local(s, "t1L") == "L.tau1 L2.tau1 LD.tau2 L.tau3",
             "t1meta fvunab numlist + combined operators (mx1/mx2.log FV|L(1/2).tau1, FV|dl.tau1, "
             "FV|l2f.tau1). Got `" + local(s, "t1L") + "`");
+    // Interactions are expanded as Stata's fvunab writes them (vs-stata bank
+    // 641697f8 `i.foreign##c.mpg` -> `i.foreign mpg i.foreign#c.mpg`, 37e467b3);
+    // mx1.log records `i.tau1#c.tau2` for this one.
     r = run("fvunab t1L : i.tau1#c.tau2", s);
-    w2check(r.rc == "199" && has(r.msg, "interactions"),
-            "t1meta fvunab refusal: an interaction (Stata: i.tau1#c.tau2, mx1.log) is refused by "
-            "name, not mangled. Got rc " + r.rc + " `" + r.msg + "`");
+    w2check(r.rc == "0" && local(s, "t1L") == "i.tau1#c.tau2",
+            "t1meta fvunab interaction (Stata: i.tau1#c.tau2, mx1.log). Got rc " + r.rc + " `" +
+                local(s, "t1L") + "`");
   }
 
   // ---- numlabel (w2ax_t1_official.do (8)) --------------------------------

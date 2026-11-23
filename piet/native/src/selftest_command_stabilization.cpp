@@ -92,17 +92,20 @@ void testCommandLayerStabilizationW3() {
       // Mission 2: BUG-034 repro — `graph bar ...` must never misroute through
       // runScatter. graph-family AI-1: it is implemented now (graph_bar.cpp;
       // w2ai gf_bar_mean `graph bar (mean) y, over(g)` rc 0, log:213-223), so
-      // it draws a bar graph; `graph pie` keeps the honest gap.
+      // it draws a bar graph; `graph pie` draws a pie.
       {
         auto j = runCmd(session, "graph bar mpg, over(foreign)");
         auto g = firstBlockOfType(j, "graph");
         check(firstBlockOfType(j, "error").is_null() && g.value("kind", std::string()) == "bar",
               "mission 2: `graph bar ...` draws a bar graph (graph-family AI-1), not a scatter error");
+        // graph pie is served now: one wedge per over() category (vs-stata bank
+        // be8eeae95146260d `graph pie price, over(foreign)` rc 0).
         auto jp = runCmd(session, "graph pie mpg, over(foreign)");
-        auto errBlock = firstBlockOfType(jp, "error");
-        check(errBlock.value("code", std::string()) == "unsupported_command" &&
-                  errBlock.value("message", std::string()).find("graph pie") != std::string::npos,
-              "mission 2: `graph pie ...` is an honest unsupported_command naming `graph pie`");
+        auto pie = firstBlockOfType(jp, "graph");
+        check(firstBlockOfType(jp, "error").is_null() && pie.is_object() &&
+                  pie.value("kind", std::string()) == "pie" && pie.contains("slices") &&
+                  pie["slices"].size() == 2,
+              "mission 2: `graph pie mpg, over(foreign)` draws a two-wedge pie");
       }
       // Regression: plain `scatter`/`graph twoway scatter` still render.
       {
@@ -148,11 +151,21 @@ void testCommandLayerStabilizationW3() {
       }
     }
     {
-      auto j = runCmd(session, "sysuse nlswork");
+      // `auto` is one of Stata's own example datasets, which this build does not
+      // ship: the refusal names what IS available. (`nlswork`, the arm's first
+      // subject, is no sysuse dataset at all -- a webuse one -- and is Stata's
+      // r(601) `file "nlswork.dta" not found`, vs-stata bank 08203cd5563e4a47's rule.)
+      auto j = runCmd(session, "sysuse auto");
       auto errBlock = firstBlockOfType(j, "error");
-      check(!errBlock.is_null(), "mission 3: `sysuse nlswork` (unbundled dataset) is an error");
+      check(!errBlock.is_null(), "mission 3: `sysuse auto` (unbundled dataset) is an error");
       check(errBlock.value("message", std::string()).find("fatalities") != std::string::npos,
             "mission 3: the unknown-dataset error names what IS available (`fatalities`)");
+      auto j2 = runCmd(session, "sysuse nlswork");
+      auto err2 = firstBlockOfType(j2, "error");
+      check(!err2.is_null() &&
+                err2.value("message", std::string()).find("nlswork.dta\" not found") !=
+                    std::string::npos,
+            "mission 3: `sysuse nlswork` (no example dataset of Stata's) is r(601) file not found");
     }
   }
 

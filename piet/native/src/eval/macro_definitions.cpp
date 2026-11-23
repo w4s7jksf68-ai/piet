@@ -20,6 +20,7 @@
 #include <functional>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <unordered_set>
 #include <vector>
 
@@ -1735,14 +1736,23 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
     else if (headLower == "gl" || headLower == "glo" || headLower == "glob" ||
              headLower == "globa")
       canon = "global";
-    else if (headLower == "sca") canon = "scalar";
+    else if (headLower == "sca" || headLower == "scal" || headLower == "scala") canon = "scalar";
     if (canon != nullptr) {
       stripped = std::string(canon) + (sp == std::string::npos ? std::string() : stripped.substr(sp));
     }
     // `scalar de|def NAME = expr` -> `scalar define NAME = expr`.
     static const std::regex reScalarDefAbbrev(R"(^scalar\s+def?\s+)", std::regex::icase);
     std::smatch dm;
-    if (std::regex_search(stripped, dm, reScalarDefAbbrev)) {
+    // The pattern is anchored on `scalar` (icase): test those six bytes first, so the
+    // every-`local` path builds no regex state (a do-file loop's `local` lines paid it).
+    auto startsScalar = [&]() {
+      static const char* kS = "scalar";
+      if (stripped.size() < 6) return false;
+      for (int i = 0; i < 6; ++i)
+        if (std::tolower(static_cast<unsigned char>(stripped[i])) != kS[i]) return false;
+      return true;
+    };
+    if (startsScalar() && std::regex_search(stripped, dm, reScalarDefAbbrev)) {
       stripped = "scalar define " + stripped.substr(dm[0].str().size());
     }
   }
@@ -1937,6 +1947,51 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
         session.stringScalars.erase(name);
       }
       return true;
+    }
+    // A line that is no definition, list, dir or drop is refused as Stata's
+    // `scalar [define] name = exp` parser refuses it (StataBE 19.5, vs-stata
+    // bank): a first word that is no name is r(198) "WORD invalid name"
+    // (`scalar , x` 2f0b92c9, `scalar 1x = 3` eaec509b), a name alone r(100)
+    // "=exp required" (`scalar zzbad` 69a5b5c5), an `=` with nothing after it
+    // r(198) "invalid syntax" (`scalar x =` c0641c12), and a name followed by
+    // anything but `=` r(101) "varlist not allowed" (`scalar a 5` 8761ba4a).
+    {
+      const auto asciiLowerCopy = [](std::string t) {
+        for (auto& ch : t) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return t;
+      };
+      std::istringstream words(scLine.substr(6));
+      std::vector<std::string> w;
+      for (std::string t; words >> t;) w.push_back(t);
+      if (!w.empty() && asciiLowerCopy(w[0]) == "define") w.erase(w.begin());
+      static const std::set<std::string> kSubs = {"list", "dir", "drop", "l", "li", "lis",
+                                                 "di", "define", "de", "def", "defi", "defin"};
+      if (!w.empty() && kSubs.count(asciiLowerCopy(w[0])) == 0 && errorOut != nullptr &&
+          !failedExp.has_value()) {
+        const std::string first = w[0].substr(0, w[0].find('='));
+        if (first.empty() || !isIdentStart(first[0]) ||
+            !std::all_of(first.begin(), first.end(), [](char c) { return isIdentChar(c); })) {
+          errorOut->rc = "198";
+          errorOut->message = (first.empty() ? w[0] : first) + " invalid name";
+          return true;
+        }
+        std::string after = strip(scLine.substr(scLine.find(first, 6) + first.size()));
+        if (after.empty()) {
+          errorOut->rc = "100";
+          errorOut->message = "=exp required";
+          return true;
+        }
+        if (after[0] == '=' && strip(after.substr(1)).empty()) {
+          errorOut->rc = "198";
+          errorOut->message = "invalid syntax";
+          return true;
+        }
+        if (after[0] != '=') {
+          errorOut->rc = "101";
+          errorOut->message = "varlist not allowed";
+          return true;
+        }
+      }
     }
     // unrecognized `scalar` line — fall through (don't swallow)
   }

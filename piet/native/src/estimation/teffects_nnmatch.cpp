@@ -85,7 +85,8 @@ using namespace statcmd_detail;
 namespace {
 const eval::OptVocab& kVocabTeffects = eval::registerOptVocab(
     {"teffects"},
-    {{"generate", "gen", "nneighbor", "nn", "ate", "atet", "metric", "vce", "level", "dtolerance"},
+    {{"generate", "gen", "nneighbor", "nn", "ate", "atet", "metric", "vce", "level", "dtolerance",
+      "pomeans"},
      // Known to Stata, absent here: each is a DIFFERENT estimator or a rule
      // this investigation never measured. Named, never silently ignored.
      // dtolerance (BUG-468) is served: the engine's --dtolerance.
@@ -152,8 +153,282 @@ bool parseTeffectsVce(const std::string& v, int* nn, std::string* why) {
 }
 }  // namespace
 
+// ===========================================================================
+// teffects ra (linear outcome model): regression adjustment. One OLS outcome
+// model per treatment level; the potential-outcome means are the averages of
+// each model's predictions over the sample (ate, pomeans) or over the treated
+// (atet); V is the robust sandwich of the stacked estimating equations (cobra
+// teffects-ra, src/estimators/nnmatch.cpp teffects_ra_fit). e() as Stata posts it
+// (vs-stata bank 2b9789b5 / 1004642c / 95b57690 / a452f72f): b V over ATE (or
+// ATET / POmeans), POmean and the OME<level> equations, N n<level> k_eq k_levels
+// treated control converged, and subcmd omodel stat tlevels tvar fvdvarlist.
+namespace {
+ojson runTeffectsRa(const eval::ParsedCommand& parsed, SessionState& session) {
+  if (!engineHasSubcommand("teffects-ra")) return engineTooOld("teffects ra", "teffects-ra");
+  if (!session.hasData() || !session.currentHbin().has_value()) return ojson(eval::noDataLoaded());
+  // the option net: ra's own options (teffects ra's syntax), everything else r(198)
+  bool atet = false, ate = false, pomeans = false, aeq = false;
+  std::optional<double> control, tlevel;
+  std::string level;
+  for (const auto& [k, v] : parsed.opts) {
+    const std::string sv = v.isBool ? std::string() : strutil::trim(v.strValue);
+    auto num = [&](std::optional<double>& dst, const char* what) -> std::optional<ojson> {
+      char* end = nullptr;
+      const double x = std::strtod(sv.c_str(), &end);
+      if (sv.empty() || end == nullptr || *end != '\0')
+        return ojson(eval::refusedCommand("teffects", std::string("ra_") + what + "_label"));
+      dst = x;
+      return std::nullopt;
+    };
+    if (k == "atet") atet = true;
+    else if (k == "ate") ate = true;
+    else if (k == "pomeans") pomeans = true;
+    else if (k == "aequations") aeq = true;
+    else if (k == "control") {
+      if (auto e = num(control, "control")) return *e;
+    } else if (k == "tlevel") {
+      if (auto e = num(tlevel, "tlevel")) return *e;
+    } else if (k == "level") level = sv;
+    else if (k == "vce") {
+      const std::string lv = strutil::lower(sv);
+      if (!(lv == "robust" || lv == "r" || lv == "rob" || lv == "robu" || lv == "robus"))
+        return ojson(eval::refusedCommand("teffects", "ra_vce_" + std::string(lv.substr(0, lv.find_first_of(" ,")))));
+    } else if (k == "iterate" || k == "tolerance" || k == "nolog" || k == "log") {
+      // the estimating equations are solved in closed form; the optimizer options change nothing
+    } else if (k == "coeflegend" || k == "pstolerance" || k == "osample") {
+      return ojson(eval::refusedCommand("teffects", "ra_" + k));
+    } else {
+      return aerErrorReason("option " + k + " not allowed", 198);
+    }
+  }
+  if ((ate ? 1 : 0) + (atet ? 1 : 0) + (pomeans ? 1 : 0) > 1)
+    return aerErrorReason("only one of ate, atet, or pomeans is allowed", 198);
+  // control() / tlevel() against the statistic and the treatment levels: the
+  // engine, in Stata's order (after the treatment variable's own checks).
+  double levelV = session.level;
+  if (!level.empty()) {
+    char* end = nullptr;
+    levelV = std::strtod(level.c_str(), &end);
+    if (end == nullptr || *end != '\0' || !(levelV >= 10 && levelV <= 99.99))
+      return aerErrorReason("level() must be between 10 and 99.99 inclusive", 198);
+  }
+  // `ra (ovar omvarlist [, omodel noconstant]) (tvar)`
+  std::string text = strutil::trim(parsed.argText);
+  {
+    const auto sp = text.find_first_of(" (");
+    if (sp != std::string::npos && strutil::lower(text.substr(0, sp)) == "ra") text = strutil::trim(text.substr(sp));
+  }
+  std::vector<std::string> groups;
+  {
+    int depth = 0;
+    std::string cur;
+    for (char c : text) {
+      if (c == '(') {
+        if (depth++ == 0) { cur.clear(); continue; }
+      } else if (c == ')') {
+        if (--depth == 0) { groups.push_back(strutil::trim(cur)); continue; }
+      }
+      if (depth > 0) cur += c;
+    }
+  }
+  if (groups.size() != 2) return aerErrorReason("invalid syntax: teffects ra (ovar omvarlist) (tvar)", 198);
+  std::string om = groups[0], omodel = "linear";
+  const auto comma = om.find(',');
+  if (comma != std::string::npos) {
+    const std::string o = strutil::lower(strutil::trim(om.substr(comma + 1)));
+    om = strutil::trim(om.substr(0, comma));
+    if (!o.empty() && o != "linear")
+      return ojson(eval::refusedCommand("teffects", "ra_omodel_" + o.substr(0, o.find(' '))));
+  }
+  std::vector<std::string> otoks;
+  {
+    std::istringstream is(om);
+    std::string t;
+    while (is >> t) otoks.push_back(t);
+  }
+  if (otoks.empty()) return aerErrorReason("too few variables specified", 102);
+  ojson terms = ojson::array();
+  std::vector<std::string> plain;
+  std::string y;
+  for (size_t i = 0; i < otoks.size(); ++i) {
+    std::string t = otoks[i];
+    const bool fac = t.size() > 2 && strutil::lower(t.substr(0, 2)) == "i.";
+    if (fac) t = t.substr(2);
+    if (t.find('.') != std::string::npos || t.find('#') != std::string::npos)
+      return ojson(eval::refusedCommand("teffects", "ra_factor_operators"));
+    std::vector<std::string> one = {t};
+    if (auto e = loops::checkKnownVarlist(one, session)) return *e;
+    if (i == 0) {
+      if (fac) return aerErrorReason("depvar may not be a factor variable", 198);
+      y = one[0];
+      continue;
+    }
+    if (fac) terms.push_back({{"factor", one[0]}});
+    else terms.push_back({{"var", one[0]}});
+    plain.push_back((fac ? "i." : "") + one[0]);
+  }
+  std::vector<std::string> tt;
+  {
+    std::istringstream is(groups[1]);
+    std::string t;
+    while (is >> t) tt.push_back(t);
+  }
+  if (tt.size() != 1) return ojson(eval::refusedCommand("teffects", "ra_treatment_model"));
+  if (auto e = loops::checkKnownVarlist(tt, session)) return *e;
+  const std::string tvar = tt[0];
+
+  ojson spec = {{"y", y}, {"t", tvar}, {"terms", terms}, {"stat", atet ? 1 : (pomeans ? 2 : 0)}};
+  if (control.has_value()) spec["control"] = *control;
+  if (tlevel.has_value()) spec["treated"] = *tlevel;
+  std::string wtype;
+  if (parsed.weightType.has_value()) {
+    const std::string w = strutil::lower(*parsed.weightType);
+    wtype = (w == "fw" || w == "fweight") ? "fw" : (w == "iw" || w == "iweight") ? "iw"
+            : (w == "pw" || w == "pweight") ? "pw" : "";
+    if (wtype.empty()) return aerErrorReason("aweights not allowed", 101);
+    const std::string wv = strutil::trim(parsed.weightVar.value_or(""));
+    if (wv.empty() || wv.find_first_of(" ()*+-/") != std::string::npos)
+      return ojson(eval::refusedCommand("teffects", "ra_weight_expression"));
+    spec["wvar"] = wv;
+    spec["wtype"] = wtype;
+  }
+  std::string keepif;
+  if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) keepif = "(" + *parsed.ifExpr + ")";
+  if (parsed.inRange.has_value() && !parsed.inRange->empty()) {
+    const InRangeBounds rr = parseInRangeBounds(*parsed.inRange, session.macroObsCount());
+    if (!rr.ok) {
+      InRangeFilterResult bad;
+      bad.ok = false;
+      bad.refusal = rr.refusal;
+      return inRangeRejectError(bad, *parsed.inRange, "teffects");
+    }
+    keepif += (keepif.empty() ? "" : " & ") + std::string("(_n>=") + std::to_string(rr.a) +
+              " & _n<=" + std::to_string(rr.b) + ")";
+  }
+  std::vector<std::string> args = {"teffects-ra", "--data", *session.currentHbin(), "--spec", spec.dump()};
+  if (!keepif.empty()) {
+    args.push_back("--keepif");
+    args.push_back(keepif);
+  }
+  const std::vector<std::string> fitArgs = args;
+  const std::string esampleValues = esampleFitArgs(session, args, std::string(), 0);
+  nlohmann::json raw;
+  try {
+    raw = runCobraJson(args);
+  } catch (const CobraError& ce) {
+    cecon::native_unlink(esampleValues);
+    const std::string msg = "teffects ra: " + cobraErrorMessage(ce);
+    static const std::regex reRc(R"(r\((\d+)\))");
+    std::smatch mrc;
+    if (std::regex_search(ce.detail, mrc, reRc)) return aerErrorReason(msg, std::stoi(mrc.str(1)));
+    if (ce.code == "no_obs") return aerErrorReason(msg, 2000);
+    if (ce.code == "unsupported") return aerError(msg, "unsupported_option");
+    return aerErrorReason(msg, 198);
+  }
+  const std::vector<std::string> names = raw["e_b"]["names"].get<std::vector<std::string>>();
+  const std::vector<double> beta = jsonDoubles(raw["e_b"]["values"]);
+  LastModel lm;
+  lm.cobraCmd = "teffects-ra";
+  lm.stataCmd = "teffects";
+  lm.y = y;
+  lm.depvar = y;
+  lm.x = plain;
+  lm.vcov = "robust";
+  lm.dataPath = *session.currentHbin();
+  est_detail::captureFitFilterM4(lm, fitArgs);
+  ojson rawO = ojson(raw);
+  (void)esampleInstallOnHead(session, esampleValues, rawO, lm);
+  lm.result = rawO;
+  session.setLastModel(lm);
+  auto& ev = session.eval;
+  const std::vector<double> lv = jsonDoubles(raw["levels"]), cnt = jsonDoubles(raw["counts"]);
+  auto lvs = [](double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), v == std::floor(v) ? "%.0f" : "%.15g", v);
+    return std::string(buf);
+  };
+  ev.setEScalar("N", raw.value("n_obs", 0.0));
+  for (size_t i = 0; i < lv.size(); ++i) ev.setEScalar("n" + lvs(lv[i]), cnt[i]);
+  ev.setEScalar("k_eq", static_cast<double>((pomeans ? 1 : 2) + lv.size()));
+  ev.setEScalar("k_levels", static_cast<double>(lv.size()));
+  ev.setEScalar("treated", raw.value("treated", 1.0));
+  ev.setEScalar("control", raw.value("control", 0.0));
+  ev.setEScalar("converged", 1.0);
+  ev.setEString("cmd", "teffects");
+  ev.setEString("subcmd", "ra");
+  ev.setEString("depvar", y);
+  ev.setEString("tvar", tvar);
+  ev.setEString("omodel", omodel);
+  ev.setEString("stat", atet ? "atet" : (pomeans ? "pomeans" : "ate"));
+  {
+    std::string tl;
+    for (double v : lv) tl += (tl.empty() ? "" : " ") + lvs(v);
+    ev.setEString("tlevels", tl);
+    std::string fv;
+    for (const auto& f : raw["fvdvarlist"]) fv += (fv.empty() ? "" : " ") + f.get<std::string>();
+    ev.setEString("fvdvarlist", fv);
+  }
+  ev.setEString("vce", "robust");
+  ev.setEString("vcetype", "Robust");
+  ev.setEString("title", "Treatment-effects estimation");
+  ev.setEString("predict", "teffects_p");
+  ev.setEString("estat_cmd", "teffects_estat");
+  ev.setEString("marginsnotok", "_ALL");
+  ev.setEString("properties", "b V");
+  ev.setEString("wtype", wtype.empty() ? std::string() : wtype == "fw" ? "fweight" : wtype == "iw" ? "iweight" : "pweight");
+  ev.setEString("wexp", wtype.empty() ? std::string() : "= " + strutil::trim(parsed.weightExp.value_or(parsed.weightVar.value_or(""))));
+  auto postM = [&session](const std::string& nm, eval::EvalMatrix m) {
+    for (auto& kv : session.eval.eMatrices)
+      if (kv.first == nm) { kv.second = std::move(m); return; }
+    session.eval.eMatrices.emplace_back(nm, std::move(m));
+  };
+  {
+    eval::EvalMatrix b;
+    b.data.push_back(beta);
+    b.rownames = {"y1"};
+    b.colnames = names;
+    postM("b", std::move(b));
+    eval::EvalMatrix V;
+    for (const auto& row : raw["e_V"]["matrix"]) V.data.push_back(jsonDoubles(row));
+    V.rownames = names;
+    V.colnames = names;
+    postM("V", std::move(V));
+  }
+  // the block: the effect and POmean rows (all equations under aequations); r(table) has every column
+  ojson block = {{"type", "estimation"}, {"estimator", "teffects"}, {"subcmd", "ra"}, {"depvar", y},
+                 {"n_obs", raw.value("n_obs", 0.0)}, {"vcov_type", "robust"}, {"level", levelV}};
+  ojson ct = ojson::array(), rc = ojson::array();
+  const double zc = cecon::z_critical(1 - levelV / 100);
+  for (size_t j = 0; j < names.size(); ++j) {
+    const double b = beta[j], se = std::sqrt(std::max(0.0, raw["e_V"]["matrix"][j][j].get<double>()));
+    ojson row = {{"name", names[j]}, {"b", b}, {"se", se}};
+    if (se > 0) {
+      row["t"] = b / se;
+      row["z"] = b / se;
+      row["p"] = std::erfc(std::fabs(b / se) / std::sqrt(2.0));
+      row["ci_lo"] = b - zc * se;
+      row["ci_hi"] = b + zc * se;
+    } else {
+      row["omitted"] = true;
+    }
+    rc.push_back(row);
+    ct.push_back(row);
+  }
+  // every e(b) column is in the table (estimates table / esttab read it); the
+  // renderer shows the OME equations only under aequations, as Stata prints
+  block["coeftable"] = ct;
+  block["aequations"] = aeq;
+  block["rtable_cols"] = rc;
+  session.lastEstBlock = block;
+  return block;
+}
+}  // namespace
+
 ojson runTeffects(const std::string& sub, const eval::ParsedCommand& parsed,
                   SessionState& session) {
+  if (sub == "ra") return runTeffectsRa(parsed, session);
+  static const std::set<std::string> kSubs = {"nnmatch", "ipw", "ipwra", "aipw", "psmatch", "overlap"};
+  if (!kSubs.count(sub)) return aerErrorReason(sub + " is not a valid teffects subcommand", 198);
   // Every other teffects estimator is a DIFFERENT method with its own
   // inference; each keeps its own named refusal rather than borrowing this one.
   if (sub != "nnmatch")
@@ -164,6 +439,10 @@ ojson runTeffects(const std::string& sub, const eval::ParsedCommand& parsed,
                                             kVocabTeffects.unimplemented)) {
     return ojson(*err);
   }
+  for (const auto& kv : parsed.opts)  // ra's pomeans is not an nnmatch option
+    if (kv.first == "pomeans") return aerErrorReason("option pomeans not allowed", 198);
+  if (parsed.weightType.has_value())
+    return ojson(eval::refusedCommand("teffects", "teffects_nnmatch_weights"));
 
   std::string genStub, metric, level, dtolerance;
   int nneighbor = 1, vceNn = 2;

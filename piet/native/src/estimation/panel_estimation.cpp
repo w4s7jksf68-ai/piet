@@ -13,6 +13,7 @@
 #include <sstream>
 #include <unordered_set>
 #include "piet/cobra_runner.h"
+#include "piet/display_hardening.h"  // resolveVarName: xtreg, re cluster()
 #include "piet/cobra_session.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/exprfns.h"  // kStataMissingSentinel
@@ -24,6 +25,7 @@
 #include "piet/scratch_seq.h"
 #include "matrix/lapack_dsyevr.h"  // BUG-1482: the clustered V's rank (clusteredVRankM4)
 #include "estimation_internal.h"
+#include "core/distributions.h"  // z_critical: xtreg,re level(#) limits
 
 #include "estimation_families_internal.h"
 #include "estimation_options.h"
@@ -439,6 +441,7 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
   // "vcetype robust|cluster not allowed", and robust, cluster() and noconstant are
   // r(198) "option ... not allowed". `wls` (weights by panel size) is not served.
   if (isBe) {
+    bool beWls = false;
     for (const auto& [k, v] : parsed.opts) {
       if ((k == "fe" || k == "re") && v.isBool && v.boolValue)  // xtreg.ado opts_exclusive
         return ojson(eval::errorBlock("engine_error",
@@ -477,9 +480,13 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
       } else if (k == "absorb") {
         refusal = "option absorb() not allowed";
       } else if (k == "wls") {
-        return engineErrorBlockM4("`xtreg ,be wls` (weights by panel size) is not available in this "
-                                  "version of PIET.",
-                                  "unsupported_option");
+        // wls weights each panel mean by T_i; on a balanced sample the weights are
+        // equal and the fit is the unweighted between fit (StataBE 19.5, vs-stata bank
+        // 71aa5807 `be wls` against a833d61d `be`: equal but for e(cmdline)). An
+        // unbalanced sample is refused after the fit below.
+        if (!v.isBool) return ojson(eval::errorBlock("engine_error", "option wls() not allowed",
+                                                     std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+        beWls = true;
       }
       if (!refusal.empty())
         return ojson(eval::errorBlock("engine_error", refusal, std::nullopt, std::nullopt,
@@ -490,7 +497,9 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     // which the shared builder does not spell.
     eval::ParsedCommand beParsed = parsed;
     beParsed.opts.erase(std::remove_if(beParsed.opts.begin(), beParsed.opts.end(),
-                                       [](const auto& o) { return o.first == "vce" || o.first == "vcov"; }),
+                                       [](const auto& o) {
+                                         return o.first == "vce" || o.first == "vcov" || o.first == "wls";
+                                       }),
                         beParsed.opts.end());
     EstimationArgvResult built = buildEstimationArgvM4("xtreg", beParsed, session);
     if (built.errored) return built.errorBlock;
@@ -516,6 +525,14 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     if (!raw.is_object() || !raw.contains("esample_n")) {
       cecon::native_unlink(esampleValues);
       esampleValues.clear();
+    }
+    if (beWls && !(raw.is_object() && raw.contains("g_min") && raw.contains("g_max") &&
+                   raw["g_min"].is_number() && raw["g_max"].is_number() &&
+                   raw["g_min"].get<double>() == raw["g_max"].get<double>())) {
+      if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
+      return engineErrorBlockM4("`xtreg ,be wls` on unbalanced panels (weights by panel size) is not "
+                                "available in this version of PIET.",
+                                "unsupported_option");
     }
     ojson block = cobraToEstimationM4(raw, "xtreg", &session);
     aliasPanelR2M4(raw);
@@ -655,6 +672,7 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     std::vector<std::string> fitArgv = cobraArgs;
     const std::string esampleValues = esampleFitArgs(session, fitArgv, std::string(), 0);
     fitArgv.push_back("--emit-v");  // eb-order T-P1: the fit's full e(V) (feols row)
+    fitArgv.push_back("--xtreg-fe");
     // FU-401: the nesting check is the fit's alone (not in cobraArgs, which the
     // refits replay: a model that was fitted already passed it). vce(robust) was
     // rewritten to cluster(panelvar) above, which nests trivially.
@@ -699,6 +717,10 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
       if (raw["dof_resid"].get<double>() == dofWithin) raw["sigma_e"] = raw["rmse"];
     }
     ojson block = cobraToEstimationM4(raw, "feols", &session);
+    // The fixed-effects table has no likelihood row. Keep these in e() for
+    // postestimation, as Stata does.
+    block.erase("ll");
+    block.erase("ll_0");
     // BUG-538, e() half: [XT] xtreg stores e(N_g) (panels in the fit) and
     // e(df_a) = N_g - 1 (w2_pweight.log X0_fe PXT: 15 and 14; X7 under
     // `if t>2`: still 15 and 14). The engine reports the panel count as the
@@ -943,23 +965,90 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     return ojson(eval::errorBlock("engine_error", "weights not allowed", std::nullopt, std::nullopt,
                                   std::nullopt, "r(101)"));
   }
+  // vce(robust) / robust: the cluster-robust VCE on the panel variable; vce(cluster v) /
+  // cluster(v): on v, the panels nested in it (Stata's xtreg_re: `_regress` of the
+  // GLS-transformed system with cluster(); bank 812f8494 `re vce(robust)` e(vce)
+  // robust, e(vcetype) Robust, e(clustvar) sid, e(N_clust) 48; 36e3c143
+  // `vce(cluster sid)` e(vce) cluster). Anything else stays refused.
+  std::string reCluster, reVce, reVceline;
   for (const auto& [k, v] : parsed.opts) {
-    // BUG-055/P2 side effect: legacy `cluster(v)` (no vce()/robust) now
-    // maps to `vce(cluster v)` inside vcovFromOpts (shared by this RE
-    // path), so it must be caught HERE too — otherwise it would sail past
-    // this guard and reach cobra's RE call as an unsupported --vcov/
-    // --cluster flag pair instead of getting this same clean message.
-    if ((k == "vce" || k == "vcov" || k == "robust" || k == "cluster") &&
-        !(v.isBool && !v.boolValue)) {
+    if (!((k == "vce" || k == "vcov" || k == "robust" || k == "cluster") &&
+          !(v.isBool && !v.boolValue)))
+      continue;
+    const std::string t = v.isBool ? std::string() : strutil::trim(v.strValue);
+    std::istringstream ts(t);
+    std::vector<std::string> w;
+    for (std::string x; ts >> x;) w.push_back(x);
+    const auto abbrevOf = [](const std::string& word, const char* full, size_t min) {
+      const std::string f(full);
+      return word.size() >= min && word.size() <= f.size() && f.compare(0, word.size(), word) == 0;
+    };
+    bool ok = false;
+    if (k == "robust" && v.isBool) {
+      reCluster = *session.panelvar, reVce = "robust", ok = true;
+    } else if (k == "cluster" && w.size() == 1) {
+      reCluster = w[0], reVce = "cluster", ok = true;
+    } else if ((k == "vce" || k == "vcov") && w.size() == 1 && abbrevOf(w[0], "robust", 1)) {
+      reCluster = *session.panelvar, reVce = "robust", ok = true;
+      if (w[0] == "robust") reVceline = "vce(robust)";
+    } else if ((k == "vce" || k == "vcov") && w.size() == 2 && abbrevOf(w[0], "cluster", 2)) {
+      reCluster = w[1], reVce = "cluster", ok = true;
+      if (w[0] == "cluster") reVceline = "vce(cluster " + w[1] + ")";
+    } else if ((k == "vce" || k == "vcov") && w.size() == 1 && abbrevOf(w[0], "conventional", 4)) {
+      ok = true;  // the default
+    }
+    if (!ok)
       return engineErrorBlockM4("cobra xtreg (random-effects) does not support vcov options.",
                                 "unsupported_option");
-    }
   }
-  EstimationArgvResult built = buildEstimationArgvM4("xtreg", parsed, session);
+  if (!reCluster.empty()) {
+    const std::optional<std::string> full = resolveVarName(reCluster, session);
+    if (!full.has_value())
+      return ojson(eval::errorBlock("engine_error", "variable " + reCluster + " not found",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(111)"));
+    if (reVceline.rfind("vce(cluster ", 0) == 0) reVceline = "vce(cluster " + *full + ")";
+    reCluster = *full;
+  }
+  // sa: the Baltagi-Chang small-sample Swamy-Arora sigma_u, which differs from the
+  // default only when the panel sizes vary (the engine's --sa; on the balanced bank
+  // cell f05bb8e1 `re sa` the e() are the plain fit's). theta: the header also
+  // shows theta (bank 922e7a3d `re theta`: "theta = .86060683", e() unchanged);
+  // drawn for a balanced panel, where e(theta) is one number.
+  eval::ParsedCommand reParsed = parsed;
+  bool showTheta = false, sawSa = false;
+  reParsed.opts.erase(std::remove_if(reParsed.opts.begin(), reParsed.opts.end(),
+                                     [&showTheta, &sawSa](const auto& o) {
+                                       if (o.first == "vce" || o.first == "vcov" ||
+                                           o.first == "robust" || o.first == "cluster")
+                                         return true;  // read above
+                                       if (!o.second.isBool || !o.second.boolValue) return false;
+                                       if (o.first == "theta") showTheta = true;
+                                       if (o.first == "sa") sawSa = true;
+                                       return o.first == "sa" || o.first == "theta";
+                                     }),
+                      reParsed.opts.end());
+  EstimationArgvResult built = buildEstimationArgvM4("xtreg", reParsed, session);
   if (built.errored) return built.errorBlock;
   std::vector<std::string> cobraArgs = built.argv;
+  // level(#): the engine's random-effects fit takes no --level; the confidence
+  // limits and p-values of its normal-reference table are formed here (below).
+  // Without level(), Stata's level is c(level) (`set level`).
+  double reLevel = static_cast<double>(session.level);
+  for (size_t i = 0; i + 1 < cobraArgs.size();) {
+    if (cobraArgs[i] == "--level") {
+      reLevel = std::stod(cobraArgs[i + 1]);
+      cobraArgs.erase(cobraArgs.begin() + static_cast<long>(i), cobraArgs.begin() + static_cast<long>(i) + 2);
+    } else {
+      ++i;
+    }
+  }
   cobraArgs.push_back("--ivar");
   cobraArgs.push_back(*session.panelvar);
+  if (!reCluster.empty()) {
+    cobraArgs.push_back("--cluster");
+    cobraArgs.push_back(reCluster);
+  }
+  if (sawSa) cobraArgs.push_back("--sa");
   cobraArgs.push_back("--emit-v");  // BUG-1196: e(V), joined by cacheLastModelM4
   cobraArgs.push_back("--data");
   cobraArgs.push_back(*session.currentHbin());
@@ -974,6 +1063,9 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     raw = runCobraJsonM4(fitArgs);
   } catch (const CobraError& ce) {
     if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
+    if (ce.detail == "panels_not_nested")  // xtreg's nesting check, r(498)
+      return ojson(eval::errorBlock("engine_error", ce.what(), std::nullopt, std::nullopt,
+                                    std::nullopt, std::string("r(498)")));
     return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
   }
   if (!raw.is_object() || !raw.contains("esample_n")) {
@@ -981,6 +1073,26 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     esampleValues.clear();
   }
   ojson block = cobraToEstimationM4(raw, "xtreg", &session);
+  // The GLS table's z, two-sided normal p-value and the level(#) limits b -/+
+  // invnormal(1 - (1 - level/100)/2) * se, which the reply leaves out (StataBE 19.5,
+  // vs-stata bank 897c4fb1 `xtreg frate beertax unemp, re` r(table) ll/ul/pvalue;
+  // c10b2b7e-style level(90) cells: crit invnormal(.95)).
+  if (block.contains("coeftable") && block["coeftable"].is_array()) {
+    const double zc = reLevel == 95.0 ? kZ975 : cecon::z_critical(1.0 - reLevel / 100.0);
+    for (auto& row : block["coeftable"]) {
+      if (!row.is_object() || !row.contains("b") || !row["b"].is_number() || !row.contains("se") ||
+          !row["se"].is_number())
+        continue;
+      const double b = row["b"].get<double>(), se = row["se"].get<double>();
+      if (!(se > 0)) continue;
+      const double z = row.contains("t") && row["t"].is_number() ? row["t"].get<double>() : b / se;
+      row["t"] = z;
+      if (!row.contains("p") || !row["p"].is_number()) row["p"] = normalPvalue(z);
+      if (!row.contains("ci_lo") || !row["ci_lo"].is_number()) row["ci_lo"] = b - zc * se;
+      if (!row.contains("ci_hi") || !row["ci_hi"].is_number()) row["ci_hi"] = b + zc * se;
+    }
+    if (reLevel != 95.0) block["level"] = reLevel;  // the table's interval header
+  }
   aliasPanelR2M4(raw);
   // BUG-1516: xtreg,re posts e(Tbar), the harmonic mean of the panel sizes
   // (the reply's T_h), e(Tcon) whether they are all equal, e(N_g), and e(rank)
@@ -995,9 +1107,64 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     if (raw.contains("e_V") && raw["e_V"].is_object() && raw["e_V"].contains("names") &&
         raw["e_V"]["names"].is_array())
       raw["k_vars"] = raw["e_V"]["names"].size();
+    // The GLS fit's residual SD is what hausman, sigmamore/sigmaless reads.
+    // sigma_e instead belongs to the within regression used by Swamy–Arora.
+    if (raw.contains("rmse_gls") && raw["rmse_gls"].is_number()) raw["rmse"] = raw["rmse_gls"];
+    if (raw.contains("sigma_e") && raw["sigma_e"].is_number() &&
+        raw.contains("sigma_u") && raw["sigma_u"].is_number()) {
+      const double sigmaE = raw["sigma_e"].get<double>();
+      const double sigmaU = raw["sigma_u"].get<double>();
+      raw["sigma"] = std::hypot(sigmaE, sigmaU);
+      // Stata posts theta for a balanced panel only (19.5 bank 897c4fb18ba9ccba).
+      if (raw.value("Tcon", 0.0) == 1.0 && raw.contains("T_h") && raw["T_h"].is_number()) {
+        const double denom = std::hypot(sigmaE, std::sqrt(raw["T_h"].get<double>()) * sigmaU);
+        raw["theta"] = denom > 0.0 ? 1.0 - sigmaE / denom : 0.0;
+      }
+    }
+  }
+  if (showTheta) {
+    if (!raw.contains("theta") || !raw["theta"].is_number()) {
+      if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
+      return engineErrorBlockM4(
+          "Option `theta` is a valid Stata option that this version of PIET does not implement "
+          "for an unbalanced panel (Stata shows the quantiles of theta there).",
+          "unsupported_option");
+    }
+    block["theta"] = raw["theta"];
   }
   cacheLastModelM4(session, "xtreg", cobraArgs, block, raw, esampleValues);
   if (session.lastModel().has_value()) putEStringNL(session, "model", "re");
+  // e(sa) "sa" when the option is typed (bank f05bb8e1)
+  if (sawSa && session.lastModel().has_value()) putEStringNL(session, "sa", "sa");
+  if (!reCluster.empty() && session.lastModel().has_value()) {
+    putEStringNL(session, "vce", reVce);
+    putEStringNL(session, "vcetype", "Robust");
+    putEStringNL(session, "clustvar", reCluster);
+    if (!reVceline.empty()) putEStringNL(session, "vceline", reVceline);
+    if (raw.contains("n_clusters") && raw["n_clusters"].is_number())
+      putEScalarNL(session, "N_clust", raw["n_clusters"].get<double>());
+  }
+  if (raw.contains("rmse") && raw["rmse"].is_number()) {
+    // Named estimates can resolve saved scalars directly from their snapshot.
+    session.eval.setEScalar("rmse", raw["rmse"].get<double>());
+    session.noteEOnFit("rmse");
+  }
+  if (raw.contains("within_fit")) {
+    const auto& within = raw.at("within_fit");
+    const auto names = within.at("names").get<std::vector<std::string>>();
+    eval::EvalMatrix b;
+    b.rownames = {"y1"};
+    b.colnames = names;
+    b.data = {within.at("beta").get<std::vector<double>>()};
+    session.eval.eMatrices.emplace_back("bf", std::move(b));
+    session.noteEOnFit("bf");
+    eval::EvalMatrix V;
+    V.rownames = names;
+    V.colnames = names;
+    V.data = within.at("matrix").get<std::vector<std::vector<double>>>();
+    session.eval.eMatrices.emplace_back("VCEf", std::move(V));
+    session.noteEOnFit("VCEf");
+  }
   return block;
 }
 

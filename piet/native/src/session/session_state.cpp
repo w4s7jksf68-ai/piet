@@ -69,6 +69,14 @@ void SessionState::clearAllSessionObjects() {
   for (const auto& [n, fp] : frames) { (void)n; paths.push_back(fp); }
   frames.clear();
   frameLinks.clear();
+  frameLinkSpecs.clear();
+  frameMeta.clear();
+  frameFiles.clear();
+  auto& temps = mintedTempvars;
+  temps.erase(std::remove_if(temps.begin(), temps.end(),
+                             [](const auto& owned) { return owned.frame != "default"; }),
+              temps.end());
+  currentFrame = "default";
   // NOT the preserve stack. Oracle (StataBE 19.5, 2026-09-02): `sysuse auto` → `preserve` →
   // `clear all` → `restore` is rc 0 with N=74 — a preserve survives `clear all` (and `clear`),
   // and `restore` brings the data back. The first cut of this function dropped the stack and

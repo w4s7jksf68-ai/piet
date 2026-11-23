@@ -31,7 +31,8 @@ nlohmann::ordered_json runTestCmd(const std::string& expr, SessionState& session
 // coefficient names (not the dataset's variables — a coefficient is what can be
 // constrained), after which it delegates to runTestCmd unchanged.
 nlohmann::ordered_json runTestparm(const std::vector<std::string>& varlist,
-                                   SessionState& session, bool equal = false);
+                                   SessionState& session, bool equal = false,
+                                   const std::string& equation = std::string());
 nlohmann::ordered_json runLincom(const std::string& expr, SessionState& session,
                                  const std::vector<std::pair<std::string, eval::OptValue>>& opts = {});
 nlohmann::ordered_json runNlcom(const std::string& expr, SessionState& session,

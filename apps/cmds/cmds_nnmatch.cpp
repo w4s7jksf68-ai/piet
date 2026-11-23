@@ -4,6 +4,7 @@
 #include "commands.h"
 #include "estimators/nnmatch.h"
 #include "core/distributions.h"
+#include <set>
 
 namespace cecon::cli {
 
@@ -185,6 +186,132 @@ int cmd_nnmatch(const std::vector<std::string>& a) {
         o_["warnings"] = json::array({w});
     }
     emit(o_, opt(a, "--out"));
+    return 0;
+}
+}  // namespace cecon::cli
+
+namespace cecon::cli {
+// `cobra teffects-ra --data F --spec JSON [--keepif E] [--esample-out P] [--out f.json]`
+// spec: y, t, terms [{"var":v} | {"factor":v}], stat (0 ate 1 atet 2 pomeans),
+// control / treated (levels), wvar, wtype (fw iw pw).
+int cmd_teffects_ra(const std::vector<std::string>& a) {
+    std::string data = opt(a, "--data");
+    const std::string specs = opt(a, "--spec"), keepif = opt(a, "--keepif");
+    const EsampleRequest esreq = esample_request(a, "teffects-ra");
+    if (data_missing(data) || specs.empty()) throw EngineError("bad_input", "teffects-ra: requires --data and --spec");
+    const json sp = json::parse(specs);
+    const std::string data_all = data;
+    const std::string yv = sp.at("y").get<std::string>(), tv = sp.at("t").get<std::string>();
+    // Stata counts negative treatment values over the whole dataset, not only the
+    // estimation sample (its "must contain nonnegative integers" check).
+    bool tneg = false;
+    if (!keepif.empty()) {
+        const Dataset full = Dataset::open(data_all);
+        const double* tf = require_num(full, "teffects", tv);
+        for (int64_t i = 0; i < full.n_rows(); ++i)
+            if (tf[i] < 0) tneg = true;
+    }
+    data = maybe_keepif(data, keepif);
+    const Dataset& ds = acquire_data(data);
+    const int64_t n = ds.n_rows();
+    const double* y = require_num(ds, "teffects", yv);
+    const double* t = require_num(ds, "teffects", tv);
+    if (keepif.empty())
+        for (int64_t i = 0; i < n; ++i)
+            if (t[i] < 0) tneg = true;
+    std::vector<double> w;
+    const std::string wvar = sp.value("wvar", std::string());
+    const std::string wtype = sp.value("wtype", std::string());
+    if (!wvar.empty()) {
+        const double* wc = require_num(ds, "teffects", wvar);
+        w.assign(wc, wc + n);
+        // the weight checks of Stata's sample marking, over the if/in sample: a
+        // negative frequency or sampling weight and a noninteger frequency weight
+        // are errors; a zero or missing weight leaves the observation out
+        for (int64_t i = 0; i < n; ++i) {
+            if (!std::isfinite(w[i])) continue;
+            if (w[i] < 0 && (wtype == "fw" || wtype == "pw"))
+                throw EngineError("bad_input", "negative weights encountered", "r(402)");
+            if (wtype == "fw" && w[i] != std::floor(w[i]))
+                throw EngineError("bad_input", "may not use noninteger frequency weights", "r(401)");
+        }
+    }
+    // raw columns first (the sample is every term nonmissing)
+    std::vector<std::pair<std::string, const double*>> raw;
+    for (const auto& term : sp.at("terms")) {
+        const bool fac = term.contains("factor");
+        const std::string v = fac ? term["factor"].get<std::string>() : term["var"].get<std::string>();
+        raw.push_back({(fac ? "i." : "") + v, require_num(ds, "teffects", v)});
+    }
+    std::vector<char> keep(n, 1);
+    for (int64_t i = 0; i < n; ++i) {
+        if (!std::isfinite(y[i]) || !std::isfinite(t[i])) keep[i] = 0;
+        for (const auto& [nm, c] : raw)
+            if (!std::isfinite(c[i])) keep[i] = 0;
+        if (!w.empty() && !(std::isfinite(w[i]) && w[i] > 0)) keep[i] = 0;
+    }
+    std::vector<std::string> xnames, fvd;
+    std::vector<std::vector<double>> xcols;
+    for (const auto& [nm, c] : raw) {
+        if (nm.rfind("i.", 0) == 0) {
+            const std::string v = nm.substr(2);
+            std::set<double> lv;
+            for (int64_t i = 0; i < n; ++i)
+                if (keep[i]) {
+                    if (c[i] != std::floor(c[i]) || c[i] < 0)
+                        throw EngineError("bad_input", "factor-variable levels must be nonnegative integers", "r(452)");
+                    lv.insert(c[i]);
+                }
+            bool first = true;
+            for (double l : lv) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "%.0f", l);
+                const std::string name = std::string(buf) + (first ? "b." : ".") + v;
+                xnames.push_back(name);
+                fvd.push_back(name);
+                std::vector<double> col(n);
+                for (int64_t i = 0; i < n; ++i) col[i] = first ? 0.0 : (c[i] == l ? 1.0 : 0.0);
+                if (!first)
+                    for (int64_t i = 0; i < n; ++i)
+                        if (!std::isfinite(c[i])) col[i] = NAN;
+                xcols.push_back(std::move(col));
+                first = false;
+            }
+        } else {
+            xnames.push_back(nm);
+            fvd.push_back(nm);
+            xcols.emplace_back(c, c + n);
+        }
+    }
+    TeRaOpts o;
+    o.stat = sp.value("stat", 0);
+    if (sp.contains("control")) { o.hasControl = true; o.control = sp["control"].get<double>(); }
+    if (sp.contains("treated")) { o.hasTreated = true; o.treated = sp["treated"].get<double>(); }
+    o.wtype = wtype;
+    o.tvarHasNegative = tneg;
+    TeRaResult r = teffects_ra_fit(y, t, xnames, xcols, w, keep, n, tv, o);
+    json out = {{"estimator", "teffects"}, {"subcmd", "ra"}, {"n_obs", r.N}, {"control", r.control},
+                {"treated", r.treated}, {"levels", r.levels}, {"counts", r.counts}, {"fvdvarlist", fvd}};
+    const int P = static_cast<int>(r.b.size());
+    json V = json::array();
+    for (int i = 0; i < P; ++i) {
+        json row = json::array();
+        for (int j = 0; j < P; ++j) row.push_back(r.V[static_cast<size_t>(i) * P + j]);
+        V.push_back(row);
+    }
+    out["e_b"] = {{"names", r.names}, {"values", r.b}};
+    out["e_V"] = {{"names", r.names}, {"matrix", V}};
+    int64_t nr = 0;
+    for (char c : r.sample) nr += c ? 1 : 0;
+    out["n_rows"] = nr;
+    if (esreq.active()) {
+        EsampleRows er;
+        for (int64_t i = 0; i < n; ++i)
+            if (r.sample[i]) er.keep.push_back(i);
+        er.loaded = &ds;
+        emit_esample(esreq, "teffects-ra", data_all, keepif, false, er, out);
+    }
+    emit(out, opt(a, "--out"));
     return 0;
 }
 }  // namespace cecon::cli

@@ -2,6 +2,12 @@
 // Existing behavioral tests: bridge routes.
 #include "selftest_support.h"
 #include "selftest_cases.h"
+
+#include <cmath>
+#include <cstring>
+
+#include "data/missing.h"
+#include "piet/counters.h"
 #include "piet/handlers/data_values.h"
 #include "piet/handlers/observations.h"
 #include "piet/handlers/variables.h"
@@ -2224,4 +2230,178 @@ void testGetcolsProjection() {
   check(!cecon::native_exists(bad),
         "getcols: a failed request leaves NO file — a partial projection would be evaluated "
         "against silently");
+}
+
+// getcell — one cell inline, the `local x = v[i]` fast path (readVarObs). It is only
+// an optimization of reading that cell off a getcols projection, so the property is
+// that the two routes agree on EVERY cell: a double, a float column (narrow; the
+// projection widens it on read), the extended missing values (NaN payloads that a
+// JSON number could not carry), a string column (and its empty cell), out-of-range
+// rows on both column kinds, and a refusal for a name the frame does not hold.
+void testGetcellMatchesProjection() {
+  std::printf("[selftest] --- getcell (inline cell read; agrees with getcols) ---\n");
+  namespace fs = std::filesystem;
+  std::string workdir = (fs::temp_directory_path() / "piet_native_selftest_getcell").u8string();
+  std::error_code ec;
+  fs::remove_all(workdir, ec);
+  fs::create_directories(workdir, ec);
+
+  piet::SessionState session(workdir);
+  (void)piet::dispatch("clear", session);
+  (void)piet::dispatch("set obs 5", session);
+  (void)piet::dispatch("gen double d = _n / 3", session);
+  (void)piet::dispatch("gen float f = _n / 7", session);
+  (void)piet::dispatch("replace f = .a in 2", session);
+  (void)piet::dispatch("replace d = .z in 4", session);
+  (void)piet::dispatch("gen str5 s = \"r\" + string(_n)", session);
+  (void)piet::dispatch("replace s = \"\" in 3", session);
+  // A cell that ends inside a UTF-8 character (BUG-1372: Stata text is bytes).
+  (void)piet::dispatch("replace s = substr(\"Jos\xC3\xA9\",1,4) in 5", session);
+
+  piet::CobraSession* cs = session.cobraSessionIfLive();
+  if (cs == nullptr || cs->framesState() == piet::CobraSession::Frames::No) {
+    check(true, "getcell PRECONDITION: this environment has no frames-capable `cobra serve` — "
+                "leg skipped, read as an ENVIRONMENT result, not a regression");
+    return;
+  }
+  const std::string head = session.currentHbin().value_or(std::string());
+  check(!head.empty(), "getcell setup: the session has a head to make resident");
+  (void)cs->frameUse(head, nullptr);
+  const std::string out = workdir + "/all.hbin";
+  auto rp = cs->frameGetcols({"d", "f", "s"}, out);
+  check(rp.ok, "getcell setup: the comparison projection is written");
+  if (!rp.ok) return;
+  cecon::Dataset ds = cecon::Dataset::open(out);
+  bool same = true, sawExtended = false;
+  for (const char* name : {"d", "f"}) {
+    const double* v = ds.col(name).f64();
+    for (long long row = 0; row <= 6; ++row) {
+      auto r = cs->frameGetcell(name, row);
+      if (!r.ok) { same = false; continue; }
+      const nlohmann::json j = nlohmann::json::parse(r.stdout_text);
+      const bool in = row >= 1 && row <= 5;
+      same = same && j.at("dtype") == "f64" && j.at("rows") == 5 && j.at("in") == in;
+      if (!in) continue;
+      uint64_t want = 0;
+      std::memcpy(&want, &v[row - 1], sizeof want);
+      char hex[17];
+      std::snprintf(hex, sizeof hex, "%016llx", static_cast<unsigned long long>(want));
+      same = same && j.at("bits") == hex;
+      sawExtended = sawExtended || (std::isnan(v[row - 1]) && cecon::missing_kind(v[row - 1]) != 0);
+    }
+  }
+  {
+    const cecon::Column& sc = ds.col("s");
+    for (long long row = 0; row <= 6; ++row) {
+      auto r = cs->frameGetcell("s", row);
+      if (!r.ok) { same = false; continue; }
+      const nlohmann::json j = nlohmann::json::parse(r.stdout_text);
+      const bool in = row >= 1 && row <= 5;
+      same = same && j.at("dtype") == "factor" && j.at("in") == in;
+      if (!in) continue;
+      const int32_t code = sc.codes()[row - 1];
+      const std::string want = code >= 0 && static_cast<size_t>(code) < sc.levels.size()
+                                   ? sc.levels[static_cast<size_t>(code)]
+                                   : std::string();
+      std::string got;
+      const std::string hx = j.at("sx").get<std::string>();
+      for (size_t i = 0; i + 1 < hx.size(); i += 2)
+        got.push_back(static_cast<char>(std::stoul(hx.substr(i, 2), nullptr, 16)));
+      same = same && got == want;
+    }
+  }
+  check(same, "getcell: every cell (double, float, .a/.z, string, empty string, a string cut "
+              "inside a UTF-8 character, rows 0..6) is what the getcols projection reads");
+  {
+    auto r5 = cs->frameGetcell("s", 5);
+    check(r5.ok && nlohmann::json::parse(r5.stdout_text).at("sx") == "4a6f73c3",
+          "getcell: the cut cell travels as its 4 bytes (Jos\\xC3) and the worker survives it");
+  }
+  check(sawExtended, "getcell: the fixture really holds an extended missing value");
+  check(!cs->frameGetcell("nosuchcolumn", 1).ok, "getcell: an unknown name is refused (exit 2)");
+
+  // The macro surface it serves: `local` off a resident head that is not on disk.
+  (void)piet::dispatch("gen double e = d * 2", session);
+  (void)piet::dispatch("local cell = e[3]", session);
+  (void)piet::dispatch("local cellz = d[4]", session);
+  (void)piet::dispatch("local cells = s[2]", session);
+  const std::string* c1 = session.eval.locals.find("cell");
+  const std::string* c2 = session.eval.locals.find("cellz");
+  const std::string* c3 = session.eval.locals.find("cells");
+  check(c1 != nullptr && *c1 == "2", "getcell: `local cell = e[3]` reads 2 (e = 2*_n/3)");
+  check(c2 != nullptr && *c2 == ".z", "getcell: `local cellz = d[4]` reads .z");
+  check(c3 != nullptr && *c3 == "r2", "getcell: `local cells = s[2]` reads r2");
+  (void)piet::dispatch("local cut = s[5]", session);
+  const std::string* c4 = session.eval.locals.find("cut");
+  check(c4 != nullptr && *c4 == std::string("Jos\xC3"),
+        "getcell: `local cut = s[5]` holds the 4 bytes Jos\\xC3");
+}
+
+// egen's r() residue (`quietly summarize ARG, meanonly`) takes ARG's summary from the
+// egen request itself (descriptive/summarize_prefetch.h) instead of asking the engine
+// again. The r() it leaves must be bit-for-bit what a summarize that DOES ask leaves,
+// and nothing may be left over for a later summarize to take.
+void testEgenResidueSummaryHandedOver() {
+  std::printf("[selftest] --- egen r() residue: summary handed over from the egen request ---\n");
+  namespace fs = std::filesystem;
+  std::string workdir = (fs::temp_directory_path() / "piet_native_selftest_egen_handover").u8string();
+  std::error_code ec;
+  fs::remove_all(workdir, ec);
+  fs::create_directories(workdir, ec);
+
+  piet::SessionState session(workdir);
+  (void)piet::dispatch("clear", session);
+  (void)piet::dispatch("set obs 9", session);
+  (void)piet::dispatch("gen double x = _n * 1.1", session);
+  (void)piet::dispatch("replace x = . in 3", session);
+  (void)piet::dispatch("replace x = .a in 5", session);
+  (void)piet::dispatch("gen float f = _n / 3", session);
+  (void)piet::dispatch("gen double allmiss = .", session);
+
+  piet::CobraSession* cs = session.cobraSessionIfLive();
+  if (cs == nullptr || cs->framesState() == piet::CobraSession::Frames::No) {
+    check(true, "egen handover PRECONDITION: this environment has no frames-capable `cobra serve` "
+                "— leg skipped, read as an ENVIRONMENT result, not a regression");
+    return;
+  }
+  const char* keys[] = {"N", "sum_w", "sum", "mean", "min", "max"};
+  auto snapshot = [&]() {
+    std::vector<std::pair<bool, uint64_t>> out;
+    for (const char* k : keys) {
+      const double* v = session.eval.rValues.find(k);
+      uint64_t bits = 0;
+      if (v != nullptr) std::memcpy(&bits, v, sizeof bits);
+      out.emplace_back(v != nullptr, bits);
+    }
+    return out;
+  };
+  struct Case { const char* cmd; const char* var; };
+  const Case cases[] = {{"egen m1 = max(x)", "x"},   {"egen m2 = mean(f)", "f"},
+                        {"egen m3 = total(x)", "x"}, {"egen m4 = min( f )", "f"},
+                        {"egen m5 = max(allmiss)", "allmiss"}};
+  for (const Case& c : cases) {
+    const int64_t before = piet::counters::engineReqTotal();
+    (void)piet::dispatch(c.cmd, session);
+    const int64_t egenReqs = piet::counters::engineReqTotal() - before;
+    const auto handed = snapshot();
+    const int64_t before2 = piet::counters::engineReqTotal();
+    (void)piet::dispatch(std::string("quietly summarize ") + c.var + ", meanonly", session);
+    const int64_t sumReqs = piet::counters::engineReqTotal() - before2;
+    const auto asked = snapshot();
+    check(handed == asked && handed[0].first,
+          std::string("egen handover: `") + c.cmd + "` leaves r(N sum_w sum mean min max) "
+          "bit-for-bit what `summarize " + c.var + ", meanonly` leaves");
+    check(egenReqs == 1, std::string("egen handover: `") + c.cmd + "` is one engine request, "
+          "the egen and its argument's summary together (got " + std::to_string(egenReqs) + ")");
+    check(sumReqs == 1, std::string("egen handover: a summarize after `") + c.cmd +
+          "` asks the engine itself — nothing is left handed over (got " +
+          std::to_string(sumReqs) + ")");
+  }
+  // A change between the egen and a later summarize is seen.
+  (void)piet::dispatch("egen m6 = max(x)", session);
+  (void)piet::dispatch("replace x = 1000 in 1", session);
+  (void)piet::dispatch("quietly summarize x, meanonly", session);
+  const double* mx = session.eval.rValues.find("max");
+  check(mx != nullptr && *mx == 1000.0,
+        "egen handover: a summarize after the data changed reads the new data (r(max) 1000)");
 }

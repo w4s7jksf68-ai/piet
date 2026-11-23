@@ -221,8 +221,18 @@ void postENameListsRegressM4(SessionState& session, const ojson& raw,
   const auto& lmo = session.lastModel();
   if (!lmo.has_value() || !raw.is_object()) return;
   const bool weighted = !lmo->fitWeight.empty();
-  if ((weighted || noConstant) && stataCmd != "regress") return;
   const LastModel& lm = *lmo;
+  // areg with ONE cluster variable other than the absorbed one: Stata's ado sends it
+  // to the method of alternating projections as it does a multiway cluster (vs-stata
+  // bank ac0c9f4b `absorb(rep78) vce(cluster foreign)`, 86fb5f1c, 087dc9c3: e(estmethod)
+  // MAP, the same e() as the multiway fit plus e(N_clust), without e(kcluster) and
+  // e(cluster#)); weighted, only [pw] is measured (fea074a7). The classic path (cluster
+  // on the absorbed variable) is fit_default_e_macros.cpp postAregClassicEContract.
+  const bool aregOneWayMap = stataCmd == "areg" && !noConstant && lm.vcov == "cluster" &&
+                             lm.fe.size() == 1 && lm.cluster.size() == 1 &&
+                             lm.cluster[0].find(',') == std::string::npos &&
+                             lm.cluster[0] != lm.fe[0] && (!weighted || lm.fitWtype == "pw");
+  if ((weighted || noConstant) && stataCmd != "regress" && !aregOneWayMap) return;
   const bool multiway = builtinMultiway && (lm.vcov == "twoway" || lm.vcov == "multiway") &&
                         raw.contains("kcluster") && raw["kcluster"].is_array() &&
                         !raw["kcluster"].empty();
@@ -234,7 +244,8 @@ void postENameListsRegressM4(SessionState& session, const ojson& raw,
 
   if (stataCmd == "regress") {
     if (!lm.fe.empty() ||
-        !onlyOptionsNL(parsed, {"vce", "robust", "cluster", "level", "noconstant", "nocons"}))
+        !onlyOptionsNL(parsed, {"vce", "robust", "cluster", "level", "noconstant", "nocons",
+                                "noheader", "notable", "depname", "beta"}))
       return;
     enum class Path { kOls, kRobust, kCluster1, kMultiway } path;
     if (multiway) path = Path::kMultiway;
@@ -365,7 +376,8 @@ void postENameListsRegressM4(SessionState& session, const ojson& raw,
   if (stataCmd == "areg") {
     // The MAP path with one absorbed variable and the built-in multiway VCE
     // (Stata's absorb step, areg's ado).
-    if (!multiway || lm.fe.size() != 1 || !onlyOptionsNL(parsed, {"absorb", "vce", "cluster", "level"}))
+    if (!(multiway || aregOneWayMap) || lm.fe.size() != 1 ||
+        !onlyOptionsNL(parsed, {"absorb", "vce", "cluster", "level", "noheader", "notable"}))
       return;
     const auto tss = rawNumNL(raw, "tss_total");
     const auto tssW = rawNumNL(raw, "tss_within");
@@ -450,7 +462,8 @@ void postENameListsRegressM4(SessionState& session, const ojson& raw,
       M = std::vector<std::string>{"cmdline", "_r_z_abs__CL", "_r_z__CL", "estmethod", "cmd",
                                    "footnote", "title2", "title", "predict", "marginsprop",
                                    "marginsnotok", "datasignaturevars", "datasignature", "vce"};
-      for (const auto& c : clusterMacrosNL(raw["kcluster"].size())) M->push_back(c);
+      if (multiway)
+        for (const auto& c : clusterMacrosNL(raw["kcluster"].size())) M->push_back(c);
       for (const char* n : {"absvar", "depvar", "vcetype", "clustvar", "apm", "map_method",
                             "properties"})
         M->push_back(n);
@@ -460,7 +473,23 @@ void postENameListsRegressM4(SessionState& session, const ojson& raw,
                               raw["fe_group_sizes"].contains("min") &&
                               raw["fe_group_sizes"]["min"].is_number() &&
                               raw["fe_group_sizes"]["min"].get<double>() > 1.0;
-    const bool vmb = recordOnBlockNL(session, raw, "e_Vmb");  // resolved when read
+    bool vmb = recordOnBlockNL(session, raw, "e_Vmb");  // resolved when read
+    // A [pw] MAP fit's e(V_modelbased) is the bread on the weights normalised to sum
+    // to N (the projection step normalises them; bank fea074a7), where the engine's
+    // one-way bread is on the raw weights (the classic path's, 477d369d): undo its
+    // n/sum(w).
+    if (vmb && weighted) {
+      const auto sw = raw.contains("weight") ? rawNumNL(raw["weight"], "sum_w") : std::nullopt;
+      ojson& rec = (*session.lastEstBlock)["e_Vmb"];
+      if (sw && *sw > 0 && rec.contains("matrix") && rec["matrix"].is_array()) {
+        for (auto& row : rec["matrix"])
+          for (auto& v : row)
+            if (v.is_number()) v = v.get<double>() * *sw / *N;
+      } else {
+        session.lastEstBlock->erase("e_Vmb");
+        vmb = false;
+      }
+    }
     if (noSingletons && vmb) {
       const auto one = [&absvar](const char* row, double v) {
         eval::EvalMatrix m;
@@ -474,14 +503,15 @@ void postENameListsRegressM4(SessionState& session, const ojson& raw,
       putEMatrixNL(session, "kabsorb", one("absvar", levels));
       X = std::vector<std::string>{"b",       "V",       "kcluster",    "ksingle",
                                    "dfabsorb", "kabsorb", "V_modelbased"};
+      if (!multiway) X->erase(X->begin() + 2);  // one cluster variable: no e(kcluster)
     }
-    installENameContractNL(
-        session, session.eval.eStrings.get("cmd"),
-        std::vector<std::string>{"rc",   "N",      "df_a",     "df_r", "df_r_mb", "rank",
-                                 "rank_mb", "ll",  "ll_0",     "rss",  "tss",     "adjdf",
-                                 "rmse", "mss",    "r2_w",     "r2",   "mss_w",   "tss_w",
-                                 "k_absorb", "df_m", "ar2",    "p",    "F",       "r2_a"},
-        std::move(M), std::move(X));
+    std::vector<std::string> S = {"rc",   "N",      "df_a",     "df_r", "df_r_mb", "rank",
+                                  "rank_mb", "ll",  "ll_0",     "rss",  "tss",     "adjdf",
+                                  "rmse", "mss",    "r2_w",     "r2",   "mss_w",   "tss_w",
+                                  "k_absorb", "df_m", "ar2",    "p",    "F",       "r2_a"};
+    if (!multiway) S.insert(S.begin() + 2, "N_clust");
+    installENameContractNL(session, session.eval.eStrings.get("cmd"), std::move(S), std::move(M),
+                           std::move(X));
   }
 }
 

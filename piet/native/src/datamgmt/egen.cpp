@@ -43,10 +43,12 @@
 #include "piet/inrange_filter.h"
 #include "piet/loops.h"  // BUG-1001: expandVarlist, the one varlist wildcard/range expander
 #include "piet/mutation_result.h"
+#include "piet/regex_scans.h"
 #include "piet/strutil.h"
 #include "piet/scratch_seq.h"
 #include "piet/storage_type.h"  // BUG-471 T2: --store-type
 #include "egen_internal.h"
+#include "descriptive/summarize_prefetch.h"
 
 namespace {
 // BUG-233 / FIX:OPTNET-ABBREV-SWEEP — egen's option vocabulary. Union of the
@@ -112,27 +114,8 @@ struct UnimplementedEgenFn {
 };
 const std::map<std::string, UnimplementedEgenFn>& unimplementedEgenFns() {
   static const std::map<std::string, UnimplementedEgenFn> t = {
-      {"any", {{{"values", 1, true}}, "anyvalue"}},     // old name of anyvalue
-      {"diff", {{}, "diff"}},
-      {"ends",
-       {{{"punct", 1, true}, {"head", 1, false}, {"last", 1, false}, {"tail", 1, false},
-         {"trim", 2, false}},
-        "ends"}},
-      {"eqany", {{{"values", 1, true}}, "anymatch"}},   // old name of anymatch
-      {"fill", {{}, "fill"}},
-      {"kurt", {{}, nullptr}},
       {"ma", {{{"t", 1, true}, {"nomiss", 3, false}}, "ma"}},
-      {"mad", {{}, nullptr}},
-      {"mdev", {{}, nullptr}},
       {"mtr", {{}, "mtr"}},
-      {"neqany", {{{"values", 1, true}}, "anycount"}},  // old name of anycount
-      {"rfirst", {{}, "rowfirst"}},                     // old name of rowfirst
-      {"rlast", {{}, "rowlast"}},                       // old name of rowlast
-      {"rowfirst", {{}, "rowfirst"}},
-      {"rowlast", {{}, "rowlast"}},
-      {"rowmedian", {{}, "rowmedian"}},
-      {"rowpctile", {{{"p", 1, true}}, "rowpctile"}},
-      {"skew", {{}, nullptr}},
   };
   return t;
 }
@@ -392,6 +375,7 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
               const std::vector<std::pair<std::string, eval::OptValue>>& opts,
               SessionState& session, const std::optional<std::string>& inRange,
               const std::string& storeTypeIn, std::string* fixedTypeOut, bool gtools) {
+  summarizePrefetchClear();  // nothing from an earlier command is handed to this one
   if (!session.currentHbin().has_value()) {
     return eval::noDataLoaded();
   }
@@ -401,25 +385,165 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
   auto eqPos = expr.find('=');
   std::string newvar = eqPos == std::string::npos ? "" : trim(expr.substr(0, eqPos));
   std::string rhs = eqPos == std::string::npos ? expr : trim(expr.substr(eqPos + 1));
+  // gtools' gegen options replace, counts(newvar) and fill(): spelled in full
+  // (every shorter spelling is r(198) "option ... not allowed" in the bank,
+  // e.g. 3fe7fd8f068e6847 `cou(cnt)`, f0c3c62d6c3e1fd3 `re`). The statistic is
+  // computed under a scratch name and then lands: replace writes it into the
+  // existing variable in place, in that variable's storage type (an integer
+  // type truncates toward zero, bank 58424944dc5f7209 mean price 6384.68 ->
+  // 6384); counts() stores each group's size on its rows, or with fill(#) on
+  // the group's first row only and # on the rest (c7a8995b3f865aa4).
+  if (gtools && eqPos != std::string::npos) {
+    bool gReplace = false;
+    const eval::OptValue* gCounts = nullptr;
+    const eval::OptValue* gFill = nullptr;
+    std::vector<std::pair<std::string, eval::OptValue>> rest;
+    for (const auto& kv : opts) {
+      // gegen parses its options before it looks at the target, so a short
+      // spelling of these three is r(198) even when the target exists.
+      for (const char* full : {"replace", "counts", "fill"}) {
+        const std::string f(full);
+        // (seq()'s from() is spelled f().)
+        if (kv.first.size() < f.size() && f.compare(0, kv.first.size(), kv.first) == 0 &&
+            kv.first != "by" && rhs.find("seq(") == std::string::npos)
+          return ojson(eval::errorBlock("unsupported_option", "option " + kv.first + " not allowed",
+                                        std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+      }
+      if (kv.first == "replace" && kv.second.isBool) gReplace = true;
+      else if (kv.first == "counts" && !kv.second.isBool) gCounts = &kv.second;
+      else if (kv.first == "fill" && !kv.second.isBool) gFill = &kv.second;
+      else rest.push_back(kv);
+    }
+    if (gReplace || gCounts != nullptr || gFill != nullptr) {
+      if (gFill != nullptr && gCounts == nullptr)
+        return egenRcError("fill() is only allowed with counts()", 198, "syntax_error");
+      std::string fnName;
+      rx::searchFnName(rhs, /*leadingSpace=*/false, &fnName);
+      fnName = lower(fnName);
+      const std::string countsVar = gCounts != nullptr ? trim(gCounts->strValue) : std::string();
+      if (gCounts != nullptr && fnName != "group")
+        return ojson(eval::unsupportedCommand("gegen, counts() with a function other than group()",
+                                              std::nullopt, std::nullopt, "refused:gegen_counts",
+                                              eval::UnsupportedCommandKind::kNotImplemented));
+      if (gCounts != nullptr && !strutil::isValidStataIdentifier(countsVar))
+        return egenRcError(countsVar + " invalid name", 198, "syntax_error");
+      if (!strutil::isValidStataIdentifier(newvar))
+        return egenRcError(newvar + " invalid name", 198, "syntax_error");
+      const bool targetExists = egenTargetExists(session, newvar);
+      if (targetExists && !gReplace) return egenRcError("variable " + newvar + " already defined", 110);
+      const bool countsExists = !countsVar.empty() && egenTargetExists(session, countsVar);
+      if (countsExists && !gReplace)
+        return egenRcError("variable " + countsVar + " already defined", 110);
+      double fillValue = std::numeric_limits<double>::quiet_NaN();
+      bool fillAll = gFill == nullptr;
+      if (gFill != nullptr) {
+        const std::string f = trim(gFill->strValue);
+        if (f == "data") {
+          fillAll = true;
+        } else if (f != ".") {
+          const std::optional<double> v = eval::pythonFloat(f);
+          if (!v.has_value())
+            return ojson(eval::unsupportedCommand("gegen, fill(" + f + ")", std::nullopt,
+                                                  std::nullopt, "refused:gegen_fill",
+                                                  eval::UnsupportedCommandKind::kNotImplemented));
+          fillValue = *v;
+        }
+      }
+      if (targetExists) {
+        const VarMeta* meta = nullptr;
+        auto it = session.varMeta.find(newvar);
+        if (it != session.varMeta.end()) meta = &it->second;
+        if (meta == nullptr || !meta->stataType.has_value() ||
+            meta->stataType->rfind("str", 0) == 0)
+          return ojson(eval::unsupportedCommand("gegen, replace on a variable of unknown or string type",
+                                                std::nullopt, std::nullopt, "refused:gegen_replace",
+                                                eval::UnsupportedCommandKind::kNotImplemented));
+      }
+      std::string scratchName = newvar;
+      if (targetExists) {
+        int serial = 0;
+        do scratchName = "__gegen" + std::to_string(++serial);
+        while (egenTargetExists(session, scratchName));
+      }
+      // With replace the scratch column is computed in double, so the cast
+      // into the existing variable's type below is the only rounding (a
+      // double or long target keeps the full value).
+      ojson made = runEgen(scratchName + " = " + rhs, by, ifExpr, rest, session, inRange,
+                           targetExists ? std::string("double") : storeTypeIn, fixedTypeOut,
+                           gtools);
+      if (made.is_object() && made.value("type", std::string()) == "error") return made;
+      std::vector<std::string> rewritten;
+      Datastore* ds = session.datastore();
+      const int64_t rows = ds->nRows();
+      const double kNaN = std::numeric_limits<double>::quiet_NaN();
+      std::vector<double> computed(static_cast<size_t>(rows), kNaN);
+      {
+        const double* c = ds->col(scratchName).f64();
+        for (int64_t i = 0; i < rows; ++i) computed[static_cast<size_t>(i)] = c[i];
+      }
+      if (targetExists) {
+        const std::string type = *session.varMeta[newvar].stataType;
+        std::vector<double> held = computed;
+        for (double& v : held) {
+          if (std::isnan(v)) continue;
+          if (type == "byte" || type == "int" || type == "long") {
+            v = std::trunc(v);
+            const double hi = type == "byte" ? 100 : type == "int" ? 32740 : 2147483620.0;
+            const double lo = type == "byte" ? -127 : type == "int" ? -32767 : -2147483647.0;
+            if (v > hi || v < lo) v = kNaN;
+          } else if (type == "float") {
+            v = static_cast<double>(static_cast<float>(v));
+          }
+        }
+        if (auto failed = egenWriteColumn(session, newvar, held, /*isNew=*/false, type)) return *failed;
+        SessionState::TempDropScope quietDrop(session);
+        (void)dispatch("quietly drop " + scratchName, session);
+        rewritten.push_back(newvar);
+      }
+      std::vector<std::string> created;
+      if (!targetExists) created.push_back(newvar);
+      if (!countsVar.empty()) {
+        std::map<double, double> sizes;
+        for (double g : computed)
+          if (!std::isnan(g)) sizes[g] += 1.0;
+        std::vector<double> cnt(static_cast<size_t>(rows), kNaN);
+        std::set<double> seen;
+        for (int64_t i = 0; i < rows; ++i) {
+          const double g = computed[static_cast<size_t>(i)];
+          if (std::isnan(g)) continue;
+          if (fillAll || seen.insert(g).second) cnt[static_cast<size_t>(i)] = sizes[g];
+          else cnt[static_cast<size_t>(i)] = fillValue;
+        }
+        if (auto failed = egenWriteColumn(session, countsVar, cnt, !countsExists, "long")) return *failed;
+        (countsExists ? rewritten : created).push_back(countsVar);
+      }
+      return mutationResult(session, "egen", created, {}, rewritten);
+    }
+  }
   // egen's syntax is `newvar = fcn(arguments)`: without the `=` (`egen v`,
   // `egen , zzabbrprobe`), and a statistic of nothing (`egen v = mean()`), it
   // is r(198) "invalid syntax" (vs-stata bank 2026-11-10).
   if (!gtools) {
     if (eqPos == std::string::npos)
       return egenRcError("invalid syntax", 198, "syntax_error");
-    static const std::regex reEmptyStat(
-        R"(^(mean|total|sum|max|min|sd|median|count|iqr|kurt|mad|mdev|pctile|rank|skew|std)\s*\(\s*\)\s*$)");
-    if (std::regex_match(rhs, reEmptyStat)) return egenRcError("invalid syntax", 198, "syntax_error");
+    // R"(^(mean|total|sum|max|min|sd|median|count|iqr|kurt|mad|mdev|pctile|rank|skew|std)\s*\(\s*\)\s*$)",
+    // matched by hand (piet/regex_scans.h).
+    static const std::set<std::string> kEmptyStatFns = {
+        "mean", "total", "sum", "max", "min",  "sd",     "median", "count",
+        "iqr",  "kurt",  "mad", "mdev", "pctile", "rank", "skew",   "std"};
+    std::string emptyFn;
+    if (rx::matchFnEmptyCall(rhs, &emptyFn) && kEmptyStatFns.count(emptyFn) != 0)
+      return egenRcError("invalid syntax", 198, "syntax_error");
   }
   {
-    static const std::regex reHead(R"(^(\w+)(\s*\(.*)$)");
-    std::smatch hm;
-    if (std::regex_match(rhs, hm, reHead)) {
+    // R"(^(\w+)(\s*\(.*)$)", matched by hand (piet/regex_scans.h).
+    std::string headName, headRest;
+    if (rx::matchFnHead(rhs, &headName, &headRest)) {
       // egen function names are case-sensitive: `Rmax` looks for _gRmax.ado and
       // is r(199) in Stata, so the name is matched as typed.
-      const std::string alias = rowAliasOf(hm.str(1));
+      const std::string alias = rowAliasOf(headName);
       if (!alias.empty()) {
-        rhs = alias + hm.str(2);
+        rhs = alias + headRest;
         expr = newvar.empty() ? rhs : newvar + " = " + rhs;
       }
     }
@@ -441,15 +565,62 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
     return egenRcError("variable " + newvar + " already defined", 110);
 
   {
-    static const std::regex reFnArgs(R"(^(\w+)\s*\((.*)\)\s*$)");
-    std::smatch fa;
-    if (std::regex_match(rhs, fa, reFnArgs)) {
-      const std::string fn = lower(fa.str(1));
-      if (auto bad = egenArgumentRefusal(fn, trim(fa.str(2)), session)) return *bad;
+    // R"(^(\w+)\s*\((.*)\)\s*$)", matched by hand (piet/regex_scans.h).
+    std::string faFn, faArgs;
+    if (rx::matchFnCall(rhs, &faFn, &faArgs)) {
+      std::string fn = lower(faFn);
+      // any(), eqany() and neqany() are the old names of anyvalue(), anymatch()
+      // and anycount(): each ado hands its arguments to the new one unchanged.
+      if (fn == "any") fn = "anyvalue";
+      else if (fn == "eqany") fn = "anymatch";
+      else if (fn == "neqany") fn = "anycount";
+      // gegen's statistics (gegen.ado's parse of `stat(varlist|exp)`): an
+      // empty or string argument is r(7) "stat(varlist) must call a numeric
+      // variable list."; a lone name that is no variable is r(198) "Invalid
+      // call; ..." (vs-stata bank ae0340afa662e1c0, 3e0be9249e145d58,
+      // 982a2b8b437701d9).
+      if (gtools) {
+        static const std::set<std::string> kGStats = {
+            "mean", "sum", "total", "sd", "count", "median", "iqr", "min", "max", "first",
+            "last", "firstnm", "lastnm", "semean", "sebinomial", "sepoisson", "skewness",
+            "kurtosis", "range", "variance", "cv", "nmissing", "nansum", "rawsum", "geomean"};
+        if (kGStats.count(fn)) {
+          const std::string a = trim(faArgs);
+          const std::string must = fn + "(varlist) must call a numeric variable list.";
+          if (a.empty()) return egenRcError(must, 7);
+          static const std::regex reName(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
+          if (std::regex_match(a, reName)) {
+            Datastore* gds = session.datastore();
+            if (gds != nullptr && gds->has(a) && gds->dtype(a) == "factor")
+              return egenRcError(must, 7);
+            if (gds != nullptr && !gds->has(a))
+              return egenRcError("Invalid call; please specify " + fn + "(varlist) or " + fn +
+                                     "(exp).",
+                                 198);
+          }
+        }
+      }
+      if (auto bad = egenArgumentRefusal(fn, trim(faArgs), session)) return *bad;
+      if (gtools)
+        if (auto r = runGegenFunction(fn, newvar, faArgs, opts, ifExpr, inRange, storeTypeIn,
+                                      session))
+          return *r;
+      // gegen hands a function it does not compute itself to egen, so these
+      // run for it too; max()/min() are gtools' own and keep their path there.
+      if (!gtools || (fn != "max" && fn != "min"))
+        if (auto r = runEgenMoreFunction(fn, newvar, faArgs, opts, ifExpr, inRange, storeTypeIn,
+                                         session)) {
+          auto vm = session.varMeta.find(newvar);
+          const bool failed = r->is_object() && r->value("type", std::string()) == "error";
+          if (!failed && fixedTypeOut != nullptr && vm != session.varMeta.end() &&
+              vm->second.stataType.has_value())
+            *fixedTypeOut = *vm->second.stataType;
+          return *r;
+        }
       // anyvalue/anycount/anymatch, cut(), at()/group() and concat(), punct()/
       // format(): computed in runEgenAdoFunction (aer_w2 w2b_dataio
       // egen_anyvalue .. egen_cut_icodes_label, w2b_dataio.log:1030-1112).
-      if (auto r = runEgenAdoFunction(fn, newvar, fa.str(2), opts, ifExpr, inRange, storeTypeIn,
+      if (auto r = runEgenAdoFunction(fn, newvar, faArgs, opts, ifExpr, inRange, storeTypeIn,
                                       session)) {
         // The function recorded the result's type; that, not the declaration, is
         // what the dispatcher records (BUG-1108).
@@ -470,9 +641,9 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
   // the measured `missing` row; the resolution below is the only one.
   std::string fnName;
   {
-    static const std::regex reFnName(R"(^(\w+)\s*\()");
-    std::smatch fm;
-    if (std::regex_search(rhs, fm, reFnName)) fnName = lower(fm.str(1));
+    // regex_search R"(^(\w+)\s*\()", by hand (piet/regex_scans.h).
+    std::string fmName;
+    if (rx::searchFnName(rhs, /*leadingSpace=*/false, &fmName)) fnName = lower(fmName);
   }
   const bool haveBy = !trim(by).empty();
   const bool isRowFn = rowFuns().count(fnName) != 0;
@@ -895,7 +1066,12 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
   static const std::regex reRowFn(R"(^(\w+)\s*\(([^)]+)\)\s*$)");
   std::smatch m;
   std::string computedPath;
-  if (std::regex_match(rhs, m, reRowFn) && rowFuns().count(lower(m.str(1)))) {
+  // A match's group 1 is the \w run before the first `(` (rx::searchFnName), so a
+  // name that is no row function decides the test without the regex.
+  std::string rowHead;
+  const bool mayRowFn =
+      rx::searchFnName(rhs, /*leadingSpace=*/false, &rowHead) && rowFuns().count(lower(rowHead)) != 0;
+  if (mayRowFn && std::regex_match(rhs, m, reRowFn) && rowFuns().count(lower(m.str(1)))) {
     std::string rowFnName = m.str(1);
     std::string argsStr = trim(m.str(2));
     // BUG-1001: the varlist expands its wildcards and ranges through the one
@@ -979,6 +1155,33 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
       args.push_back("--summarize");
       args.push_back(newvar);
     }
+    // egenPublishResidue runs `quietly summarize ARG, meanonly` right after this call
+    // for these functions over a plain numeric variable with no by()/if/in, and that
+    // used to be one more engine request over the frame this call has in hand. Ask for
+    // ARG's summary here instead and hand it to that summarize (summarize_prefetch.h).
+    // Only a variable the current card shows as numeric: the engine summarizes a column
+    // that is there, so the extra ask cannot fail the egen. gegen leaves no such r().
+    std::string residueVar;
+    if (!gtools && !haveBy && !haveIf && !haveIn && !seqSummary &&
+        (egenFnName == "mean" || egenFnName == "total" || egenFnName == "sum" ||
+         egenFnName == "pc" ||
+         ((egenFnName == "min" || egenFnName == "max") && fnOpt("missing") == nullptr))) {
+      const size_t open = rhs.find('(');
+      const size_t close = rhs.rfind(')');
+      const std::string arg = (open != std::string::npos && close != std::string::npos && close > open)
+                                  ? trim(rhs.substr(open + 1, close - open - 1))
+                                  : std::string();
+      if (strutil::isValidStataIdentifier(arg) && arg != newvar) {
+        if (const std::vector<VarInfo>* card = session.residentReadCard()) {
+          for (const auto& v : *card)
+            if (v.name == arg && v.dtype == "f64") residueVar = arg;
+        }
+      }
+    }
+    if (!residueVar.empty()) {
+      args.push_back("--summarize");
+      args.push_back(residueVar);
+    }
     ojson egenOut;
     try {
       egenOut = runCobraJson(args);
@@ -1004,6 +1207,11 @@ ojson runEgen(const std::string& exprIn, const std::string& by,
       // No stored value (every row excluded): the `gen byte` stands.
       *fixedTypeOut = num("N") > 0 ? storage::promotedType("byte", false, num("min"), num("max"))
                                  : std::string("byte");
+    }
+    if (!residueVar.empty()) {
+      const ojson summ = egenOut.value("summarize", ojson::object());
+      if (summ.contains(residueVar) && summ[residueVar].is_object())
+        summarizePrefetchSet(outPath, residueVar, summ[residueVar]);
     }
     computedPath = outPath;
   }
@@ -1158,12 +1366,15 @@ void egenPublishResidue(SessionState& session, const std::string& newvar, const 
                         const std::optional<std::string>& inRange,
                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                         const std::string& typeToken) {
-  static const std::regex reFnArgs(R"(^(\w+)\s*\((.*)\)\s*$)");
-  std::smatch fa;
+  // Whatever runEgen handed to this step's summarize is spent or unused by the end.
+  struct PrefetchScope {
+    ~PrefetchScope() { summarizePrefetchClear(); }
+  } prefetchScope;
+  // R"(^(\w+)\s*\((.*)\)\s*$)", matched by hand (piet/regex_scans.h).
   const std::string rhs = trim(rhsIn);
-  if (!std::regex_match(rhs, fa, reFnArgs)) return;
-  std::string fn = fa.str(1);
-  const std::string arg = trim(fa.str(2));
+  std::string fn, faArgs;
+  if (!rx::matchFnCall(rhs, &fn, &faArgs)) return;
+  const std::string arg = trim(faArgs);
   if (auto alias = rowAliasOf(fn); !alias.empty()) fn = alias;
   auto hasOptNamed = [&](const char* full) {
     auto vit = egenFnVocab().find(fn);
@@ -1198,10 +1409,29 @@ void egenPublishResidue(SessionState& session, const std::string& newvar, const 
   std::string qual;  // the `if` / `in` text of the call
   if (ifExpr.has_value() && !trim(*ifExpr).empty()) qual += " if " + *ifExpr;
   if (inRange.has_value() && !trim(*inRange).empty()) qual += " in " + *inRange;
-  auto plainVar = [&]() -> bool {
+  // The dtype of a column of the current dataset, nullopt when there is no such column. This
+  // function only ever asks for a NAME and its type, so it reads the resident card when that is
+  // current and opens the datastore only when it is not: opening it writes a resident head that
+  // is not on disk yet out in full, and egen in a loop paid that once per call (78,002 frame
+  // snapshots in a run of the AEA package openICPSR-226844, 119 s of its 414 s with the
+  // scratch reclaim each snapshot sets off). Same "f64"|"factor" vocabulary on both paths.
+  auto columnDtype = [&](const std::string& name) -> std::optional<std::string> {
+    if (const std::vector<VarInfo>* card = session.residentReadCard()) {
+      const VarInfo* hit = nullptr;
+      for (const auto& v : *card)
+        if (v.name == name) hit = &v;
+      if (hit == nullptr) return std::nullopt;
+      // a type spelling this code does not know is not guessed at: ask the file
+      if (hit->dtype == "f64" || hit->dtype == "factor") return hit->dtype;
+    }
     Datastore* ds = session.datastore();
-    return ds != nullptr && strutil::isValidStataIdentifier(arg) && ds->has(arg) &&
-           ds->dtype(arg) == "f64";
+    if (ds == nullptr || !ds->has(name)) return std::nullopt;
+    return ds->dtype(name);
+  };
+  auto plainVar = [&]() -> bool {
+    if (!strutil::isValidStataIdentifier(arg)) return false;
+    const std::optional<std::string> dt = columnDtype(arg);
+    return dt.has_value() && *dt == "f64";
   };
   // `count if <cond> [& (if)] [in]`
   auto countIf = [&](const std::string& cond) {
@@ -1279,8 +1509,7 @@ void egenPublishResidue(SessionState& session, const std::string& newvar, const 
     }
     if (arg.empty()) return false;
     quiet("generate double " + kScratch + " = (" + arg + ")" + qual);
-    Datastore* ds = session.datastore();
-    if (ds == nullptr || !ds->has(kScratch)) return false;
+    if (!columnDtype(kScratch).has_value()) return false;
     run(kScratch);
     // drop is r-class too (r(k_drop)); what the quiet command above left is what egen leaves.
     const eval::OrderedFloatDict kept = session.eval.rValues;
@@ -1301,8 +1530,7 @@ void egenPublishResidue(SessionState& session, const std::string& newvar, const 
     return;
   }
   if (fn == "count") {
-    Datastore* ds = session.datastore();
-    if (ds == nullptr || !strutil::isValidStataIdentifier(arg) || !ds->has(arg)) return;
+    if (!strutil::isValidStataIdentifier(arg) || !columnDtype(arg).has_value()) return;
     countIf("!missing(" + arg + ")");
     posted({"N"});
     return;

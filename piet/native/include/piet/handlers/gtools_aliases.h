@@ -39,6 +39,17 @@ GtoolsTranslation translateGtoolsAlias(const eval::ParsedCommand& parsed,
 // `gquantiles x, _pctile nq(#)` / `pctile new = x, nq(#)` -- the one form with no
 // native twin. The percentile rule is transcribed from the engine's own
 // stata_pctile so the two cannot disagree.
+// gquantiles' own options (cutpoints/cutoffs/quantiles/cutquantiles, by,
+// altdef, binfreq, genp, minmax, replace, method, dedup, cutifin, strict,
+// returnlimit): true when the line uses one, so the gquantiles arm computes it.
+// gisid: the uniqueness check over an if/in sample, and the r() gtools leaves
+// after a gisid that succeeds.
+nlohmann::ordered_json runGisidSample(const eval::ParsedCommand& parsed, SessionState& session,
+                                      bool missok);
+void gisidPublishResults(const eval::ParsedCommand& parsed, SessionState& session);
+bool gquantilesNeedsExtended(const eval::ParsedCommand& parsed);
+nlohmann::ordered_json runGQuantilesExtended(const eval::ParsedCommand& parsed,
+                                             SessionState& session);
 nlohmann::ordered_json runGQuantilesPctile(const eval::ParsedCommand& parsed,
                                             SessionState& session);
 // `gstats winsor|sum` -- a multiplex, not an alias: the two sub-commands forward

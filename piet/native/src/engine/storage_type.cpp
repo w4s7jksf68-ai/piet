@@ -14,6 +14,7 @@
 #include "piet/cobra_runner.h"
 #include "piet/column_fetch.h"
 #include "piet/datastore.h"
+#include "piet/regex_scans.h"
 #include "piet/eval/errors.h"
 #include "piet/session_state.h"
 #include "piet/strutil.h"
@@ -250,10 +251,10 @@ void recordReplaceType(SessionState& session, const std::string& varname,
 }
 
 std::string egenFunctionName(const std::string& rhs) {
-  static const std::regex reFn(R"(^\s*(\w+)\s*\()");
-  std::smatch m;
-  if (!std::regex_search(rhs, m, reFn)) return std::string();
-  return strutil::lower(m.str(1));
+  // regex_search R"(^\s*(\w+)\s*\()", by hand (piet/regex_scans.h).
+  std::string fn;
+  if (!rx::searchFnName(rhs, /*leadingSpace=*/true, &fn)) return std::string();
+  return strutil::lower(fn);
 }
 
 bool egenIgnoresStoreType(const std::string& fn) {

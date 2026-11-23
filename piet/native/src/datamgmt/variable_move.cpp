@@ -56,13 +56,16 @@ ojson runMove(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, {}, {})) return ojson(*err);
   if (!session.hasData()) return ojson(eval::noDataLoaded());
 
-  // Measured rcs: one name is r(102) `too few variables specified`, three is
-  // r(103) `too many variables specified`.
-  if (parsed.varlist.size() < 2) return k1ErrorRc("too few variables specified", 102);
-  if (parsed.varlist.size() > 2) return k1ErrorRc("too many variables specified", 103);
+  // move.ado's `syntax varlist(min=2 max=2)`: the varlist is expanded first (a
+  // wildcard, a range, a unique abbreviation; bank a0f4e20ee854af3b `move p* mpg`),
+  // then one name is r(102) `too few variables specified`, three r(103) `too many`.
+  std::vector<std::string> expanded = parsed.varlist;
+  if (auto err = resolveByKeyNames(session, expanded)) return *err;
+  if (expanded.size() < 2) return k1ErrorRc("too few variables specified", 102);
+  if (expanded.size() > 2) return k1ErrorRc("too many variables specified", 103);
 
-  const std::string& from = parsed.varlist[0];
-  const std::string& to = parsed.varlist[1];
+  const std::string& from = expanded[0];
+  const std::string& to = expanded[1];
 
   std::vector<std::string> names;
   ojson err;

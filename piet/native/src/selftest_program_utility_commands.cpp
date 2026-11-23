@@ -155,7 +155,10 @@ void testW2T1Env() {
     ojson b = run("capture noisily require estout>=3.23, install\nlocal r1 = _rc\n"
                   "capture noisily require distinct==1.2.1\nlocal r2 = _rc\n"
                   "capture noisily require estout\nlocal r3 = _rc\n"
-                  "capture noisily require estout distinct\nlocal r4 = _rc\n");
+                  "capture noisily require estout distinct\nlocal r4 = _rc\n"
+                  "capture noisily require zz_missing_pkg>=1, install\nlocal r5 = _rc\n"
+                  "capture noisily require reghdfe, install\nlocal r6 = _rc\n"
+                  "capture noisily require regre\nlocal r7 = _rc\n");
     w2check(L("r1") == "0" && L("r2") == "0" && L("r3") == "0" &&
                 hasText(displayTexts(b), "(require estout>=3.23: PIET bundles its own implementations"),
             "T1 Env require (require_ge, require_eq, require_bare `|0|`): rc 0 with the "
@@ -164,6 +167,10 @@ void testW2T1Env() {
                                                     "\"==\", \"\")") != std::string::npos,
             "T1 Env require (require_two `|9|`, log `assert failed: inlist(\"distinct\", ...)`): "
             "a second package name is read as the operator. Got rc=" + L("r4"));
+    w2check(L("r5") == "601" && errorMessages(b).find("zz_missing_pkg") != std::string::npos,
+            "require rejects an unavailable package even with install");
+    w2check(L("r6") == "0" && L("r7") == "601",
+            "require recognizes a registered community implementation, but not a short command spelling");
   }
 
   // ── _dots ─────────────────────────────────────────────────────────────────

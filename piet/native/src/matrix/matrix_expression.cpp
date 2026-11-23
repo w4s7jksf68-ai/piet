@@ -1253,7 +1253,8 @@ bool mxNeedsGrammar(const std::string& e, SessionState& session) {
   auto isDigit = [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; };
   static const char* const kMatrixFns[] = {"J",        "I",    "nullmat", "inv",  "invsym",
                                            "syminv",   "vecdiag", "cholesky", "corr",
-                                           "diag",     "vec",  "vech",    "hadamard"};
+                                           "diag",     "vec",  "vech",    "hadamard",
+                                           "get",      "sweep", "matuniform"};
   size_t i = 0;
   while (i < e.size()) {
     const char c = e[i];
@@ -1797,6 +1798,96 @@ std::optional<MxValue> evalMxPrimary(const std::string& e, SessionState& session
     }
     return mxMatrix(std::move(m));
   }
+  // get(systemname) ([P] matrix get): a copy of the live fit's coefficient
+  // vector (`_b`, `b`) or variance matrix (`VCE`), as e(b)/e(V) (vs-stata bank
+  // 6ac4f2de `matrix V = get(VCE)`). Rr and Cns are not implemented here.
+  if (callArg("get", inner)) {
+    const std::string which = trim(inner);
+    if (which != "_b" && which != "b" && which != "VCE") {
+      err = "r(198): get(" + which + ") is not implemented in this version of PIET";
+      return std::nullopt;
+    }
+    std::string classErr;
+    int classRc = 301;
+    std::optional<eval::EvalMatrix> got =
+        resolveClassMatrixRef('e', which == "VCE" ? "V" : "b", session, classErr, &classRc);
+    if (!got.has_value()) {
+      err = "r(" + std::to_string(classRc) + "): " + classErr;
+      return std::nullopt;
+    }
+    return mxMatrix(std::move(*got));
+  }
+  // sweep(M,i) ([FN] Matrix functions): M with its i-th row and column swept,
+  // b_ii = 1/a_ii, b_ij = a_ij/a_ii, b_ji = -a_ji/a_ii and b_jk = a_jk -
+  // a_ji a_ik/a_ii elsewhere; the i-th row takes M's i-th column name and the
+  // i-th column its row name (vs-stata bank b2d35414: (4,2\2,3), 1 -> .25 .5 \
+  // -.5 2, rows c1 r2, columns r1 c2).
+  if (callArg("sweep", inner)) {
+    std::vector<std::string> args;
+    std::vector<char> argOps;
+    if (!splitTopLevel(inner, args, argOps) || args.size() != 2) {
+      err = "r(198): invalid syntax";
+      return std::nullopt;
+    }
+    std::optional<MxValue> a = evalMx(trim(args[0]), session, err);
+    if (!a.has_value()) return std::nullopt;
+    if (a->scalar) {
+      err = "r(109): type mismatch";
+      return std::nullopt;
+    }
+    double kd = 0.0;
+    if (!evalMatrixScalarExpr(trim(args[1]), session, kd, err)) return std::nullopt;
+    eval::EvalMatrix src = mxAsMatrix(*a);
+    const size_t n = src.data.size();
+    if (n == 0 || mxCols(src) != n) {
+      err = "r(503): conformability error";
+      return std::nullopt;
+    }
+    if (std::isnan(kd) || kd < 1.0 || kd >= static_cast<double>(n) + 1.0) {
+      err = "r(503): conformability error";
+      return std::nullopt;
+    }
+    const size_t k = static_cast<size_t>(kd) - 1;
+    eval::EvalMatrix m = src;
+    const double piv = src.data[k][k];
+    for (size_t i = 0; i < n; ++i)
+      for (size_t j = 0; j < n; ++j) {
+        if (i == k && j == k) m.data[i][j] = 1.0 / piv;
+        else if (i == k) m.data[i][j] = src.data[k][j] / piv;
+        else if (j == k) m.data[i][j] = -src.data[i][k] / piv;
+        else m.data[i][j] = src.data[i][j] - src.data[i][k] * src.data[k][j] / piv;
+      }
+    if (m.rownames.size() == n && m.colnames.size() == n)
+      std::swap(m.rownames[k], m.colnames[k]);
+    return mxMatrix(std::move(m));
+  }
+  // matuniform(r,c) ([FN] Matrix functions): an r x c matrix of runiform()
+  // draws, filled row by row from the session's stream (vs-stata bank
+  // 06c50d36 after `set seed 20261110`: .27341727 .38044133 .06482489 \ ...).
+  if (callArg("matuniform", inner)) {
+    std::vector<std::string> args;
+    std::vector<char> argOps;
+    if (!splitTopLevel(inner, args, argOps) || args.size() != 2) {
+      err = "r(198): invalid syntax";
+      return std::nullopt;
+    }
+    double rd = 0.0, cd = 0.0;
+    if (!evalMatrixScalarExpr(trim(args[0]), session, rd, err) ||
+        !evalMatrixScalarExpr(trim(args[1]), session, cd, err))
+      return std::nullopt;
+    if (std::isnan(rd) || std::isnan(cd) || rd < 1.0 || cd < 1.0 || rd > 1e6 || cd > 1e6) {
+      err = "r(503): conformability error";
+      return std::nullopt;
+    }
+    eval::EvalMatrix m;
+    const size_t nr = static_cast<size_t>(rd), nc = static_cast<size_t>(cd);
+    m.data.assign(nr, std::vector<double>(nc, 0.0));
+    for (size_t i = 0; i < nr; ++i)
+      for (size_t j = 0; j < nc; ++j)
+        if (!evalMatrixScalarExpr("runiform()", session, m.data[i][j], err)) return std::nullopt;
+    applyDefaultStripe(m);
+    return mxMatrix(std::move(m));
+  }
   // hadamard(A,B): the element-by-element product of two matrices of the same
   // shape, A's names (vs-stata bank 034cb05c1722078a, d8b1d1b4af572bf5); other
   // shapes r(503).
@@ -2220,8 +2311,16 @@ std::string renderMatrixList(const std::string& name, const eval::EvalMatrix& m,
 // a b b). A name is a word or a quoted string, blanks and all (`"a b" c`
 // names two rows); an empty one, `""`, keeps that row's name (`"" c` on r1
 // r2 r3 is r1 c c), and an empty list changes nothing.
+//
+// Equation names ([P] matrix rownames, technical notes): a name without a colon
+// leaves the equation part in place, `eq:` sets only the equation and leaves
+// the name, `eq:name` sets both, and the equation `_` is the null one (`_:`
+// clears it). matrix roweq/coleq (`equations`) read a name without a colon as
+// an equation name (vs-stata bank 46a174ff, e73c91c4). The last name given is
+// replicated over the rows/columns left, each keeping what it does not set (the
+// manual's `rownames XX = myeq:` names every row's equation).
 ojson runMatrixStripe(bool isRow, const std::string& name, const std::string& namesRhs,
-                       SessionState& session) {
+                       SessionState& session, bool equations) {
   std::vector<std::string> names;
   for (std::string rest = namesRhs; !trim(rest).empty();) {
     auto [tok, next] = eval::scanOneToken(rest, /*bind=*/true);
@@ -2239,13 +2338,34 @@ ojson runMatrixStripe(bool isRow, const std::string& name, const std::string& na
   if (names.size() > want) return engineErrorBlockRc("conformability error", 503);
   std::vector<std::string>& stripe = isRow ? mat->rownames : mat->colnames;
   stripe.resize(want);
+  for (size_t k = 0; k < want; ++k)
+    if (stripe[k].empty()) stripe[k] = std::string(1, isRow ? 'r' : 'c') + std::to_string(k + 1);
+  const auto apply = [equations](const std::string& old, const std::string& tok) {
+    const size_t oc = old.find(':');
+    std::string oldEq = oc == std::string::npos ? std::string() : old.substr(0, oc);
+    std::string oldSub = oc == std::string::npos ? old : old.substr(oc + 1);
+    std::string eq = oldEq, sub = oldSub;
+    const size_t tc = tok.find(':');
+    if (tc != std::string::npos) {
+      eq = tok.substr(0, tc);
+      if (tc + 1 < tok.size()) sub = tok.substr(tc + 1);
+    } else if (equations) {
+      eq = tok;
+    } else {
+      sub = tok;
+    }
+    if (eq == "_") eq.clear();
+    return eq.empty() ? sub : eq + ":" + sub;
+  };
   for (size_t k = 0; k < want; ++k) {
     if (k < names.size()) {
-      if (!names[k].empty()) stripe[k] = names[k];
+      if (!names[k].empty()) stripe[k] = apply(stripe[k], names[k]);
     } else if (!names.empty()) {
-      stripe[k] = stripe[names.size() - 1];
+      if (names.back().empty())
+        stripe[k] = stripe[names.size() - 1];
+      else
+        stripe[k] = apply(stripe[k], names.back());
     }
-    if (stripe[k].empty()) stripe[k] = std::string(1, isRow ? 'r' : 'c') + std::to_string(k + 1);
   }
   return ojson::array();
 }

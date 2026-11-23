@@ -442,13 +442,167 @@ void texdocClearSClass(SessionState& session) {
 }  // namespace
 
 
+// texdoc's subcommand word as it reads it: `gettoken subcmd 0 : 0, parse(",: ")`,
+// each name abbreviable to its own minimum (write 1, _write 2, append 1, local 3,
+// substitute 3, init 1, close 1, stlog 1, graph 2; strip and do exactly), and
+// the text after it (`0`, the delimiter that ended the word included).
+static std::string texdocSubcommand(const std::string& raw, std::string* rest) {
+  size_t b = raw.find_first_not_of(" \t");
+  size_t e = b == std::string::npos ? raw.size() : raw.find_first_of(" \t", b);
+  if (e == std::string::npos) e = raw.size();
+  size_t s = raw.find_first_not_of(" \t", e);
+  if (s == std::string::npos) {
+    rest->clear();
+    return std::string();
+  }
+  size_t t = s;
+  if (raw[t] == ',' || raw[t] == ':') {
+    ++t;
+  } else {
+    while (t < raw.size() && raw[t] != ',' && raw[t] != ':' && raw[t] != ' ' && raw[t] != '\t')
+      ++t;
+  }
+  *rest = raw.substr(t);
+  const std::string w = raw.substr(s, t - s);
+  struct Sub {
+    const char* full;
+    size_t min;
+  };
+  static const Sub kSubs[] = {{"write", 1},      {"_write", 2}, {"append", 1}, {"local", 3},
+                              {"substitute", 3}, {"init", 1},   {"close", 1},  {"stlog", 1},
+                              {"graph", 2}};
+  for (const auto& sb : kSubs) {
+    const std::string f(sb.full);
+    if (w.size() >= sb.min && w.size() <= f.size() && f.compare(0, w.size(), w) == 0) return f;
+  }
+  return w;
+}
+
+// texdoc write / _write / append / local / substitute: what they do outside
+// `texdoc do` (texdoc 2.4.0, the version the bank's Stata ran). write puts
+// the text after the subcommand word (less the one character that ended the
+// word) as a line of the document, _write without the line end; append copies
+// a file's lines in, after substitute()'s from/to pairs; local defines the
+// local macro (no stlog section to back it up to: "(no stlog available;
+// skipping backup)"); substitute keeps the pairs `texdoc do` applies to its
+// tex blocks. Each is a note when no document is open (vs-stata bank
+// ee2677d0f65929cd, 5739d498655cea3d, bfc4a64a11987e3b, 58f8f00d321b3275).
+static ojson texdocAppendText(SessionState& session, const std::string& text, const char* verb) {
+  const std::string resolved = session.eval.globals.get(kTexdocPathKey);
+  bool ok = false;
+  std::string existing;
+  if (cecon::native_exists(resolved)) {
+    existing = readWholeFile(resolved, &ok);
+    if (!ok) return tblError(std::string(verb) + ": cannot read the open texdoc file", "data_io");
+  }
+  existing += text;
+  return writeTextFileAtomic(verb, resolved, "the open texdoc file", existing);
+}
+
 ojson runTexdoc(const eval::ParsedCommand& parsed, SessionState& session) {
+  {
+    std::string rest;
+    const std::string sub = texdocSubcommand(parsed.raw, &rest);
+    const bool open = !session.eval.globals.get(kTexdocPathKey).empty();
+    const ojson notInit = displayBlock("(texdoc not initialized; nothing to do)");
+    if (sub == "write" || sub == "_write") {
+      if (!open) return notInit;
+      const std::string text = rest.empty() ? std::string() : rest.substr(1);
+      ojson werr = texdocAppendText(session, sub == "write" ? text + "\n" : text, "texdoc write");
+      if (!werr.is_null()) return werr;
+      return ojson::array();
+    }
+    if (sub == "substitute") {
+      if (!open) return ojson::array();
+      bool add = false;
+      std::string body = rest;
+      const size_t comma = body.find(',');
+      if (comma != std::string::npos) {
+        const std::string opt = strutil::lower(strutil::trim(body.substr(comma + 1)));
+        if (!opt.empty() && std::string("add").compare(0, opt.size(), opt) != 0)
+          return tblErrorRc("option " + opt + " not allowed", 198);
+        add = !opt.empty();
+        body = body.substr(0, comma);
+      }
+      body = strutil::trim(body);
+      std::istringstream iss(body);
+      size_t n = 0;
+      for (std::string w; iss >> w;) ++n;
+      if (n % 2 == 1) body += " \"\"";
+      const std::string key = kTexdocSettingPrefix + std::string("substitute");
+      if (add) {
+        if (!body.empty()) {
+          const std::string s0 = session.eval.globals.get(key);
+          session.eval.globals.set(key, (s0.empty() ? "" : s0 + " ") + body);
+        }
+      } else {
+        session.eval.globals.set(key, body);
+      }
+      return ojson::array();
+    }
+    if (sub == "append") {
+      if (!open) return notInit;
+      std::string body = rest;
+      std::vector<std::string> subs;
+      const size_t comma = body.find(',');
+      if (comma != std::string::npos) {
+        const std::string opt = strutil::trim(body.substr(comma + 1));
+        body = body.substr(0, comma);
+        static const std::regex reSub(R"(^sub(?:s(?:t(?:i(?:t(?:u(?:t(?:e)?)?)?)?)?)?)?\((.*)\)$)",
+                                      std::regex::icase);
+        std::smatch m;
+        if (!std::regex_match(opt, m, reSub))
+          return tblErrorRc("option " + opt + " not allowed", 198);
+        std::istringstream iss(m.str(1));
+        for (std::string w; iss >> w;) subs.push_back(dequote(w));
+        if (subs.size() % 2 == 1) subs.push_back(std::string());
+      }
+      const std::string file = dequote(strutil::trim(body));
+      if (file.empty()) return tblErrorRc("using required", 100);
+      const std::string resolved = resolveUserPath(session, file);
+      if (!cecon::native_exists(resolved)) return tblErrorRc("file " + file + " not found", 601);
+      bool ok = false;
+      std::string content = readWholeFile(resolved, &ok);
+      if (!ok) return tblErrorRc("file " + file + " could not be opened", 603);
+      std::string out;
+      size_t i = 0;
+      while (i < content.size()) {
+        size_t e = content.find('\n', i);
+        std::string line = content.substr(i, (e == std::string::npos ? content.size() : e) - i);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        for (size_t k = 0; k + 1 < subs.size(); k += 2) {
+          if (subs[k].empty()) continue;
+          size_t p = 0;
+          while ((p = line.find(subs[k], p)) != std::string::npos) {
+            line.replace(p, subs[k].size(), subs[k + 1]);
+            p += subs[k + 1].size();
+          }
+        }
+        out += line + "\n";
+        if (e == std::string::npos) break;
+        i = e + 1;
+      }
+      ojson werr = texdocAppendText(session, out, "texdoc append");
+      if (!werr.is_null()) return werr;
+      return displayBlock("(" + file + " appended)");
+    }
+    if (sub == "local") {
+      ojson res = dispatch("local" + rest, session);
+      ojson out = ojson::array();
+      if (open) out.push_back(displayBlock("(no stlog available; skipping backup)"));
+      for (const auto& b : res)
+        if (b.value("type", std::string()) != "echo") out.push_back(b);
+      return out;
+    }
+    static const std::set<std::string> kKnown = {"init", "close", "stlog", "graph", "strip", "do"};
+    if (!sub.empty() && kKnown.count(sub) == 0)
+      return tblErrorRc(sub + " invalid subcommand", 198);
+  }
   // The subcommands this build does not run carry options of their own (`texdoc
   // do d.do, cd nostop init()`); they are refused by name before the options
   // are judged against init's.
   if (!parsed.varlist.empty()) {
-    static const std::set<std::string> kNotRunSubs = {"do", "stlog", "local", "graph",
-                                                      "write", "substitute", "append"};
+    static const std::set<std::string> kNotRunSubs = {"do", "stlog", "graph", "strip"};
     const std::string first = strutil::lower(parsed.varlist[0]);
     if (kNotRunSubs.count(first) != 0)
       return ojson(eval::unsupportedCommand("texdoc " + first, std::nullopt, std::nullopt,
@@ -464,8 +618,7 @@ ojson runTexdoc(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   const std::string sub = strutil::lower(parsed.varlist[0]);
 
-  static const std::set<std::string> kNotImplementedSubs = {"do", "stlog", "local", "graph",
-                                                            "write", "substitute", "append"};
+  static const std::set<std::string> kNotImplementedSubs = {"do", "stlog", "graph", "strip"};
   if (kNotImplementedSubs.count(sub) != 0) {
     return ojson(eval::unsupportedCommand("texdoc " + sub, std::nullopt, std::nullopt,
                                           "refused:not_implemented_sub",

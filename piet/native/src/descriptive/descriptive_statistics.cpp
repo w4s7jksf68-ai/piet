@@ -13,12 +13,14 @@
 #include <set>
 #include <sstream>
 #include <unordered_set>
+#include "core/distributions.h"  // t_twosided_pvalue / t_critical (ttesti)
 #include "piet/cobra_runner.h"
 #include "piet/cobra_session.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/exprfns.h"  // kStataMissingSentinel
 #include "piet/inrange_filter.h"
 #include "piet/settings.h"
+#include "piet/stata_format.h"
 #include "piet/strutil.h"
 #include "io/win_compat.h"  // cecon::native_unlink (BUG-050 wide unlink)
 #include "piet/translate.h"
@@ -366,6 +368,16 @@ ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, boo
     if (covar) {
       const ojson& CV = raw.contains("cov") ? raw["cov"] : ojson();
       postMatrix("C", CV);
+      ojson displayRows = ojson::array();
+      for (size_t i = 0; i < varlist.size(); ++i) {
+        ojson row = ojson::array();
+        for (size_t j = 0; j <= i; ++j) {
+          const double value = cell(CV, i, j);
+          row.push_back(value >= eval::kStataMissingSentinel ? "." : fmt::general(value, 8, 0));
+        }
+        displayRows.push_back(std::move(row));
+      }
+      corrBlock["covariance_display"] = std::move(displayRows);
       post("Var_1", cell(CV, 0, 0));
       if (varlist.size() >= 2) {
         post("cov_12", cell(CV, 0, 1));
@@ -633,6 +645,265 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
   eval::declareRPosted(session.eval, "ttest", std::move(posted));
   ttBlock.erase("r");  // r() carriage, not part of the displayed block
   return ttBlock;
+}
+
+// ttesti: the immediate form of ttest, from summary statistics. One sample:
+// `ttesti #obs #mean #sd #val`; two samples: `ttesti #obs1 #mean1 #sd1 #obs2
+// #mean2 #sd2 [, unequal welch]`; both take level() and xname()/yname() (the
+// row labels). Stata's own method (ttesti's OneTest/TwoTest with _ttest's
+// table rows): se = sd/sqrt(n), t, df (n-1; n1+n2-2 pooled; Satterthwaite's or
+// Welch's under unequal/welch), p = 2 ttail(df,|t|), the one-sided p's as
+// p/2 and 1-p/2, and each row's interval mean -/+ invt(df_row, level) se.
+// Bank: 3a8d742de94ef851 `ttesti 24 62.6 15.8 75`, 9bc8a7490c905276 level(90),
+// 19147700e0806102 welch, 5ae23a055c3c4d91 unequal.
+ojson runTtesti(const eval::ParsedCommand& parsed, SessionState& session) {
+  auto rc = [](const std::string& msg, int code) {
+    return ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(code) + ")"));
+  };
+  const std::vector<std::string>& a = parsed.varlist;
+  if (a.size() != 4 && a.size() != 6)
+    return rc("either four arguments for a one-sample test or six arguments for a two-sample "
+              "test must be specified", 198);
+  double level = static_cast<double>(session.level);
+  bool unequal = false, welch = false;
+  std::string xname = "x", yname = "y";
+  bool xnameGiven = false;
+  for (const auto& [k, v] : parsed.opts) {
+    const std::string lk = strutil::lower(k);
+    auto prefixOf = [&lk](const char* full, size_t minLen) {
+      const std::string f(full);
+      return lk.size() >= minLen && lk.size() <= f.size() && f.compare(0, lk.size(), lk) == 0;
+    };
+    if (prefixOf("level", 1) && !v.isBool) {
+      const std::string t = trimM4(v.strValue);
+      char* end = nullptr;
+      const double lv = std::strtod(t.c_str(), &end);
+      if (t.empty() || end == nullptr || *end != '\0') return rc("option level() incorrectly specified", 198);
+      if (!(lv >= 10.0 && lv <= 99.99)) return rc("level() must be between 10 and 99.99 inclusive", 198);
+      level = lv;
+    } else if (prefixOf("xname", 1) && !v.isBool) {
+      xname = trimM4(v.strValue);
+      xnameGiven = !xname.empty();
+      if (!xnameGiven) xname = "x";
+    } else if (prefixOf("yname", 1) && !v.isBool) {
+      yname = trimM4(v.strValue);
+      if (yname.empty()) yname = "y";
+    } else if (a.size() == 6 && prefixOf("unequal", 3) && v.isBool) {
+      unequal = true;
+    } else if (a.size() == 6 && prefixOf("welch", 1) && v.isBool) {
+      welch = true;
+    } else if (prefixOf("reverse", 3) || (a.size() == 6 && lk == "cate")) {
+      return ojson(eval::unsupportedOption(k, "ttesti's " + k + " option is not implemented in this "
+                                              "version of PIET."));
+    } else {
+      return rc("option " + k + " not allowed", 198);
+    }
+  }
+  // _ttest check: each number as Stata confirms it.
+  std::vector<double> x(a.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    const std::string t = trimM4(a[i]);
+    if (t == ".") {
+      x[i] = std::numeric_limits<double>::quiet_NaN();
+      continue;
+    }
+    char* end = nullptr;
+    x[i] = std::strtod(t.c_str(), &end);
+    if (t.empty() || end == nullptr || *end != '\0' || !std::isfinite(x[i]))
+      return rc("'" + t + "' found where number expected", 7);
+  }
+  auto checkSample = [&](size_t at, const std::string& which) -> std::optional<ojson> {
+    const double n = x[at], m = x[at + 1], sd = x[at + 2];
+    const std::string pre = which.empty() ? std::string() : which + " sample ";
+    if (std::isnan(n))
+      return rc(which.empty() ? "number of observations is missing"
+                              : "number of observations of " + which + " sample is missing", 416);
+    if (n != std::floor(n)) return rc("'" + trimM4(a[at]) + "' found where integer expected", 7);
+    if (n < 0)
+      return rc(which.empty() ? "number of observations is negative"
+                              : "number of observations of " + which + " sample is negative", 411);
+    if (n == 0) return rc(which.empty() ? "no observations" : which + " sample has no observations", 2000);
+    if (std::isnan(m))
+      return rc(which.empty() ? "mean is missing" : "mean of " + which + " sample is missing", 416);
+    if (std::isnan(sd)) {
+      if (n != 1)
+        return rc(which.empty() ? "standard deviation is missing"
+                                : "standard deviation of " + which + " sample is missing", 416);
+    } else {
+      if (sd < 0)
+        return rc(which.empty() ? "standard deviation is negative"
+                                : which + " sample has a negative standard deviation", 411);
+      if (n == 1 && sd != 0)
+        return rc(which.empty() ? "only one observation, but positive standard deviation"
+                                : which + " sample has only one observation, but positive standard "
+                                          "deviation", 499);
+    }
+    (void)pre;
+    return std::nullopt;
+  };
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  const double alpha = level == 95.0 ? 0.05 : 1.0 - level / 100.0;
+  auto pvals = [](double t, double df, double& p, double& pl, double& pu) {
+    p = cecon::t_twosided_pvalue(t, df);
+    if (t < 0) {
+      pl = p / 2.0;
+      pu = 1.0 - pl;
+    } else {
+      pu = p / 2.0;
+      pl = 1.0 - pu;
+    }
+  };
+  auto rowCi = [&](double n, double m, double sd, double& se, double& lb, double& ub) {
+    if (n == 1) sd = kNaN;
+    se = sd / std::sqrt(n);
+    const double q = n > 1 ? cecon::t_critical(alpha, n - 1.0) : kNaN;
+    lb = m - q * se;
+    ub = m + q * se;
+  };
+  auto& R = session.eval.rValues;
+  ojson block;
+  block["type"] = "estimation";
+  block["estimator"] = "ttest";
+  block["depvar"] = "";
+  block["immediate"] = true;
+  // What the renderer draws (estimation-format.js formatTtestTable), Stata's
+  // one- and two-sample table: the title, a first column headed "Variable" when
+  // xname() names a variable of the data, "   Group" when it names anything
+  // else, nothing without xname(); one row per sample (Obs, Mean, Std. err.,
+  // Std. dev., interval), Combined and diff rows for two samples; the t line,
+  // H0 with the degrees of freedom, the three alternatives' p-values (bank
+  // 3a8d742de94ef851, 5ae23a055c3c4d91, 19147700e0806102).
+  ojson tt;
+  tt["level"] = level;
+  {
+    std::string col1;
+    if (xnameGiven) {
+      Datastore* ds = session.datastore();
+      col1 = ds != nullptr && ds->has(xname) ? "Variable" : "   Group";
+    }
+    tt["col1"] = col1;
+  }
+  auto ttRow = [](const std::string& name, double n, double m, double se, double sd, double lb,
+                  double ub) {
+    return ojson{{"name", name}, {"n", n}, {"mean", m}, {"se", se}, {"sd", sd}, {"lb", lb}, {"ub", ub}};
+  };
+  if (a.size() == 4) {
+    if (auto e = checkSample(0, "")) return *e;
+    if (std::isnan(x[3])) return rc("hypothesized value is missing", 416);
+    const double n = x[0], m = x[1], m0 = x[3];
+    const double sd = n == 1 ? kNaN : x[2];
+    const double t = (m - m0) * std::sqrt(n) / sd;
+    double se, lb, ub, p, pl, pu;
+    rowCi(n, m, sd, se, lb, ub);
+    pvals(t, n - 1.0, p, pl, pu);
+    eval::replaceRClass(session.eval);
+    R.set("N_1", n);
+    R.set("mu_1", m);
+    R.set("df_t", n - 1.0);
+    R.set("t", t);
+    R.set("p", p);
+    R.set("p_l", pl);
+    R.set("p_u", pu);
+    R.set("se", se);
+    R.set("sd_1", sd);
+    R.set("lb_1", lb);
+    R.set("ub_1", ub);
+    eval::declareRPosted(session.eval, "ttesti",
+                         {"N_1", "mu_1", "df_t", "t", "p", "p_l", "p_u", "se", "sd_1", "lb_1", "ub_1"});
+    block["n_obs"] = n;
+    ojson row = {{"name", xname}, {"b", m}, {"se", se}, {"t", t}, {"p", p}, {"ci_lo", lb}, {"ci_hi", ub}};
+    block["coeftable"] = ojson::array({row});
+    block["coefs"] = block["coeftable"];
+    block["df"] = n - 1.0;
+    block["p"] = p;
+    block["h0"] = m0;
+    tt["form"] = "one";
+    tt["title"] = "One-sample t test";
+    tt["xname"] = xname;
+    tt["rows"] = ojson::array({ttRow(xname, n, m, se, sd, lb, ub)});
+    tt["h0"] = m0;
+    tt["h0_text"] = trimM4(a[3]);  // the value as typed (ttesti's H0 line)
+    tt["t"] = t;
+    tt["df"] = n - 1.0;
+    tt["p_l"] = pl;
+    tt["p"] = p;
+    tt["p_u"] = pu;
+    block["ttest_table"] = std::move(tt);
+    return block;
+  }
+  if (auto e = checkSample(0, "first")) return *e;
+  if (auto e = checkSample(3, "second")) return *e;
+  const double n1 = x[0], m1 = x[1], n2 = x[3], m2 = x[4];
+  const double s1 = n1 == 1 ? kNaN : x[2], s2 = n2 == 1 ? kNaN : x[5];
+  double var, df;
+  if (unequal || welch) {
+    var = s1 * s1 / n1 + s2 * s2 / n2;
+    const double a1 = s1 * s1 / n1, a2 = s2 * s2 / n2;
+    df = welch ? -2.0 + var * var / (a1 * a1 / (n1 + 1.0) + a2 * a2 / (n2 + 1.0))
+               : var * var / (a1 * a1 / (n1 - 1.0) + a2 * a2 / (n2 - 1.0));
+  } else {
+    df = n1 + n2 - 2.0;
+    var = (((n1 - 1.0) * s1 * s1 + (n2 - 1.0) * s2 * s2) / df) * (1.0 / n1 + 1.0 / n2);
+  }
+  const double t = (m1 - m2) / std::sqrt(var);
+  const double se = std::sqrt(var);
+  double p, pl, pu;
+  pvals(t, df, p, pl, pu);
+  double se1, lb1, ub1, se2, lb2, ub2, sec, lbc, ubc;
+  rowCi(n1, m1, s1, se1, lb1, ub1);
+  rowCi(n2, m2, s2, se2, lb2, ub2);
+  const double n = n1 + n2;
+  const double m = (n1 * m1 + n2 * m2) / n;
+  const double sc = std::sqrt(((n1 - 1.0) * s1 * s1 + n1 * (m - m1) * (m - m1) +
+                               (n2 - 1.0) * s2 * s2 + n2 * (m - m2) * (m - m2)) / (n - 1.0));
+  rowCi(n, m, sc, sec, lbc, ubc);
+  const double qd = cecon::t_critical(alpha, df);
+  const double lbd = (m1 - m2) - qd * se, ubd = (m1 - m2) + qd * se;
+  eval::replaceRClass(session.eval);
+  const std::vector<std::pair<const char*, double>> items = {
+      {"N_1", n1},         {"mu_1", m1},        {"N_2", n2},         {"mu_2", m2},
+      {"df_t", df},        {"t", t},            {"p", p},            {"p_l", pl},
+      {"p_u", pu},         {"se", se},          {"sd_1", s1},        {"sd_2", s2},
+      {"sd", sc},          {"se_1", se1},       {"lb_1", lb1},       {"ub_1", ub1},
+      {"se_2", se2},       {"lb_2", lb2},       {"ub_2", ub2},       {"N_combined", n},
+      {"mu_combined", m},  {"se_combined", sec}, {"lb_combined", lbc}, {"ub_combined", ubc},
+      {"mu_diff", m1 - m2}, {"lb_diff", lbd},   {"ub_diff", ubd}};
+  std::vector<std::string> posted;
+  for (const auto& [k, v] : items) {
+    R.set(k, v);
+    posted.push_back(k);
+  }
+  eval::declareRPosted(session.eval, "ttesti", std::move(posted));
+  block["n_obs"] = n;
+  ojson row = {{"name", "diff"}, {"b", m1 - m2}, {"se", se}, {"t", t}, {"p", p}, {"ci_lo", lbd}, {"ci_hi", ubd}};
+  block["coeftable"] = ojson::array({row});
+  block["coefs"] = block["coeftable"];
+  block["df"] = df;
+  block["p"] = p;
+  block["mean_1"] = m1;
+  block["mean_2"] = m2;
+  block["n_1"] = n1;
+  block["n_2"] = n2;
+  block["sd_1"] = s1;
+  block["sd_2"] = s2;
+  block["by"] = xname + " vs " + yname;
+  tt["form"] = "two";
+  tt["title"] = std::string("Two-sample t test with ") + (unequal || welch ? "unequal" : "equal") +
+                " variances";
+  tt["xname"] = xname;
+  tt["yname"] = yname;
+  tt["rows"] = ojson::array({ttRow(xname, n1, m1, se1, s1, lb1, ub1), ttRow(yname, n2, m2, se2, s2, lb2, ub2)});
+  tt["combined"] = ttRow("Combined", n, m, sec, sc, lbc, ubc);
+  tt["diff"] = ojson{{"name", "diff"}, {"mean", m1 - m2}, {"se", se}, {"lb", lbd}, {"ub", ubd}};
+  tt["df_kind"] = welch ? "welch" : unequal ? "satterthwaite" : "pooled";
+  tt["t"] = t;
+  tt["df"] = df;
+  tt["p_l"] = pl;
+  tt["p"] = p;
+  tt["p_u"] = pu;
+  block["ttest_table"] = std::move(tt);
+  return block;
 }
 
 

@@ -502,7 +502,24 @@ std::optional<ojson> lpolyBandwidthRefusal(SessionState& session, const std::str
   if (!hasAt) return aerErrorReason("variable name in bwidth() is allowed only with at() option", 198);
   if (!smoothIsNumeric(session, *variable))
     return aerErrorReason("bwidth(): " + text + " is not a numeric variable", 198);
-  return aerErrorReason("lpoly: a variable in bwidth() is not implemented in this build", 198);
+  return std::nullopt;
+}
+
+// A positive-valued variable option of lpoly (bwidth(varname), var(varname)) over the grid rows:
+// every row where at() and the variable are both nonmissing must hold a positive value
+// (Stata: `<opt>(): <var> has nonpositive values`, r(499)).
+std::optional<ojson> lpolyPositiveColumn(SessionState& session, const std::string& opt, const std::string& var,
+                                         const std::string& atVar) {
+  Datastore* ds = session.datastore();
+  if (ds == nullptr || !ds->has(var) || !ds->has(atVar)) return std::nullopt;
+  const double* v = ds->col(var).f64();
+  const double* at = ds->col(atVar).f64();
+  if (v == nullptr || at == nullptr) return std::nullopt;
+  for (int64_t i = 0; i < ds->nRows(); ++i) {
+    if (smoothCellMissing(at[i]) || smoothCellMissing(v[i])) continue;
+    if (!(v[i] > 0)) return aerErrorReason(opt + "(): " + var + " has nonpositive values", 499);
+  }
+  return std::nullopt;
 }
 
 // A column lpoly will add, once the fit is in hand.
@@ -651,11 +668,6 @@ ojson runLpoly(const eval::ParsedCommand& parsed, SessionState& session) {
   const std::string weightKind = parsed.weightType.value_or(std::string()).substr(0, 1);
   if (weightKind == "p") return aerErrorReason("pweights not allowed", 101);
   if (weightKind == "i") return aerErrorReason("iweights not allowed", 101);
-  if (weightKind == "f")
-    return aerErrorReason(
-        "lpoly: fweights are not implemented in this build (how Stata counts r(N) and the rule-of-thumb n under "
-        "fweights is unmeasured); [aw=] is",
-        198);
   if (parsed.varlist.size() < 2) return aerErrorReason("too few variables specified", 102);
   if (parsed.varlist.size() > 2) return aerErrorReason("too many variables specified", 103);
   if (!session.hasData() || !session.currentHbin().has_value()) return ojson(eval::noDataLoaded());
@@ -682,21 +694,13 @@ ojson runLpoly(const eval::ParsedCommand& parsed, SessionState& session) {
   }
 
   if (smoothOpt(parsed, "by") != nullptr) return aerErrorReason("option by() not allowed", 191);
-  const std::vector<std::pair<std::string, size_t>> namedGaps = {{"var", 1}, {"generatevar", 9}, {"generateci", 9}};
-  for (const auto& [gap, atLeast] : namedGaps) {
-    if (const auto* gapOpt = smoothFirstOpt(parsed, gap, atLeast)) {
-      // var(varname) names a variable that must exist (bank: `lpoly price weight,
-      // nograph generate(gx gs) var(gv)` r(111) "variable gv not found").
-      if (gap == "var") {
-        const std::string vt = strutil::trim(smoothOptText(gapOpt));
-        const bool nameLike = !vt.empty() && (std::isalpha(static_cast<unsigned char>(vt[0])) || vt[0] == '_') &&
-                              std::all_of(vt.begin(), vt.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; });
-        if (nameLike && !resolveVarName(vt, session).has_value())
-          return aerErrorReason("variable " + vt + " not found", 111);
-      }
-      return aerErrorReason("lpoly: option " + gap + "() is not implemented in this build", 198);
-    }
-  }
+  // generateci(lo hi): the pointwise CI band as two new float variables, made first
+  const std::vector<std::string> ciNames = smoothBlankWords(smoothOptText(smoothFirstOpt(parsed, "generateci", 9)));
+  // An empty generateci() asks for nothing; any other count than two is Stata's r(198) "Two
+  // variables must be specified" (bank 7b91cb395a5974e6 `generateci(gs)`).
+  if (!ciNames.empty() && ciNames.size() != 2) return aerErrorReason("Two variables must be specified", 198);
+  // generatevar(name): the conditional variance each SE uses, as a new double variable
+  const std::string cvarName = strutil::trim(smoothOptText(smoothFirstOpt(parsed, "generatevar", 9)));
 
   const std::string pilotText = smoothOptText(smoothFirstOpt(parsed, "pwidth", 2));
   const bool pilotGiven = smoothFirstOpt(parsed, "pwidth", 2) != nullptr;
@@ -744,12 +748,45 @@ ojson runLpoly(const eval::ParsedCommand& parsed, SessionState& session) {
 
   const std::string widthText = smoothOptText(smoothFirstOpt(parsed, "bwidth", 2));
   if (auto bad = lpolyBandwidthRefusal(session, widthText, !atVar.empty())) return *bad;
+  // bwidth(varname) with at(): each at() row's own bandwidth; r(bwidth) is then not set
+  std::string widthVar;
+  {
+    double w = 0.0;
+    if (!widthText.empty() && !smoothPlainNumber(widthText, &w)) {
+      widthVar = resolveVarName(widthText, session).value_or(widthText);
+      if (auto bad = lpolyPositiveColumn(session, "bwidth", widthVar, atVar)) return *bad;
+    }
+  }
+  // var(# | varname): the conditional variance of the SEs, given instead of estimated (a
+  // varname only with at()); it asks for the SEs (bank 245dc26780e467e6 `ci var(1000000)`,
+  // d2881a294fa528ab `at(ga) generate(gs) var(gv) se(gse)`).
+  std::string varNumber, varColumn;
+  if (const auto* varOpt = smoothFirstOpt(parsed, "var", 1)) {
+    const std::string vt = strutil::trim(smoothOptText(varOpt));
+    double v = 0.0;
+    if (smoothPlainNumber(vt, &v)) {
+      if (v <= 0.0) return aerErrorReason("var() must be a positive number", 198);
+      varNumber = vt;
+    } else {
+      const std::optional<std::string> found = resolveVarName(vt, session);
+      if (!found) return aerErrorReason("variable " + vt + " not found", 111);
+      if (atVar.empty()) return aerErrorReason("variable name in var() is allowed only with at() option", 198);
+      if (!smoothIsNumeric(session, *found)) return aerErrorReason("var(): " + vt + " is not a numeric variable", 198);
+      if (auto bad = lpolyPositiveColumn(session, "var", *found, atVar)) return *bad;
+      varColumn = *found;
+    }
+  }
+  if (!cvarName.empty())
+    if (auto bad = lpolyNewNameRefusal(session, cvarName)) return *bad;
+  for (const std::string& word : ciNames)
+    if (auto bad = lpolyNewNameRefusal(session, word)) return *bad;
 
   const bool drawn = smoothFirstOpt(parsed, "nograph", 4) == nullptr;
   if (drawn)
     if (auto bad = smoothDrawnNet(parsed, "lpoly")) return *bad;
 
-  const bool bandsInForce = smoothFirstOpt(parsed, "ci", 2) != nullptr || pilotGiven;
+  const bool bandsInForce = smoothFirstOpt(parsed, "ci", 2) != nullptr || pilotGiven || !varNumber.empty() ||
+                            !varColumn.empty() || !cvarName.empty() || !ciNames.empty();
   const bool wantScatter = drawn && smoothFirstOpt(parsed, "noscatter", 4) == nullptr;
   std::vector<std::string> args = {"lpoly", "--data", *session.currentHbin(), "--y", yVar, "--x", xVar, "--kernel", kernel};
   auto addFlag = [&args](const char* flag, const std::string& value) {
@@ -757,16 +794,19 @@ ojson runLpoly(const eval::ParsedCommand& parsed, SessionState& session) {
     args.push_back(flag);
     args.push_back(value);
   };
-  addFlag("--bw", widthText);
+  if (widthVar.empty()) addFlag("--bw", widthText);
+  addFlag("--bw-col", widthVar);
+  addFlag("--var", varNumber);
+  addFlag("--var-col", varColumn);
   addFlag("--degree", degreeArg);
   addFlag("--pwidth", pilotText);
   addFlag("--at", atVar);
   if (atVar.empty()) addFlag("--n", gridArg);
   if (bandsInForce || !seName.empty()) args.push_back("--se");
   if (wantScatter) args.push_back("--emit-touse");
-  if (weightKind == "a") {
+  if (weightKind == "a" || weightKind == "f") {
     addFlag("--weight", parsed.weightVar.value_or(std::string()));
-    addFlag("--wtype", "aweight");
+    addFlag("--wtype", weightKind == "a" ? "aweight" : "fweight");
   }
   if (auto bad = smoothSampleArgs(parsed, session, "lpoly", &args)) return *bad;
 
@@ -783,16 +823,21 @@ ojson runLpoly(const eval::ParsedCommand& parsed, SessionState& session) {
   const int chosenDegree = reply.value("degree", 0);
   const std::string chosenKernel = reply.value("kernel", kernel);
   session.eval.rValues.set("N", static_cast<double>(reply.value("n_obs", 0)));
-  session.eval.rValues.set("bwidth", chosenWidth);
+  if (widthVar.empty()) session.eval.rValues.set("bwidth", chosenWidth);
   session.eval.rValues.set("pwidth", (bandsInForce || !seName.empty()) ? chosenPilot : absent);
   session.eval.rValues.set("ngrid", static_cast<double>(reply.value("ngrid", 0)));
   session.eval.rValues.set("degree", static_cast<double>(chosenDegree));
   session.eval.rStrings.set("kernel", chosenKernel);
-  eval::declareRPosted(session.eval, "lpoly", {"N", "bwidth", "pwidth", "ngrid", "degree", "kernel"});
+  if (widthVar.empty())
+    eval::declareRPosted(session.eval, "lpoly", {"N", "bwidth", "pwidth", "ngrid", "degree", "kernel"});
+  else
+    eval::declareRPosted(session.eval, "lpoly", {"N", "pwidth", "ngrid", "degree", "kernel"});
 
   const std::vector<double> grid = jsonDoubles(reply["grid"]);
   const std::vector<double> fitted = jsonDoubles(reply["smooth"]);
   const std::vector<double> fittedSe = reply.contains("se") ? jsonDoubles(reply["se"]) : std::vector<double>();
+  const std::vector<double> condVar =
+      reply.contains("cvar") && reply["cvar"].is_array() ? jsonDoubles(reply["cvar"]) : std::vector<double>();
 
   ojson blocks = ojson::array();
   const bool capped = reply.contains("n_capped") && reply["n_capped"].is_boolean() ? reply["n_capped"].get<bool>()
@@ -808,6 +853,22 @@ ojson runLpoly(const eval::ParsedCommand& parsed, SessionState& session) {
     outputs.push_back({outWords.back(), "lpoly smooth: " + smoothVarTitle(session, yVar), lpolyRowLength(fitted, rows), 1});
   if (outWords.size() == 2) outputs.push_back({outWords[0], "lpoly smoothing grid", lpolyRowLength(grid, rows), 0});
   if (!seName.empty()) outputs.push_back({seName, "lpoly SEs", lpolyRowLength(fittedSe, rows), 2});
+  if (!cvarName.empty()) outputs.push_back({cvarName, "conditional variance", lpolyRowLength(condVar, rows), 3});
+  std::set<std::string> floatOutputs;
+  if (ciNames.size() == 2) {
+    // gen (float) of yhat -/+ invnormal((1+level/100)/2) * SE over the grid rows
+    const double z = cecon::z_critical(1.0 - confidence / 100.0);
+    std::vector<double> lo(grid.size(), absent), hi(grid.size(), absent);
+    for (size_t g = 0; g < grid.size() && g < fitted.size() && g < fittedSe.size(); ++g) {
+      if (smoothCellMissing(fitted[g]) || smoothCellMissing(fittedSe[g])) continue;
+      lo[g] = static_cast<double>(static_cast<float>(fitted[g] - z * fittedSe[g]));
+      hi[g] = static_cast<double>(static_cast<float>(fitted[g] + z * fittedSe[g]));
+    }
+    const std::string ciLabel = smoothRound2(confidence) + "% CI";
+    outputs.push_back({ciNames[0], ciLabel, lpolyRowLength(lo, rows), -2});
+    outputs.push_back({ciNames[1], ciLabel, lpolyRowLength(hi, rows), -1});
+    floatOutputs = {ciNames[0], ciNames[1]};
+  }
   std::optional<ojson> lateRefusal;
   size_t creatable = 0;
   for (; creatable < outputs.size(); ++creatable) {
@@ -841,8 +902,8 @@ ojson runLpoly(const eval::ParsedCommand& parsed, SessionState& session) {
         band.push_back({grid[g], fitted[g] - zScore * fittedSe[g], fitted[g] + zScore * fittedSe[g]});
     }
     std::stable_sort(band.begin(), band.end(), [](const auto& l, const auto& r) { return l[0] < r[0]; });
-    std::string note = "kernel = " + chosenKernel + ", degree = " + std::to_string(chosenDegree) +
-                       ", bandwidth = " + smoothRound2(chosenWidth);
+    std::string note = "kernel = " + chosenKernel + ", degree = " + std::to_string(chosenDegree);
+    if (widthVar.empty()) note += ", bandwidth = " + smoothRound2(chosenWidth);
     if (bandsInForce) note += ", pwidth = " + smoothRound2(chosenPilot);
     blocks.push_back(smoothGraphBlock(parsed, session, "Local polynomial smooth", note, yVar, xVar, scatter, band,
                                       smoothPairsSortedByX(std::move(line))));
@@ -854,6 +915,10 @@ ojson runLpoly(const eval::ParsedCommand& parsed, SessionState& session) {
   for (const LpolyOutput& output : outputs) {
     ojson failure;
     if (!smoothWriteColumn(session, output.name, output.values, output.label, &failure)) return failure;
+    if (floatOutputs.count(output.name) != 0) {
+      session.varMeta[output.name].stataType.reset();
+      session.implicitFloatVars.insert(output.name);
+    }
     added.push_back(output.name);
   }
   if (!added.empty()) blocks.push_back(mutationResult(session, "lpoly", added, {}));

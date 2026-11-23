@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "piet/handlers/io.h"
+#include "piet/serset.h"  // storageType: strL / str# > 244 for format 115
 
 #include <algorithm>
 #include <cctype>
@@ -117,6 +118,28 @@ ojson runSaveold(const eval::ParsedCommand& parsed, SessionState& session) {
     long long v = 0;
     (void)parseStrictInt(*version, &v);
     release = v <= 12 ? 115 : (v == 13 ? 117 : 118);
+  }
+  // Format 115 (Stata 11 and 12) holds strings of up to 244 bytes and no
+  // strL: data with either is r(459) before anything is written (vs-stata
+  // bank 34fa3371cf5d89f8 version(11), da9509c056bf8289 version(12)).
+  if (release == 115 && session.hasData()) {
+    if (Datastore* ds = session.datastore()) {
+      for (const auto& nm : ds->names()) {
+        const std::string t = serset::storageType(session, *ds, nm);
+        bool tooWide = t == "strL";
+        if (!tooWide && t.size() > 3 && t.compare(0, 3, "str") == 0) {
+          long long w = 0;
+          tooWide = parseStrictInt(t.substr(3), &w) && w > 244;
+        }
+        if (tooWide)
+          return ioErrorRc(
+              "data cannot be saved in old .dta format\n    Data contain strL or str#, #>244, and "
+              "prior releases of Stata would not\n    know how to process these variables.  "
+              "Either drop the variables or use\n    recast with the force option to change "
+              "them to str244.",
+              459);
+      }
+    }
   }
   // runSaveData names the spelling it was handed (`effectiveFp`) in its echo
   // and in every refusal (BUG-410), so its block goes out as it is.

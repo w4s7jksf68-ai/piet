@@ -579,7 +579,7 @@ ojson runConfirm(const std::string& typedRaw, const std::vector<std::string>& ty
     const bool newFrame = sub == "new";
     for (size_t i = newFrame ? 2 : 1; i < varlist.size(); ++i) {
       const std::string& f = varlist[i];
-      const bool exists = f == "default" || session.frames.count(f) != 0;
+      const bool exists = f == session.currentFrame || session.frames.count(f) != 0;
       if (newFrame && exists) return engineErrorBlockRc("frame " + f + " already defined", 110);
       if (!newFrame && !exists) return engineErrorBlockRc("frame " + f + " not found", 111);
     }

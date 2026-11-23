@@ -1093,6 +1093,50 @@ int cmd_expand(const std::vector<std::string>& a) {
     return 0;
 }
 
+// cobra take --data f.hbin --rows-file idx.txt --out new.hbin
+// Row gather: the output's row k is input row idx[k], where the rows file holds
+// 1-based row numbers, one per line, repeats allowed, in the output's order.
+// Columns, labels and storage carry as for expand (take_rows); no sort claim.
+// Why it exists: the bootstrap prefix used to build each replicate with
+// convert (the index CSV) + merge m:1 (index -> stamped base) + eval --keepif,
+// three requests and three whole-width writes per replicate. On a 606 x 273
+// dataset those were ~19 ms of a ~25 ms replicate whose estimator took 0.2 ms.
+// This is one request and one write.
+int cmd_take(const std::vector<std::string>& a) {
+    std::string data = opt(a, "--data"), rows = opt(a, "--rows-file"), out = opt(a, "--out");
+    if (data_missing(data) || rows.empty() || out_missing(out)) {
+        std::fprintf(stderr, "usage: cobra take --data f.hbin --rows-file idx.txt --out new.hbin\n"
+                             "  Gather rows: output row k = input row idx[k] (1-based, one per line,\n"
+                             "  repeats allowed).\n");
+        return 2;
+    }
+    std::ifstream in(cecon::to_native_path(rows));
+    if (!in) throw EngineError("data_io", "take: could not open the rows file '" + rows + "'");
+    std::vector<int64_t> idx;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        size_t pos = 0;
+        long long v = 0;
+        try {
+            v = std::stoll(line, &pos);
+        } catch (const std::exception&) {
+            pos = 0;
+        }
+        if (pos == 0 || pos != line.size())
+            throw EngineError("bad_input", "take: the rows file holds a non-integer line '" + line + "'");
+        idx.push_back(static_cast<int64_t>(v) - 1);
+    }
+    const Dataset& ds = acquire_data(data);
+    Frame fr = frame_from_acquired(ds);
+    Frame res = fr.take(idx);
+    int64_t nrows = res.n_rows();
+    if (!commit_frame(std::move(res), out))
+        std::fprintf(stderr, "take: wrote %s (%lld rows)\n", out.c_str(), static_cast<long long>(nrows));
+    return 0;
+}
+
 // cobra fillin --data f.hbin --vars v1[,v2,...] --out new.hbin
 // Stata `fillin v1 v2 ...`: rectangularize over the OBSERVED values of the
 // listed variables. New rows are missing in every other column and are marked

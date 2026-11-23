@@ -630,8 +630,34 @@ int cmd_mean(const std::vector<std::string>& a) {
         keep_cols.push_back(cl);
     }
     std::vector<int64_t> keep = casewise_keep(keep_cols, w, N);
+    // A zero aweight or pweight leaves the sample: `mean price [aw=foreign]` is
+    // e(N) 22, e(sample) 22 rows (vs-stata bank bce4d4a312c17223). A zero
+    // fweight stays in e(sample) but counts no row of e(_N) (da06b6d418f07568
+    // `[fw=foreign]`: e(sample) 74 rows, e(N) 22, e(_N) 22); an iweight stays.
+    {
+        const bool keep0 = !weight.empty() && (wtype_in == "iw" || wtype_in == "iweight" ||
+                                               wtype_in == "fw" || wtype_in == "fweight");
+        if (w && !keep0) {
+            std::vector<int64_t> kept;
+            kept.reserve(keep.size());
+            for (int64_t i : keep)
+                if (w[i] != 0.0) kept.push_back(i);
+            keep.swap(kept);
+        }
+    }
     const int64_t n = static_cast<int64_t>(keep.size());
+    // No row with every variable present: r(2000) "no observations" (vs-stata
+    // bank 3d0ad29226d8345e `mean x` over an all-missing x, 79a62c511d36edff).
+    if (n == 0) throw EngineError("no_obs", "no observations", "r(2000)");
     double W = 0; for (int64_t i : keep) W += w ? w[i] : 1.0;
+    // A negative aweight, fweight or pweight is Stata's r(402) "negative weights
+    // encountered", ahead of a frequency weight's integrality (vs-stata bank
+    // 0364c489f733be11 `mean price [aw=w]`, bc4516167c8c8a50 `[fw=w]`, w = +-0.5).
+    // An iweight may be negative.
+    const bool importance_w = !weight.empty() && (wtype_in == "iw" || wtype_in == "iweight");
+    if (w && !importance_w)
+        for (int64_t i : keep)
+            if (w[i] < 0.0) throw EngineError("bad_input", "negative weights encountered", "r(402)");
     if (freq_fw)
         for (int64_t i : keep)
             if (w[i] != std::floor(w[i]))
@@ -821,7 +847,12 @@ int cmd_mean(const std::vector<std::string>& a) {
                 ss += a_i * d * d;
             }
             const double den = freq_w ? W - 1.0 : nn - 1.0;
-            nvec.push_back(n);
+            int64_t nrow = n;
+            if (w && freq_fw) {
+                nrow = 0;
+                for (int64_t i : keep) nrow += w[i] != 0.0 ? 1 : 0;
+            }
+            nvec.push_back(nrow);
             sdv.push_back(nz(den > 0 ? std::sqrt(ss / den) : std::numeric_limits<double>::quiet_NaN()));
         }
         out["e__N"] = nvec;

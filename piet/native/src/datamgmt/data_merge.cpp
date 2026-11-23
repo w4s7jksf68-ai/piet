@@ -92,11 +92,12 @@ ojson runMerge(const std::string& mergeType, const std::vector<std::string>& key
   if (keepOpt.has_value())
     if (auto err = parseMergeResults(*keepOpt, keepCodes)) return *err;
   // Stata: `generate()` RENAMES the marker; `nogenerate` suppresses it.
+  // generate() with nogenerate: Stata's merge means to print a note here, but the note's
+  // first line names a display style without `as` (`as smcl err "{p}"`), so display reads
+  // `err` as a variable and the command stops with r(111) "err not found" (bank
+  // b204e2c23cc1b9dc). That is the answer the user gets, so it is the one given here.
   if (generateOpt.has_value() && nogenerate) {
-    return engineErrorBlock(
-        "merge: `generate()` and `nogenerate` are alternatives — one names the marker variable, "
-        "the other suppresses it.",
-        "bad_input");
+    return rcError("engine_error", "err not found", "111");
   }
   if (generateOpt.has_value() &&
       (generateOpt->empty() || !strutil::isValidStataIdentifier(*generateOpt))) {

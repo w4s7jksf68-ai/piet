@@ -63,7 +63,8 @@ void postVarEResults(SessionState& session, const ojson& raw, const eval::Parsed
   for (const auto& v : raw["vars"]) vars.push_back(v.get<std::string>());
   const size_t K = vars.size();
   const size_t p = raw["lags"].get<size_t>();
-  const size_t Kp = K * p, m = Kp + 1, KM = K * m;
+  const bool cons = raw.value("constant", true);
+  const size_t Kp = K * p, m = Kp + (cons ? 1 : 0), KM = K * m;
   const double T = raw["n_obs"].get<double>();
   const ojson& eqs = raw["equations"];
   if (K < 1 || eqs.size() != K || raw["vcov"].size() != KM * KM || raw["xtx"].size() != m * m ||
@@ -91,8 +92,10 @@ void postVarEResults(SessionState& session, const ojson& raw, const eval::Parsed
       order.push_back((j - 1) * K + c);
       within.push_back(lagName(j, c));
     }
-  order.push_back(Kp);
-  within.push_back("_cons");
+  if (cons) {
+    order.push_back(Kp);
+    within.push_back("_cons");
+  }
   std::vector<std::string> names;
   std::vector<size_t> full;  // Stata position -> engine system index
   std::vector<double> b;
@@ -138,8 +141,12 @@ void postVarEResults(SessionState& session, const ojson& raw, const eval::Parsed
     session.eval.eMatrices.emplace_back(nm, std::move(mat));
   };
   {
-    std::vector<size_t> g = {Kp};
-    std::vector<std::string> gn = {"_cons"};
+    std::vector<size_t> g;
+    std::vector<std::string> gn;
+    if (cons) {
+      g.push_back(Kp);
+      gn.push_back("_cons");
+    }
     for (size_t j = 1; j <= p; ++j)
       for (size_t c = 0; c < K; ++c) {
         g.push_back((j - 1) * K + c);
@@ -244,6 +251,7 @@ void postVarEResults(SessionState& session, const ojson& raw, const eval::Parsed
     if (Datastore* ds = session.datastore(); ds != nullptr && ds->has(*session.timevar))
       mac("tsfmt", session.displayFormat(ds->varinfo(*session.timevar)));
   }
+  if (!cons) mac("nocons", "nocons");
   if (nobigf) mac("bigf", "nobigf");
   if (dfk) mac("dfk", "dfk");
   if (small) mac("small", "small");
@@ -266,7 +274,7 @@ ojson runVar(const eval::ParsedCommand& parsed, SessionState& session) {
     return engineErrorBlockM4("syntax_error: var requires at least two endogenous variables",
                               "syntax_error");
   std::string lags = "1/2";
-  bool lutstats = false, nobigf = false, dfk = false, small = false;
+  bool lutstats = false, nobigf = false, dfk = false, small = false, noconstant = false;
   double level = static_cast<double>(session.level);
   // var's iteration controls belong to its constrained (iterated SUR) fit: noisure,
   // log / nolog, tolerance() and iterate() without constraints() are r(198), in
@@ -400,10 +408,7 @@ ojson runVar(const eval::ParsedCommand& parsed, SessionState& session) {
     // always carry one, so fitting without it posted the constant model's numbers
     // (bank e21e2db0 `var close volume, noconstant`: e(sbic) 26.6985 against 26.6003).
     else if (k == "noconstant" && v.isBool && v.boolValue)
-      return engineErrorBlockM4(
-          "Option `noconstant` is a valid Stata option that this version of PIET does not "
-          "implement for `var`.",
-          "unsupported_option");
+      noconstant = true;
     else if (k == "lutstats" && v.isBool && v.boolValue)
       lutstats = true;
     else if (k == "nobigf" && v.isBool && v.boolValue)
@@ -415,9 +420,16 @@ ojson runVar(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   std::vector<std::string> argv = {"var", "--y", joinCommaM4(parsed.varlist), "--lags", lags,
                                    "--tsset", *session.timevar, "--irf-steps", "8"};
-  if (parsed.ifExpr.has_value()) {
+  if (noconstant) argv.push_back("--noconstant");
+  // `in a/b` restricts the estimation rows as `if` does -- the rows outside still
+  // supply lagged values (vs-stata bank c53a2733 `var close volume in 10/200`,
+  // 86dd66d7 `if t>20 in 1/200`): the range joins the `if` as an observation-number
+  // condition on the engine's in-sample mask.
+  std::optional<std::string> ifEff = parsed.ifExpr;
+  if (auto err = inRangeConditionM4(session, parsed, ifEff, "var")) return *err;
+  if (ifEff.has_value() && !ifEff->empty()) {
     argv.push_back("--keepif");
-    argv.push_back(*parsed.ifExpr);
+    argv.push_back(*ifEff);
     // the rows `if` excludes supply lags only within the sample's own panel
     if (session.panelvar.has_value() && !session.panelvar->empty()) {
       argv.push_back("--panelvar");

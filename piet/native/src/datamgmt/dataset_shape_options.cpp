@@ -64,25 +64,25 @@ namespace piet::handlers::dataset_shape_detail {
 // `p()` is split's own abbreviation for `parse()`; both are exact members, so
 // the prefix resolver never has to choose between them.
 const piet::eval::OptVocab& kVocabSplit = piet::eval::registerOptVocab(
-    {"split"}, {{"parse", "p", "gen", "generate", "limit", "destring"},
-                // `ignore()` deletes characters before parsing, `notrim` keeps
-                // the padding, `force` splits a numeric variable. None is read
-                // here, and each would change WHAT THE PARTS ARE, so none may
-                // be accepted-and-ignored.
+    {"split"}, {{"parse", "p", "gen", "generate", "limit", "destring",
+                 // split.ado: `notrim` keeps the padding; force, float, ignore()
+                 // and percent are destring's, handed to it (each needs destring).
+                 "notrim", "ignore", "force", "float", "percent"},
                 // `g` is split.ado's Generate() minimum (aer_w2 w2b_dataio
                 // split_p_g `p("-") g(Job)` rc 0); it prefixes both
                 // registered spellings, so it is declared.
-                {"ignore", "notrim", "force"},
+                {},
                 {{"g", "generate"}, {"ge", "generate"}}});
 
 // `promote` asks for the narrowest storage type that holds the transposed
 // values. It IS read below (it produces a note), because this build's frame is
 // f64 throughout and there is nothing to promote -- saying so is honest, where
 // silently accepting it would claim a storage decision that never happened.
-// `format` asks for the transposed values to be rendered through a display
-// format, which would change the VALUES this build writes, so it is refused.
+// `format` / `format(%fmt)` (xpose.ado `Format(string) Format1`, abbreviated to
+// `f`) set the display format of every new variable: format() the one given,
+// bare `format` the widest numeric format among the source variables.
 const piet::eval::OptVocab& kVocabXpose = piet::eval::registerOptVocab(
-    {"xpose"}, {{"clear", "varname", "promote"}, {"format"}});
+    {"xpose"}, {{"clear", "varname", "promote", "format"}, {}, {{"f", "format"}}});
 
 const piet::eval::OptVocab& kVocabRecast =
     piet::eval::registerOptVocab({"recast"}, {{"force"}, {}});
@@ -106,8 +106,10 @@ const piet::eval::OptVocab& kVocabSample =
     piet::eval::registerOptVocab({"sample"}, {{"count", "by"}, {}});
 
 const piet::eval::OptVocab& kVocabSplitsample = piet::eval::registerOptVocab(
-    {"splitsample"}, {{"generate", "nsplit", "rseed", "show"},
-                      {"split", "cluster", "strata", "balance"}});
+    {"splitsample"}, {{"generate", "nsplit", "rseed", "show", "split", "values", "cluster",
+                       "strok", "percent"},
+                      {"strata", "balance", "rround"},
+                      {{"value", "values"}, {"cl", "cluster"}}});
 
 // `double` asks for double storage, which is what this build's frame already
 // is, so it is honoured by construction rather than ignored. `cstorage()`
@@ -141,14 +143,16 @@ const piet::eval::OptVocab& kVocabCumul = piet::eval::registerOptVocab(
                 {{"g", "generate"}, {"ge", "generate"}, {"f", "freq"}}});
 
 const piet::eval::OptVocab& kVocabBsample = piet::eval::registerOptVocab(
-    {"bsample"}, {{"cluster", "idcluster"}, {"strata", "weight"}});
+    {"bsample"}, {{"cluster", "idcluster", "strata", "weight"}, {}});
 
 // `altdef` selects Stata's ALTERNATIVE percentile definition, the interpolating
 // rule of [D] pctile "Methods and formulas" (pctile.cpp stataAltdefPercentile).
 // pctile.ado's syntax line has no percentiles(): `pctile pc = x, p(10 50)` is
 // "option p() not allowed" r(198) (StataBE 19.5); only _pctile takes it.
 const piet::eval::OptVocab& kVocabPctile = piet::eval::registerOptVocab(
-    {"pctile"}, {{"nquantiles", "nq", "genp", "altdef"}, {}});
+    {"pctile"}, {{"nquantiles", "nq", "genp", "altdef"}, {},
+                 // pctile's syntax: Nquantiles(), ALTdef, Genp() (bank afd2f5ddbc6615f9 `g(pp)`).
+                 {{"n", "nquantiles"}, {"g", "genp"}}});
 
 const piet::eval::OptVocab& kVocabPctileR = piet::eval::registerOptVocab(
     {"_pctile"}, {{"nquantiles", "nq", "percentiles", "p", "altdef"}, {}});

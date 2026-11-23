@@ -266,6 +266,45 @@ ConditionMaskInstall installConditionMask(SessionState& session, const std::stri
   return out;
 }
 
+ConditionMaskInstall installGroupConditionMask(SessionState& session, const std::string& cond,
+                                               const std::vector<std::string>& groupKeys) {
+  if (groupKeys.empty() || needsConditionMask(session, cond))
+    return installConditionMask(session, cond, groupKeys);
+  ConditionMaskInstall out;
+  if (!session.hasData() || !session.currentHbin().has_value()) {
+    out.ok = false;
+    out.error = ojson(eval::noDataLoaded());
+    return out;
+  }
+  session.ensureMaterializedHead();
+  std::string byOpt = ", by(";
+  for (size_t i = 0; i < groupKeys.size(); ++i) byOpt += (i ? " " : "") + groupKeys[i];
+  byOpt += ")";
+  const std::string column = nextQualifierColumn("if");
+  const std::string basePath = *session.currentHbin();
+  const std::string maskHbin = nextPath(session.workdir(), "qualif") + ".hbin";
+  // `!=0` is Stata's truth rule: a missing condition selects the row. Stateless for the reason
+  // installConditionMask gives.
+  const CobraRunResult cr = runCobra(translate::injectTsContextForExpr(
+      {"eval", "--data", basePath, "--bygen", column + "=((" + cond + ")!=0)" + byOpt, "--out",
+       maskHbin},
+      cond, session));
+  if (!cr.ok || !cecon::native_exists(maskHbin)) {
+    const CobraError ce = errorFromRaw(cr);
+    out.ok = false;
+    out.error = errBlock(cobraErrorMessage(ce), ce.code);
+    return out;
+  }
+  const bool changed = session.datasetChanged;
+  session.pinPreInstallHead();
+  session.load(maskHbin);
+  session.carryCardAcrossHiddenInstall(basePath, maskHbin);
+  session.datasetChanged = changed;
+  out.column = column;
+  out.condition = "(" + column + "!=0)";
+  return out;
+}
+
 ConditionMaskInstall writeConditionMaskColumn(SessionState& session, const std::string& dataPath,
                                               const std::string& cond, const std::string& column,
                                               const std::string& outPath) {

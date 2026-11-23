@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include "piet/dispatcher.h"  // dispatch(): i()/t() xtset the panel
+#include "piet/handlers/variables.h"  // resolveByKeyNames
 #include "data/missing.h"  // cecon::stata_cmp / missing_kind -- Stata's `!=`, extended missings
 #include "io/win_compat.h"  // cecon::to_native_path / native_unlink
 #include "piet/cobra_runner.h"
@@ -56,7 +58,7 @@ namespace {
 // xtdescribe: `i()`/`t()` override the xtset variables (the pre-xtset
 // spelling); not read here.
 const piet::eval::OptVocab& kVocabXtdescribe = piet::eval::registerOptVocab(
-    {"xtdescribe"}, {{"patterns", "width"}, {"i", "t"}});
+    {"xtdescribe"}, {{"patterns", "width", "i", "t"}, {}});
 
 }  // namespace
 
@@ -175,6 +177,54 @@ ojson runXtdescribe(const eval::ParsedCommand& parsed, SessionState& session) {
   // 459 leaves r(N) empty behind an earlier summarize).
   eval::replaceRClass(session.eval);
   eval::declareRPosted(session.eval, "xtdescribe", {});
+  // i() / t() (the pre-xtset spelling, xtdescribe's `_xt, i() t() trequired`): the panel
+  // comes from i() else xtset, the time from t() (delta 1) else xtset, and the pair is then
+  // xtset -- the setting stays (bank 242440b529d55c1d `xtdescribe, i(sid)` with no time:
+  // r(459) "must specify timevar; use xtset"; cfd5e00828b6c976 i(sid) t(year)).
+  std::string notePrefix;
+  {
+    std::optional<std::string> iOpt, tOpt;
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "i" && !v.isBool) iOpt = strutil::trim(v.strValue);
+      if (k == "t" && !v.isBool) tOpt = strutil::trim(v.strValue);
+    }
+    if (iOpt.has_value() || tOpt.has_value()) {
+      Datastore* d0 = session.datastore();
+      if (d0 == nullptr) return ojson(eval::noDataLoaded());
+      const std::string curPanel = session.panelvar.value_or("");
+      const std::string curTime = session.timevar.value_or("");
+      std::string iv = curPanel, tv = curTime;
+      double delta = session.delta.value_or(1.0);
+      if (iOpt.has_value()) {
+        std::vector<std::string> one{*iOpt};
+        if (auto err = resolveByKeyNames(session, one)) return *err;
+        iv = one.front();
+        if (!d0->has(iv)) return rcError("variable " + iv + " not found", 111);
+        if (!curPanel.empty() && curPanel != iv)
+          notePrefix += "warning: existing panel variable is not " + iv + "\n";
+      } else if (iv.empty()) {
+        return rcError("must specify panelvar; use xtset", 459);
+      }
+      if (tOpt.has_value()) {
+        std::vector<std::string> one{*tOpt};
+        if (auto err = resolveByKeyNames(session, one)) return *err;
+        tv = one.front();
+        if (!d0->has(tv)) return rcError("variable " + tv + " not found", 111);
+        if (d0->dtype(tv) != "f64") return rcError("numeric variable expected", 7);
+        delta = 1.0;
+        if (!curTime.empty() && curTime != tv)
+          notePrefix += "warning: existing time variable is not " + tv + "; assuming delta = 1\n";
+      }
+      if (tv.empty()) return rcError("must specify timevar; use xtset", 459);
+      char dbuf[64];
+      std::snprintf(dbuf, sizeof(dbuf), "%.17g", delta);
+      ojson set = dispatch("quietly xtset " + iv + " " + tv + ", delta(" + dbuf + ")", session);
+      for (const auto& b : set)
+        if (b.is_object() && b.value("type", std::string()) == "error") return b;
+      eval::replaceRClass(session.eval);
+      eval::declareRPosted(session.eval, "xtdescribe", {});
+    }
+  }
   const bool havePanel = session.panelvar.has_value() && !session.panelvar->empty();
   const bool haveTime = session.timevar.has_value() && !session.timevar->empty();
   if (!havePanel && !haveTime)
@@ -350,7 +400,7 @@ ojson runXtdescribe(const eval::ParsedCommand& parsed, SessionState& session) {
                   "  " + fmtNum(rv("p25"), "%6.0f") + "    " + fmtNum(rv("p50"), "%6.0f") + "    " +
                   fmtNum(rv("p75"), "%6.0f") + "  " + fmtNum(rv("p95"), "%6.0f") + "  " +
                   fmtNum(rv("max"), "%6.0f"));
-  if (*patterns == 0) return displayBlock(joinWords(lines, "\n"));
+  if (*patterns == 0) return displayBlock(notePrefix + joinWords(lines, "\n"));
 
   // ---- the pattern table ---------------------------------------------------
   std::vector<std::pair<double, double>> bins;  // (l, u]: l < t <= u
@@ -415,7 +465,7 @@ ojson runXtdescribe(const eval::ParsedCommand& parsed, SessionState& session) {
                     " periods.");
     lines.emplace_back();
   }
-  return displayBlock(joinWords(lines, "\n"));
+  return displayBlock(notePrefix + joinWords(lines, "\n"));
 }
 
 }  // namespace piet::handlers

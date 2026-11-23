@@ -90,7 +90,7 @@ constexpr char kReservedKeyLeadByte = '\x01';
 
 }  // namespace
 
-ojson runReturnList(SessionState& session) {
+ojson runReturnList(SessionState& session, bool all) {
   std::ostringstream out;
 
   // MOST-RECENTLY-SET FIRST, which is why both loops run in reverse: the
@@ -148,6 +148,37 @@ ojson runReturnList(SessionState& session) {
       const size_t nc = nr > 0 ? it->second.data[0].size() : 0;
       out << padLabel22("r(" + it->first + ")") << " :  " << nr << " x " << nc << "\n";
     }
+  }
+
+  // `return list, all` adds the hidden results after a warning line, in the
+  // same sections (StataBE 19.5, vs-stata bank b6400ae8).
+  if (all) {
+    std::ostringstream hid;
+    bool hs = false, hm = false, hx = false;
+    for (auto it = scalars.rbegin(); it != scalars.rend(); ++it) {
+      if (!session.eval.isRHidden(it->first)) continue;
+      if (!hs) hid << "\nscalars:\n";
+      hs = true;
+      hid << padLabel22("r(" + it->first + ")") << " =  " << fmtRScalar(it->second) << "\n";
+    }
+    for (auto it = macros.rbegin(); it != macros.rend(); ++it) {
+      if (!it->first.empty() && it->first[0] == kReservedKeyLeadByte) continue;
+      if (!session.eval.isRMacroHidden(it->first)) continue;
+      if (!hm) hid << "\nmacros:\n";
+      hm = true;
+      hid << padLabel22("r(" + it->first + ")") << " : \"" << it->second << "\"\n";
+    }
+    const auto& rmats = session.eval.rMatrices;
+    for (auto it = rmats.rbegin(); it != rmats.rend(); ++it) {
+      if (!hiddenMatrix(*it)) continue;
+      if (!hx) hid << "\nmatrices:\n";
+      hx = true;
+      const size_t nr = it->second.data.size();
+      const size_t nc = nr > 0 ? it->second.data[0].size() : 0;
+      hid << padLabel22("r(" + it->first + ")") << " :  " << nr << " x " << nc << "\n";
+    }
+    if (hs || hm || hx)
+      out << "\nHidden; names and contents could change in future versions of Stata\n" << hid.str();
   }
 
   if (out.str().empty()) return ojson::array();  // nothing in r(): no output

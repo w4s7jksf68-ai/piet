@@ -49,12 +49,23 @@
 
 namespace cecon {
 
-// The families and links this fitter has an oracle for. Everything else glm
-// accepts (igaussian, binomial with a denominator, nbinomial ml, power/opower/
-// cloglog/loglog/logc/reciprocal links, a non-default link for the covered
-// families) is refused by name at the caller, never approximated here.
-enum class GlmFamily { Gaussian, Bernoulli, Poisson, Gamma, NegBinomial };
-enum class GlmLinkFn { Identity, Log, Logit, Probit };
+// The families and links of Stata's glm (glim_v1..glim_v6, glim_l01..glim_l12).
+// Bernoulli is the binomial family: its denominator m is 1 unless
+// GlmOptions::binom_m gives one per observation. The values are positional
+// (posted in the fit's model record): new members go at the end. nbinomial ml
+// is refused at the caller (it is a different estimator: nbreg's alpha).
+enum class GlmFamily { Gaussian, Bernoulli, Poisson, Gamma, NegBinomial, InverseGaussian };
+enum class GlmLinkFn {
+    Identity, Log, Logit, Probit,
+    Cloglog,     // glim_l07  ln(-ln(1-u/m))
+    Loglog,      // glim_l06  -ln(-ln(u/m))
+    Logc,        // glim_l05  ln(1-u/m)
+    Reciprocal,  // glim_l09  m/u           (power -1)
+    PowerM2,     // glim_l10  (m/u)^2       (power -2)
+    Power,       // glim_l11  (u/m)^p       (GlmOptions::power)
+    OPower,      // glim_l12  ((u/(m-u))^p - 1)/p
+    NegBin       // glim_l04  ln(u/(u+1/alpha))
+};
 
 struct GlmOptions {
     GlmFamily family = GlmFamily::Gaussian;
@@ -64,6 +75,32 @@ struct GlmOptions {
     double ltol = 1e-7;    // ltolerance()  -- reldif of the log likelihood
     double nrtol = 1e-5;   // nrtolerance() -- g*inv(H)*g'
     int maxiter = 300;     // iterate(), default c(maxiter)
+    double power = 1.0;    // the p of link(power p) / link(opower p)
+    // Binomial denominators, one per observation (family(binomial varname|#));
+    // nullptr = 1 (Bernoulli).
+    const double* binom_m = nullptr;
+    // Frequency weights: used as given (not normalized), N = their sum. Exclusive
+    // with the aweight argument; nullptr = none.
+    const double* fweight = nullptr;
+    // vce(robust) with no cluster argument: the sandwich of the per-observation
+    // scores. A frequency-weighted row stands for w_i observations, as ml's robust
+    // variance counts it: meat sum w_i s_i s_i' (s_i the unweighted score), factor
+    // N/(N-1) with N the sum of the weights -- the robust V of the expanded data.
+    // Analytic weights enter the score as w_i s_i (meat sum (w_i s_i)^2), factor
+    // n/(n-1). Ignored when a cluster argument is given.
+    bool robust = false;
+    // init()/mu(): the starting mean, one per observation, in place of glm's
+    // (y+ybar)/2 (binomial m(y+.5)/(m+1)); nullptr = glm's start.
+    const double* mu_start = nullptr;
+    // from(): the starting coefficients (length k, in X's column order); empty =
+    // the start step above. The WLS start step and its Pearson seed are skipped.
+    std::vector<double> b_start;
+    // fisher(#): the Hessian at iterations 0..fisher is the expected information
+    // (glim_lf: "$SGLM_f >= $ML_ic"); -1 = the observed information throughout.
+    int fisher = -1;
+    // scale(#) for a scale-one family: the fixed dispersion phi every evaluation
+    // divides by ($SGLM_s1); 0 = the family's own (1 or the Pearson scale).
+    double fixed_phi = 0.0;
 };
 
 struct GlmResult {
@@ -85,6 +122,11 @@ struct GlmResult {
     double deviance_p = 0.0;        // e(deviance_p), the Pearson chi2
     int64_t n_clusters = 0;         // e(N_clust); 0 = no cluster VCE
     double sum_w = 0.0;             // sum of the raw analytic weights (0 when unweighted)
+    double pearson_phi = 0.0;       // Pearson chi2/(N-k) at the final point ($SGLM_ph after ml)
+    bool nonconcave = false;        // some iteration's Hessian was not negative definite
+    std::vector<double> scores;     // n, the equation-level score (y-mu) dmu/(phi V) at the final point
+    std::vector<std::vector<double>> grad_log;  // gradient at iteration 0..ic (ml's `gradient` display)
+    std::vector<std::vector<double>> hess_log;  // negative Hessian at iteration 0..ic (row-major k*k)
 };
 
 // X: column-major n*k design (the caller appends the constant column itself).

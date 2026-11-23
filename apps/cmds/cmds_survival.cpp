@@ -60,11 +60,13 @@ struct StSample {
     double time_at_risk = 0;
     int64_t n_fail = 0;
     bool multi_record = false;  // any row enters after t = 0 (delayed entry)
+    std::vector<int64_t> rows;  // the dataset row of each sample row
 };
 
 StSample load_st(const Dataset& ds, const char* cmd, const std::vector<std::string>& xs,
                  const std::string& cluster_var,
-                 const std::vector<std::string>& strata_vars = {}) {
+                 const std::vector<std::string>& strata_vars = {},
+                 const std::vector<std::string>& listwise_extra = {}) {
     require_st(ds, cmd);
     std::vector<std::string> cl;
     if (!cluster_var.empty()) cl.push_back(cluster_var);
@@ -72,6 +74,9 @@ StSample load_st(const Dataset& ds, const char* cmd, const std::vector<std::stri
     // deletion Stata's `mark(STrata ...)` applies), after the cluster variable.
     const size_t strata_at = cl.size();
     for (const auto& v : strata_vars) cl.push_back(v);
+    // streg's ancillary() variables: in the same listwise pass (marksample over
+    // both equations), their design loaded on its own.
+    for (const auto& v : listwise_extra) cl.push_back(v);
     GlmInputs g = load_glm(ds, cmd, kT, xs, cl);
     const double* raw_t0 = require_num(ds, cmd, kT0);
     const double* raw_t = require_num(ds, cmd, kT);
@@ -98,8 +103,10 @@ StSample load_st(const Dataset& ds, const char* cmd, const std::vector<std::stri
     s.t0.resize(static_cast<size_t>(s.n));
     s.t.resize(static_cast<size_t>(s.n));
     s.d.resize(static_cast<size_t>(s.n));
+    s.rows.resize(static_cast<size_t>(s.n));
     for (int64_t q = 0; q < s.n; ++q) {
         const int64_t row = g.keep[static_cast<size_t>(sel[static_cast<size_t>(q)])];
+        s.rows[static_cast<size_t>(q)] = row;
         s.t0[static_cast<size_t>(q)] = raw_t0[row];
         s.t[static_cast<size_t>(q)] = raw_t[row];
         s.d[static_cast<size_t>(q)] = raw_d[row] != 0.0 ? 1.0 : 0.0;
@@ -139,6 +146,18 @@ StSample load_st(const Dataset& ds, const char* cmd, const std::vector<std::stri
         }
     }
     return s;
+}
+
+// The number of distinct subjects (the stset id() values) among the sample's rows
+// (e(N_sub)); -1 when no id variable was named or it cannot be read.
+int64_t count_subjects(const Dataset& ds, const StSample& s, const std::string& idvar) {
+    if (idvar.empty() || !ds.has(idvar)) return -1;
+    const double* id = require_num(ds, "st", idvar.c_str());
+    std::vector<double> v;
+    v.reserve(s.rows.size());
+    for (const int64_t r : s.rows) v.push_back(id[r]);
+    std::sort(v.begin(), v.end());
+    return static_cast<int64_t>(std::unique(v.begin(), v.end()) - v.begin());
 }
 
 }  // namespace
@@ -378,7 +397,11 @@ int cmd_stcox(const std::vector<std::string>& a) {
                 {"converged", r.converged},
                 {"iters", r.iters},
                 {"level", level}};
-    if (!cluster_var.empty()) out["n_subjects"] = s.n_clusters;
+    // e(N_sub): the stset id()'s distinct subjects (--id), else one per record
+    {
+        const int64_t ns = count_subjects(ds, s, opt(a, "--id"));
+        out["n_subjects"] = ns >= 0 ? ns : s.n;
+    }
     if (!strata_vars.empty()) out["n_strata"] = s.n_strata;
     std::vector<int> idx(static_cast<size_t>(k));
     for (int c = 0; c < k; ++c) idx[static_cast<size_t>(c)] = c;
@@ -401,29 +424,64 @@ int cmd_stcox(const std::vector<std::string>& a) {
     }
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
     out["coefs"] = coefs;
+    // --emit-v: the fit's full e(V) on the covariates' names (and, under a sandwich,
+    // the observed-information variance as e_Vmb: Stata's e(V_modelbased)).
+    if (has(a, "--emit-v")) {
+        const std::vector<std::string> vnames(s.names.begin(), s.names.begin() + k);
+        add_e_v(out, vnames, V);
+        if (vce == "robust" || vce == "cluster") {
+            json tmp;
+            add_e_v(tmp, vnames, r.vcov);
+            if (tmp.contains("e_V")) out["e_Vmb"] = tmp["e_V"];
+        }
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }
 
-// cobra streg --data f.hbin --x X1,X2 --dist weibull [--vce iid|robust|cluster] [--cluster C] ...
+// cobra streg --data f.hbin --x X1,X2 --dist D [--time] [--anc Z1,Z2] [--vce iid|robust|cluster]
+//             [--cluster C] [--level P] [--keepif EXPR] [--emit-v] [--out f.json]
 int cmd_streg(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), xcsv = opt(a, "--x"), cluster_var = opt(a, "--cluster"),
                 dist = opt(a, "--dist", "weibull");
     if (data_missing(data) || xcsv.empty()) {
         std::fprintf(stderr,
-                     "usage: cobra streg --data f.hbin --x X1,X2 --dist weibull "
-                     "[--vce iid|robust|cluster] [--cluster C] [--level P] [--keepif EXPR] [--out f.json]\n"
-                     "  Weibull PH regression on stset data (needs _t0/_t/_d/_st), fitted in\n"
-                     "  (beta, ln p) with the delayed-entry correction -(t^p - t0^p)exp(xb).\n"
-                     "  Reports hazard ratios exp(b) (_cons estimates the baseline hazard), plus\n"
-                     "  /ln_p, p and 1/p with delta-method standard errors.\n"
+                     "usage: cobra streg --data f.hbin --x X1,X2 --dist D [--time] [--anc Z1,Z2]\n"
+                     "                   [--vce iid|robust|cluster] [--cluster C] [--level P]\n"
+                     "                   [--keepif EXPR] [--emit-v] [--out f.json]\n"
+                     "  Parametric survival regression on stset data (needs _t0/_t/_d/_st), on\n"
+                     "  Stata's ml path: D = exponential | weibull | gompertz (PH) | loglogistic |\n"
+                     "  lognormal (AFT). --time: weibull's accelerated failure-time metric.\n"
+                     "  --anc: the ancillary parameter's own covariates (Stata's ancillary()).\n"
+                     "  Reports the main equation, the ancillary equation, e_V (--emit-v), the\n"
+                     "  constant-only ll (ll_null), the iteration count and log.\n"
                      "  --vce robust on MULTI-RECORD st data requires --cluster ID: Stata clusters\n"
                      "  vce(robust) on the stset id() SUBJECT, not on the record.\n");
         return 2;
     }
-    if (dist != "weibull")
-        throw EngineError("bad_input",
-                          "streg: --dist " + dist + " is not implemented in this build (only weibull)");
+    StregDist sd;
+    const char* ancEq = nullptr;  // e(b)'s ancillary equation name
+    if (dist == "exponential") {
+        sd = StregDist::Exponential;
+    } else if (dist == "weibull") {
+        sd = StregDist::Weibull;
+        ancEq = "ln_p";
+    } else if (dist == "gompertz") {
+        sd = StregDist::Gompertz;
+        ancEq = "gamma";
+    } else if (dist == "loglogistic") {
+        sd = StregDist::Loglogistic;
+        ancEq = "lngamma";
+    } else if (dist == "lognormal") {
+        sd = StregDist::Lognormal;
+        ancEq = "lnsigma";
+    } else {
+        throw EngineError("bad_input", "streg: --dist " + dist + " is not implemented in this build");
+    }
+    const bool time_metric = has(a, "--time");
+    const std::vector<std::string> anc_vars = split_csv(opt(a, "--anc"));
+    if (sd == StregDist::Exponential && !anc_vars.empty())
+        throw EngineError("bad_input", "streg: exponential has no ancillary parameter");
     const std::string vce = parse_vce(a, "streg", cluster_var);
     const double level = std::stod(opt(a, "--level", "95"));
     if (level < 10.0 || level > 99.99)
@@ -432,20 +490,30 @@ int cmd_streg(const std::vector<std::string>& a) {
 
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
-    StSample s = load_st(ds, "streg", split_csv(xcsv), cluster_var);
+    StSample s = load_st(ds, "streg", split_csv(xcsv), cluster_var, {}, anc_vars);
     if (s.n == 0) { std::fprintf(stderr, "streg: no rows in the analysis sample.\n"); return 1; }
-    const int k = s.k;              // intercept INCLUDED (it is the baseline hazard)
-    const int cons_col = s.k - 1;   // load_glm puts it last
-    const int np = k + 1;           // + ln p
+    const int k = s.k;              // intercept INCLUDED (load_glm puts it last)
+    const int cons_col = s.k - 1;
+    // The ancillary design: its variables then a constant, on the sample's rows.
+    int kz = sd == StregDist::Exponential ? 0 : 1;
+    std::vector<double> Z(static_cast<size_t>(s.n), 1.0);
+    std::vector<std::string> znames = {"(intercept)"};
+    if (!anc_vars.empty()) {
+        GlmInputs gz = load_glm(ds, "streg", kT, anc_vars, {});
+        std::map<int64_t, int64_t> at;
+        for (int64_t i = 0; i < gz.n; ++i) at[gz.keep[static_cast<size_t>(i)]] = i;
+        kz = gz.k;
+        znames = gz.names;
+        Z.assign(static_cast<size_t>(s.n) * static_cast<size_t>(kz), 0.0);
+        for (int64_t q = 0; q < s.n; ++q) {
+            const auto it = at.find(s.rows[static_cast<size_t>(q)]);
+            if (it == at.end()) throw EngineError("bad_input", "streg: ancillary() row not in the sample");
+            for (int c = 0; c < kz; ++c)
+                Z[static_cast<int64_t>(c) * s.n + q] = gz.X[static_cast<int64_t>(c) * gz.n + it->second];
+        }
+    }
+    const int np = k + kz;
 
-    // Stata's vce(robust) on st data with id() is SUBJECT-clustered, not
-    // record-clustered — 199 independent subjects here, not 1,173 independent
-    // records. VERIFIED against the oracle: subject-clustered with q_c = G/(G-1)
-    // gives /ln_p se .0423804 (oracle .0423804) and Haz. ratio std. errs
-    // .0596222 / .1013885 / .0050684, all matching; the record-level sandwich
-    // gives .0407665 for /ln_p, which misses on the second digit. Rather than
-    // silently produce that wrong number, refuse: on multi-record data the caller
-    // must name the subject id.
     const bool cluster_on_id = (vce == "cluster") || (vce == "robust" && !cluster_var.empty());
     if (vce == "robust" && cluster_var.empty() && s.multi_record)
         throw EngineError("bad_input",
@@ -453,16 +521,13 @@ int cmd_streg(const std::vector<std::string>& a) {
                           "(Stata clusters vce(robust) on the stset id() subject); pass the id() "
                           "variable used by stset");
 
-    WeibullResult r = weibull_fit(s.X.data(), s.n, k, s.t0.data(), s.t.data(), s.d.data(), cons_col);
+    StregFit r = streg_fit(sd, time_metric, s.X.data(), s.n, k, cons_col, kz > 0 ? Z.data() : nullptr,
+                           kz, s.t0.data(), s.t.data(), s.d.data());
     if (!r.ok) throw EngineError("bad_input", r.err.empty() ? "streg: MLE failed" : r.err);
 
-    std::vector<double> V = r.vcov;
+    std::vector<double> V = r.V;
     int n_clusters = 0;
     if (vce == "robust" || vce == "cluster") {
-        std::vector<double> theta = r.beta;
-        theta.push_back(r.ln_p);
-        std::vector<double> S;
-        weib::ll_grad(s.X.data(), s.n, k, s.t0.data(), s.t.data(), s.d.data(), theta, nullptr, &S);
         if (cluster_on_id) {
             n_clusters = s.n_clusters;
             if (n_clusters < 2)
@@ -470,57 +535,57 @@ int cmd_streg(const std::vector<std::string>& a) {
                                   "streg: clustering requires at least 2 clusters, but the cluster "
                                   "variable has " + std::to_string(n_clusters));
         }
-        // Same verified factor as stcox: q_c = G/(G-1) when clustered (matches the
-        // oracle to <1e-6 relative), N/(N-1) for the unclustered single-record arm.
+        // q_c = G/(G-1) when clustered, N/(N-1) for the unclustered single-record arm
+        // (the factor stcox and streg have carried since P7).
         const double factor =
             cluster_on_id ? static_cast<double>(n_clusters) / static_cast<double>(n_clusters - 1)
                           : (s.n > 1 ? static_cast<double>(s.n) / static_cast<double>(s.n - 1) : 1.0);
-        V = survival_sandwich(S, s.n, np, r.vcov, cluster_on_id ? s.cl_codes.data() : nullptr,
-                              cluster_on_id ? n_clusters : 0, factor);
-        if (V.empty()) throw EngineError("bad_input", "streg: robust VCE failed (non-invertible sandwich)");
+        const std::vector<double> Vf = survival_sandwich(r.scores, s.n, np, r.V_fit,
+                                                         cluster_on_id ? s.cl_codes.data() : nullptr,
+                                                         cluster_on_id ? n_clusters : 0, factor);
+        if (Vf.empty()) throw EngineError("bad_input", "streg: robust VCE failed (non-invertible sandwich)");
+        V = streg_remetric(r.J, Vf, np);
     }
-
+    auto se_of = [&V, np](int c) {
+        return std::sqrt(std::max(0.0, V[static_cast<size_t>(c) * static_cast<size_t>(np) + static_cast<size_t>(c)]));
+    };
     json coefs = json::array();
-    for (int c = 0; c < k; ++c) {
-        const double se =
-            std::sqrt(std::max(0.0, V[static_cast<size_t>(c) * static_cast<size_t>(np) + static_cast<size_t>(c)]));
-        coefs.push_back(coef_row(s.names[static_cast<size_t>(c)], r.beta[static_cast<size_t>(c)], se, zc));
-    }
-    const double se_lnp =
-        std::sqrt(std::max(0.0, V[static_cast<size_t>(k) * static_cast<size_t>(np) + static_cast<size_t>(k)]));
-    const double p = std::exp(r.ln_p);
+    for (int c = 0; c < k; ++c)
+        coefs.push_back(coef_row(s.names[static_cast<size_t>(c)], r.theta[static_cast<size_t>(c)], se_of(c), zc));
+    json ancj = json::array();
+    for (int c = 0; c < kz; ++c)
+        ancj.push_back(coef_row(znames[static_cast<size_t>(c)], r.theta[static_cast<size_t>(k + c)], se_of(k + c), zc));
 
+    const bool aft = time_metric || sd == StregDist::Loglogistic || sd == StregDist::Lognormal;
     json out = {{"estimator", "streg"},
-                {"distribution", "weibull"},
-                {"metric", "ph"},
+                {"distribution", dist},
+                {"metric", aft ? "aft" : "ph"},
                 {"vce", vce},
                 {"n_obs", s.n},
                 {"n_dropped_missing", s.n_st - s.n},
                 {"n_failures", s.n_fail},
                 {"time_at_risk", s.time_at_risk},
                 {"ll", r.ll},
-                {"ll_null", r.ll_null},
+                {"ll_null", r.ll_0},
                 {"converged", r.converged},
-                {"iters", r.iters},
-                {"level", level},
-                {"cons_note", "_cons estimates baseline hazard"}};
-    if (!cluster_var.empty()) out["n_subjects"] = s.n_clusters;
-    // Stata's header Wald tests the SLOPES only — _cons and /ln_p are excluded.
-    // Verified: 1.02 on the oracle (p 0.5992); including _cons would not give it.
+                {"converged_cons", r.converged_cons},
+                {"iters", r.ic},
+                {"level", level}};
+    if (!aft) out["cons_note"] = "_cons estimates baseline hazard";
+    // e(N_sub): the stset id()'s distinct subjects (--id), else one per record
+    {
+        const int64_t ns = count_subjects(ds, s, opt(a, "--id"));
+        out["n_subjects"] = ns >= 0 ? ns : s.n;
+    }
+    // The model test: the slopes of the main equation (_cons and the ancillary
+    // equation excluded) -- Wald under a sandwich, else the LR against the
+    // constant-only fit: 2(e(ll) - e(ll_0)) (bank ed95841f LR chi2(3) 37.0667007250652).
     std::vector<int> idx;
     for (int c = 0; c < k; ++c)
         if (c != cons_col) idx.push_back(c);
-    {
-        std::vector<double> theta = r.beta;
-        theta.push_back(r.ln_p);
-        add_wald(out, theta, V, np, idx);
-    }
-    // With the default VCE Stata's streg header and e(chi2) are the likelihood-ratio
-    // statistic against the constant-only Weibull fit (ln p free), as for stcox above:
-    // bank ed95841f `streg age i.drug, distribution(weibull)` LR chi2(3)
-    // 37.0667007250652 = 2(e(ll) - e(ll_0)), where the Wald said 33.37.
+    add_wald(out, r.theta, V, np, idx);
     if (vce == "iid" && !idx.empty()) {
-        const double lr = 2.0 * (r.ll - r.ll_null);
+        const double lr = 2.0 * (r.ll - r.ll_0);
         const int df = static_cast<int>(idx.size());
         out["chi2"] = lr;
         out["chi2_df"] = df;
@@ -529,23 +594,33 @@ int cmd_streg(const std::vector<std::string>& a) {
     }
     if (cluster_on_id) { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
     out["coefs"] = coefs;
-    // The ancillary parameter, in all three metrics Stata prints. p and 1/p are
-    // delta-method transforms of ln_p, and their CIs are the ln_p CI mapped
-    // through the same transform (so 1/p's bounds come out reversed), matching
-    // Stata's [9.676766, 11.42559] for p and [.0875228, .1033403] for 1/p.
-    out["ln_p"] = {{"b", r.ln_p},
-                   {"se", se_lnp},
-                   {"z", tstat(r.ln_p, se_lnp)},
-                   {"ci_lo", r.ln_p - zc * se_lnp},
-                   {"ci_hi", r.ln_p + zc * se_lnp}};
-    out["p"] = {{"b", p},
-                {"se", p * se_lnp},
-                {"ci_lo", std::exp(r.ln_p - zc * se_lnp)},
-                {"ci_hi", std::exp(r.ln_p + zc * se_lnp)}};
-    out["inv_p"] = {{"b", 1.0 / p},
-                    {"se", se_lnp / p},
-                    {"ci_lo", std::exp(-(r.ln_p + zc * se_lnp))},
-                    {"ci_hi", std::exp(-(r.ln_p - zc * se_lnp))}};
+    if (ancEq != nullptr) {
+        out["anc_eq"] = ancEq;
+        out["anc"] = ancj;
+    }
+    out["ilog"] = r.ilog;
+    out["gradient"] = r.gradient;
+    // weibull without ancillary(): /ln_p and its two transforms p and 1/p, their
+    // intervals the /ln_p interval mapped through each (1/p's comes out reversed).
+    if (sd == StregDist::Weibull && anc_vars.empty()) {
+        const double lnp = r.theta[static_cast<size_t>(k)], se_lnp = se_of(k), p = std::exp(lnp);
+        out["ln_p"] = {{"b", lnp}, {"se", se_lnp}, {"z", tstat(lnp, se_lnp)},
+                       {"ci_lo", lnp - zc * se_lnp}, {"ci_hi", lnp + zc * se_lnp}};
+        out["p"] = {{"b", p}, {"se", p * se_lnp},
+                    {"ci_lo", std::exp(lnp - zc * se_lnp)}, {"ci_hi", std::exp(lnp + zc * se_lnp)}};
+        out["inv_p"] = {{"b", 1.0 / p}, {"se", se_lnp / p},
+                        {"ci_lo", std::exp(-(lnp + zc * se_lnp))}, {"ci_hi", std::exp(-(lnp - zc * se_lnp))}};
+    }
+    if (has(a, "--emit-v")) {
+        std::vector<std::string> vnames(s.names.begin(), s.names.begin() + k);
+        for (int c = 0; c < kz; ++c) vnames.push_back("anc:" + znames[static_cast<size_t>(c)]);
+        add_e_v(out, vnames, V);
+        if (vce == "robust" || vce == "cluster") {
+            json tmp;
+            add_e_v(tmp, vnames, r.V);
+            if (tmp.contains("e_V")) out["e_Vmb"] = tmp["e_V"];
+        }
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }

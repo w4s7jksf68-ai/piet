@@ -352,6 +352,10 @@ inline HeckmanMlResult heckman_ml(const double* Z, int64_t n, int kz, const doub
     // where it is not concave takes the m-marquardt step (Stata's "(not concave)"
     // iterations) instead of ending the fit. The two-step start is often such a point.
     mo.stata_invsym = true;
+    // Refine the solution past the reference optimizer's reportable iterate.
+    mo.tol = 1e-10;
+    mo.ltol = 0.0;
+    mo.nrtol = 1e-12;
     MlPath path = ml_newton_path(obj, start, mo);
     if (path.failed) return out;
     const size_t np = path.b.size();

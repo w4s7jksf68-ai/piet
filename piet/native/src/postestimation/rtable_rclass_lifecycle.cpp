@@ -371,6 +371,39 @@ bool buildRTableFromBlock(SessionState& session, const ojson& block, double leve
                                   ? block["var_small_df_r"].get<double>()
                                   : rtNan(),
                               out);
+  // `ereturn display` (results/ereturn_commands.cpp runDisplay): the live e(b)/e(V)
+  // on t(e(df_r)) or the normal; under eform() b, se and the interval exponentiated,
+  // z and p unchanged, eform 1 (bank 88509ffa `ereturn display, eform(OR)` after logit).
+  if (block.is_object() && block.value("estimator", std::string()) == "ereturn_display" &&
+      level >= 10.0 && level <= 99.99) {
+    if (!buildRTableFromEbV(session, level,
+                            block.contains("var_small_df_r") && block["var_small_df_r"].is_number()
+                                ? block["var_small_df_r"].get<double>()
+                                : rtNan(),
+                            out))
+      return false;
+    // Only the columns runDisplay marks (the first e(k_eform) equations) are
+    // exponentiated, eform 1; the rest keep the coefficient metric, eform 0. A
+    // value past the double range is missing.
+    if (block.value("rtable_eform", false) && out.data.size() == 9) {
+      const ojson* mask = block.contains("rtable_eform_cols") && block["rtable_eform_cols"].is_array()
+                              ? &block["rtable_eform_cols"]
+                              : nullptr;
+      const auto fin = [](double x) { return std::isfinite(x) ? x : rtNan(); };
+      for (size_t j = 0; j < out.colnames.size(); ++j) {
+        if (mask != nullptr && (j >= mask->size() || !(*mask)[j].is_boolean() || !(*mask)[j].get<bool>()))
+          continue;
+        const double b = out.data[0][j];
+        const double ebj = std::exp(b);
+        out.data[0][j] = fin(ebj);
+        if (!std::isnan(out.data[1][j])) out.data[1][j] = fin(ebj * out.data[1][j]);
+        for (size_t r : {4u, 5u})
+          if (!std::isnan(out.data[r][j])) out.data[r][j] = fin(std::exp(out.data[r][j]));
+        out.data[8][j] = 1.0;
+      }
+    }
+    return true;
+  }
   if (!block.is_object()) return false;
   const bool prelaid = block.contains("rtable_cols") && block["rtable_cols"].is_array() &&
                        !block["rtable_cols"].empty();
@@ -379,8 +412,11 @@ bool buildRTableFromBlock(SessionState& session, const ojson& block, double leve
     return false;
   // mean / proportion carry the level their intervals were built at (applied again,
   // with its reasons, where their table is built below).
+  // glm likewise: its link() abbreviates to `l`, which the declared-level reader
+  // would take for level() (bank e97edb52 `glm fatal beertax unemp, l(log)`).
   if ((block.value("estimator", std::string()) == "mean" ||
-       block.value("estimator", std::string()) == "proportion") &&
+       block.value("estimator", std::string()) == "proportion" ||
+       block.value("estimator", std::string()) == "glm") &&
       block.contains("level") && block["level"].is_number())
     level = block["level"].get<double>();
   if (!(level >= 10.0 && level <= 99.99)) return false;
@@ -391,9 +427,30 @@ bool buildRTableFromBlock(SessionState& session, const ojson& block, double leve
   // the declared level and the normal give.
   if (block.contains("rtable_cols") && block["rtable_cols"].is_array() &&
       !block["rtable_cols"].empty()) {
-    const auto eb = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kNames);
+    // `rtable_of`: the e() matrix whose columns the table follows (default e(b);
+    // oaxaca's xb option shows e(b0) last, bank 9a6960b8). `rtable_b_only`: a
+    // posting without a variance (oaxaca nose) leaves a one-row table `b`
+    // (bank adaef5f7).
+    const std::string of = block.value("rtable_of", std::string("b"));
+    const bool bOnly = block.value("rtable_b_only", false);
+    const auto eb = session.eval.resolveEMatrixFor(of, eval::EvalSession::EReader::kNames);
     const ojson& rc = block["rtable_cols"];
     if (!eb.matrix.has_value() || eb.matrix->colnames.size() != rc.size()) return false;
+    if (bOnly) {
+      eval::EvalMatrix m;
+      m.rownames = {"b"};
+      m.data.assign(1, std::vector<double>());
+      for (size_t j = 0; j < rc.size(); ++j) {
+        const ojson& c = rc[j];
+        if (!c.is_object() || c.value("name", std::string()) != eb.matrix->colnames[j]) return false;
+        const double b = rowNum(c, "b");
+        if (!std::isfinite(b)) return false;
+        m.colnames.push_back(eb.matrix->colnames[j]);
+        m.data[0].push_back(b);
+      }
+      out = std::move(m);
+      return true;
+    }
     const double crit = critFor(level, true, rtNan());
     if (!(crit > 0)) return false;
     eval::EvalMatrix m;
@@ -405,7 +462,16 @@ bool buildRTableFromBlock(SessionState& session, const ojson& block, double leve
       const bool eform = c.value("eform", false);
       double col[9] = {eform ? 1.0 : 0.0, rtNan(), rtNan(), rtNan(), rtNan(), rtNan(), rtNan(), crit,
                        eform ? 1.0 : 0.0};
-      if (!c.value("omitted", false)) {
+      // `se_missing`: an estimate whose variance is 0 (a posted V Stata zeroed, a
+      // mean held fixed): b as estimated, every inferential cell missing. A coefficient
+      // constraints() holds at a nonzero value is the same: its value, every statistic
+      // missing (bank eae58c67 ologit `mpg` -.1, se . .. ul .).
+      if (c.value("se_missing", false) ||
+          (c.value("constrained", false) && !c.value("omitted", false))) {
+        const double b = rowNum(c, "b");
+        if (!std::isfinite(b)) return false;
+        col[0] = eform ? std::exp(b) : b;
+      } else if (!c.value("omitted", false)) {
         const double b = rowNum(c, "b"), se = rowNum(c, "se"), z = rowNum(c, "z"), p = rowNum(c, "p");
         const double ll = rowNum(c, "ci_lo"), ul = rowNum(c, "ci_hi");
         if (!std::isfinite(b) || !(se > 0) || !std::isfinite(z) || !std::isfinite(p) ||
@@ -591,7 +657,10 @@ bool buildRTableFromBlock(SessionState& session, const ojson& block, double leve
     }
     if (c.row != nullptr && rowNum(*c.row, "b") == (eform ? 1.0 : 0.0) &&
         rowNum(*c.row, "se") == 0.0) {
-      m.colnames.push_back(eqPrefix + omittedColumnName(c.name));
+      // nlcom's results are not variables: an identically-zero one keeps its own
+      // name in r(table) (bank 4724a9ce `nlcom [3]_b[mpg] / [4]_b[mpg]` after
+      // mlogit with base outcome 3: `_nl_1`, printed "(omitted)").
+      m.colnames.push_back(eqPrefix + (estimator == "nlcom" ? c.name : omittedColumnName(c.name)));
       const double col[9] = {eform ? 1.0 : 0.0, rtNan(), rtNan(), rtNan(), rtNan(), rtNan(),
                              zRef ? rtNan() : dfR, crit, eform ? 1.0 : 0.0};
       for (int r = 0; r < 9; ++r) m.data[static_cast<size_t>(r)].push_back(col[r]);
@@ -603,8 +672,27 @@ bool buildRTableFromBlock(SessionState& session, const ojson& block, double leve
     if (c.row != nullptr) {
       b = rowNum(*c.row, "b");
       se = rowNum(*c.row, "se");
-      if (eform && !(b > 0) && !blockEform) return false;
-      if (eform && !(b > 0)) {
+      // exp(b) overflowed (+inf; bank 8f32ea74 `suest A C, ef(OR)`: A_mean:_cons
+      // exp(11253) shows b, se and the interval as `.` with z 8.23 and its p kept)
+      // is rebuilt from e(b)/e(V) as the underflow below is.
+      bool overflowed = false;
+      if (eform && std::isinf(b) && b > 0) {
+        const auto eb = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
+        const auto eV = session.eval.resolveEMatrixFor("V", eval::EvalSession::EReader::kCopy);
+        if (eb.matrix.has_value() && eV.matrix.has_value() && eb.matrix->data.size() == 1 &&
+            eb.matrix->data[0].size() == cols.size() && eV.matrix->data.size() == cols.size() &&
+            eV.matrix->data[ci].size() == cols.size() && std::isfinite(eb.matrix->data[0][ci]) &&
+            eV.matrix->data[ci][ci] > 0) {
+          b = eb.matrix->data[0][ci];
+          se = std::sqrt(eV.matrix->data[ci][ci]);
+          colRebuild = true;
+          overflowed = true;
+        }
+      }
+      if (overflowed) {
+      } else if (eform && !(b > 0) && !blockEform) {
+        return false;
+      } else if (eform && !(b > 0)) {
         // exp(b) underflowed to 0 (bank 016b8ffe `logit foreign mpg tw, or` with
         // tw = weight*1e-6: odds ratio 0, se 0, z -3.86, interval 0 0): the
         // coefficient-metric b and se are e(b)'s and sqrt(e(V))'s, and the test
@@ -687,12 +775,14 @@ bool buildRTableFromBlock(SessionState& session, const ojson& block, double leve
       }
     }
     if (eform) {
-      // exp() back to the reported metric; the base column's 0 becomes 1.
+      // exp() back to the reported metric; the base column's 0 becomes 1. A value
+      // past the double range is missing, as Stata stores it.
       const double eb = std::exp(b);
-      b = eb;
-      if (!std::isnan(se)) se = eb * se;
-      if (!std::isnan(ll)) ll = std::exp(ll);
-      if (!std::isnan(ul)) ul = std::exp(ul);
+      const auto fin = [](double x) { return std::isfinite(x) ? x : rtNan(); };
+      b = fin(eb);
+      if (!std::isnan(se)) se = fin(eb * se);
+      if (!std::isnan(ll)) ll = fin(std::exp(ll));
+      if (!std::isnan(ul)) ul = fin(std::exp(ul));
     }
     const double col[9] = {b, se, t, p, ll, ul, zRef ? rtNan() : dfR, crit, eform ? 1.0 : 0.0};
     for (int r = 0; r < 9; ++r) m.data[static_cast<size_t>(r)].push_back(col[r]);
@@ -835,12 +925,35 @@ bool postRTableFromBlock(SessionState& session, const ojson& block, double level
     }
   } else if (est != "nlcom") {
     postCoefficientLabels(session, tbl, est == "margins_rtable");
+    // A coefficient a constraints() fit holds at a nonzero value (its row flagged
+    // `constrained`, no standard error): Stata's `(constrained)` (vs-stata bank
+    // eae58c67 `ologit rep78 mpg weight, const(1)` with mpg = -.1: r(label1)).
+    if (block.is_object() && block.contains("coeftable") && block["coeftable"].is_array() &&
+        tbl.data.size() >= 2) {
+      std::set<std::string> fixed;
+      for (const auto& row : block["coeftable"])
+        if (row.is_object() && row.value("constrained", false)) fixed.insert(row.value("name", std::string()));
+      for (size_t i = 0; !fixed.empty() && i < tbl.colnames.size(); ++i) {
+        const std::string& full = tbl.colnames[i];
+        const size_t colon = full.rfind(':');
+        const std::string nm = colon == std::string::npos ? full : full.substr(colon + 1);
+        if (fixed.count(nm) == 0 || tbl.data[0][i] == 0.0 || !std::isnan(tbl.data[1][i])) continue;
+        const std::string key = "label" + std::to_string(i + 1);
+        session.eval.rStrings.set(key, "(constrained)");
+        session.eval.markRMacroHidden(key);
+      }
+    }
   }
   const size_t nCols = tbl.colnames.size();
   setRTable(session, std::move(tbl));
   // r(level) beside r(table) (w2o_rnames.log:400 N24 `regress` r(level) 95,
   // :410 N25 level(90) -> 90).
   session.eval.rValues.set("level", level);
+  // A last table drawn by `ereturn display` of a re-posted result (oaxaca xb's
+  // b0/V0 table) leaves its multiple-comparison method (bank 9a6960b8:
+  // r(mcmethod) "noadjust").
+  if (block.contains("rtable_mcmethod") && block["rtable_mcmethod"].is_string())
+    session.eval.rStrings.set("mcmethod", block["rtable_mcmethod"].get<std::string>());
   // mean / proportion's table also returns its title, the multiple-comparison method,
   // the interval type and k_eform (vs-stata bank 85536cc0 `mean price mpg`: r(title)
   // "Estimated means", r(mcmethod) "noadjust", r(citype) "normal", r(k_eform) 1;
@@ -959,8 +1072,14 @@ RAfter leafPostsOrRetires(SessionState& session, const ojson& result, const std:
   // earlier summarize read `.` after `regress`) and posts its own table.
   if (eChanged && est != nullptr) {
     eval::replaceRClass(session.eval);
-    if (session.lastEstBlock.has_value() &&
-        !postRTableFromBlock(session, *est, declaredLevel(rawCmd, session)))
+    // a fit displayed without its coefficient table (logit ..., notable / nocoef)
+    // posts no r(table): Stata's _coef_table never ran (vs-stata bank c7fe3d70)
+    const bool noTable = est->contains("r_after_fit") && (*est)["r_after_fit"].is_object() &&
+                         (*est)["r_after_fit"].value("no_rtable", false);
+    if (noTable)
+      refuseRTable(session, "r(table) is posted by the coefficient table, which this fit did not display");
+    else if (session.lastEstBlock.has_value() &&
+             !postRTableFromBlock(session, *est, declaredLevel(rawCmd, session)))
       refuseRTable(session, estimationRefusal(session));
     // A fit whose ado leaves its own r-class results behind (ivreg2's last
     // `_ms_parse_parts`) carries them as the block's `r_after_fit`: posted on top.

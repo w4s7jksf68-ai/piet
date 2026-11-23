@@ -424,4 +424,302 @@ NnmatchResult nnmatch_fit(const double* y, const double* t,
     return R;
 }
 
+
+namespace {
+std::string te_lv(double v) {
+    char buf[64];
+    if (v == std::floor(v)) std::snprintf(buf, sizeof(buf), "%.0f", v);
+    else std::snprintf(buf, sizeof(buf), "%.15g", v);
+    return buf;
+}
+}  // namespace
+
+TeRaResult teffects_ra_fit(const double* y, const double* t, const std::vector<std::string>& xnames,
+                           const std::vector<std::vector<double>>& xcols, const std::vector<double>& w,
+                           const std::vector<char>& keep, int64_t n, const std::string& tvar,
+                           const TeRaOpts& o) {
+    TeRaResult r;
+    const int k = static_cast<int>(xcols.size()) + 1;  // + _cons
+    std::vector<int64_t> rows;
+    r.sample.assign(n, 0);
+    for (int64_t i = 0; i < n; ++i) {
+        if (!keep[i] || !std::isfinite(y[i]) || !std::isfinite(t[i])) continue;
+        bool ok = true;
+        for (const auto& c : xcols)
+            if (!std::isfinite(c[i])) ok = false;
+        if (!w.empty() && !(std::isfinite(w[i]) && w[i] > 0)) ok = false;
+        if (!ok) continue;
+        rows.push_back(i);
+        r.sample[i] = 1;
+    }
+    const int64_t m = static_cast<int64_t>(rows.size());
+    if (m == 0) throw EngineError("no_obs", "no observations", "r(2000)");
+    std::vector<double> X(static_cast<size_t>(m) * k), Y(m), T(m), W(m, 1.0);
+    for (int64_t q = 0; q < m; ++q) {
+        const int64_t i = rows[q];
+        for (int j = 0; j + 1 < k; ++j) X[q * k + j] = xcols[j][i];
+        X[q * k + k - 1] = 1.0;
+        Y[q] = y[i];
+        T[q] = t[i];
+        if (!w.empty()) W[q] = w[i];
+    }
+    std::vector<double> lv;
+    for (double v : T)
+        if (std::find(lv.begin(), lv.end(), v) == lv.end()) lv.push_back(v);
+    std::sort(lv.begin(), lv.end());
+    const int L = static_cast<int>(lv.size());
+    // Stata's treatment-variable checks, in its order: the levels must be
+    // nonnegative integers (non-integer values counted in the estimation sample,
+    // negative ones anywhere in the data: o.tvarHasNegative), at least two and at
+    // most 20 of them; then control() with pomeans, tlevel() with ate / pomeans,
+    // control() equal to tlevel(), and a control() or tlevel() that is not a level.
+    bool nonint = o.tvarHasNegative;
+    for (double v : lv)
+        if (v != std::trunc(v) || v < 0) nonint = true;
+    if (nonint)
+        throw EngineError("bad_input", "treatment variable " + tvar + " must contain nonnegative integers", "r(459)");
+    if (L < 2)
+        throw EngineError("bad_input", "there is only one level in treatment variable " + tvar + "; this is not allowed",
+                          "r(459)");
+    if (L > 20)
+        throw EngineError("bad_input", "treatment variable " + tvar + " has " + std::to_string(L) +
+                                           " levels exceeding the maximum of 20",
+                          "r(459)");
+    if (o.hasControl && o.stat == 2)
+        throw EngineError("bad_input", "options control() and pomeans may not be combined", "r(184)");
+    if (o.hasTreated && o.stat != 1)
+        throw EngineError("bad_input",
+                          std::string("options tlevel() and ") + (o.stat == 2 ? "pomeans" : "ate (the default)") +
+                              " may not be combined",
+                          "r(184)");
+    if (o.hasControl && o.hasTreated && o.control == o.treated)
+        throw EngineError("bad_input", "control(" + te_lv(o.control) + ") and tlevel(" + te_lv(o.treated) +
+                                           ") cannot be the same value",
+                          "r(198)");
+    auto found = [&](double v) { return std::find(lv.begin(), lv.end(), v) != lv.end(); };
+    if (o.hasControl && !found(o.control))
+        throw EngineError("bad_input", "invalid control(" + te_lv(o.control) + ") specification; level " +
+                                           te_lv(o.control) + " not found in treatment variable " + tvar,
+                          "r(459)");
+    if (o.hasTreated && !found(o.treated))
+        throw EngineError("bad_input", "invalid tlevel(" + te_lv(o.treated) + ") specification; level " +
+                                           te_lv(o.treated) + " not found in treatment variable " + tvar,
+                          "r(459)");
+    // The control: control(), else the first level that is not tlevel(), else the
+    // lowest level. The treated level: tlevel(), else the lowest level that is not
+    // the control (the first level when the control is not the lowest).
+    double ctrl = lv[0];
+    if (o.hasControl) ctrl = o.control;
+    else if (o.hasTreated)
+        for (double v : lv)
+            if (v != o.treated) { ctrl = v; break; }
+    double tr = o.hasTreated ? o.treated : (ctrl != lv[0] ? lv[0] : lv[1]);
+    if (o.stat == 1 && L != 2 && !o.hasTreated)
+        throw EngineError("unsupported", "teffects ra: atet with more than two levels needs tlevel()");
+    const bool fw = o.wtype == "fw";
+    for (double v : lv) {
+        double c = 0;
+        for (int64_t q = 0; q < m; ++q)
+            if (T[q] == v) c += fw ? W[q] : 1.0;
+        r.counts.push_back(c);
+    }
+    for (int64_t q = 0; q < m; ++q) r.N += fw ? W[q] : 1.0;
+    r.levels = lv;
+    r.control = ctrl;
+    r.treated = tr;
+    // POM order: control first, then the other levels ascending (pomeans: level order)
+    std::vector<double> ord;
+    if (o.stat == 2) ord = lv;
+    else {
+        ord.push_back(ctrl);
+        for (double v : lv)
+            if (v != ctrl) ord.push_back(v);
+    }
+    // per-level OLS (weighted normal equations), dropping exactly collinear columns
+    std::vector<std::vector<double>> beta(L, std::vector<double>(k, 0.0));
+    std::vector<std::vector<int>> kept(L);
+    for (int l = 0; l < L; ++l) {
+        std::vector<double> G(static_cast<size_t>(k) * k, 0.0), xy(k, 0.0);
+        for (int64_t q = 0; q < m; ++q) {
+            if (T[q] != lv[l]) continue;
+            for (int a = 0; a < k; ++a) {
+                xy[a] += W[q] * X[q * k + a] * Y[q];
+                for (int b = 0; b < k; ++b) G[a * k + b] += W[q] * X[q * k + a] * X[q * k + b];
+            }
+        }
+        // the constant first, then the columns in order: keep a column whose
+        // residual diagonal is not ~0 (a factor's base level is all zeros)
+        std::vector<int> ks;
+        std::vector<int> order;
+        order.push_back(k - 1);
+        for (int a = 0; a + 1 < k; ++a) order.push_back(a);
+        for (int a : order) {
+            std::vector<int> trial = ks;
+            trial.push_back(a);
+            const int kk = static_cast<int>(trial.size());
+            std::vector<double> sub(static_cast<size_t>(kk) * kk);
+            for (int i = 0; i < kk; ++i)
+                for (int j = 0; j < kk; ++j) sub[i + j * kk] = G[trial[i] * k + trial[j]];
+            if (G[a * k + a] > 0 && la::spd_inverse(sub.data(), kk) == 0 && std::isfinite(sub[(kk - 1) * (kk + 1)]) &&
+                sub[(kk - 1) * (kk + 1)] * G[a * k + a] < 1e13)
+                ks.push_back(a);
+        }
+        std::sort(ks.begin(), ks.end());
+        for (int a = 0; a < k; ++a)
+            if (G[a * k + a] > 0 && std::find(ks.begin(), ks.end(), a) == ks.end())
+                throw EngineError("unsupported",
+                                  "teffects ra: a treatment level's outcome model is rank deficient (Stata "
+                                  "reports it unconverged); not implemented in this version");
+        const int kk = static_cast<int>(ks.size());
+        std::vector<double> sub(static_cast<size_t>(kk) * kk), rhs(kk), bb(kk);
+        for (int i = 0; i < kk; ++i) {
+            rhs[i] = xy[ks[i]];
+            for (int j = 0; j < kk; ++j) sub[i + j * kk] = G[ks[i] * k + ks[j]];
+        }
+        if (la::spd_inverse(sub.data(), kk)) throw EngineError("collinear", "teffects ra: singular outcome model");
+        la::matvec(sub.data(), kk, rhs.data(), bb.data());
+        for (int i = 0; i < kk; ++i) beta[l][ks[i]] = bb[i];
+        kept[l] = ks;
+    }
+    // stacked estimating equations, parameters: mu (ord), beta (level order, kept columns)
+    std::vector<int> boff(L);
+    int q = L;
+    for (int l = 0; l < L; ++l) {
+        boff[l] = q;
+        q += static_cast<int>(kept[l].size());
+    }
+    auto levIdx = [&](double v) { return static_cast<int>(std::find(lv.begin(), lv.end(), v) - lv.begin()); };
+    std::vector<double> mu(L);
+    for (int j = 0; j < L; ++j) {
+        const int l = levIdx(ord[j]);
+        double num = 0, den = 0;
+        for (int64_t s = 0; s < m; ++s) {
+            const double wt = W[s] * (o.stat == 1 ? (T[s] == tr ? 1.0 : 0.0) : 1.0);
+            double f = 0;
+            for (int a = 0; a < k; ++a) f += X[s * k + a] * beta[l][a];
+            num += wt * f;
+            den += wt;
+        }
+        mu[j] = num / den;
+    }
+    std::vector<double> A(static_cast<size_t>(q) * q, 0.0), B(static_cast<size_t>(q) * q, 0.0), psi(q);
+    for (int64_t s = 0; s < m; ++s) {
+        std::fill(psi.begin(), psi.end(), 0.0);
+        const double in = o.stat == 1 ? (T[s] == tr ? 1.0 : 0.0) : 1.0;
+        for (int j = 0; j < L; ++j) {
+            const int l = levIdx(ord[j]);
+            double f = 0;
+            for (int a = 0; a < k; ++a) f += X[s * k + a] * beta[l][a];
+            psi[j] = in * (f - mu[j]);
+            A[j * q + j] -= W[s] * in;
+            for (size_t c = 0; c < kept[l].size(); ++c) A[j * q + boff[l] + c] += W[s] * in * X[s * k + kept[l][c]];
+        }
+        for (int l = 0; l < L; ++l) {
+            if (T[s] != lv[l]) continue;
+            double f = 0;
+            for (int a = 0; a < k; ++a) f += X[s * k + a] * beta[l][a];
+            const double e = Y[s] - f;
+            const int nk = static_cast<int>(kept[l].size());
+            for (int c = 0; c < nk; ++c) {
+                psi[boff[l] + c] = X[s * k + kept[l][c]] * e;
+                for (int d = 0; d < nk; ++d)
+                    A[(boff[l] + c) * q + boff[l] + d] -= W[s] * X[s * k + kept[l][c]] * X[s * k + kept[l][d]];
+            }
+        }
+        const double bw = o.wtype == "pw" ? W[s] * W[s] : W[s];
+        for (int a = 0; a < q; ++a) {
+            if (psi[a] == 0) continue;
+            for (int b = 0; b < q; ++b) B[a * q + b] += bw * psi[a] * psi[b];
+        }
+    }
+    // V = A^-1 B A^-T (A is not symmetric: invert by Gauss-Jordan)
+    std::vector<double> Ai(static_cast<size_t>(q) * q, 0.0), M = A;
+    for (int i = 0; i < q; ++i) Ai[i * q + i] = 1;
+    for (int c = 0; c < q; ++c) {
+        int piv = c;
+        for (int r2 = c + 1; r2 < q; ++r2)
+            if (std::fabs(M[r2 * q + c]) > std::fabs(M[piv * q + c])) piv = r2;
+        if (M[piv * q + c] == 0) throw EngineError("collinear", "teffects ra: singular estimating equations");
+        if (piv != c)
+            for (int j = 0; j < q; ++j) {
+                std::swap(M[c * q + j], M[piv * q + j]);
+                std::swap(Ai[c * q + j], Ai[piv * q + j]);
+            }
+        const double d = M[c * q + c];
+        for (int j = 0; j < q; ++j) {
+            M[c * q + j] /= d;
+            Ai[c * q + j] /= d;
+        }
+        for (int r2 = 0; r2 < q; ++r2) {
+            if (r2 == c || M[r2 * q + c] == 0) continue;
+            const double f = M[r2 * q + c];
+            for (int j = 0; j < q; ++j) {
+                M[r2 * q + j] -= f * M[c * q + j];
+                Ai[r2 * q + j] -= f * Ai[c * q + j];
+            }
+        }
+    }
+    std::vector<double> AB(static_cast<size_t>(q) * q, 0.0), Vt(static_cast<size_t>(q) * q, 0.0);
+    for (int i = 0; i < q; ++i)
+        for (int c = 0; c < q; ++c) {
+            const double v = Ai[i * q + c];
+            if (v == 0) continue;
+            for (int j = 0; j < q; ++j) AB[i * q + j] += v * B[c * q + j];
+        }
+    for (int i = 0; i < q; ++i)
+        for (int j = 0; j < q; ++j) {
+            double s2 = 0;
+            for (int c = 0; c < q; ++c) s2 += AB[i * q + c] * Ai[j * q + c];
+            Vt[i * q + j] = s2;
+        }
+    // output parameterisation: [ATE/ATET r_l vs c ..., POmean c] or [POmeans l ...], then OME_l (all columns)
+    const int P = L + L * k;
+    std::vector<double> Gm(static_cast<size_t>(P) * q, 0.0), th(q, 0.0);
+    for (int j = 0; j < L; ++j) th[j] = mu[j];
+    for (int l = 0; l < L; ++l)
+        for (size_t c = 0; c < kept[l].size(); ++c) th[boff[l] + c] = beta[l][kept[l][c]];
+    const std::string tlab = "." + tvar;
+    if (o.stat == 2) {
+        for (int j = 0; j < L; ++j) {
+            Gm[j * q + j] = 1;
+            r.names.push_back("POmeans:" + te_lv(ord[j]) + (j == 0 ? "bn" : "") + tlab);
+        }
+    } else {
+        const std::string eq = o.stat == 1 ? "ATET" : "ATE";
+        for (int j = 1; j < L; ++j) {
+            Gm[(j - 1) * q + j] = 1;
+            Gm[(j - 1) * q + 0] = -1;
+            r.names.push_back(eq + ":r" + te_lv(ord[j]) + "vs" + te_lv(ord[0]) + tlab);
+        }
+        Gm[(L - 1) * q + 0] = 1;
+        r.names.push_back("POmean:" + te_lv(ord[0]) + tlab);
+    }
+    for (int l = 0; l < L; ++l) {
+        const std::string eq = "OME" + te_lv(lv[l]) + ":";
+        for (int a = 0; a < k; ++a) {
+            r.names.push_back(eq + (a + 1 < k ? xnames[a] : std::string("_cons")));
+            const auto it = std::find(kept[l].begin(), kept[l].end(), a);
+            if (it != kept[l].end()) Gm[(L + l * k + a) * q + boff[l] + (it - kept[l].begin())] = 1;
+        }
+    }
+    r.b.assign(P, 0.0);
+    for (int i = 0; i < P; ++i)
+        for (int c = 0; c < q; ++c) r.b[i] += Gm[i * q + c] * th[c];
+    std::vector<double> GV(static_cast<size_t>(P) * q, 0.0);
+    for (int i = 0; i < P; ++i)
+        for (int c = 0; c < q; ++c) {
+            const double g = Gm[i * q + c];
+            if (g == 0) continue;
+            for (int j = 0; j < q; ++j) GV[i * q + j] += g * Vt[c * q + j];
+        }
+    r.V.assign(static_cast<size_t>(P) * P, 0.0);
+    for (int i = 0; i < P; ++i)
+        for (int j = 0; j < P; ++j) {
+            double s2 = 0;
+            for (int c = 0; c < q; ++c) s2 += GV[i * q + c] * Gm[j * q + c];
+            r.V[i * P + j] = s2;
+        }
+    return r;
+}
+
 }  // namespace cecon

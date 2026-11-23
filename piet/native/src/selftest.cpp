@@ -127,6 +127,11 @@ int runSelftest() {
   testAsyncRouteShimContract();
   testSplitByteRouteAndRowRange();
   testGetcolsProjection();
+  testGetcellMatchesProjection();
+  testEgenResidueSummaryHandedOver();
+  testRegexScansMatchRegex();
+  testDumpedJsonSizeMatchesDump();
+  testServeResponseFastRead();
   testVirtualHeadSurvivesForeignMutation();
   testVersionSingleSource();
   testLegalNoticesRoute();

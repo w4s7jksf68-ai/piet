@@ -1,0 +1,189 @@
+{
+ "hbar": {
+  "type": "graph",
+  "kind": "bar",
+  "chart": "hbar",
+  "horizontal": true,
+  "stack": false,
+  "percentages": false,
+  "title": null,
+  "ytitle": null,
+  "bars": [
+   {
+    "value": 5913.0,
+    "series": "Price",
+    "category": "5"
+   },
+   {
+    "value": 6071.5,
+    "series": "Price",
+    "category": "4"
+   },
+   {
+    "value": 6429.2333984375,
+    "series": "Price",
+    "category": "3"
+   },
+   {
+    "value": 5967.625,
+    "series": "Price",
+    "category": "2"
+   },
+   {
+    "value": 4564.5,
+    "series": "Price",
+    "category": "1"
+   }
+  ],
+  "suppressed": false
+ },
+ "dot2": {
+  "type": "graph",
+  "kind": "bar",
+  "chart": "dot",
+  "horizontal": true,
+  "stack": false,
+  "percentages": false,
+  "title": "T",
+  "ytitle": "Y",
+  "bars": [
+   {
+    "value": 2315.9091796875,
+    "series": "Weight (lbs.)",
+    "category": "Foreign"
+   },
+   {
+    "value": 6384.681640625,
+    "series": "Price",
+    "category": "Foreign"
+   },
+   {
+    "value": 3317.115478515625,
+    "series": "Weight (lbs.)",
+    "category": "Domestic"
+   },
+   {
+    "value": 6072.4228515625,
+    "series": "Price",
+    "category": "Domestic"
+   }
+  ],
+  "suppressed": false
+ },
+ "dotv": {
+  "type": "graph",
+  "kind": "bar",
+  "chart": "dot",
+  "horizontal": false,
+  "stack": false,
+  "percentages": false,
+  "title": null,
+  "ytitle": null,
+  "bars": [
+   {
+    "value": 4564.5,
+    "series": "Price",
+    "category": "1"
+   },
+   {
+    "value": 5967.625,
+    "series": "Price",
+    "category": "2"
+   },
+   {
+    "value": 6429.2333984375,
+    "series": "Price",
+    "category": "3"
+   },
+   {
+    "value": 6071.5,
+    "series": "Price",
+    "category": "4"
+   },
+   {
+    "value": 5913.0,
+    "series": "Price",
+    "category": "5"
+   }
+  ],
+  "suppressed": false
+ },
+ "box": {
+  "type": "graph",
+  "kind": "bar",
+  "chart": "box",
+  "horizontal": false,
+  "stack": false,
+  "percentages": false,
+  "title": null,
+  "ytitle": null,
+  "boxes": [
+   {
+    "median": 4782.5,
+    "p25": 4184.0,
+    "p75": 6234.0,
+    "adjl": 3291.0,
+    "adjh": 8814.0,
+    "outside": [
+     10372.0,
+     11385.0,
+     14500.0,
+     15906.0,
+     11497.0,
+     13594.0,
+     13466.0,
+     10371.0
+    ],
+    "series": "price",
+    "category": "Domestic"
+   },
+   {
+    "median": 5759.0,
+    "p25": 4499.0,
+    "p75": 7140.0,
+    "adjl": 3748.0,
+    "adjh": 9735.0,
+    "outside": [
+     12990.0,
+     11995.0
+    ],
+    "series": "price",
+    "category": "Foreign"
+   }
+  ],
+  "suppressed": false
+ },
+ "barstack": {
+  "type": "graph",
+  "kind": "bar",
+  "chart": "bar",
+  "horizontal": false,
+  "stack": true,
+  "percentages": false,
+  "title": null,
+  "ytitle": null,
+  "bars": [
+   {
+    "value": 6072.4228515625,
+    "series": "Price",
+    "category": "Domestic"
+   },
+   {
+    "value": 3317.115478515625,
+    "series": "Weight (lbs.)",
+    "category": "Domestic"
+   },
+   {
+    "value": 6384.681640625,
+    "series": "Price",
+    "category": "Foreign"
+   },
+   {
+    "value": 2315.9091796875,
+    "series": "Weight (lbs.)",
+    "category": "Foreign"
+   }
+  ],
+  "suppressed": false
+ }
+}

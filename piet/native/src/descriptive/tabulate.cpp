@@ -371,10 +371,11 @@ std::optional<ojson> readFweightCol(Datastore& ds, const std::string& weightVar,
     if (kind == TabWeight::Analytic || kind == TabWeight::Importance) {
       // Stata's mark: a zero weight leaves the sample (w2aj_qualifiers
       // qf_cl_aw_wzero counts 5, not 6, in the group holding the zero); a
-      // negative aweight is r(402), a negative iweight is legal.
+      // negative aweight is r(402), and so is a negative iweight (vs-stata bank
+      // 146ac7afc1d4c96c `tabulate foreign [iw=w]`, w = +-0.5: r(402)).
       if (v == 0.0) {
         outW[static_cast<size_t>(i)] = std::numeric_limits<double>::quiet_NaN();
-      } else if (v < 0.0 && kind == TabWeight::Analytic) {
+      } else if (v < 0.0) {
         return ojson(eval::errorBlock("engine_error", "negative weights encountered", std::nullopt,
                                       std::nullopt, std::nullopt, "r(402)"));
       }
@@ -1241,12 +1242,8 @@ ojson tabulateSummaryTwo(Datastore& ds, const std::string& rowVar, const std::st
   // Deliberately NOT "summarize" (the one-way mode string): formatTabulate's
   // one-way summarize renderer (console.js) reads block.rows[].level/mean/
   // sd/N — a single flat list — and would misrender this compound (row,
-  // col) shape. No frontend renderer for "summarize_twoway" exists yet
-  // either (out of scope, piet/frontend/** forbidden this batch), but with
-  // no "table" key present formatTabulate() safely falls through to its
-  // honest "(no tabulation)" default instead of a plausible-looking wrong
-  // rendering — the data layer is correct and ready for when a renderer is
-  // added.
+  // col) shape; formatTabulate draws it through its own two-way summarize
+  // renderer (table-format.js), which reads cells/row_margins/col_margins/grand.
   out["mode"] = "summarize_twoway";
   out["vars"] = ojson::array({rowVar, colVar});
   out["sumvar"] = sumvar;
@@ -1297,15 +1294,8 @@ ojson runTabulate(Datastore& ds, const std::vector<std::string>& varlist, bool c
     // BS-027: two-way form (`tabulate v1 v2, summarize(v3)`) — one-way
     // behavior (varlist.size() == 1) stays byte-identical to before.
     if (varlist.size() >= 2) {
-      // The weighted two-way summarize table adds an Obs line to every cell and no renderer draws
-      // the two-way table's cells: refuse it rather than answer a table the user cannot see whole.
-      if (weightPtr != nullptr) {
-        ojson err;
-        err["type"] = "error";
-        err["code"] = "unsupported_option";
-        err["message"] = "tabulate: weights are not yet supported with the two-way sum() option";
-        return err;
-      }
+      // A weight adds the number of observations to every cell (the frontend draws it from each
+      // cell's `obs`; bank 16ba2aac `[fw=trunk]`, bf9a5a5d `[aw=hours]`).
       return tabulateSummaryTwo(ds, varlist[0], varlist[1], *sumvar, weightPtr, kind);
     }
     return tabulateSummary(ds, varlist[0], *sumvar, includeMissing, weightPtr, kind);

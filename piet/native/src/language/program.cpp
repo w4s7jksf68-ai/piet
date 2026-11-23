@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <filesystem>   // BUG-360: ScopeGuard reaps this call's tempfiles
 #include <functional>   // std::hash: the program archive's definition key
+#include <map>
 #include <regex>
 #include <sstream>
 #include <system_error>
@@ -22,6 +23,7 @@
 #include "piet/eval/macros.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/datastore.h"
+#include "piet/handlers/data_combine.h"
 #include "piet/handlers/observations.h"
 #include "piet/handlers/results.h"  // noteEContractName
 #include "piet/loops.h"
@@ -225,6 +227,12 @@ std::vector<std::string> captureProgams(const std::vector<std::string>& lines, S
       ProgramDef def;
       def.name = progName;
       def.rclass = isRclass;
+      {
+        static const std::regex reByable(R"(,.*\bbyable\s*\(\s*(recall|onecall)\b)",
+                                         std::regex::icase);
+        std::smatch bm;
+        if (std::regex_search(stripped, bm, reByable)) def.byable = lower(bm[1].str());
+      }
       def.body = std::move(body);
       // A body with no statement is installed only by its sentinel, which may
       // decline it (doexec.cpp kInBlockMark: StataBE leaves such a program
@@ -405,32 +413,38 @@ void concludeLevel(int callerLevel, SessionState& session, ojson& blocks) {
   restorePreservesDeeperThan(callerLevel, session, blocks);
   dropTempfilesAndNamesDeeperThan(callerLevel, session);
   if (session.mintedTempvars.empty()) return;
-  std::vector<std::string> mine;
+  std::map<std::string, std::vector<std::string>> expiredByFrame;
   auto& tv = session.mintedTempvars;
   auto keep = tv.begin();
   for (auto it = tv.begin(); it != tv.end(); ++it) {
-    if (it->first > callerLevel) {
-      mine.push_back(it->second);
+    if (it->level > callerLevel) {
+      expiredByFrame[it->frame].push_back(std::move(it->name));
     } else {
       if (keep != it) *keep = std::move(*it);
       ++keep;
     }
   }
   tv.erase(keep, tv.end());
-  std::vector<std::string> live;
-  if (!mine.empty() && session.currentHbin().has_value()) {
-    if (Datastore* ds = session.datastore()) {
-      for (const auto& v : mine)
-        if (ds->has(v)) live.push_back(v);
-    }
-  }
-  // Dropping temporary variables is no change to the data: c(changed) and
-  // describe's r(changed) stay as they were (StataBE 19.5, vs-stata bank
-  // fe389cbc6b0d0af5: a program's `tempvar t` + `generate `t'` leaves 0).
-  if (!live.empty()) {
-    const bool changed = session.datasetChanged;
-    (void)handlers::runDrop(live, session);
-    session.datasetChanged = changed;
+  for (const auto& entry : expiredByFrame) {
+    const auto& frame = entry.first;
+    const auto& names = entry.second;
+    if (frame != session.currentFrame && session.frames.count(frame) == 0) continue;
+    ojson cleanup = handlers::runWithFrameCurrent(frame, session, [&]() -> ojson {
+      std::vector<std::string> live;
+      if (session.currentHbin().has_value()) {
+        if (Datastore* ds = session.datastore())
+          for (const auto& name : names)
+            if (ds->has(name)) live.push_back(name);
+      }
+      if (live.empty()) return ojson::array();
+      // Reaping scoped variables leaves the changed flag as it was.
+      const bool changed = session.datasetChanged;
+      ojson result = handlers::runDrop(live, session);
+      session.datasetChanged = changed;
+      return result;
+    });
+    if (cleanup.is_object() && cleanup.value("type", "") == "error")
+      blocks.push_back(std::move(cleanup));
   }
 }
 
@@ -464,7 +478,9 @@ ojson runProgram(const ProgramDef& progDef, const std::string& argstr, SessionSt
 
   // --- Snapshot and reset returnStaging ---
   std::map<std::string, std::pair<std::string, std::string>> callerStaging = session.returnStaging;
+  std::set<std::string> callerHidden = std::move(session.returnStagingHidden);
   session.returnStaging.clear();
+  session.returnStagingHidden.clear();
 
   // --- Build scope args ---
   std::map<std::string, std::string> args = buildArgs(argstr);
@@ -570,8 +586,10 @@ ojson runProgram(const ProgramDef& progDef, const std::string& argstr, SessionSt
           d = std::nan("");
         }
         session.eval.rValues.set(rname, d);
+        if (session.returnStagingHidden.count(rname)) session.eval.markRHidden(rname);
       } else if (progDef.rclass && kind == "local") {
         session.eval.rStrings.set(rname, val);
+        if (session.returnStagingHidden.count(rname)) session.eval.markRMacroHidden(rname);
       } else if (kind == "matrix") {
         // `return matrix`: the parked matrix (handleReturnStmt) becomes r(rname).
         auto& mats = session.eval.matrices;
@@ -613,6 +631,7 @@ ojson runProgram(const ProgramDef& progDef, const std::string& argstr, SessionSt
 
   // Restore caller's staging (nested rclass programs layer correctly).
   session.returnStaging = std::move(callerStaging);
+  session.returnStagingHidden = std::move(callerHidden);
 
   return allBlocks;
 }
@@ -774,10 +793,77 @@ static int localFormValue(const std::string& raw, const std::string& expanded,
 // ---------------------------------------------------------------------------
 // S7: return scalar/local step-0 handlers
 
+std::string canonicalReturnSubcommand(const std::string& word) {
+  std::string w = word;
+  for (char& c : w) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  // {cmdab:li:st} {cmdab:sca:lar} {cmdab:loc:al} {cmdab:mat:rix} ([P] return).
+  static const struct { const char* full; size_t floor; } kSubs[] = {
+      {"list", 2}, {"scalar", 3}, {"local", 3}, {"matrix", 3}};
+  for (const auto& s : kSubs) {
+    const std::string full = s.full;
+    if (w.size() >= s.floor && w.size() <= full.size() && full.compare(0, w.size(), w) == 0)
+      return full;
+  }
+  return w;
+}
+
 bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& outErrorBlock) {
   outErrorBlock = ojson();
 
   std::string stripped = trim(rawLine);
+  // `ret:urn` and its subcommand abbreviations ([P] return: `ret sca a = 1`,
+  // `retu loc b "x"`, `return hidden sca h = 3`) are spelled out first, so every
+  // form below reads one spelling.
+  {
+    const size_t e0 = stripped.find_first_of(" \t");
+    std::string head = stripped.substr(0, e0 == std::string::npos ? stripped.size() : e0);
+    for (char& c : head) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (e0 != std::string::npos && head.size() >= 3 && head.size() <= 6 &&
+        std::string("return").compare(0, head.size(), head) == 0) {
+      std::string rest = stripped.substr(e0);
+      std::string out = "return";
+      for (int pass = 0; pass < 2; ++pass) {
+        const size_t b = rest.find_first_not_of(" \t");
+        if (b == std::string::npos) break;
+        const size_t e = rest.find_first_of(" \t", b);
+        const std::string word = rest.substr(b, e == std::string::npos ? std::string::npos : e - b);
+        const std::string canon = canonicalReturnSubcommand(word);
+        const bool hidden = pass == 0 && canon == "hidden";
+        out += rest.substr(0, b) + (hidden ? word : canon);
+        rest = e == std::string::npos ? std::string() : rest.substr(e);
+        if (!hidden) break;
+      }
+      stripped = out + rest;
+    }
+  }
+  // `return hidden scalar|local NAME ...` ([P] return): staged as the plain
+  // form, then flushed as a hidden r() (vs-stata bank b6400ae8). A later plain
+  // return of the same name is visible again.
+  bool hiddenReturn = false;
+  {
+    static const std::regex reHidden(R"(^return\s+hidden\s+((?:scalar|local)\s.*)$)", std::regex::icase);
+    std::smatch hm;
+    if (std::regex_search(stripped, hm, reHidden)) {
+      stripped = "return " + hm.str(1);
+      hiddenReturn = true;
+    }
+  }
+  struct HiddenMark {
+    SessionState& s;
+    bool hidden;
+    const std::string& stripped;
+    ~HiddenMark() {
+      if (!hidden && s.returnStagingHidden.empty()) return;  // the common case: nothing to track
+      static const std::regex reName(R"(^return\s+(?:scalar|local)\s+([A-Za-z_][A-Za-z0-9_]*))",
+                                     std::regex::icase);
+      std::smatch nm;
+      if (!std::regex_search(stripped, nm, reName)) return;
+      const std::string name = nm.str(1);
+      if (!s.returnStaging.count(name)) return;
+      if (hidden) s.returnStagingHidden.insert(name);
+      else s.returnStagingHidden.erase(name);
+    }
+  } hiddenMark{session, hiddenReturn, stripped};
 
   // A2/A3: this function is SEVEN regex searches, and it sits in the dispatch
   // prologue ahead of the macro-definition intercept — so every `local` line in

@@ -136,7 +136,9 @@ EoV eoElemValue(const EoModel& m, const EoKey& key, const std::string& stat) {
     if (stat == "ci_u") return eoNum(c.ciu);
     return EoV{};
   }
-  if (stat == "beta") {
+  // esttab's beta option fills m.beta; without it `cells(beta)` is the e(beta) matrix like any
+  // other (estadd beta, bank b1da7033), read below.
+  if (stat == "beta" && !m.beta.empty()) {
     auto it = m.beta.find(key.second);
     if (it == m.beta.end()) {
       if (m.vals.count(key) != 0 && key.second == "_cons") return EoV{};

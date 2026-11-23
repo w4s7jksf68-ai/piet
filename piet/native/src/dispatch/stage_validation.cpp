@@ -311,7 +311,15 @@ bool resolveCommandOptions(std::string& cmd,
     }
     const OptKeyResolution optRes =
         resolveOptionKeyForCommand(cmd, kv.first, kv.second.isBool ? 1 : 2, bankSub);
-    if (std::strcmp(optRes.stage, "bank-refuse") == 0) {
+    // list's `N` is case-sensitive and the key arrives lower-cased: the bank's
+    // refusal is of a typed lower-case `n` (`list ..., n` r(198)), while
+    // `list ..., mean sum N` runs (bank 3227e56bff29bd73). parseListLayout
+    // re-reads the spelling typed.
+    const bool listCapitalN =
+        kv.first == "n" && (cmd == "list" || (cmd == "duplicates" && (bankSub == "list" ||
+                                                                      bankSub == "examples"))) &&
+        std::regex_search(parsed.raw, std::regex(R"([\s,]N(\(|\s|$))"));
+    if (std::strcmp(optRes.stage, "bank-refuse") == 0 && !listCapitalN) {
       // StataBE refused this exact spelling on this command (truth bank,
       // 2026-11-10). Answered here, before any handler, because a handler that
       // parses its own options never reaches a reject net and would run it.
@@ -764,6 +772,18 @@ void stampStringVarlistRc(const std::string& cmd, const eval::ParsedCommand& par
       if (b.value("reason", std::string()).rfind("r(", 0) == 0) continue;
       b["reason"] = "r(402)";
       b["message"] = "negative weights encountered";
+    }
+    // A string variable as the weight is r(109) "type mismatch" (vs-stata bank
+    // 0a800c4fdcce9673 `summarize price [aw=make]`); the engine names the
+    // column it could not read as a number.
+    if (parsed.weightVar.has_value() && !parsed.weightVar->empty()) {
+      const std::string want = "column '" + *parsed.weightVar + "' is a factor, not f64";
+      for (auto& b : blocks) {
+        if (!b.is_object() || b.value("type", std::string()) != "error") continue;
+        if (b.value("message", std::string()).find(want) == std::string::npos) continue;
+        b["reason"] = "r(109)";
+        b["message"] = "type mismatch";
+      }
     }
     return;
   }

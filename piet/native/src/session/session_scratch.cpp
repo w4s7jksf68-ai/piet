@@ -122,6 +122,23 @@ void SessionState::reclaimSupersededScratch(const std::string& oldPath, bool aba
   namespace fs = std::filesystem;
   std::error_code ec;
 
+  // Nothing on disk, nothing to reclaim. This is the same test the function ends on
+  // ("only track an existing regular file"), asked first: every exclusion below can only
+  // SPARE the path, so a path with no regular file behind it leaves here unregistered
+  // whichever of them it would have met. And that is nearly every call. Each resident
+  // mutation retires a virtual head token that never reached disk, load() parks it on
+  // deferredReclaim_, and the next materialization hands them all to this function, where
+  // each one used to pay a weakly_canonical per pin (preserve frames, `use` memos, frames,
+  // the model's paths) before being told there was no file: 74 s of a 414 s run of the AEA
+  // package openICPSR-226844, about 0.2 ms per mutation. One stat instead.
+  {
+    std::error_code existsEc;
+    if (!fs::is_regular_file(cecon::to_native_path(oldPath), existsEc)) {
+      if (scratchTraceOn()) scratchTrace("SPARE(no-file)", "reclaim", oldPath);
+      return;
+    }
+  }
+
   fs::path wd = fs::weakly_canonical(cecon::to_native_path(workdir_), ec);
   if (ec) return;
   fs::path op = fs::weakly_canonical(cecon::to_native_path(oldPath), ec);
@@ -298,7 +315,42 @@ void SessionState::flushDeferredReclaim() {
   if (deferredReclaim_.empty()) return;
   std::vector<std::string> pending;
   pending.swap(deferredReclaim_);
-  for (const auto& p : pending) reclaimSupersededScratch(p);
+  // A long list is nearly all virtual-head tokens that never reached disk (each
+  // resident mutation retires one: 11,000 for one 1,000-pass loop of the AEA
+  // package openICPSR-226844), and reclaimSupersededScratch's first question for
+  // each is a stat, "is there a regular file?", whose "no" ends the call. One
+  // listing of the scratch directory gives that "no" for every name directly in
+  // workdir_ that the listing lacks; a name it holds -- compared with ASCII case
+  // folded, so a case-insensitive volume's other spelling still counts as held --
+  // takes the full call as before. Nothing in the loop creates a file, so a name
+  // absent from the listing is absent at its turn too. Off for a short list, a
+  // failed listing, and under the scratch trace (whose lines the call writes).
+  auto fold = [](std::string name) {
+    for (char& c : name)
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return name;
+  };
+  std::unordered_set<std::string> present;
+  bool listed = false;
+  if (pending.size() >= 64 && !workdir_.empty() && !scratchTraceOn()) {
+    std::error_code ec;
+    std::filesystem::directory_iterator it(cecon::to_native_path(workdir_), ec);
+    listed = !ec;
+    for (; listed && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+      if (ec) break;
+      present.insert(fold(cecon::from_native_path(it->path().filename())));
+    }
+    if (ec) listed = false;
+  }
+  for (const auto& p : pending) {
+    if (listed) {
+      const size_t slash = p.rfind('/');
+      if (slash == workdir_.size() && p.compare(0, slash, workdir_) == 0 &&
+          present.count(fold(p.substr(slash + 1))) == 0)
+        continue;  // no file there: nothing to reclaim
+    }
+    reclaimSupersededScratch(p);
+  }
 }
 
 void SessionState::scratchTrace(const char* what, const std::string& a,

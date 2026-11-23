@@ -57,6 +57,8 @@ struct BodyRunResult {
 BodyRunResult runBody(const std::vector<std::string>& bodyLines, SessionState& session,
                        const DispatchFn& dispatchFn);
 void pushLoopBlock(ojson& allBlocks, bool& truncated, const ojson& b);
+// The same for a block the caller gives up (moved, not copied).
+void pushLoopBlock(ojson& allBlocks, bool& truncated, ojson&& b);
 
 ojson runParallelBlock(const std::string& header, const std::vector<std::string>& bodyLines,
                        SessionState& session, const DispatchFn& dispatchFn);

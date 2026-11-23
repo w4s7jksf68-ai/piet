@@ -11,6 +11,7 @@
 #include "estimators/xtlogit.h"
 #include "estimators/nbreg.h"
 #include "core/collinear.h"
+#include <unordered_map>
 #include "estimators/posthest.h"  // wald_test/WaldResult (cmd_xtreg's df_chi2/Wald chi2)
 
 namespace cecon {
@@ -509,6 +510,8 @@ int cmd_xtpois(const std::vector<std::string>& a) {
         {"loglik", R.loglik},
         {"iters", R.iters},
         {"converged", R.converged},
+        {"ilog", R.ilog},
+        {"gradient", R.gradient},
         {"coefs", coefs},
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
     };
@@ -556,6 +559,32 @@ int cmd_xtreg(const std::vector<std::string>& a) {
     for (int c = 0; c < k; ++c) xraw[c] = require_num(ds, "xtreg", xs[c]);
     std::vector<const double*> all = {yraw, iraw};
     for (auto* p : xraw) all.push_back(p);
+    // --cluster V (random effects only): the GLS step's cluster-robust VCE. Stata's
+    // xtreg, re marks out only the varlist and the panel variable: a row whose V is
+    // missing stays in the variance components and leaves only the final GLS
+    // regression (xtreg_re). A string V is grouped by its levels (its "" is missing).
+    const std::string clname = has(a, "--cluster") ? opt(a, "--cluster") : std::string();
+    if (!clname.empty() && be)
+        throw EngineError("bad_input", "xtreg: --cluster is not supported with --be");
+    std::vector<double> cl_raw;
+    if (!clname.empty()) {
+        if (!ds.has(clname))
+            throw EngineError("missing_column", "xtreg: column '" + clname + "' not found in dataset",
+                              clname);
+        const Column& cc = ds.col(clname);
+        cl_raw.resize(static_cast<size_t>(n_raw));
+        if (cc.dtype == DType::F64) {
+            std::copy(cc.f64(), cc.f64() + n_raw, cl_raw.begin());
+        } else {
+            const int32_t* codes = cc.codes();
+            for (int64_t i = 0; i < n_raw; ++i)
+                cl_raw[static_cast<size_t>(i)] =
+                    codes[i] >= 0 ? static_cast<double>(codes[i]) : std::nan("");
+        }
+    }
+    const double* craw = clname.empty() ? nullptr : cl_raw.data();
+    const bool sa = has(a, "--sa");
+    if (sa && be) throw EngineError("bad_input", "xtreg: --sa is not supported with --be");
     auto keep = listwise_keep(all, n_raw);
     // BUG-1269: Stata's `xtreg, re` refuses 0 rows r(2000) and 1 row r(2001).
     require_sample(static_cast<int64_t>(keep.size()));
@@ -571,8 +600,26 @@ int cmd_xtreg(const std::vector<std::string>& a) {
     auto t0 = std::chrono::steady_clock::now();
     XtregReResult R;
     XtregBeResult B;
+    const bool emit_v = has(a, "--emit-v");
     if (be) B = xtreg_be(X.data(), n_obs, k, yv_v.data(), iv_v.data());
-    else R = xtreg_re(X.data(), n_obs, k, yv_v.data(), iv_v.data());
+    std::vector<double> cl_v;
+    if (craw != nullptr) {
+        cl_v = gather_rows(craw, keep);
+        // xtreg's own check: every panel lies in one cluster (Stata r(498)), over the
+        // whole sample, where a missing cluster value is a value of its own (a panel
+        // with some rows missing and some not is not nested).
+        std::unordered_map<double, double> cl_of_panel;
+        for (size_t i = 0; i < cl_v.size(); ++i) {
+            const auto ins = cl_of_panel.emplace(iv_v[i], cl_v[i]);
+            const double prev = ins.first->second;
+            const bool same = (std::isnan(prev) && std::isnan(cl_v[i])) || prev == cl_v[i];
+            if (!ins.second && !same)
+                throw EngineError("bad_input", "panels are not nested within clusters",
+                                  "panels_not_nested");
+        }
+    }
+    if (!be) R = xtreg_re(X.data(), n_obs, k, yv_v.data(), iv_v.data(), emit_v,
+                          craw != nullptr ? cl_v.data() : nullptr, sa);
     auto t1 = std::chrono::steady_clock::now();
     // xtreg, re starts from the within regression, which leaves out the regressors
     // without within-panel variation; its residual dof N - N_g - (time-varying k)
@@ -728,6 +775,14 @@ int cmd_xtreg(const std::vector<std::string>& a) {
         {"coefs", coefs},
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
     };
+    if (craw != nullptr) {
+        out["n_clusters"] = R.n_clusters;
+        out["vcov_type"] = "cluster(" + clname + ")";
+        // rows with a missing cluster left only the GLS regression (e(N)); e(sample)
+        // is still every listwise-kept row: the row count the e(sample) mask carries
+        if (R.n_obs != static_cast<int64_t>(keep.size()))
+            out["n_rows"] = static_cast<int64_t>(keep.size());
+    }
     if (wr.ok && k > 0) {
         out["chi2"] = wr.chi2;
         out["p_chi2"] = chi2_pvalue(wr.chi2, static_cast<double>(k));
@@ -743,10 +798,17 @@ int cmd_xtreg(const std::vector<std::string>& a) {
         emit_esample(esreq, "xtreg", src_data, keepif, false, rows, out);
     }
     // --emit-v (BUG-1196): the FGLS covariance, slopes then `_cons`.
-    if (has(a, "--emit-v")) {
+    if (emit_v) {
         std::vector<std::string> names = xs;
         names.push_back("_cons");
         add_e_v(out, names, R.vcov_matrix);
+        out["rmse_gls"] = R.rmse;
+        if (!R.within_beta.empty()) {
+            json within;
+            add_e_v(within, names, R.within_vcov);
+            out["within_fit"] = std::move(within["e_V"]);
+            out["within_fit"]["beta"] = R.within_beta;
+        }
     }
     emit(out, opt(a, "--out"));
     return 0;

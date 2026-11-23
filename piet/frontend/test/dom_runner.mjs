@@ -121,6 +121,7 @@ const { formatEstimation, formatCorrelate, formatSummarize, formatTabulate, form
         setGraphSpill, getGraphEntries, getGraphById, getGraphsAsync, getGraphSpilledCount, flushGraphSpill,
         setMemoryBudgetMb, DEFAULT_MEMORY_BUDGET_MB, noviceErrorHint } = await import(JS('console.js'));
 const { renderGraph } = await import(JS('graph.js'));
+const { formatListing } = await import(JS('list-format.js'));
 const { createSpill } = await import(JS('graph_spill.js'));
 // fmtG: reused (not reimplemented) so BS-022/BS-026 value assertions below derive
 // their expected strings from the SAME formatter console.js renders with — no
@@ -484,6 +485,14 @@ suite('WS1: correlate renders Stata lower-triangular matrix', (ctx) => {
   check(ctx, (yRow.match(/-?\d\.\d{4}/g) || []).length === 1, `y row has 1 coefficient (lower-triangular)`);
   check(ctx, (x2Row.match(/-?\d\.\d{4}/g) || []).length === 3, `x2 row has 3 coefficients (lower-triangular)`);
   check(ctx, text.includes('0.3720'), `off-diagonal r(y,x1)=0.3720 rendered`);
+  const covariance = loadFix('dom/statistics_display.json').covariance;
+  const covText = formatCorrelate(covariance);
+  // StataBE 19.5 bank d6cd793e4a75ab77, against the same auto.dta.
+  check(ctx, /price\s*│\s*8\.7e\+06/.test(covText) &&
+    /mpg\s*│\s*-7996\.28\s+33\.472/.test(covText) &&
+    /weight\s*│\s*1\.2e\+06\s+-3629\.43\s+604030/.test(covText),
+    'correlate, covariance renders the covariance matrix in general format');
+  check(ctx, !covText.includes('1.0000'), 'the covariance table omits the correlation diagonal');
 });
 
 suite('WS1: pwcorr,sig adds a significance (p-value) line under each coef row', (ctx) => {
@@ -568,6 +577,57 @@ suite('vs-stata s3b_est_other: mean & proportion tables: CI type, vce(cluster) R
   check(ctx, formatEstimation(mcl).includes('[95% conf. interval]'), `level 95 -> "[95% conf. interval]"`);
 });
 
+suite('vs-stata s4_ml_a: logit constraints() rows and lines; noheader / notable / nocoef', (ctx) => {
+  // the blocks runLogitProbit produced for `constraint 1 mpg = 0`, `constraint 2 weight = -0.003`,
+  // `logit foreign mpg weight, constraints(1 2)` and `logit foreign mpg weight, noheader` (auto.dta)
+  const cns = {"type": "estimation", "estimator": "logit", "depvar": "foreign", "n_obs": 74, "coeftable": [{"b": 0.0, "ci_hi": null, "ci_lo": null, "name": "mpg", "p": null, "se": null, "t": null, "constrained": true}, {"b": -0.003, "ci_hi": null, "ci_lo": null, "name": "weight", "p": null, "se": null, "t": null, "constrained": true}, {"b": 7.338515025220484, "ci_hi": 8.017854944886402, "ci_lo": 6.6591751055545645, "name": "(intercept)", "p": 1.717611658424352e-99, "se": 0.34660836883966517, "t": 21.172353829157395}], "chi2": null, "chi2type": "Wald", "ll": -29.264494645119637, "constraint_lines": ["( 1)  [foreign]mpg = 0", "( 2)  [foreign]weight = -.003"], "p_chi2": null};
+  const noh = {"type": "estimation", "estimator": "logit", "depvar": "foreign", "n_obs": 74, "coeftable": [{"b": -0.1685868992056171, "ci_hi": 0.011568028209125059, "ci_lo": -0.34874182662035924, "name": "mpg", "p": 0.06663742282265145, "se": 0.0919174682982857, "t": -1.8341116474022958}, {"b": -0.003906700626513625, "ci_hi": -0.0019239722794452132, "ci_lo": -0.0058894289735820365, "name": "weight", "p": 0.00011253326634365751, "se": 0.0010116146841002793, "t": -3.8618464993795616}, {"b": 13.708367022511515, "ci_hi": 22.56487479096404, "ci_lo": 4.85185925405899, "name": "(intercept)", "p": 0.0024158193624938605, "se": 4.518709444822216, "t": 3.033690745090794}], "chi2": 35.716106715725054, "ll": -27.175156199128867, "r2_pseudo": 0.3965529779808925, "noheader": true, "p_chi2": 1.7552782407509313e-08};
+  const t = formatEstimation(cns);
+  check(ctx, /mpg │\s+0\s+\(omitted\)$/m.test(t), `a coefficient held at 0 reads (omitted) (bank 8eb99a9a)`);
+  check(ctx, /weight │\s+-\.003\s+\(constrained\)$/m.test(t), `a coefficient held elsewhere reads (constrained) (bank 27cdcef5)`);
+  check(ctx, t.includes(' ( 1)  [foreign]mpg = 0') && t.includes(' ( 2)  [foreign]weight = -.003'), `the constraint lines above the table`);
+  const nl = formatEstimation(noh).split('\n');
+  check(ctx, nl[0].startsWith('──') && !nl.some(l => l.includes('Number of obs')), `noheader: the table alone (bank bae7906b)`);
+  const nt = formatEstimation({ ...noh, noheader: undefined, notable: true });
+  check(ctx, nt.includes('Number of obs') && !nt.includes('Coefficient'), `notable: the header alone (bank c7fe3d70)`);
+  check(ctx, formatEstimation({ ...noh, notable: true }) === '', `nocoef (notable + noheader): nothing (bank 46cd0f47)`);
+});
+
+suite('vs-stata s4_lin_b: oaxaca draws its header, definitions, equation sections, eform, legend and xb', (ctx) => {
+  // the blocks runOaxaca produced for `oaxaca lw grade ttl_exp tenure, by(south) detail(hc: grade
+  // ttl_exp, job: tenure)` and `oaxaca lw grade tenure, by(south) pooled eform xb nolegend` (nlsw88)
+  const det = {"type": "estimation", "estimator": "oaxaca", "depvar": "lw", "n_obs": 2229, "coeftable": [{"b": 1.9570786008221257, "ci_hi": 1.9880660026182333, "ci_lo": 1.926091199026018, "name": "overall:group_1", "p": 0.0, "se": 0.01581018939150523, "t": 123.78590492240772}, {"b": 1.756252731240878, "ci_hi": 1.7921702333391978, "ci_lo": 1.7203352291425582, "name": "overall:group_2", "p": 0.0, "se": 0.018325592909682206, "t": 95.83606598141627}, {"b": 0.2008258695812477, "ci_hi": 0.2482630493778609, "ci_lo": 0.15338868978463452, "name": "overall:difference", "p": 1.0629733728602117e-16, "se": 0.024203087490786365, "t": 8.297531034323539}, {"b": 0.046523326361860295, "ci_hi": 0.07245593155400687, "ci_lo": 0.02059072116971372, "name": "overall:endowments", "p": 0.000437782669868006, "se": 0.013231164142147332, "t": 3.5161929715362037}, {"b": 0.15991742238110684, "ci_hi": 0.20066230343968025, "ci_lo": 0.11917254132253342, "name": "overall:coefficients", "p": 1.442213015515596e-14, "se": 0.020788586616878595, "t": 7.6925586779077735}, {"b": -0.005614879161719433, "ci_hi": 0.003634545077754849, "ci_lo": -0.014864303401193714, "name": "overall:interaction", "p": 0.23412518070371288, "se": 0.004719180715784861, "t": -1.1897995647716164}, {"b": 0.04329814747350802, "ci_hi": 0.06758391840010558, "ci_lo": 0.019012376546910452, "name": "endowments:hc", "p": 0.0004752303230396401, "se": 0.0123909271385396, "t": 3.4943428356412043}, {"b": 0.0032251788883525707, "ci_hi": 0.007809483379407542, "ci_lo": -0.0013591256027024004, "name": "endowments:job", "p": 0.16792982578793458, "se": 0.002338973841976373, "t": 1.37888625792727}, {"b": -0.1787876856582461, "ci_hi": 0.050202254133547515, "ci_lo": -0.4077776254500397, "name": "coefficients:hc", "p": 0.12594884156206823, "se": 0.11683374878213938, "t": -1.5302743216057597}, {"b": 0.029939537447294114, "ci_hi": 0.08168382501797014, "ci_lo": -0.021804750123381917, "name": "coefficients:job", "p": 0.2567751495084084, "se": 0.02640063183753802, "t": 1.1340462467539987}, {"b": 0.30876557059205917, "ci_hi": 0.5326642081901476, "ci_lo": 0.08486693299397069, "name": "coefficients:_cons", "p": 0.006874317660476912, "se": 0.11423609788964101, "t": 2.7028721769746147}, {"b": -0.00770007215243689, "ci_hi": 0.0006875826709110295, "ci_lo": -0.01608772697578481, "name": "interaction:hc", "p": 0.07197205288439787, "se": 0.004279494362911089, "t": -1.7992948464124117}, {"b": 0.0020851929907170354, "ci_hi": 0.006402877167113591, "ci_lo": -0.0022324911856795204, "name": "interaction:job", "p": 0.3438682263137384, "se": 0.002202940569548164, "t": 0.9465498159783406}], "by": "south", "level": 95.0, "group_1": "0", "group_2": "1", "N_1": 1294.0, "N_2": 935.0, "model": "linear", "tf": 1, "ref": "", "split": false, "adjusted": false, "adjust": "", "weights_macro": "", "refname": "", "vcetype": "", "se": true, "eform": false, "show_header": true, "show_table": true, "show_definitions": true, "show_legend": true, "legend": "\"hc: grade ttl_exp\" \"job: tenure\""};
+  const ex = {"type": "estimation", "estimator": "oaxaca", "depvar": "lw", "n_obs": 2229, "coeftable": [{"b": 1.9570786008221273, "ci_hi": 1.9880351172928392, "ci_lo": 1.9261220843514153, "name": "overall:group_1", "p": 0.0, "se": 0.01579443128286699, "t": 123.9094061553877}, {"b": 1.7562527312408707, "ci_hi": 1.792121974941358, "ci_lo": 1.7203834875403834, "name": "overall:group_2", "p": 0.0, "se": 0.01830097082569844, "t": 95.96500360378258}, {"b": 0.2008258695812566, "ci_hi": 0.24820633555243934, "ci_lo": 0.15344540361007383, "name": "overall:difference", "p": 9.776979193247285e-17, "se": 0.02417415133385809, "t": 8.307463075238623}, {"b": 0.05078473555510343, "ci_hi": 0.07424998574294568, "ci_lo": 0.02731948536726118, "name": "overall:explained", "p": 2.2167721468967e-05, "se": 0.01197228641594088, "t": 4.24185771963194}, {"b": 0.15004113402615316, "ci_hi": 0.19165617341694619, "ci_lo": 0.10842609463536013, "name": "overall:unexplained", "p": 1.5882025152151695e-12, "se": 0.021232553107632154, "t": 7.066561108575307}, {"b": 0.0403827896584321, "ci_hi": 0.05920200626462256, "ci_lo": 0.02156357305224164, "name": "explained:grade", "p": 2.6022429660504992e-05, "se": 0.009601817561258288, "t": 4.205744318801665}, {"b": 0.010401945896671273, "ci_hi": 0.022364949500140157, "ci_lo": -0.0015610577067976105, "name": "explained:tenure", "p": 0.0883423462915993, "se": 0.0061036854237279505, "t": 1.704207404961259}, {"b": -0.17857543944256987, "ci_hi": 0.03729195039156497, "ci_lo": -0.3944428292767047, "name": "unexplained:grade", "p": 0.10493779440464615, "se": 0.11013844720457583, "t": -1.6213724087727173}, {"b": 0.04374495760260493, "ci_hi": 0.08711553768261264, "ci_lo": 0.00037437752259722283, "name": "unexplained:tenure", "p": 0.048054911730390476, "se": 0.022128253591448266, "t": 1.976882514556445}, {"b": 0.28487161586611787, "ci_hi": 0.49618355576101497, "ci_lo": 0.07355967597122076, "name": "unexplained:_cons", "p": 0.008235823697328662, "se": 0.10781419534323014, "t": 2.6422459023992104}], "by": "south", "level": 95.0, "group_1": "0", "group_2": "1", "N_1": 1294.0, "N_2": 935.0, "model": "linear", "tf": 0, "ref": "pooled", "split": false, "adjusted": false, "adjust": "", "weights_macro": "", "refname": "", "vcetype": "Robust", "se": true, "eform": true, "show_header": true, "show_table": true, "show_definitions": true, "show_legend": false, "xb": [{"name": "b1:grade", "b": 0.07860549423369126, "se": 0.006236522167926003, "t": 12.60405914019737, "p": 2.0055152888600706e-36, "ci_lo": 0.06638213539577063, "ci_hi": 0.09082885307161188}, {"name": "b1:tenure", "b": 0.028776978438744962, "se": 0.002267270730405692, "t": 12.69234328870632, "p": 6.520526337933267e-37, "ci_lo": 0.024333209463947982, "ci_hi": 0.03322074741354194}, {"name": "b1:_cons", "b": 0.7349361717847743, "se": 0.08153469422158015, "t": 9.013784607905668, "p": 1.9906545410501128e-19, "ci_lo": 0.5751311076199912, "ci_hi": 0.8947412359495575}, {"name": "b2:grade", "b": 0.09229104312855574, "se": 0.005680505373050915, "t": 16.2469775253443, "p": 2.3465114171016525e-59, "ci_lo": 0.08115745718338968, "ci_hi": 0.1034246290737218}, {"name": "b2:tenure", "b": 0.021345629636051917, "se": 0.002992942732055002, "t": 7.1319873272000995, "p": 9.89299852707995e-13, "ci_lo": 0.015479569673433202, "ci_hi": 0.027211689598670635}, {"name": "b2:_cons", "b": 0.45006455591865646, "se": 0.07054072834683246, "t": 6.38020851876937, "p": 1.7684702196348749e-10, "ci_lo": 0.3118072689156412, "ci_hi": 0.5883218429216718}, {"name": "b_ref:grade", "b": 0.0850253871223755, "se": 0.004219917442748109, "t": 20.14859017407814, "p": 2.768875888924879e-90, "ci_lo": 0.07675450091685684, "ci_hi": 0.09329627332789417}, {"name": "b_ref:tenure", "b": 0.026026039625874558, "se": 0.001817147535384388, "t": 14.322469210167448, "p": 1.5839383250971181e-46, "ci_lo": 0.022464495901925435, "ci_hi": 0.02958758334982368}, {"name": "b_ref:_cons", "b": 0.6664336225294027, "se": 0.0558680288418555, "t": 11.928711936765533, "p": 8.38610288240009e-33, "ci_lo": 0.556934298112121, "ci_hi": 0.7759329469466845}, {"name": "x1:grade", "b": 13.300618238021638, "se": 0.06541719454447675, "t": 203.31991199926233, "p": 0.0, "ci_lo": 13.172402892744813, "ci_hi": 13.428833583298463}, {"name": "x1:tenure", "b": 6.138266364552967, "se": 0.1586642546665311, "t": 38.687140827364836, "p": 0.0, "ci_lo": 5.827290139772675, "ci_hi": 6.4492425893332594}, {"name": "x1:_cons", "b": 1.0, "se": 0.0, "t": null, "p": null, "ci_lo": null, "ci_hi": null}, {"name": "x2:grade", "b": 12.825668449197861, "se": 0.08898233205037355, "t": 144.13724785204727, "p": 0.0, "ci_lo": 12.651266283118746, "ci_hi": 13.000070615276977}, {"name": "x2:tenure", "b": 5.738591806064634, "se": 0.1704336479528226, "t": 33.670533225065526, "p": 1.5611218271157476e-248, "ci_lo": 5.404547994323323, "ci_hi": 6.072635617805945}, {"name": "x2:_cons", "b": 1.0, "se": 0.0, "t": null, "p": null, "ci_lo": null, "ci_hi": null}]};
+  const t = formatEstimation(det).split('\n');
+  check(ctx, t[0].startsWith('Blinder-Oaxaca decomposition') && /Number of obs\s+=\s+2,229$/.test(t[0]), 'header: title and Number of obs 2,229');
+  check(ctx, t.some(l => /^Group 1: south = 0\s+N of obs 1\s+=\s+1,294$/.test(l)), 'header: Group 1 line with N of obs 1');
+  check(ctx, t.includes('   endowments: (X1 - X2) * b2') && t.includes('  interaction: (X1 - X2) * (b1 - b2)'), 'threefold definitions (bank 0016e934)');
+  const eqs = t.filter(l => /^\S+\s+│$/.test(l)).map(l => l.split(/\s/)[0]);
+  check(ctx, JSON.stringify(eqs) === JSON.stringify(['overall', 'endowments', 'coefficients', 'interaction']), 'one section per equation, in e(b) order: ' + JSON.stringify(eqs));
+  check(ctx, t.some(l => /^\s+hc │\s+\.04329815/.test(l)) && t.some(l => /^\s+_cons │\s+\.3087656/.test(l)), 'detail() groups name the rows (hc, job) and _cons stays in its section');
+  check(ctx, t.includes('hc: grade ttl_exp') && t.includes('job: tenure'), 'the detail() legend under the table');
+  const u = formatEstimation(ex).split('\n');
+  check(ctx, u.includes('               with b from pooled model (including group dummy)'), 'pooled definition line');
+  check(ctx, u.some(l => /lw │\s+exp\(b\)/.test(l)) && u.some(l => /│\s+Robust$/.test(l)), 'eform: exp(b) header; suest Robust banner');
+  check(ctx, u.some(l => /^\s+group_1 │\s+7\.078617\s+\.1118027/.test(l)), 'eform: exp(b) and exp(b)*se');
+  check(ctx, u.includes('Coefficients (b) and means (x)') && u.some(l => /^b_ref\s+│$/.test(l)) && u.some(l => /^x2\s+│$/.test(l)), 'xb: the models and means table (b1 b2 b_ref x1 x2)');
+  const noTab = formatEstimation({ ...det, show_table: false, show_definitions: false }).split('\n');
+  check(ctx, !noTab.some(l => l.includes('│')) && !noTab.some(l => l.includes('endowments:')), 'notable / nodefinitions drop the table and the definitions');
+  const noHead = formatEstimation({ ...det, show_header: false, show_legend: false }).split('\n');
+  check(ctx, noHead[0].startsWith('──') && !noHead.includes('hc: grade ttl_exp'), 'noheader starts on the rule; nolegend drops the legend');
+});
+
+suite('vs-stata s4_lin_b: teffects ra prints the effect and POmean rows; aequations adds the outcome models', (ctx) => {
+  // the block runTeffects produced for `teffects ra (wage age grade ttl_exp) (union)` (nlsw88)
+  const te = {"type": "estimation", "estimator": "teffects", "subcmd": "ra", "depvar": "wage", "n_obs": 1876.0, "vcov_type": "robust", "level": 95.0, "coeftable": [{"name": "ATE:r1vs0.union", "b": 1.0299423902248313, "se": 0.19492599409684408, "t": 5.283761126867104, "z": 5.283761126867104, "p": 1.2655825216008113e-07, "ci_lo": 0.6478944621443498, "ci_hi": 1.4119903183053129}, {"name": "POmean:0.union", "b": 7.330324523889565, "se": 0.10870582768752181, "t": 67.43267292863824, "z": 67.43267292863824, "p": 0.0, "ci_lo": 7.1172650167124045, "ci_hi": 7.543384031066725}, {"name": "OME0:age", "b": -0.05890985765182149, "se": 0.029729385335809072, "t": -1.981536348175504, "z": -1.981536348175504, "p": 0.0475311573228837, "ci_lo": -0.11717838219252048, "ci_hi": -0.0006413331111224936}, {"name": "OME0:grade", "b": 0.6478756910580391, "se": 0.04642721080487657, "t": 13.95465460505304, "z": 13.95465460505304, "p": 2.947260552612576e-44, "ci_lo": 0.5568800299778321, "ci_hi": 0.7388713521382461}, {"name": "OME0:ttl_exp", "b": 0.2720020561259013, "se": 0.019052766023107678, "t": 14.276250272323205, "z": 14.276250272323205, "p": 3.0771903213928783e-46, "ci_lo": 0.23465932091474181, "ci_hi": 0.3093447913370608}, {"name": "OME0:_cons", "b": -2.3741377256516616, "se": 1.266130061397185, "t": -1.8751136222386038, "z": -1.8751136222386038, "p": 0.060777093894208344, "ci_lo": -4.855707045733632, "ci_hi": 0.1074315944303083}, {"name": "OME1:age", "b": 0.06691641246756547, "se": 0.056392041042380735, "t": 1.1866286665750452, "z": 1.1866286665750452, "p": 0.23537412335960903, "ci_lo": -0.043609956990205326, "ci_hi": 0.17744278192533627}, {"name": "OME1:grade", "b": 0.5086369866395174, "se": 0.05864196636426815, "t": 8.673600463531544, "z": 8.673600463531544, "p": 4.186674381490232e-18, "ci_lo": 0.3937008445829426, "ci_hi": 0.6235731286960922}, {"name": "OME1:ttl_exp", "b": 0.24092379316780624, "se": 0.034106884439355105, "t": 7.063787769773839, "z": 7.063787769773839, "p": 1.6202414684048841e-12, "ci_lo": 0.17407552804180065, "ci_hi": 0.3077720582938118}, {"name": "OME1:_cons", "b": -4.048338782174956, "se": 2.364386676125182, "t": -1.7122151901183431, "z": -1.7122151901183431, "p": 0.08685701911858926, "ci_lo": -8.682451512906681, "ci_hi": 0.5857739485567697}], "aequations": false};
+  const t = formatEstimation(te);
+  check(ctx, t.includes('ATE:r1vs0.union') && t.includes('POmean:0.union'), 'the ATE and POmean rows are printed');
+  check(ctx, !t.includes('OME0:') && !t.includes('OME1:'), 'the OME equations are not printed without aequations (bank 2b9789b5)');
+  const a = formatEstimation({ ...te, aequations: true });
+  check(ctx, a.includes('OME0:age') && a.includes('OME1:_cons'), 'aequations prints the outcome-model equations');
+  check(ctx, te.coeftable.length === 10, 'the block carries all 10 e(b) columns for estimates table');
+});
+
 suite('vs-stata s3b_est_other: proportion citype(agresti) notes an upper limit cut at 1', (ctx) => {
   // the blocks runMeanOrProportion produced for `generate y = _n > 1` then
   // `proportion y in 1/10, citype(agresti)` and `..., citype(wilson)` (auto.dta)
@@ -619,6 +679,125 @@ suite('s3b_tables: tabulate summarize() draws its column set (weighted Obs, obs)
         `a block with no columns list keeps the default Mean, Std. dev., Freq.`);
 });
 
+suite('tabulate: two-way tables draw the requested percentages and frequencies', (ctx) => {
+  const { percentages, percent_only: percentOnly, pairs } = loadFix('dom/statistics_display.json');
+  const table = formatTabulate(percentages);
+  check(ctx, /Key\nfrequency\nrow percentage\ncolumn percentage\ncell percentage/.test(table),
+    'key identifies the percentage lines in display order');
+  check(ctx, /│\s*22\s+8\s+30\n\s*│\s*73\.33\s+26\.67\s+100\.00\n\s*│\s*62\.86\s+32\.00\s+50\.00\n\s*│\s*36\.67\s+13\.33\s+50\.00/.test(table),
+    'count and percentage lines use the right denominators, including margins');
+  check(ctx, table.includes('Pearson chi2(1) =   5.5543'), 'chi-square stays visible below the table');
+  const rowOnly = formatTabulate(percentOnly);
+  check(ctx, !rowOnly.includes('Key') && !/│\s*22\s+8\s+30/.test(rowOnly) &&
+    /│\s*73\.33\s+26\.67\s+100\.00/.test(rowOnly),
+    'row nofreq nokey draws percentages alone');
+  check(ctx, (formatTabulate(pairs).match(/column percentage/g) || []).length === 3,
+    'tab2 applies percentages to every pair');
+});
+
+suite('tabulate: two-way expected frequencies and chi2 contributions (bank eb3a65a9, 99a9cf32, 6753d09f)', (ctx) => {
+  const { expected_contributions: full, expected_only: alone } = loadFix('dom/statistics_display.json');
+  const table = formatTabulate(full);
+  check(ctx, /Key\nfrequency\nexpected frequency\nchi2 contribution\nLR chi2 contribution/.test(table),
+    'key lists expected frequency, chi2 and LR chi2 contributions in Stata order');
+  check(ctx, /│\s*27\s+3\s+30\n\s*│\s*20\.9\s+9\.1\s+30\.0\n\s*│\s*1\.8\s+4\.1\s+5\.9\n\s*│\s*13\.9\s+-6\.7\s+7\.2/.test(table),
+    'rep78==3 row: Stata\'s expected 20.9 9.1, contributions 1.8 4.1 5.9 and 13.9 -6.7 7.2');
+  check(ctx, /Total\s*│\s*48\s+21\s+69\n\s*│\s*48\.0\s+21\.0\s+69\.0\n\s*│\s*8\.3\s+19\.0\s+27\.3\n\s*│\s*9\.9\s+20\.1\s+29\.9/.test(table),
+    'Total row sums the contributions to Pearson 27.3 and LR 29.9');
+  const only = formatTabulate(alone);
+  check(ctx, !only.includes('Key') && /│\s*1\.4\s+0\.6\s+2\.0\n\s*2\.0\s*│\s*5\.6\s+2\.4\s+8\.0/.test(only),
+    'expected nofreq: one line per cell, no key and no rule between rows');
+});
+
+suite('tabulate: one-way plot draws frequencies and asterisk bars (bank a5db8a76, 54f73a3b)', (ctx) => {
+  const { plot_counts: counts, plot_scaled: scaled } = loadFix('dom/statistics_display.json');
+  const plain = formatTabulate(counts);
+  check(ctx, !plain.includes('Percent') && /3\.0 │\s+30 │\*{30}\n/.test(plain) && /1\.0 │\s+2 │\*\*\n/.test(plain),
+    'one star per observation while the largest frequency fits the line');
+  const bars = formatTabulate(scaled).split('\n').filter(l => l.includes('*')).map(l => l.split('│')[2].length);
+  const widest = Math.max(...bars);
+  check(ctx, bars.length === 5 && bars[2] === widest && bars[0] === Math.round(2000 * widest / 30000) &&
+    bars[3] === Math.round(18000 * widest / 30000), 'larger frequencies are scaled so the largest fills the line');
+  check(ctx, /Total │\s+69000$/.test(formatTabulate(scaled)), 'the Total line shows the frequency alone');
+});
+
+suite('tabulate: two-way summarize() draws its cells and the line options (bank bf9a5a5d-like aw, 82d7a614)', (ctx) => {
+  const { summarize_twoway_weighted: wtd, summarize_twoway_means: means } = loadFix('dom/statistics_display.json');
+  const t = formatTabulate(wtd);
+  check(ctx, t.includes('Means, Standard Deviations, Frequencies and Number of observations of price'),
+    'a weight adds the number of observations to the title');
+  check(ctx, /0\.0 │\s+4608\.6016[^\n]*6617\.0844\n\s*│\s+518\.81653[^\n]*\n\s*│\s+6200[^\n]*161680\n\s*│\s+2\s[^\n]*48\n/.test(t),
+    'each cell stacks mean, sd, sum of weights and observations (Stata 4,608.602 / 518.81653 / 6200 / 2)');
+  const m = formatTabulate(means);
+  check(ctx, m.includes('Means of price') && !/Std|Freq/.test(m) && /1\.0 │\s+4564\.5\s+\.\s+4564\.5\n\s*2\.0 │/.test(m),
+    'means alone: one line per cell, no rules between rows, . for an empty cell');
+});
+
+suite('display: wrap long console lines at linesize', (ctx) => {
+  document.body.innerHTML =
+    '<div id="console-wrap"><div id="console-body"></div></div><div id="console-empty"></div>';
+  initConsole(document.getElementById('console-body'), document.getElementById('console-empty'), null);
+  clearConsole();
+  const text = 'x'.repeat(150);
+  appendBlock({ type: 'display', text, linesize: 80 });
+  const display = () => document.querySelector('#console-body .block-display').textContent;
+  check(ctx, display() === 'x'.repeat(80) + '\n> ' + 'x'.repeat(70),
+    'reference display _dup(150) uses an 80-column first line and a continuation');
+  clearConsole();
+  appendBlock({ type: 'display', text: '한'.repeat(16), linesize: 20, continue: true });
+  appendBlock({ type: 'display', text: '글'.repeat(9) });
+  check(ctx, display() === '한'.repeat(16) + '글'.repeat(4) + '\n> ' + '글'.repeat(5),
+    'continued Unicode output wraps as a single line');
+  clearConsole();
+});
+
+// vs-stata stage 4 (s4_data_b): `list` and `duplicates list|examples` draw Stata's listing from the
+// `listing` object the native handler attaches (descriptive/data_listing.cpp buildListing). Each
+// fixture case is a block the handler really produced for a truth-bank cell, beside the lines
+// StataBE 19.5 printed for it (table and display layouts, divider, separator/sepby, header(#),
+// mean/sum/N, labvar, constant, string(), compress, notrim, ds, display-column widths); the
+// BUG-1096 probe's examples tables are checked line for line as well.
+suite('vs-stata s4_data_b: list / duplicates listings match StataBE 19.5 line for line', (ctx) => {
+  const fx = loadFix('dom/list_layouts.json');
+  const norm = (t) => t.split('\n').map(l => l.replace(/\s+$/, '')).filter(l => l !== '');
+  for (const c of fx.cases) {
+    const got = norm(formatListing(c.listing));
+    const bad = got.length !== c.stata.length ? -1 : got.findIndex((l, i) => l !== c.stata[i]);
+    check(ctx, got.length === c.stata.length && bad < 0,
+      `${c.cell} \`${c.cmd}\` draws Stata's ${c.stata.length} lines` +
+      (bad >= 0 ? ` (line ${bad}: ${JSON.stringify(got[bad])} vs ${JSON.stringify(c.stata[bad])})` : ''));
+  }
+  const probe = fx.probe_bug1096.listings.map(formatListing).join('\n');
+  for (const e of fx.probe_bug1096.expect) check(ctx, probe.includes(e), `BUG-1096 examples table has ${JSON.stringify(e)}`);
+  // The console draws a listing browse block as text; it does not echo its JSON.
+  document.body.innerHTML =
+    '<div id="console-wrap"><div id="console-body"></div></div><div id="console-empty"></div>';
+  initConsole(document.getElementById('console-body'), document.getElementById('console-empty'), null);
+  clearConsole();
+  appendBlock({ type: 'browse', editable: false, columns: [], rows: [], listing: fx.cases[0].listing });
+  const pre = document.querySelector('#console-body .block-listing pre');
+  check(ctx, !!pre && norm(pre.textContent).join('\n') === fx.cases[0].stata.join('\n'),
+    'appendBlock draws a list block\'s listing in the Results pane');
+  clearConsole();
+});
+
+// vs-stata stage 4 (s4_data_b): `summarize` with factor variables and time-series operators draws
+// Stata's fixed-width stub (term headers broken after `#`, level rows, `(empty)` cells, `--.` / `L1.`
+// operator rows, blank rows between terms, vsquish, separator) from the block's `fvrows`. Each case is
+// the block the native handler produced for a truth-bank cell, beside the lines StataBE 19.5 printed.
+suite('vs-stata s4_data_b: summarize factor-variable / operator tables match StataBE 19.5 line for line', (ctx) => {
+  const fx = loadFix('dom/summarize_fv_layouts.json');
+  const asc = (l) => l.replace(/│/g, '|').replace(/─/g, '-').replace(/┼/g, '+').replace(/\s+$/, '');
+  for (const c of fx.cases) {
+    const got = formatSummarize(c.block).split('\n').map(asc).filter(l => l.replace(/[| ]/g, '') !== '');
+    const want = c.stata.filter(l => l.replace(/[| ]/g, '') !== '');
+    const bad = got.length !== want.length ? -1 : got.findIndex((l, i) => l !== want[i]);
+    check(ctx, got.length === want.length && bad < 0,
+      `${c.cell} \`${c.cmd}\` draws Stata's ${want.length} lines` +
+      (bad >= 0 ? ` (line ${bad}: ${JSON.stringify(got[bad])} vs ${JSON.stringify(want[bad])})` : ''));
+  }
+});
+
 suite('WS1: describe uses Stata two-row Storage/Display/Value + Variable label header', (ctx) => {
   const block = { type: 'describe', variables: [
     { name: 'id', dtype: 'int', format: '%9.0g', label: 'Unit id', n_missing: 0 },
@@ -629,6 +808,26 @@ suite('WS1: describe uses Stata two-row Storage/Display/Value + Variable label h
   check(ctx, text.includes('Variable label'), `describe header includes "Variable label"`);
   check(ctx, !text.includes('Missing'), `describe drops the non-Stata "Missing" column`);
   check(ctx, text.includes('Unit id'), `describe shows the variable label "Unit id"`);
+});
+
+suite('vs-stata s4_io_misc: describe, numbers draws the position column; detail draws Observations/Variables/Width', (ctx) => {
+  // The block runDescribe + route_describe.cpp emit for `describe price mpg, numbers detail`
+  // on auto.dta (fixtures/auto.dta: price is variable 2, mpg 3; N 74, k 12, width 43).
+  const block = { type: 'describe', numbers: true,
+    detail: { observations: 74, variables: 12, width: 43 },
+    variables: [
+      { name: 'price', dtype: 'int', format: '%8.0gc', label: 'Price', n_missing: 0, n_unique: 74, number: 2 },
+      { name: 'mpg', dtype: 'int', format: '%8.0g', label: 'Mileage (mpg)', n_missing: 0, n_unique: 21, number: 3 },
+    ]};
+  const text = formatDescribe(block);
+  const lines = text.split('\n');
+  check(ctx, /^\s+2\. price\b/.test(lines.find(l => l.includes('price')) || ''), 'price row starts with its position "2."');
+  check(ctx, /^\s+3\. mpg\b/.test(lines.find(l => l.includes('Mileage')) || ''), 'mpg row starts with its position "3."');
+  check(ctx, /Observations:\s+74$/.test(lines[0]), 'detail header line 1 is Observations: 74');
+  check(ctx, /Variables:\s+12$/.test(lines[1]), 'detail header line 2 is Variables: 12');
+  check(ctx, /Width:\s+43$/.test(lines[2]), 'detail header line 3 is Width: 43');
+  const plain = formatDescribe({ type: 'describe', variables: block.variables });
+  check(ctx, !/Width:/.test(plain) && !/^\s+2\. /m.test(plain), 'without the flags neither is drawn');
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -976,6 +1175,88 @@ suite('Stage-4: graph combine tiles panels into a grid SVG', (ctx) => {
   const offsets = tg.map(g => g.getAttribute('transform'));
   check(ctx, offsets.some(t => /translate\(520\b/.test(t)),
     `second panel is translated by one panel width (520)`);
+
+  const { full, half } = loadFix('dom/scatter_matrix.json');
+  const fullMatrix = renderGraph(full);
+  const upperRight = full.panels[2].layers[0];
+  check(ctx, fullMatrix.querySelector('svg').getAttribute('viewBox') === '0 0 1560 1080' &&
+    fullMatrix.querySelectorAll('circle').length === 14,
+    'graph matrix renders all six off-diagonal plots with pairwise missing values removed');
+  check(ctx, upperRight.x_var === 'y' && upperRight.y_var === 'z' &&
+    JSON.stringify(upperRight.points) === '[[6,9],[8,16]]',
+    'matrix columns select the x variable and rows select the y variable');
+  check(ctx, fullMatrix.textContent.includes('Row & year'), 'matrix diagonal renders variable labels as text');
+  const halfMatrix = renderGraph(half);
+  const custom = [...halfMatrix.querySelectorAll('text')].find(el => el.textContent === 'Custom label');
+  check(ctx, halfMatrix.querySelectorAll('circle').length === 13 && custom?.getAttribute('fill') === '#d42a1c',
+    'half draws three plots and honors a colored diagonal label override');
+});
+
+// vs-stata s4_graph: graph bar / hbar / dot / box blocks (kind "bar") had no
+// renderer and fell through to renderScatter (empty axes). The fixture is the
+// real piet_native output of `graph hbar (mean) price, over(rep78)`, `graph dot
+// (mean) price weight, over(foreign) title("T") ytitle("Y")`, `graph dot (mean)
+// price, over(rep78) vertical`, `graph box price, over(foreign)` and `graph bar
+// (mean) price weight, over(foreign) stack` on auto.dta.
+suite('vs-stata s4_graph: graph bar / hbar / dot / box draw their bars, dots and boxes', (ctx) => {
+  const fx = loadFix('dom/graph_bar_dot_box.json');
+  const labelsOf = (el) => [...el.querySelectorAll('text.g-ticklabel')].map(t => t.textContent);
+  const hbar = renderGraph(fx.hbar);
+  const hbars = [...hbar.querySelectorAll('rect.g-cbar')];
+  check(ctx, hbars.length === 5, `hbar draws one bar per rep78 level (got ${hbars.length})`);
+  // horizontal: bar length along x is proportional to the mean, first category on top
+  const w = hbars.map(r => Number(r.getAttribute('width')));
+  const v = fx.hbar.bars.map(b => b.value);
+  check(ctx, Math.abs(w[0] / w[4] - v[0] / v[4]) < 1e-6, 'hbar bar lengths are proportional to the means');
+  const yOf = (cat) => Number(hbars[fx.hbar.bars.findIndex(b => b.category === cat)].getAttribute('y'));
+  check(ctx, yOf('1') < yOf('5'), 'hbar draws the first category (rep78 1) above the last');
+  check(ctx, labelsOf(hbar).includes('3'), 'hbar labels its categories');
+
+  const dot = renderGraph(fx.dot2);
+  check(ctx, dot.querySelectorAll('circle.g-cdot').length === 4, 'dot draws one marker per series and category');
+  check(ctx, dot.querySelectorAll('line.g-dotguide').length === 2, 'dot draws one guide line per category');
+  check(ctx, dot.querySelectorAll('rect.g-cbar').length === 0, 'dot draws no bars');
+  const fills = new Set([...dot.querySelectorAll('circle.g-cdot')].map(c => c.getAttribute('fill')));
+  check(ctx, fills.size === 2, 'the two series of a dot chart have distinct colours');
+  check(ctx, dot.textContent.includes('T') && dot.textContent.includes('Y'), 'dot draws title() and ytitle()');
+  check(ctx, dot.textContent.includes('Weight (lbs.)'), 'a two-series chart draws a legend of the series');
+  const vdot = renderGraph(fx.dotv);
+  const guides = [...vdot.querySelectorAll('line.g-dotguide')];
+  check(ctx, guides.length === 5 && guides.every(l => l.getAttribute('x1') === l.getAttribute('x2')),
+    'dot, vertical draws vertical guide lines');
+
+  const box = renderGraph(fx.box);
+  check(ctx, box.querySelectorAll('rect.g-cbox').length === 2, 'box draws one box per over() group');
+  check(ctx, box.querySelectorAll('circle.g-coutside').length ===
+    fx.box.boxes.reduce((n, b) => n + b.outside.length, 0), 'box draws every outside value');
+
+  const st = renderGraph(fx.barstack);
+  const segs = [...st.querySelectorAll('rect.g-cbar')];
+  check(ctx, segs.length === 4, 'stack draws one segment per series and category');
+  const xs = new Set(segs.map(r => r.getAttribute('x')));
+  check(ctx, xs.size === 2, 'stacked segments of a category share one column');
+});
+
+// vs-stata s4_graph: graph pie. The fixture is the real piet_native output of `graph
+// pie, over(rep78) plabel(_all percent) sort descending` and `graph pie price weight,
+// pie(1, explode) plabel(2 name)` on auto.dta.
+suite('vs-stata s4_graph: graph pie draws its wedges, labels and exploded wedge', (ctx) => {
+  const fx = loadFix('dom/graph_pie.json');
+  const el = renderGraph(fx.over_sorted);
+  const wedges = [...el.querySelectorAll('path.g-wedge')];
+  check(ctx, wedges.length === fx.over_sorted.slices.length, `one wedge per rep78 level (got ${wedges.length})`);
+  const labels = [...el.querySelectorAll('text.g-pielabel')].map(t => t.textContent);
+  check(ctx, labels.length === 5 && labels[0] === fx.over_sorted.slices[0].plabel && labels[0].endsWith('%'),
+    'plabel(_all percent) labels every wedge with its percent');
+  check(ctx, [...el.querySelectorAll('text.g-legend')].length === 5, 'the legend names each wedge');
+  // the first wedge (the largest, 43% of the pie) is under half the pie
+  check(ctx, /A [0-9.]+ [0-9.]+ 0 0 1 /.test(wedges[0].getAttribute('d')), 'a wedge under half the pie draws the small clockwise arc');
+  const ex = renderGraph(fx.vars_explode);
+  const [w1, w2] = [...ex.querySelectorAll('path.g-wedge')];
+  const centre = (w) => w.getAttribute('d').split(' ').slice(1, 3).map(Number);
+  check(ctx, JSON.stringify(centre(w1)) !== JSON.stringify(centre(w2)), 'pie(1, explode) pulls wedge 1 off the centre');
+  check(ctx, [...ex.querySelectorAll('text.g-pielabel')].map(t => t.textContent).join() === 'weight',
+    'plabel(2 name) labels only wedge 2 with its name');
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2216,6 +2497,77 @@ suite('MVP F6: coeftable-less estimation payloads render a generic fallback card
     'generic rows retain every coefficient name');
 });
 
+suite('vs-stata: estat hettest, rhs fstat draws the F form from a real dispatcher block', (ctx) => {
+  // piet/fixtures/dom/hettest_fstat_estimation.json: auto, `regress price mpg
+  // weight foreign`, then `estat hettest, rhs fstat` through piet_native.
+  // StataBE 19.5 prints "Assumption: i.i.d. error terms", "F(3, 70) = 2.38",
+  // "Prob > F = 0.0766" (vs-stata bank 25f567a78ea2abe3).
+  const block = loadFix('dom/hettest_fstat_estimation.json');
+  const lines = formatEstimation(block).split('\n');
+  for (const w of ['Assumption: i.i.d. error terms', 'F(3, 70) = 2.38', 'Prob > F = 0.0766'])
+    check(ctx, lines.includes(w), `line drawn: ${JSON.stringify(w)} (got ${JSON.stringify(lines)})`);
+  check(ctx, !lines.some((l) => l.includes('chi2')), 'no chi2 line in the F form');
+});
+
+suite('vs-stata: suest, eform(OR) draws the exponentiated table under its label from a real dispatcher block', (ctx) => {
+  // piet/fixtures/dom/suest_eform_estimation.json: auto, `logit foreign mpg`
+  // stored as C, `probit foreign weight` as P, then `suest C P, eform(OR)`
+  // through piet_native. StataBE 19.5 prints the C_foreign:mpg row as
+  // 1.173232 .0603647 3.11 0.002 1.060689 1.297716 under the title OR (vs-stata
+  // bank 8f32ea74d28802ee, same equation).
+  const block = loadFix('dom/suest_eform_estimation.json');
+  const text = formatEstimation(block);
+  check(ctx, /\bOR\b/.test(text) && !text.includes('Coefficient'), `the column is titled OR (got ${JSON.stringify(text)})`);
+  for (const v of ['1.173232', '1.060689', '1.297716'])
+    check(ctx, text.includes(v), `exponentiated value ${v} drawn`);
+});
+
+suite('vs-stata: ereturn display, eform(OR) draws e(b) under its equation line from a real dispatcher block', (ctx) => {
+  // piet/fixtures/dom/ereturn_display_eform_estimation.json: auto, `logit foreign mpg
+  // weight` then `ereturn display, eform(OR)` through piet_native. StataBE 19.5
+  // (vs-stata bank 88509ffa175e5c12) prints the table alone: OR / Std. err. / z,
+  // a `foreign |` equation line, then mpg .8448578 .0776572 -1.83 0.067 .7055753
+  // 1.011635, weight, _cons in e(b)'s order.
+  const block = loadFix('dom/ereturn_display_eform_estimation.json');
+  const lines = formatEstimation(block).split('\n');
+  check(ctx, lines.some(l => /│\s+OR\s+Std\. err\.\s+z\s+P>\|z\|/.test(l)), 'header: OR, z, P>|z|');
+  check(ctx, !lines.some(l => /Number of obs|Coefficient/.test(l)), 'no title or header statistics');
+  const eqAt = lines.findIndex(l => /^\s*foreign │$/.test(l));
+  check(ctx, eqAt > 0 && /^\s*mpg │/.test(lines[eqAt + 1] || ''), `equation line foreign above mpg (got ${JSON.stringify(lines)})`);
+  for (const v of ['.8448578', '-1.83', '0.067', '.7055753', '1.011635'])
+    check(ctx, (lines[eqAt + 1] || '').includes(v), `mpg row value ${v}`);
+  const order = lines.map(l => (l.match(/^\s*(\w+) │\s+[-.\d]/) || [])[1]).filter(Boolean);
+  check(ctx, order.join(',') === 'mpg,weight,_cons', `rows in e(b) order (got ${order})`);
+});
+
+suite('vs-stata: hausman draws Stata\'s table with the tconsistent() title from a real dispatcher block', (ctx) => {
+  // piet/fixtures/dom/hausman_tconsistent_estimation.json: fatalities, `xtreg frate
+  // beertax unemp, fe` / `, re` stored as fe and re, then `hausman fe re,
+  // tcon(FixedFX)` through piet_native. The expected lines are StataBE 19.5's
+  // (vs-stata bank 30280271c2143616).
+  const block = loadFix('dom/hausman_tconsistent_estimation.json');
+  const lines = formatEstimation(block).split('\n');
+  const want = [
+    '                 ---- Coefficients ----',
+    '             |      (b)          (B)            (b-B)     sqrt(diag(V_b-V_B))',
+    '             |    FixedFX         re         Difference       Std. err.',
+    '-------------+----------------------------------------------------------------',
+    '     beertax |   -.4134987      .060327       -.4738257        .1441027',
+    '       unemp |   -.0299757    -.0310241        .0010483        .0007885',
+    '------------------------------------------------------------------------------',
+    '                          b = Consistent under H0 and Ha; obtained from xtreg.',
+    '           B = Inconsistent under Ha, efficient under H0; obtained from xtreg.',
+    'Test of H0: Difference in coefficients not systematic',
+    "    chi2(2) = (b-B)'[(V_b-V_B)^(-1)](b-B)",
+    '            =   1.15',
+    'Prob > chi2 = 0.5616',
+    '(V_b-V_B is not positive definite)',
+  ];
+  for (const w of want) check(ctx, lines.includes(w), `line drawn: ${JSON.stringify(w)} (got ${JSON.stringify(lines)})`);
+  const order = want.map((w) => lines.indexOf(w));
+  check(ctx, order.every((v, i) => i === 0 || v > order[i - 1]), 'lines in Stata\'s order');
+});
+
 suite('vs-stata: test, mtest() draws the per-constraint table from a real dispatcher block', (ctx) => {
   // piet/fixtures/dom/test_mtest_bonferroni.json: `regress price mpg weight foreign`
   // then `test (mpg) (weight), mtest(bonferroni)` through piet_native (vs-stata
@@ -2231,6 +2583,84 @@ suite('vs-stata: test, mtest() draws the per-constraint table from a real dispat
   check(ctx, lines.includes('   All |       34.77      2     0.0000'), 'joint row');
   check(ctx, lines.includes('* Bonferroni-adjusted p-values'), 'method footnote');
   check(ctx, !text.includes('Prob > F'), 'the plain joint lines are replaced by the table');
+});
+
+suite('vs-stata: test/testparm df(#) draws F(q, #) after every fit, the chi2 form only when a chi2 is carried (real dispatcher blocks)', (ctx) => {
+  // piet/fixtures/dom/test_df_estimation.json: auto through piet_native.
+  // `logit foreign mpg weight` + `testparm mpg weight, df(30)`: r(F) 8.890745,
+  // r(df_r) 30 (vs-stata bank 3b1dd274); `regress price mpg weight foreign,
+  // robust` + `test mpg weight, df(30)` and the same without df().
+  const fx = loadFix('dom/test_df_estimation.json');
+  const logit = formatEstimation(fx.logit_testparm_df30).split('\n');
+  check(ctx, logit.includes('F(2, 30) = 8.89') && !logit.some((l) => l.includes('chi2')),
+    `after logit, df(30) is drawn as F(2, 30) (got ${JSON.stringify(logit)})`);
+  check(ctx, !logit.some((l) => / = \.$/.test(l)), 'no statistic drawn as a missing value');
+  const robust = formatEstimation(fx.robust_test_df30).split('\n');
+  check(ctx, robust.includes('F(2, 30) = 22.10') && !robust.some((l) => l.includes('chi2')),
+    `after regress, robust, df(30) is drawn as F(2, 30) (got ${JSON.stringify(robust)})`);
+  const plain = formatEstimation(fx.robust_test_plain).split('\n');
+  check(ctx, plain.includes('chi2(2) = 44.20'), `without df() the robust block keeps its chi2 form (got ${JSON.stringify(plain)})`);
+});
+
+suite('vs-stata: lincom, df(#) after an ML fit is headed t / P>|t| (real dispatcher blocks)', (ctx) => {
+  // piet/fixtures/dom/lincom_df_estimation.json: auto, `logit foreign mpg
+  // weight`, then `lincom mpg + weight, df(30)` and plain `lincom mpg + weight`
+  // through piet_native. lincom's df(#) uses the t distribution with # degrees
+  // of freedom; without it the reference after logit is the normal.
+  const fx = loadFix('dom/lincom_df_estimation.json');
+  const withDf = formatEstimation(fx.logit_lincom_df30);
+  check(ctx, withDf.includes('P>|t|') && !withDf.includes('P>|z|'), `df(30): t / P>|t| (got ${JSON.stringify(withDf)})`);
+  check(ctx, withDf.includes('0.073') && withDf.includes('-.3617889') && withDf.includes('.01680172'),
+    'df(30): the t(30) p-value and interval are the ones drawn');
+  const plain = formatEstimation(fx.logit_lincom_plain);
+  check(ctx, plain.includes('P>|z|') && !plain.includes('P>|t|'), `no df(): z / P>|z| (got ${JSON.stringify(plain)})`);
+});
+
+suite('vs-stata: ttesti draws Stata\'s one- and two-sample t-test table (real dispatcher blocks)', (ctx) => {
+  // piet/fixtures/dom/ttesti_estimation.json: `ttesti 20 5 1 25 6 1.5, unequal`,
+  // `ttesti 24 62.6 15.8 75, xname(score) level(90)` and `ttesti 20 5 1 25 6
+  // 1.5, welch xname(men) yname(women)` through piet_native (no data in memory).
+  // The expected lines are StataBE 19.5's (vs-stata bank 5ae23a055c3c4d91,
+  // 9bc8a7490c905276, 19147700e0806102); score is not a variable, so the first
+  // column is headed "   Group".
+  const fx = loadFix('dom/ttesti_estimation.json');
+  const expectLines = (block, want, label) => {
+    const lines = formatEstimation(block).split('\n');
+    for (const w of want) check(ctx, lines.includes(w), `[${label}] line drawn: ${JSON.stringify(w)} (got ${JSON.stringify(lines)})`);
+    const order = want.map((w) => lines.indexOf(w));
+    check(ctx, order.every((v, i) => i === 0 || v > order[i - 1]), `[${label}] lines in Stata's order`);
+  };
+  expectLines(fx.unequal, [
+    'Two-sample t test with unequal variances',
+    '------------------------------------------------------------------------------',
+    '         |     Obs        Mean    Std. err.   Std. dev.   [95% conf. interval]',
+    '---------+--------------------------------------------------------------------',
+    '       x |      20           5    .2236068           1    4.531986    5.468014',
+    '       y |      25           6          .3         1.5     5.38083     6.61917',
+    'Combined |      45    5.555556    .2061076    1.382612    5.140173    5.970938',
+    '    diff |                  -1    .3741657               -1.755213   -.2447873',
+    '    diff = mean(x) - mean(y)                                      t =  -2.6726',
+    "H0: diff = 0                     Satterthwaite's degrees of freedom =   41.784",
+    '    Ha: diff < 0                 Ha: diff != 0                 Ha: diff > 0',
+    ' Pr(T < t) = 0.0053         Pr(|T| > |t|) = 0.0107          Pr(T > t) = 0.9947',
+  ], 'unequal');
+  expectLines(fx.one_xname_level90, [
+    'One-sample t test',
+    '   Group |     Obs        Mean    Std. err.   Std. dev.   [90% conf. interval]',
+    '   score |      24        62.6    3.225161        15.8    57.07249    68.12751',
+    '    mean = mean(score)                                            t =  -3.8448',
+    'H0: mean = 75                                    Degrees of freedom =       23',
+    '    Ha: mean < 75               Ha: mean != 75                 Ha: mean > 75',
+    ' Pr(T < t) = 0.0004         Pr(|T| > |t|) = 0.0008          Pr(T > t) = 0.9996',
+  ], 'one-sample');
+  expectLines(fx.welch_names, [
+    '     men |      20           5    .2236068           1    4.531986    5.468014',
+    '   women |      25           6          .3         1.5     5.38083     6.61917',
+    '    diff |                  -1    .3741657               -1.754317   -.2456832',
+    '    diff = mean(men) - mean(women)                                t =  -2.6726',
+    "H0: diff = 0                             Welch's degrees of freedom =  43.5194",
+    ' Pr(T < t) = 0.0053         Pr(|T| > |t|) = 0.0106          Pr(T > t) = 0.9947',
+  ], 'welch');
 });
 
 suite('vs-stata: test, notest lists the constraints and draws no statistic (real dispatcher block)', (ctx) => {
@@ -5877,6 +6307,43 @@ suite('FIX:GRID-TFMT-DETAIL: %td detail-string token map renders Stata\'s exact 
 //     forvalues i = 1/1 { display "x" _continue / display "y" }
 // ════════════════════════════════════════════════════════════════════════════
 
+suite('vs-stata s4_lin_a: xtreg, re level(#) draws its limits under the level it was built at', (ctx) => {
+  // the block runXtreg produced for `xtreg frate beertax unemp, re level(90)` (fatalities, xtset sid year)
+  const re90 = {"type": "estimation", "estimator": "xtreg_re", "depvar": "", "n_obs": 336, "coeftable": [{"b": 0.060326952104349754, "ci_hi": 0.26009395806331387, "ci_lo": -0.13944005385461433, "name": "beertax", "p": 0.6193839084641459, "se": 0.12144971606331129, "t": 0.49672369816740897}, {"b": -0.031024080894144875, "ci_hi": -0.02063062335676155, "ci_lo": -0.0414175384315282, "name": "unemp", "p": 9.115706465179651e-07, "se": 0.006318773517037062, "t": -4.909826378567907}, {"b": 2.23740604334555, "ci_hi": 2.405533181680762, "ci_lo": 2.0692789050103375, "name": "_cons", "p": 3.27660485316825e-106, "se": 0.10221404238066734, "t": 21.889419410817965}], "chi2": 24.25617466578039, "p_chi2": 5.4055338997448905e-06, "df_chi2": 2, "level": 90.0, "r2_within": 0.08957940828085359, "r2_between": 0.02436531720098992, "r2_overall": 0.003663676082773015};
+  const t = formatEstimation(re90);
+  check(ctx, t.includes('[90% conf. interval]') && !t.includes('[95% conf. interval]'), 'level(90) -> "[90% conf. interval]"');
+  check(ctx, /beertax │.*-\.1394\d*\s+\.2600\d*$/m.test(t) || /beertax\s+│.*-0?\.13944\S*\s+0?\.26009\S*$/m.test(t), 'the 90% limits are the block\'s');
+  // `xtreg frate beertax unemp, re theta` (bank 922e7a3d: "theta        = .86060683" closes the header)
+  const th = {"type": "estimation", "estimator": "xtreg_re", "depvar": "", "n_obs": 336, "coeftable": [{"b": 0.060326952104349754, "ci_hi": 0.29836402152105557, "ci_lo": -0.17771011731235603, "name": "beertax", "p": 0.6193839084641459, "se": 0.12144971606331129, "t": 0.49672369816740897}, {"b": -0.031024080894144875, "ci_hi": -0.018639512374286744, "ci_lo": -0.043408649414003006, "name": "unemp", "p": 9.115706465179651e-07, "se": 0.006318773517037062, "t": -4.909826378567907}, {"b": 2.23740604334555, "ci_hi": 2.4377418851259085, "ci_lo": 2.037070201565191, "name": "_cons", "p": 3.27660485316825e-106, "se": 0.10221404238066734, "t": 21.889419410817965}], "chi2": 24.25617466578039, "p_chi2": 5.4055338997448905e-06, "df_chi2": 2, "r2_within": 0.08957940828085359, "r2_between": 0.02436531720098992, "r2_overall": 0.003663676082773015, "theta": 0.8606068311684265};
+  const tt = formatEstimation(th).split('\n');
+  check(ctx, tt.some(l => /^theta {8}= 0?\.860606/.test(l)), 're theta: the theta line');
+  check(ctx, !formatEstimation(re90).includes('theta'), 're without theta: no theta line');
+  const { level, ...re95 } = re90;
+  check(ctx, formatEstimation(re95).includes('[95% conf. interval]'), 'no level -> "[95% conf. interval]"');
+  // the block runIvRegress produced for `ivreg2 price weight (mpg = length turn), level(90)` (auto.dta;
+  // Stata prints [90% conf. interval] -398.4615 3248.613 for mpg, bank 749ad38b)
+  const iv90 = {"type": "estimation", "estimator": "ivreghdfe", "depvar": "price", "n_obs": 74, "coeftable": [{"b": -56212.09472188444, "ci_hi": 15837.398235241912, "ci_lo": -128261.58767901079, "name": "(intercept)", "p": 0.1993891626620442, "se": 43802.98147906385, "t": -1.2832938038419068}, {"b": 1425.0756418815843, "ci_hi": 3248.6127510156007, "ci_lo": -398.46146725243216, "name": "mpg", "p": 0.1986398547335649, "se": 1108.6318437426623, "t": 1.2854363239924897}, {"b": 10.606895801171753, "ci_hi": 21.650648553110486, "ci_lo": -0.4368569507669804, "name": "weight", "p": 0.1141553633086336, "se": 6.714124935485552, "t": 1.5797882677327157}], "level": 90.0, "vcov_type": "iid"};
+  const ti = formatEstimation(iv90);
+  check(ctx, ti.includes('[90% conf. interval]') && /mpg \u2502.*-398\.46\d*\s+3248\.61\d*$/m.test(ti), 'ivreg2 level(90): header and limits');
+});
+
+suite('vs-stata s4_lin_a: regress depname(), noheader and notable', (ctx) => {
+  // the block runRegress produced for `regress price mpg weight, depname(cost)` (auto.dta;
+  // bank c329367f: the table's first column reads "cost")
+  const dn = {"type": "estimation", "estimator": "feols", "depvar": "cost", "n_obs": 74, "coeftable": [{"b": 1946.0686679648365, "ci_hi": 9118.381859220288, "ci_lo": -5226.244523290616, "name": "(intercept)", "p": 0.5901886282312114, "se": 3597.049598758079, "t": 0.5410180245045101}, {"b": -49.51222066635501, "ci_hi": 122.27804163271796, "ci_lo": -221.302482965428, "name": "mpg", "p": 0.5673237265003643, "se": 86.1560388671846, "t": -0.5746807921692114}, {"b": 1.746559158345757, "ci_hi": 3.0253822932223495, "ci_lo": 0.46773602346916415, "name": "weight", "p": 0.008129813475429758, "se": 0.6413537894299911, "t": 2.7232382300228193}], "r2": 0.2933891231947526, "adj_r2": 0.2734845914537596, "F": 14.739815385384052, "p_F": 4.424877952974906e-06, "rmse": 2514.0285732971524, "mss": 186321279.73945072, "rss": 448744116.3821706, "df_m": 2, "df_r": 71, "vcov_type": "iid"};
+  const t = formatEstimation(dn).split('\n');
+  check(ctx, t.some(l => /^\s*cost \u2502\s+Coefficient/.test(l)), 'depname(cost) heads the table');
+  const noh = formatEstimation({ ...dn, noheader: true }).split('\n');
+  check(ctx, noh[0].startsWith('\u2500') && !noh.some(l => l.includes('Number of obs')), 'noheader: the table opens on its rule');
+  const nt = formatEstimation({ ...dn, notable: true });
+  check(ctx, nt.includes('Number of obs') && !nt.includes('Coefficient') && !nt.includes('mpg'), 'notable: header only');
+  // the block for `regress price mpg weight, beta` (bank 23a12224: Beta -.0971193 .4602192, `.` on _cons)
+  const bt = {"type": "estimation", "estimator": "feols", "depvar": "price", "n_obs": 74, "coeftable": [{"b": 1946.0686679648365, "ci_hi": 9118.381859220288, "ci_lo": -5226.244523290616, "name": "(intercept)", "p": 0.5901886282312114, "se": 3597.049598758079, "t": 0.5410180245045101}, {"b": -49.51222066635501, "ci_hi": 122.27804163271796, "ci_lo": -221.302482965428, "name": "mpg", "p": 0.5673237265003643, "se": 86.1560388671846, "t": -0.5746807921692114, "beta": -0.0971193460772548}, {"b": 1.746559158345757, "ci_hi": 3.0253822932223495, "ci_lo": 0.46773602346916415, "name": "weight", "p": 0.008129813475429758, "se": 0.6413537894299911, "t": 2.7232382300228193, "beta": 0.460219168129988}], "r2": 0.2933891231947526, "adj_r2": 0.2734845914537596, "F": 14.739815385384052, "p_F": 4.424877952974906e-06, "rmse": 2514.0285732971524, "df_m": 2, "df_r": 71, "beta": true};
+  const tb = formatEstimation(bt).split('\n');
+  check(ctx, tb.some(l => /\u2502.*P>\|t\|\s+Beta$/.test(l)) && !tb.some(l => l.includes('conf. interval')), 'beta: a Beta column in place of the interval');
+  check(ctx, tb.some(l => /^\s*mpg \u2502.*\s-\.0971193\d*$/.test(l) || /^\s*mpg \u2502.*\s-0?\.09711\S*$/.test(l)) && tb.some(l => /^\s*_cons \u2502.*\s\.$/.test(l)), 'beta: values, and . on _cons');
+});
+
 suite('display _continue: an echo closes the open line; a loop body joins its pieces', (ctx) => {
   document.body.innerHTML =
     '<div id="console-wrap"><div id="console-body"></div></div><div id="console-empty"></div>';
@@ -5898,6 +6365,39 @@ suite('display _continue: an echo closes the open line; a loop body joins its pi
 //   When env var is unset the suite is skipped. Run with:
 //     DOM_RUNNER_SELFTEST=1 node dom_runner.mjs   → must exit 1
 // ════════════════════════════════════════════════════════════════════════════
+// constraints(): the constraint lines above the table and a coefficient the
+// constraints fix (vs-stata bank eae58c67 `ologit rep78 mpg weight, const(1)`
+// with mpg = -.1; 908e6dce `mlogit race age grade wage, c(1)` with [2]age = 0).
+// Fixtures are the handlers' real blocks.
+suite('constraints(): ologit/mlogit draw the constraint lines and (constrained)/(omitted) rows', (ctx) => {
+  const ob = loadFix('dom/ologit_constraints_estimation.json');
+  const ot = formatEstimation(ob);
+  const olines = ot.split('\n');
+  const ci = olines.findIndex(l => l === ' ( 1)  [rep78]mpg = -.1');
+  check(ctx, ci >= 0, `ologit: constraint line drawn (got: ${JSON.stringify(olines.slice(0, 8))})`);
+  check(ctx, /Wald chi2\(1\)\s+=\s+25\.02/.test(ot) && !ot.includes('LR chi2'), 'ologit: the model test is Wald chi2(1) = 25.02');
+  check(ctx, ci > 0 && olines[ci - 1] === '', 'ologit: a blank line separates the header from the constraint line');
+  check(ctx, ci >= 0 && /^─+┬─+$/.test(olines[ci + 1] || ''), 'ologit: the table rule follows the constraint line');
+  const mpg = olines.find(l => /^\s*mpg │/.test(l)) || '';
+  check(ctx, /│\s+-\.1  \(constrained\)$/.test(mpg), `ologit: mpg row shows its value and (constrained) (got: ${JSON.stringify(mpg)})`);
+  const wt = olines.find(l => /^\s*weight │/.test(l)) || '';
+  check(ctx, !wt.includes('(constrained)') && /\d/.test(wt), 'ologit: an estimated row keeps its numbers');
+  const mb = loadFix('dom/mlogit_constraints_estimation.json');
+  const mt = formatEstimation(mb);
+  check(ctx, mt.startsWith(' ( 1)  [Black]o.age = 0\n'), `mlogit: constraint line drawn first (got: ${JSON.stringify(mt.slice(0, 40))})`);
+  check(ctx, /age │\s+\(omitted\)/.test(mt), 'mlogit: the coefficient held at 0 is drawn (omitted)');
+  // a coefficient held at a nonzero value: `wage | .01  (constrained)` in Other's
+  // table (`constraint 2 [3]wage = 0.01`, `mlogit race age grade wage, const(2)`)
+  const nb = loadFix('dom/mlogit_constraint_nonzero_estimation.json');
+  const nt = formatEstimation(nb);
+  check(ctx, nt.startsWith(' ( 1)  [Other]wage = .01\n'), `mlogit: nonzero constraint line drawn first (got: ${JSON.stringify(nt.slice(0, 40))})`);
+  const wageRows = nt.split('\n').filter(l => /^\s*wage │/.test(l));
+  check(ctx, wageRows.length === 2 && !wageRows[0].includes('(constrained)') &&
+    /│\s+\.01  \(constrained\)$/.test(wageRows[1]),
+    `mlogit: Other's wage shows .01 (constrained), Black's keeps its numbers (got: ${JSON.stringify(wageRows)})`);
+  check(ctx, !/\bundefined\b|NaN/.test(ot + mt + nt), 'no undefined / NaN in either table');
+});
+
 if (process.env.DOM_RUNNER_SELFTEST === '1') {
   suite('SELFTEST: negative-control — deliberate wrong assertion (must turn RED)', (ctx) => {
     // logit is an MLE estimator → must show P>|z|. Asserting P>|t| is deliberately wrong.

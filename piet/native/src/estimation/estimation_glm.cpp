@@ -49,6 +49,13 @@
 #include "piet/session_state.h"
 #include "piet/stata_format.h"
 #include "estimator_command_support.h"  // e3::installEsampleMask
+#include "statistics_command_support.h"  // estimWriteColumn: score()
+
+namespace piet::handlers {
+// engine/inrange_filter.cpp (declared at each caller, as linear_estimation.cpp does)
+InRangeFilterResult applyIfAndInFilterKeepingIndex(SessionState&, const std::string&,
+    const std::optional<std::string>&, const std::optional<std::string>&, std::string*);
+}  // namespace piet::handlers
 
 namespace piet::handlers {
 
@@ -99,10 +106,10 @@ namespace {
 const eval::OptVocab& kVocabGlm = eval::registerOptVocab(
     {"glm"},
     {{"family", "link", "vce", "iterate", "tolerance", "ltolerance", "nrtolerance", "offset",
-      "exposure", "nolog", "log", "trace", "showstep", "showtolerance", "cluster", "eform", "level", "robust"},
-     {"from", "lnoffset", "noconstant", "asis", "search",
-      "irls", "ml", "score", "notable", "nodisplay", "fisher", "nodots", "scale", "mu", "init",
-      "noheader", "disp", "vfactor", "difficult", "technique", "gradient", "hessian",
+      "exposure", "nolog", "log", "trace", "showstep", "showtolerance", "cluster", "eform", "level", "robust",
+      "from", "lnoffset", "noconstant", "asis", "ml", "score", "fisher", "nodots", "scale", "mu", "init",
+      "vfactor", "difficult", "technique", "gradient", "hessian", "noheader"},
+     {"search", "irls", "notable", "nodisplay", "disp",
       "constraints", "collinear", "coeflegend", "nocnsreport"},
      {}});
 
@@ -234,12 +241,18 @@ struct FamilySpec {
     std::string heldRefusal;
     bool wordUnknown = false;      // the first token named no family at all
     const char* tag = "gaussian";  // the family's word in glm_family_link_<tag>_<link>
+    // family(binomial #|varname): the denominator, as typed (e(m)), and either a
+    // positive constant or a variable resolved once the data is open.
+    std::string mText = "1";
+    double mConst = 1.0;
+    std::string mVar;
 };
 struct LinkSpec {
     cecon::GlmLinkFn link = cecon::GlmLinkFn::Identity;
     std::string linkt, linkf;
     std::string link_prog;  // e(link): glm's link program (glim_l#)
     std::string power;      // e(power): the link's power, "." when it has none
+    double p = 1.0;         // the power of link(power #) / link(opower #)
 };
 
 // Resolve a variable name: exact match, else Stata's unique-abbreviation rule.
@@ -482,7 +495,7 @@ const Spelling kFamilySpellings[] = {
 
 enum LinkWord {
     kLnkIdentity, kLnkLog, kLnkLogit, kLnkProbit, kLnkCloglog, kLnkPower, kLnkOpower,
-    kLnkNegBin, kLnkLoglog, kLnkLogc, kLnkReciprocal
+    kLnkNegBin, kLnkLoglog, kLnkLogc, kLnkReciprocal, kLnkPowerM2
 };
 // `log` sits above `logit`: the three letters are the log link, while one, two or
 // four letters of `logit` mean logit.
@@ -553,7 +566,11 @@ bool parseFamily(const std::string& rawIn, FamilySpec& fs, ojson& err) {
             fs.tag = "gaussian";
             return true;
         case kFamInverse:
-            fs.heldRefusal = "glm_family_igaussian";
+            fs.fam = cecon::GlmFamily::InverseGaussian;
+            fs.varfunct = "Inverse Gaussian";
+            fs.varfunc = "glim_v5";
+            fs.varfuncf = "u^3";
+            fs.tag = "igaussian";
             return true;
         case kFamPoisson:
             fs.fam = cecon::GlmFamily::Poisson;
@@ -577,11 +594,18 @@ bool parseFamily(const std::string& rawIn, FamilySpec& fs, ojson& err) {
             fs.varfuncf = "u*(1-u)";
             fs.tag = "bernoulli";
             if (tokens.size() < 2 || tokens[1] == "1") return true;
-            if (readNumericToken(tokens[1], argValue) && argValue <= 0.0)
-                return notPositive("binomial", tokens[1]);
-            // A denominator: a number spelled otherwise, or a variable name (this
-            // parser cannot see the dataset, so every other word lands here too).
-            fs.heldRefusal = "glm_family_binomial_denominator";
+            if (readNumericToken(tokens[1], argValue)) {
+                if (argValue < 1.0) return notPositive("binomial", tokens[1]);  // glm: "# < 1 invalid"
+                fs.mConst = argValue;
+            } else {
+                fs.mVar = tokens[1];  // a variable name, resolved against the data
+            }
+            // A denominator other than 1 is the binomial (glim_v2's title and
+            // variance u*(1-u/m), m as typed: bank 435c8f90 `family(binomial fatal)`).
+            fs.mText = tokens[1];
+            fs.varfunct = "Binomial";
+            fs.varfuncf = "u*(1-u/" + tokens[1] + ")";
+            fs.tag = "binomial";
             return true;
         }
         default: {  // kFamNegBin
@@ -612,10 +636,13 @@ bool parseFamily(const std::string& rawIn, FamilySpec& fs, ojson& err) {
 
 // power and opower rewrite these numeric values to another link; every other value
 // stays in the (refused) power family.
+// (glm's MapLink: power 0 is the log link, -1 the reciprocal, -2 glim_l10;
+// power 1 stays the power link with p = 1.)
 int linkAfterPowerArgument(int word, double power) {
     if (word == kLnkPower) {
         if (power == 0.0) return kLnkLog;
         if (power == -1.0) return kLnkReciprocal;
+        if (power == -2.0) return kLnkPowerM2;
         return kLnkPower;
     }
     return power == 0.0 ? kLnkLogit : kLnkOpower;
@@ -626,16 +653,9 @@ int defaultLinkOf(cecon::GlmFamily family) {
         case cecon::GlmFamily::Gaussian: return kLnkIdentity;
         case cecon::GlmFamily::Bernoulli: return kLnkLogit;
         case cecon::GlmFamily::Gamma: return kLnkReciprocal;
+        case cecon::GlmFamily::InverseGaussian: return kLnkPowerM2;
         default: return kLnkLog;  // poisson, nbinomial
     }
-}
-
-bool familyLinkIsFitted(cecon::GlmFamily family, cecon::GlmLinkFn link) {
-    using F = cecon::GlmFamily;
-    using L = cecon::GlmLinkFn;
-    if (family == F::Gaussian) return link == L::Identity;
-    if (family == F::Bernoulli) return link == L::Logit || link == L::Probit;
-    return link == L::Log;  // poisson, gamma, nbinomial
 }
 
 // Second half of the grammar, and the arbiter between the two options: errors in
@@ -651,12 +671,12 @@ bool parseLink(const std::string& rawIn, const FamilySpec& fs, LinkSpec& ls, ojs
         word = lookUpSpelling(kLinkSpellings, tokens[0]);
         wordUnknown = word < 0;
     }
+    double power = 0.0;
     if (word == kLnkPower || word == kLnkOpower) {
         if (tokens.size() > 2) {
             err = syntaxErr("link(" + trim(rawIn) + ") invalid");
             return false;
         }
-        double power = 0.0;
         if (tokens.size() < 2 || !readNumericToken(tokens[1], power)) {
             err = syntaxErr(std::string("invalid # in link(") +
                             (word == kLnkPower ? "power" : "opower") + " #)");
@@ -676,51 +696,102 @@ bool parseLink(const std::string& rawIn, const FamilySpec& fs, LinkSpec& ls, ojs
         err = refuse("glm_link_unrecognized");
         return false;
     }
-    const char* tagOfLink = "";
+    // The link programs' titles and formulas (glim_l01..glim_l12), with the
+    // binomial denominator written in when it is not 1 (bank 435c8f90
+    // `family(binomial fatal)`: e(linkf) ln(u/(fatal-u))); e(power) is MapLink's.
+    const bool hasM = fs.mText != "1";
+    const std::string m = fs.mText;
+    // power / opower: the argument as typed (MapLink returns the token itself,
+    // and glim_l11 / glim_l12 write it into the formula: link(power .5) is u^(.5))
+    const std::string powTyped = tokens.size() >= 2 ? tokens[1] : std::string();
     switch (word) {
         case kLnkIdentity:
             ls.link = cecon::GlmLinkFn::Identity;
             ls.linkt = "Identity";
             ls.link_prog = "glim_l01";
             ls.power = "1";
-            ls.linkf = "u";
-            tagOfLink = "identity";
+            ls.linkf = hasM ? "u/" + m : "u";
             break;
         case kLnkLog:
             ls.link = cecon::GlmLinkFn::Log;
             ls.linkt = "Log";
             ls.link_prog = "glim_l03";
             ls.power = "0";
-            ls.linkf = "ln(u)";
-            tagOfLink = "log";
+            ls.linkf = hasM ? "ln(u/" + m + ")" : "ln(u)";
             break;
         case kLnkLogit:
             ls.link = cecon::GlmLinkFn::Logit;
             ls.linkt = "Logit";
             ls.link_prog = "glim_l02";
             ls.power = "0";
-            ls.linkf = "ln(u/(1-u))";
-            tagOfLink = "logit";
+            ls.linkf = "ln(u/(" + m + "-u))";
             break;
         case kLnkProbit:
             ls.link = cecon::GlmLinkFn::Probit;
             ls.linkt = "Probit";
             ls.link_prog = "glim_l08";
             ls.power = ".";
-            ls.linkf = "invnorm(u)";
-            tagOfLink = "probit";
+            ls.linkf = hasM ? "invnorm(u/" + m + ")" : "invnorm(u)";
             break;
-        default: {
-            // Valid in Stata, not fitted here: refused under the link's full word.
-            const char* const notFitted[] = {"", "", "", "", "cloglog", "power", "opower",
-                                             "nbinomial", "loglog", "logc", "reciprocal"};
-            err = refuse(std::string("glm_link_") + notFitted[word]);
-            return false;
-        }
-    }
-    if (!familyLinkIsFitted(fs.fam, ls.link)) {
-        err = refuse(std::string("glm_family_link_") + fs.tag + "_" + tagOfLink);
-        return false;
+        case kLnkCloglog:
+            ls.link = cecon::GlmLinkFn::Cloglog;
+            ls.linkt = "Complementary log\xE2\x80\x93log";  // with an en dash (bank 3034ee28)
+            ls.link_prog = "glim_l07";
+            ls.power = ".";
+            ls.linkf = hasM ? "ln(-ln(1-u/" + m + "))" : "ln(-ln(1-u))";
+            break;
+        case kLnkLoglog:
+            ls.link = cecon::GlmLinkFn::Loglog;
+            ls.linkt = "Log-log";
+            ls.link_prog = "glim_l06";
+            ls.power = ".";
+            ls.linkf = hasM ? "-ln(-ln(u/" + m + "))" : "-ln(-ln(u))";
+            break;
+        case kLnkLogc:
+            ls.link = cecon::GlmLinkFn::Logc;
+            ls.linkt = "Log complement";
+            ls.link_prog = "glim_l05";
+            ls.power = ".";
+            ls.linkf = hasM ? "ln(1-u/" + m + ")" : "ln(1-u)";
+            break;
+        case kLnkReciprocal:
+            ls.link = cecon::GlmLinkFn::Reciprocal;
+            ls.linkt = "Reciprocal";
+            ls.link_prog = "glim_l09";
+            ls.power = "-1";
+            ls.linkf = hasM ? m + "/u" : "1/u";
+            break;
+        case kLnkPowerM2:
+            ls.link = cecon::GlmLinkFn::PowerM2;
+            ls.linkt = "Power(-2)";
+            ls.link_prog = "glim_l10";
+            ls.power = "-2";
+            ls.linkf = "1/(u^2)";
+            break;
+        case kLnkPower:
+            ls.link = cecon::GlmLinkFn::Power;
+            ls.linkt = "Power";
+            ls.link_prog = "glim_l11";
+            ls.p = power;
+            ls.power = powTyped;
+            ls.linkf = hasM ? "(u/" + m + ")^(" + ls.power + ")" : "u^(" + ls.power + ")";
+            break;
+        case kLnkOpower:
+            ls.link = cecon::GlmLinkFn::OPower;
+            ls.linkt = "Odds power";
+            ls.link_prog = "glim_l12";
+            ls.p = power;
+            ls.power = powTyped;
+            ls.linkf = hasM ? "((u/(" + m + "-u))^(" + ls.power + ")-1)/(" + ls.power + ")"
+                            : "((u/(1-u))^(" + ls.power + ")-1)/(" + ls.power + ")";
+            break;
+        default:  // kLnkNegBin
+            ls.link = cecon::GlmLinkFn::NegBin;
+            ls.linkt = "Neg. Binomial";
+            ls.link_prog = "glim_l04";
+            ls.power = ".";
+            ls.linkf = "ln(u/(u+(1/" + fs.alphaText + ")))";
+            break;
     }
     return true;
 }
@@ -737,6 +808,7 @@ struct Design {
     int64_t nClust = 0;
     std::vector<int64_t> rows;      // the frame rows of the sample, in order
     double sumW = 0.0;
+    std::vector<double> m;          // binomial denominators; empty = 1
     // e(b) layout: every posted column, base levels included.
     std::vector<std::string> names;  // posted names ("x1", "1b.g", "2.g", "_cons")
     std::vector<int> estIndex;       // posted column -> estimable column, -1 = base
@@ -763,6 +835,11 @@ struct ModelSpec {
     bool robust = false;
     std::string offsetVar;   // offset() or exposure() variable, "" = none
     bool exposure = false;
+    std::string wtype = "aw";  // the weight's kind: "aw" or "fw"
+    bool noconstant = false;
+    // family(binomial varname|#): the denominator variable, or the constant
+    std::string mVar;
+    double mConst = 1.0;
 };
 
 ojson specToJson(const ModelSpec& m) {
@@ -786,6 +863,10 @@ ojson specToJson(const ModelSpec& m) {
     if (m.robust) j["robust"] = true;
     j["offset"] = m.offsetVar;
     j["exposure"] = m.exposure;
+    if (m.wtype != "aw") j["wtype"] = m.wtype;
+    if (m.noconstant) j["noconstant"] = true;
+    if (!m.mVar.empty()) j["binomial_m_var"] = m.mVar;
+    if (m.mConst != 1.0) j["binomial_m"] = m.mConst;
     return j;
 }
 ModelSpec specFromJson(const ojson& j) {
@@ -810,6 +891,10 @@ ModelSpec specFromJson(const ojson& j) {
     m.robust = j.value("robust", false);
     m.offsetVar = j.value("offset", std::string());
     m.exposure = j.value("exposure", false);
+    m.wtype = j.value("wtype", std::string("aw"));
+    m.noconstant = j.value("noconstant", false);
+    m.mVar = j.value("binomial_m_var", std::string());
+    m.mConst = j.value("binomial_m", 1.0);
     return m;
 }
 
@@ -838,6 +923,9 @@ struct FrameScope {
     std::unique_ptr<Datastore> owned;
     Datastore* ds = nullptr;
     ojson err;
+    // the fit's filtered copy keeps each row's 1-based position in the working
+    // frame here, so e(sample) maps back onto it ("" = the frame itself)
+    std::string indexVar;
 };
 FrameScope openFrame(SessionState& session, const std::string& basePath, const ModelSpec& m,
                      bool live) {
@@ -845,7 +933,9 @@ FrameScope openFrame(SessionState& session, const std::string& basePath, const M
     const bool wantFilter = (m.ifExpr && !m.ifExpr->empty()) || (m.inRange && !m.inRange->empty());
     try {
         if (wantFilter) {
-            InRangeFilterResult r = applyIfAndInFilter(session, basePath, m.ifExpr, m.inRange);
+            InRangeFilterResult r = live ? applyIfAndInFilterKeepingIndex(session, basePath, m.ifExpr, m.inRange,
+                                                                          &f.indexVar)
+                                         : applyIfAndInFilter(session, basePath, m.ifExpr, m.inRange);
             if (!r.ok) {
                 f.err = inRangeRejectError(r, m.inRange.value_or(std::string()), "glm");
                 return f;
@@ -888,6 +978,8 @@ bool buildDesign(const Datastore& ds, const ModelSpec& m, cecon::GlmFamily fam, 
     if (!m.weightVar.empty() && !readNumeric(ds, m.weightVar, w, err)) return false;
     if (!m.clusterVar.empty() && !readNumeric(ds, m.clusterVar, cl, err)) return false;
     if (!m.offsetVar.empty() && !readNumeric(ds, m.offsetVar, off, err)) return false;
+    std::vector<double> mv;
+    if (!m.mVar.empty() && !readNumeric(ds, m.mVar, mv, err)) return false;
 
     std::vector<int64_t> rows;
     for (int64_t i = 0; i < nAll; ++i) {
@@ -896,6 +988,7 @@ bool buildDesign(const Datastore& ds, const ModelSpec& m, cecon::GlmFamily fam, 
         if (ok && !w.empty()) ok = std::isfinite(w[i]);
         if (ok && !cl.empty()) ok = std::isfinite(cl[i]);
         if (ok && !off.empty()) ok = std::isfinite(off[i]);
+        if (ok && !mv.empty()) ok = std::isfinite(mv[i]);
         if (ok) rows.push_back(i);
     }
     const int64_t n = static_cast<int64_t>(rows.size());
@@ -916,12 +1009,18 @@ bool buildDesign(const Datastore& ds, const ModelSpec& m, cecon::GlmFamily fam, 
             err = errRc("dependent variable " + m.depvar + " has negative values", 499);
             return false;
         }
-        if (fam == cecon::GlmFamily::Bernoulli && yi > 1) {
-            err = errRc(m.depvar + " > 1 in some cases", 499);
+        // glim_v2's checks: m > 0, then y <= m ("`y' > `m' in some cases")
+        const double mi = mv.empty() ? m.mConst : mv[r];
+        if (fam == cecon::GlmFamily::Bernoulli && !(mi > 0)) {
+            err = errRc(m.mVar + " has nonpositive values", 499);
             return false;
         }
-        if (fam == cecon::GlmFamily::Bernoulli && yi != 0 && yi != 1) {
-            err = refuse("glm_binomial_fractional_depvar");
+        if (fam == cecon::GlmFamily::Bernoulli && yi > mi) {
+            err = errRc(m.depvar + " > " + (m.mVar.empty() ? std::string("1") : m.mVar) + " in some cases", 499);
+            return false;
+        }
+        if (fam == cecon::GlmFamily::InverseGaussian && !(yi > 0)) {
+            err = refuse("glm_igaussian_nonpositive_depvar");
             return false;
         }
         if (fam == cecon::GlmFamily::Gamma && !(yi > 0)) {
@@ -950,6 +1049,10 @@ bool buildDesign(const Datastore& ds, const ModelSpec& m, cecon::GlmFamily fam, 
             out.sumW += out.w[i];
         }
     }
+    if (!mv.empty() || m.mConst != 1.0) {
+        out.m.resize(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i) out.m[i] = mv.empty() ? m.mConst : mv[rows[i]];
+    }
     if (!off.empty()) {
         out.off.resize(static_cast<size_t>(n));
         for (int64_t i = 0; i < n; ++i) out.off[i] = m.exposure ? std::log(off[rows[i]]) : off[rows[i]];
@@ -963,8 +1066,8 @@ bool buildDesign(const Datastore& ds, const ModelSpec& m, cecon::GlmFamily fam, 
         for (int64_t i = 0; i < n; ++i) out.cl[i] = ids[cl[rows[i]]];
         out.nClust = g;
     } else if (m.robust) {
-        out.cl.resize(static_cast<size_t>(n));
-        for (int64_t i = 0; i < n; ++i) out.cl[i] = i;
+        // every observation its own cluster: the engine's robust sandwich (which
+        // counts a frequency-weighted row w_i times), no cluster ids
         out.nClust = n;
     }
     auto addCol = [&](const std::vector<double>& c, const std::string& name) {
@@ -1093,7 +1196,11 @@ bool buildDesign(const Datastore& ds, const ModelSpec& m, cecon::GlmFamily fam, 
         }
         out.terms.push_back(tc);
     }
-    addCol(std::vector<double>(static_cast<size_t>(n), 1.0), "_cons");
+    if (!m.noconstant) addCol(std::vector<double>(static_cast<size_t>(n), 1.0), "_cons");
+    if (out.k == 0) {
+        err = errRc("no variables specified", 102);
+        return false;
+    }
     d = std::move(out);
     return true;
 }
@@ -1227,7 +1334,12 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
 
     // ---- options ----
     std::string famRaw, linkRaw, vceRaw, offsetRaw, exposureRaw, clusterOptRaw;
+    std::string lnoffsetRaw, initRaw, fromRaw, scoreRaw;
     bool sawVce = false, noLog = false, robustOpt = false;
+    bool noConstant = false, noHeader = false, asisOpt = false, difficultOpt = false, showGradient = false, showHessian = false;
+    double vfactor = 1.0;
+    int scaleKind = -1;  // -1 default, 0 scale(x2), 1 scale(#)
+    double scaleValue = 0.0;
     std::optional<double> levelPct;
     cecon::GlmOptions opt;
     auto num = [](const eval::OptValue& v, double& out) {
@@ -1279,10 +1391,66 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
             if (k == "ltolerance" && t >= 1) return syntaxErr("ltolerance() must be in [0,1)");
             (k == "tolerance" ? opt.tol : k == "ltolerance" ? opt.ltol : opt.nrtol) = t;
         }
+        // lnoffset(varname): exposure()'s other spelling (glm.ado: `local lnoffset
+        // `exposure''), e(offset) ln(varname)
+        else if (k == "lnoffset") lnoffsetRaw = v.isBool ? std::string() : trim(v.strValue);
+        else if (k == "noconstant") noConstant = true;
+        else if (k == "noheader") noHeader = true;
+        else if (k == "asis") asisOpt = true;
+        // ml is the default optimization (Newton-Raphson through ml); nodots only
+        // silences the replication dots of vce(bootstrap)/vce(jackknife), which
+        // this fit never runs
+        else if (k == "ml" || k == "nodots") {
+            if (!v.isBool) return errRc("option " + k + "() not allowed", 198);
+        } else if (k == "difficult") difficultOpt = true;
+        else if (k == "gradient") showGradient = true;
+        else if (k == "hessian") showHessian = true;
+        else if (k == "technique") {
+            const std::string t = lower(trim(v.isBool ? std::string() : v.strValue));
+            // Newton-Raphson, glm's own (e(technique) nr); bhhh/dfp/bfgs walk another path
+            if (t != "nr") {
+                const std::vector<std::pair<std::string, eval::OptValue>> one = {{k, v}};
+                if (auto e = eval::rejectUnknownOptions(one, {}, {"technique"})) return ojson(*e);
+            }
+        } else if (k == "vfactor") {
+            double vf = 0;
+            if (!num(v, vf)) return syntaxErr("option vfactor() incorrectly specified");
+            if (!(vf > 0)) return syntaxErr("vfactor() must be positive");
+            vfactor = vf;
+        } else if (k == "fisher") {
+            double f = 0;
+            if (!num(v, f) || f != std::floor(f)) return syntaxErr("option fisher() incorrectly specified");
+            if (!(f > 0)) return syntaxErr("fisher() must be positive");
+            opt.fisher = static_cast<int>(f);
+        } else if (k == "scale") {
+            const std::string t = lower(trim(v.isBool ? std::string() : v.strValue));
+            if (t == "x2") scaleKind = 0;
+            else if (t == "dev") return syntaxErr("option scale(dev) allowed only with option irls");
+            else {
+                double sc = 0;
+                if (!num(v, sc)) return syntaxErr("invalid scale()");
+                if (!(sc > 0)) return syntaxErr("scale(#) must be positive");
+                scaleKind = 1;
+                scaleValue = sc;
+            }
+        } else if (k == "init" || k == "mu") {
+            const std::string vn = v.isBool ? std::string() : trim(v.strValue);
+            if (!initRaw.empty() && initRaw != vn) return syntaxErr("mu() and init() should use the same varname");
+            initRaw = vn;
+        } else if (k == "from") {
+            fromRaw = v.isBool ? std::string() : trim(v.strValue);
+        } else if (k == "score") {
+            scoreRaw = v.isBool ? std::string() : trim(v.strValue);
+        }
         // log / trace / showstep / showtolerance change only the iteration
         // display; the plain iteration log below is printed for all of them (the
         // trace's parameter/gradient dumps are text Stata's oracle marks "not pins").
     }
+    if (!offsetRaw.empty() && !lnoffsetRaw.empty())
+        return syntaxErr("only one of offset() or lnoffset() can be specified");
+    if (!lnoffsetRaw.empty() && !exposureRaw.empty())
+        return syntaxErr("only one of lnoffset() or exposure() can be specified");
+    if (!lnoffsetRaw.empty()) exposureRaw = lnoffsetRaw;
     if (!offsetRaw.empty() && !exposureRaw.empty())
         return syntaxErr("only one of offset() or exposure() can be specified");
 
@@ -1333,8 +1501,14 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     // ---- weights ----
     if (parsed.weightType.has_value()) {
         const std::string wt = lower(*parsed.weightType);
-        if (wt != "aw" && wt != "aweight") return refuse("glm_weight_" + wt);
+        if (wt == "fw" || wt == "fweight") spec.wtype = "fw";
+        else if (wt != "aw" && wt != "aweight") return refuse("glm_weight_" + wt);
     }
+    spec.noconstant = noConstant;
+    spec.mConst = fs.mConst;
+    if (asisOpt && !(fs.fam == cecon::GlmFamily::Bernoulli && fs.mText == "1" && fs.mVar.empty()))
+        return syntaxErr("option asis not allowed; option asis is only allowed with family(binomial) "
+                         "with a denominator of 1");
 
     // ---- data + terms ----
     const std::string basePath = *session.currentHbin();
@@ -1346,6 +1520,9 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     }
     if (live == nullptr) return ojson(eval::noDataLoaded());
     const std::vector<std::string> raw = rawTerms(parsed.varlist);
+    // glm.ado counts the varlist: a depvar alone beside noconstant is r(100)
+    if (noConstant && raw.size() == 1)
+        return errRc("independent variables required with noconstant option", 100);
     {
         std::vector<Term> dep;
         if (!parseTerm(*live, raw[0], dep, err)) return err;
@@ -1369,6 +1546,19 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
         !resolveAux(trim(*parsed.weightVar), spec.weightVar))
         return err;
     if (!offsetRaw.empty() && !resolveAux(offsetRaw, spec.offsetVar)) return err;
+    if (!fs.mVar.empty()) {
+        if (!resolveAux(fs.mVar, spec.mVar)) return err;
+        // family(binomial varname) is unabbreviated before its name is written into
+        // e(m), the variance and the link formulas
+        if (spec.mVar != fs.mVar) {
+            fs.mVar = spec.mVar;
+            fs.mText = spec.mVar;
+            fs.varfuncf = "u*(1-u/" + spec.mVar + ")";
+            if (!parseLink(linkRaw, fs, ls, err)) return err;
+        }
+    }
+    std::string initVar;
+    if (!initRaw.empty() && !resolveAux(initRaw, initVar)) return err;
     if (!exposureRaw.empty()) {
         if (!resolveAux(exposureRaw, spec.offsetVar)) return err;
         spec.exposure = true;
@@ -1380,16 +1570,140 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     if (!frame.err.is_null()) return frame.err;
     Design d;
     if (!buildDesign(*frame.ds, spec, fs.fam, d, err)) return err;
+    // each sample row's position in the working frame (the design's own rows
+    // unless the fit read a filtered copy)
+    std::vector<int64_t> headRows = d.rows;
+    bool headRowsKnown = true;
+    if (!frame.indexVar.empty()) {
+        std::vector<double> idx;
+        ojson ierr;
+        headRowsKnown = readNumeric(*frame.ds, frame.indexVar, idx, ierr);
+        for (size_t i = 0; headRowsKnown && i < d.rows.size(); ++i) {
+            const double v = idx[static_cast<size_t>(d.rows[i])];
+            if (!(v >= 1)) headRowsKnown = false;
+            else headRows[i] = static_cast<int64_t>(v) - 1;
+        }
+    } else if ((spec.ifExpr && !spec.ifExpr->empty()) || (spec.inRange && !spec.inRange->empty())) {
+        headRowsKnown = false;
+    }
+    // An m = 1 binomial whose outcome is not 0/1 is glim_v2's "Binomial" (the
+    // variance written u*(1-u/1)), not the Bernoulli.
+    if (fs.fam == cecon::GlmFamily::Bernoulli && fs.mText == "1") {
+        bool binaryY = true;
+        for (double yi : d.y) binaryY = binaryY && (yi == 0.0 || yi == 1.0);
+        if (!binaryY) {
+            fs.varfunct = "Binomial";
+            fs.varfuncf = "u*(1-u/1)";
+        }
+    }
 
     // ---- fit ----
+    opt.power = ls.p;
+    opt.binom_m = d.m.empty() ? nullptr : d.m.data();
+    const bool fweighted = !d.w.empty() && spec.wtype == "fw";
+    if (fweighted) {
+        for (double wi : d.w)
+            if (wi != std::floor(wi)) return errRc("may not use noninteger frequency weights", 401);
+        opt.fweight = d.w.data();
+    }
+    // scale(#) of a family whose dispersion is estimated fixes phi in every
+    // evaluation ($SGLM_s1 = #); a scale-one family keeps 1 and has e(V) rescaled
+    // after the fit (glm.ado `fixme`).
+    const bool scaleOneFam = fs.fam == cecon::GlmFamily::Bernoulli || fs.fam == cecon::GlmFamily::Poisson ||
+                             fs.fam == cecon::GlmFamily::NegBinomial;
+    if (scaleKind == 1 && !scaleOneFam) opt.fixed_phi = scaleValue;
+    std::vector<double> muStart;
+    if (!initVar.empty()) {
+        std::vector<double> col;
+        if (!readNumeric(*frame.ds, initVar, col, err)) return err;
+        for (int64_t r0 : d.rows) muStart.push_back(col[static_cast<size_t>(r0)]);
+        opt.mu_start = muStart.data();
+    }
+    if (!fromRaw.empty()) {
+        // from(matname[, copy]): by position with copy, else by the column names
+        // (an equation stripe is read past; a missing name starts at 0)
+        std::string mat = fromRaw, rest;
+        const size_t comma = fromRaw.find(',');
+        if (comma != std::string::npos) {
+            mat = trim(fromRaw.substr(0, comma));
+            rest = lower(trim(fromRaw.substr(comma + 1)));
+        }
+        const bool copy = rest == "copy";
+        if (!rest.empty() && !copy && rest != "skip") return syntaxErr("from() invalid");
+        const eval::EvalMatrix* fm = session.eval.findMatrix(mat);
+        if (fm == nullptr || fm->data.size() != 1) return errRc("matrix " + mat + " not found", 111);
+        const std::vector<double>& row = fm->data[0];
+        std::vector<double> start(static_cast<size_t>(d.k), 0.0);
+        if (copy) {
+            if (row.size() != static_cast<size_t>(d.k)) return errRc("from():  wrong number of values", 503);
+            start = row;
+        } else {
+            for (size_t i = 0; i < d.names.size(); ++i) {
+                if (d.estIndex[i] < 0) continue;
+                for (size_t c = 0; c < fm->colnames.size() && c < row.size(); ++c) {
+                    std::string cn = fm->colnames[c];
+                    const size_t colon = cn.find(':');
+                    if (colon != std::string::npos) cn = cn.substr(colon + 1);
+                    if (cn == d.names[i]) start[static_cast<size_t>(d.estIndex[i])] = row[c];
+                }
+            }
+        }
+        opt.b_start = start;
+    }
+    opt.robust = spec.robust;
     cecon::GlmResult r = cecon::glm_fit(d.X.data(), d.n, d.k, d.y.data(),
-                                        d.w.empty() ? nullptr : d.w.data(),
+                                        d.w.empty() || fweighted ? nullptr : d.w.data(),
                                         d.off.empty() ? nullptr : d.off.data(),
                                         d.cl.empty() ? nullptr : d.cl.data(), opt);
     if (!r.ok) {
         if (r.error.find("singular (collinear") != std::string::npos)
             return refuse("glm_collinear_regressors");
         return errRc("glm: " + r.error, 430);
+    }
+    // `difficult` changes ml's step only where the Hessian is not negative
+    // definite; this fit has no nonconcave stepping of its own, so such a path is
+    // refused rather than reported as difficult's.
+    if (difficultOpt && r.nonconcave) return refuse("glm_difficult_nonconcave");
+    // ml's model test reads the V it posts; scale() and vfactor() repost e(V)
+    // afterwards (glm.ado), so e(chi2) keeps the unscaled one.
+    const std::vector<double> Vml = r.V;
+    std::string scaleMsg;
+    {
+        double fix = 1.0;
+        if (scaleKind == 0 && scaleOneFam) {
+            fix = r.pearson_phi;  // $SGLM_ph after ml: the Pearson scale at the last evaluation
+            scaleMsg = "square root of Pearson X2-based dispersion";
+        } else if (scaleKind == 1 && (!scaleOneFam || scaleValue != 1.0)) {
+            if (scaleOneFam) fix = scaleValue;
+            scaleMsg = "dispersion equal to square root of " + trim(gfmt(scaleValue, 12));
+        }
+        fix *= vfactor;
+        if (fix != 1.0) {
+            for (double& v : r.V) v *= fix;
+            for (double& v : r.V_oim) v *= fix;
+        }
+    }
+    // N: the frequency-weighted count under fweights (bank 14061316 [fw=w]: e(N) 672)
+    const double nObs = fweighted ? d.sumW : static_cast<double>(d.n);
+    // score(newvar): the equation-level score (y-mu) dmu/(phi V(mu)) of each
+    // sample observation (glim_lf), missing elsewhere
+    if (!scoreRaw.empty()) {
+        std::vector<std::string> sv = splitWs(scoreRaw);
+        if (sv.size() != 1) return syntaxErr("score(): one new variable name is required");
+        std::string nm = sv[0];
+        if (!nm.empty() && nm.back() == '*') nm = nm.substr(0, nm.size() - 1) + "1";
+        if (session.datastore() != nullptr && session.datastore()->has(nm))
+            return errRc("variable " + nm + " already defined", 110);
+        if (!headRowsKnown || headRows.size() != r.scores.size() || session.datastore() == nullptr)
+            return refuse("glm_score_filtered");
+        std::vector<double> col(static_cast<size_t>(session.datastore()->nRows()),
+                                std::numeric_limits<double>::quiet_NaN());
+        for (size_t i = 0; i < headRows.size(); ++i)
+            if (headRows[i] >= 0 && static_cast<size_t>(headRows[i]) < col.size())
+                col[static_cast<size_t>(headRows[i])] = r.scores[i];
+        ojson werr;
+        if (!statcmd_detail::estimWriteColumn(session, nm, col, &werr, "double")) return werr;
+        session.invalidateDatastore();
     }
 
     std::vector<double> bp, Vp;
@@ -1399,7 +1713,7 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     // df_m = rank - 1. e(phi) is the fitter's (N - k) Pearson scale and does not
     // follow (oracle syn_C: phi = Pearson/199 while e(df) = 239).
     const int64_t rank = glmVceRank(r.V, static_cast<size_t>(d.k));
-    const double df = static_cast<double>(d.n - rank);
+    const double df = nObs - static_cast<double>(rank);
     // the sandwich fits: vce(cluster) and vce(robust), the latter one observation per cluster
     const bool clustered = !spec.clusterVar.empty() || spec.robust;
     const std::string crit = clustered ? "Log pseudolikelihood" : "Log likelihood";
@@ -1412,7 +1726,52 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     }
     {
         std::string text;
-        if (!noLog) {
+        if (!noLog && (showGradient || showHessian)) {
+            // ml's `hessian` / `gradient` display: each iteration framed by rules,
+            // the criterion right-aligned, then the Hessian (lower triangle) and the
+            // gradient vector in matrix-list layout on the equation stripe.
+            const std::string rule(80, '-');
+            std::vector<std::string> cn;
+            for (size_t i = 0; i < d.names.size(); ++i)
+                if (d.estIndex[i] >= 0) cn.push_back(d.names[i]);
+            const std::string eq = spec.depvar + ":";
+            const auto pad = [](const std::string& t, size_t w) {
+                return t.size() >= w ? t : std::string(w - t.size(), ' ') + t;
+            };
+            const auto header = [&](size_t L) {
+                std::string a(L + 1, ' '), b(L, ' ');
+                for (const auto& c : cn) {
+                    a += pad(spec.depvar, 10) + ":";
+                    b += pad(c, 11);
+                }
+                return a + "\n" + b + "\n";
+            };
+            text += rule + "\n";
+            for (size_t i = 0; i < r.ilog.size(); ++i) {
+                text += "Iteration " + std::to_string(i) + ":\n";
+                text += pad(crit + " = " + trim(gfmt(r.ilog[i], 10)), 80) + "\n";
+                const size_t kk = cn.size();
+                if (showHessian && i < r.hess_log.size() && r.hess_log[i].size() == kk * kk) {
+                    size_t L = 0;
+                    for (const auto& c : cn) L = std::max(L, eq.size() + c.size());
+                    text += "Hessian matrix:\n" + header(L);
+                    for (size_t a = 0; a < kk; ++a) {
+                        std::string line = pad(eq + cn[a], L);
+                        for (size_t c = 0; c <= a; ++c) line += "  " + pad(trim(gfmt(-r.hess_log[i][a * kk + c], 9)), 9);
+                        text += line + "\n";
+                    }
+                }
+                if (showGradient && i < r.grad_log.size() && r.grad_log[i].size() == kk) {
+                    double g2 = 0.0;
+                    for (double g : r.grad_log[i]) g2 += g * g;
+                    text += "Gradient vector (length = " + trim(gfmt(std::sqrt(g2), 9)) + "):\n" + header(2);
+                    std::string line = "r1";
+                    for (double g : r.grad_log[i]) line += "  " + pad(trim(gfmt(g, 9)), 9);
+                    text += line + "\n";
+                }
+                text += rule + "\n";
+            }
+        } else if (!noLog) {
             for (size_t i = 0; i < r.ilog.size(); ++i) {
                 text += "Iteration " + std::to_string(i) + ":  " + crit + " = " + gfmt(r.ilog[i], 10) +
                         "  \n";
@@ -1427,12 +1786,12 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
 
     // ---- header ----
     const double dispers = r.deviance / df, dispersP = r.deviance_p / df;
-    const double aic = (-2.0 * r.ll + 2.0 * static_cast<double>(rank)) / static_cast<double>(d.n);
-    const double bic = r.deviance - df * std::log(static_cast<double>(d.n));
+    const double aic = (-2.0 * r.ll + 2.0 * static_cast<double>(rank)) / nObs;
+    const double bic = r.deviance - df * std::log(nObs);
     {
         std::vector<std::string> L;
         std::string s = "Generalized linear models";
-        toCol(s, 51); s += "Number of obs"; toCol(s, 67); s += "="; toCol(s, 69); s += countFmt(d.n);
+        toCol(s, 51); s += "Number of obs"; toCol(s, 67); s += "="; toCol(s, 69); s += countFmt(nObs);
         L.push_back(s);
         s = "Optimization     : ML";
         toCol(s, 51); s += "Residual df"; toCol(s, 67); s += "="; toCol(s, 69); s += countFmt(df);
@@ -1468,15 +1827,20 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
         std::string text;
         for (const auto& line : L) text += line + "\n";
         text.pop_back();
-        blocks.push_back(displayBlock(text));
+        // noheader: the table alone (glm's header block is this text; the
+        // renderer drops its own title lines under the block's noheader)
+        if (!noHeader) blocks.push_back(displayBlock(text));
     }
 
     // ---- the estimation block: e() is read from it ----
     ojson block;
     block["type"] = "estimation";
     block["estimator"] = "glm";
+    if (noHeader) block["noheader"] = true;
     block["depvar"] = spec.depvar;
-    block["n_obs"] = d.n;
+    block["n_obs"] = nObs;
+    // the level the reported interval is built at (r(table) reads it from here)
+    block["level"] = levelPct.has_value() ? *levelPct : static_cast<double>(session.level);
     ojson ct = ojson::array();
     for (size_t i = 0; i < K; ++i) {
         if (d.estIndex[i] < 0) continue;  // base levels: posted in e(b), not tabulated
@@ -1487,7 +1851,7 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     // looks up: N/rank/N_clust/ll through the eScalarKey table, the rest by name.
     block["ll"] = r.ll;
     block["k_vars"] = rank;           // e(rank)
-    block["df_m"] = rank - 1;
+    block["df_m"] = spec.noconstant ? rank : rank - 1;
     block["df"] = df;
     block["k"] = static_cast<double>(K);
     block["ic"] = r.ic;
@@ -1515,33 +1879,41 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     // chi2 3086.44, chi2type Wald); a V that does not invert posts none.
     std::optional<double> modelP;  // e(p), posted after the model install below
     {
-        const bool canonical = (fs.fam == cecon::GlmFamily::Gaussian && ls.link == cecon::GlmLinkFn::Identity) ||
-                               (fs.fam == cecon::GlmFamily::Bernoulli && ls.link == cecon::GlmLinkFn::Logit) ||
-                               (fs.fam == cecon::GlmFamily::Poisson && ls.link == cecon::GlmLinkFn::Log);
+        // glm.ado's canonical pairs: gaussian/identity, igaussian/power(-2),
+        // poisson/log, nbinomial/nbinomial, binomial/logit, gamma/reciprocal
+        using F = cecon::GlmFamily;
+        using Lk = cecon::GlmLinkFn;
+        const bool canonical = (fs.fam == F::Gaussian && ls.link == Lk::Identity) ||
+                               (fs.fam == F::InverseGaussian && ls.link == Lk::PowerM2) ||
+                               (fs.fam == F::Poisson && ls.link == Lk::Log) ||
+                               (fs.fam == F::NegBinomial && ls.link == Lk::NegBin) ||
+                               (fs.fam == F::Bernoulli && ls.link == Lk::Logit) ||
+                               (fs.fam == F::Gamma && ls.link == Lk::Reciprocal);
         block["canonical"] = canonical ? 1.0 : 0.0;
-        block["vf"] = 1.0;
+        block["vf"] = vfactor;
         block["nbml"] = 0.0;
         block["k_eq"] = 1.0;
         block["k_eq_model"] = 0.0;
         block["k_dv"] = 1.0;
-        block["noconstant"] = 0.0;
-        block["consonly"] = spec.terms.empty() ? 1.0 : 0.0;
+        block["noconstant"] = spec.noconstant ? 1.0 : 0.0;
+        block["consonly"] = spec.terms.empty() && !spec.noconstant ? 1.0 : 0.0;
         double autoCns = 0.0;
         for (size_t i = 0; i < K; ++i) autoCns += d.estIndex[i] < 0 ? 1.0 : 0.0;
         block["k_autoCns"] = autoCns;
-        if (ls.power != ".") block["power"] = std::stod(ls.power);
+        if (ls.power != ".") block["power"] = ls.link == cecon::GlmLinkFn::Power || ls.link == cecon::GlmLinkFn::OPower
+                                                  ? ls.p : std::stod(ls.power);
         std::vector<int> slope;  // estimable columns other than the constant
         for (size_t i = 0; i < K; ++i)
             if (d.estIndex[i] >= 0 && d.names[i] != "_cons") slope.push_back(d.estIndex[i]);
         const int q = static_cast<int>(slope.size());
         const size_t ke = static_cast<size_t>(d.k);
-        if (q > 0 && r.V.size() == ke * ke && r.beta.size() == ke) {
+        if (q > 0 && Vml.size() == ke * ke && r.beta.size() == ke) {
             std::vector<double> Vs(static_cast<size_t>(q) * static_cast<size_t>(q)), bs(static_cast<size_t>(q));
             for (int a = 0; a < q; ++a) {
                 bs[static_cast<size_t>(a)] = r.beta[static_cast<size_t>(slope[static_cast<size_t>(a)])];
                 for (int c = 0; c < q; ++c)
                     Vs[static_cast<size_t>(a) * static_cast<size_t>(q) + static_cast<size_t>(c)] =
-                        r.V[static_cast<size_t>(slope[static_cast<size_t>(a)]) * ke +
+                        Vml[static_cast<size_t>(slope[static_cast<size_t>(a)]) * ke +
                             static_cast<size_t>(slope[static_cast<size_t>(c)])];
             }
             if (const auto w = waldQuadForm(Vs, bs, q)) {
@@ -1590,17 +1962,17 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     if (spec.ifExpr) lm.fitKeepif = *spec.ifExpr;
     if (!spec.weightVar.empty()) {
         lm.fitWeight = spec.weightVar;
-        lm.fitWtype = "aw";
+        lm.fitWtype = spec.wtype;
     }
     lm.result = block;
     // e(sample): the design's rows. Without if/in the design read the working
     // frame itself, so its rows are the head's (a filtered fit reads a projected
     // copy whose rows are not, and keeps e(sample) unavailable).
-    const bool filtered = (spec.ifExpr && !spec.ifExpr->empty()) || (spec.inRange && !spec.inRange->empty());
-    if (!filtered && session.datastore() != nullptr) {
+    // (a filtered fit maps its copy's rows back through the kept index column)
+    if (headRowsKnown && session.datastore() != nullptr) {
         std::vector<char> mask(static_cast<size_t>(session.datastore()->nRows()), 0);
         bool inRange = true;
-        for (int64_t r : d.rows) {
+        for (int64_t r : headRows) {
             if (r < 0 || static_cast<size_t>(r) >= mask.size()) inRange = false;
             else mask[static_cast<size_t>(r)] = 1;
         }
@@ -1631,16 +2003,25 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
     postNoted("varfunc", fs.varfunc);
     postNoted("linkf", ls.linkf);
     postNoted("varfuncf", fs.varfuncf);
-    postNoted("m", "1");
     if (ls.power == ".") postNoted("power", ".");
-    postNoted("hac_lag", std::to_string(d.n - 2));
+    postNoted("hac_lag", std::to_string(d.n - 2));  // rows, not the fweighted N (bank 14061316: 334)
+    if (spec.noconstant) postNoted("cons", "noconstant");
+    if (!scoreRaw.empty()) {
+        std::string nm = splitWs(scoreRaw)[0];
+        if (!nm.empty() && nm.back() == '*') nm = nm.substr(0, nm.size() - 1) + "1";
+        postNoted("scorevars", nm);
+    }
+    postNoted("m", fs.mText);
+    if (fs.mText != "1") postNoted("marginsprop", "atslow");  // glm.ado: m other than 1
+    if (!scaleMsg.empty()) postNoted("msg", scaleMsg);
     postNoted("opt1", "ML");
     postNoted("oim", "oim");
     postNoted("chi2type", "Wald");
     postNoted("crittype", clustered ? "log pseudolikelihood" : "log likelihood");
     postNoted("ml_method", "e2");
     postNoted("user", "glim_lf");
-    postNoted("singularHmethod", "m-marquardt");
+    // `difficult` switches ml's nonconcave stepping to the hybrid method
+    postNoted("singularHmethod", difficultOpt ? "hybrid" : "m-marquardt");
     postNoted("which", "max");
     postNoted("deriv_useminbound", "off");
     if (!spec.offsetVar.empty())
@@ -1740,6 +2121,7 @@ ojson runGlm(const eval::ParsedCommand& parsed, SessionState& session) {
         block["coef_metric"] = "eform";
     }
     blocks.push_back(block);
+    if (!scaleMsg.empty()) blocks.push_back(displayBlock("(Standard errors scaled using " + scaleMsg + ".)"));
     if (!r.converged) blocks.push_back(displayBlock("Warning: Convergence not achieved."));
     return blocks;
 }
@@ -1760,6 +2142,11 @@ ojson runGlmMargins(const eval::ParsedCommand& parsed, SessionState& session) {
     const LastModel lm = *lmOpt;
     const ojson& gm = (*lm.result)["glm_model"];
     const ModelSpec spec = specFromJson(gm);
+    // margins differentiates the four links it was built on (glm_mean); the other
+    // links, the binomial with a denominator and the inverse Gaussian keep a refusal
+    if (gm.value("link", 0) > static_cast<int>(cecon::GlmLinkFn::Probit) || !spec.mVar.empty() ||
+        spec.mConst != 1.0 || gm.value("family", 0) > static_cast<int>(cecon::GlmFamily::NegBinomial))
+        return ojson(eval::refusedCommand("margins", "glm_margins_link"));
     bool interacted = false;
     for (const auto& t : spec.terms) interacted = interacted || !t.atoms.empty();
     bool hasDydx = false, hasAt = false, atmeans = false;

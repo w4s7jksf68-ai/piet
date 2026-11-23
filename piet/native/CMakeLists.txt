@@ -101,6 +101,9 @@ set_source_files_properties(
   # Mata invsym(): StataBE's invsym() rounds every product and difference
   # separately; its %21x bits match unfused arithmetic and not FMA.
   src/matrix/mata_subset.cpp
+  # matrix symeigen/svd: an eigenvector element that cancels to ~1e-16 keeps the
+  # sign StataBE prints (vs-stata bank ed2c6a3b `0.00000`) only unfused.
+  src/matrix/matrix_subcommands.cpp
   # ml (moptimize lf): StataBE's gradient, Hessian and step arithmetic match
   # separately rounded products and sums, never FMA (scratch-r150/ml_tail).
   src/estimation/ml_estimation.cpp
@@ -568,6 +571,7 @@ add_library(piet_core OBJECT
   src/datamgmt/astile.cpp
   src/datamgmt/column_write_support.cpp
   src/matrix/matrix_sort_select.cpp
+  src/matrix/matrix_subcommands.cpp
   # vs-stata bank (2026-11-11): programmer list parsers and the .dta format probe.
   src/datamgmt/list_parsing_commands.cpp
   src/fileio/dta_version.cpp
@@ -611,6 +615,7 @@ add_executable(piet_selftest src/selftest.cpp
   src/selftest_support.cpp
   src/selftest_bridge_transport.cpp
   src/selftest_bridge_routes.cpp
+  src/selftest_language_hand_scans.cpp
   src/selftest_data_storage.cpp
   src/selftest_startup_and_paths.cpp
   src/selftest_language_values.cpp
@@ -775,9 +780,9 @@ target_link_libraries(piet_settings INTERFACE Iconv::Iconv)
 # — the RC strings, the manifest assemblyIdentity, and the Inno installer's
 # AppVersion all trace back to PIET_VERSION_VALUE here. Editing these three
 # lines is still the one and only version bump.
-set(PIET_VERSION_VALUE    "A.1.1")
-set(PIET_CONTRACT_A_VALUE "1.27.0")
-set(PIET_CONTRACT_B_VALUE "2.11.0")
+set(PIET_VERSION_VALUE    "A.2.0")
+set(PIET_CONTRACT_A_VALUE "1.28.0")
+set(PIET_CONTRACT_B_VALUE "2.12.0")
 target_compile_definitions(piet_settings INTERFACE
   PIET_VERSION_STRING="${PIET_VERSION_VALUE}"
   PIET_CONTRACT_A_VERSION="${PIET_CONTRACT_A_VALUE}"

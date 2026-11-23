@@ -71,6 +71,8 @@ nlohmann::ordered_json runXtset(const std::string& ivar, const std::optional<std
 // `tsfill [, full]` (BUG-897: varlist/if/in are tsfill.ado's r(101); `full`
 // forwards cobra tsfill --full).
 nlohmann::ordered_json runTsfill(const eval::ParsedCommand& parsed, SessionState& session);
+// `tsreport [if] [in] [, detail panel nopanel]`: the sample periods and the gaps in it.
+nlohmann::ordered_json runTsreport(const eval::ParsedCommand& parsed, SessionState& session);
 
 // tsset's delta phrase ("1 unit", "2 quarters", the %tc breakdown); defined in
 // time/time_panel_state.cpp beside the tsset/xtset arm that prints it too.

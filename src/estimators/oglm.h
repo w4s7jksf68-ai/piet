@@ -39,6 +39,7 @@
 
 #include "core/distributions.h"
 #include "core/linalg.h"
+#include "estimators/ml_constraints.h"
 
 namespace cecon {
 
@@ -237,7 +238,7 @@ inline std::vector<double> ord_categories(const double* y, int64_t n, std::vecto
 // whether or not it has converged, and `converged` then reports false.
 inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, int J, OrdLink link,
                            int max_iter = 300, const double* wt = nullptr,
-                           const double* off = nullptr) {
+                           const double* off = nullptr, const MlCns* cns = nullptr) {
     OglmResult r;
     r.n = n;
     r.n_cats = J;
@@ -276,13 +277,16 @@ inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, in
                 (link == OrdLink::Logit) ? std::log(cum / (1.0 - cum)) : ogl::norm_ppf(cum);
         }
     }
+    // constraints(): the start projected onto R·θ = r (ml_constraints.h)
+    if (cns != nullptr) ml_cns_project(*cns, theta);
 
     // ml's Newton-Raphson (header comment). `V` holds inv(−H) at `theta`.
     std::vector<double> grad(static_cast<size_t>(np)), V, step(static_cast<size_t>(np));
     auto evaluate = [&](const std::vector<double>& th, std::vector<double>& g, std::vector<double>& Vinv) {
         const double LL = ogl::ll_grad(X, n, k, cat, J, link, th, &g, nullptr, wt, off);
         ogl::neg_hessian(X, n, k, cat, J, link, th, Vinv, wt, off);
-        return la::spd_inverse(Vinv.data(), np) == 0 ? LL : std::nan("");
+        const int info = cns != nullptr ? ml_cns_inverse(*cns, Vinv.data()) : la::spd_inverse(Vinv.data(), np);
+        return info == 0 ? LL : std::nan("");
     };
     auto llat = [&](const std::vector<double>& th) { return ogl::ll_grad(X, n, k, cat, J, link, th, nullptr, nullptr, wt, off); };
     double LL = evaluate(theta, grad, V);
@@ -336,6 +340,7 @@ inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, in
     r.ll = LL;
     r.vcov = V;
     r.gradient = grad;
+    if (cns != nullptr) ml_cns_project_gradient(*cns, r.gradient);
     r.beta.assign(theta.begin(), theta.begin() + k);
     r.cuts.assign(theta.begin() + k, theta.end());
     r.se.resize(static_cast<size_t>(k));

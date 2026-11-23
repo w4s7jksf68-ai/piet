@@ -1231,19 +1231,27 @@ void testBS097OptionNetAndBS018DoNostop() {
           "BS-097 hausman over-rejection guard: plain `hausman A B` (D5e oracle shape) still "
           "succeeds");
 
-    // BUG-105 secondary ⑤: `tconsistent()` is real Stata `hausman` syntax ([R]
+    // BUG-105 secondary ⑤: `syminv` is real Stata `hausman` syntax ([R]
     // hausman) this handler doesn't implement — distinct wording from the
     // `bogusopt` typo case just above, same "not allowed" code both ways.
     // (`alleqs`, the option this arm used to name, is served since stage-3 lane
-    // s3b_post: vs-stata bank b479e666 `hausman tsls tsls3, alleqs` rc 0.)
-    auto rejReal = piet::dispatch("hausman feHausBS097 reHausBS097, tconsistent(FixedFX)", session);
+    // s3b_post: vs-stata bank b479e666 `hausman tsls tsls3, alleqs` rc 0;
+    // `tconsistent()`, its successor here, since stage-4 lane s4_post: bank
+    // 30280271c2143616 `hausman fe re, tcon(FixedFX)` rc 0, the title drawn.)
+    {
+      auto served = piet::dispatch("hausman feHausBS097 reHausBS097, tconsistent(FixedFX)", session);
+      check(firstBlockOfType(served, "error").is_null() &&
+                firstBlockOfType(served, "estimation").value("b_title", std::string()) == "FixedFX",
+            "hausman tconsistent(): answered, the (b) column titled FixedFX (bank 30280271c2143616)");
+    }
+    auto rejReal = piet::dispatch("hausman feHausBS097 reHausBS097, syminv", session);
     auto realErr = firstBlockOfType(rejReal, "error");
     check(!realErr.is_null() &&
               realErr.value("code", std::string()) == "unsupported_option" &&
               realErr.value("message", std::string())
                       .find("is a valid Stata option that this version of PIET does not yet "
                             "implement") != std::string::npos,
-          "BUG-105 secondary ⑤: hausman's `tconsistent()` (a real Stata option this build doesn't "
+          "BUG-105 secondary ⑤: hausman's `syminv` (a real Stata option this build doesn't "
           "implement) is named as such, not lumped with a bogus typo");
   }
 
@@ -1632,7 +1640,7 @@ void testC3BS037Tempvar() {
         "C3/BS-037: `tempvar tv` no longer trips the macro-reference tripwire (was \"Macro "
         "reference `tempvar` detected\")");
   std::string minted = session.eval.locals.get("tv", "");
-  check(!minted.empty(), "C3/BS-037: `tv' resolves to a non-empty minted name");
+  check(minted == "__000000", "C3/BS-037: the first tempvar is __000000");
   check(minted.size() >= 2 && minted[0] == '_' && minted[1] == '_',
         "C3/BS-037: the minted name follows Stata's own __NNNNNN pattern, got: " + minted);
 
@@ -1659,6 +1667,29 @@ void testC3BS037Tempvar() {
   std::string mintedB = session.eval.locals.get("tvb", "");
   check(!mintedA.empty() && !mintedB.empty() && mintedA != mintedB,
         "C3/BS-037: two tempvar names in one call mint two DISTINCT names");
+
+  fs::create_directories(workdir + "/frames", ec);
+  piet::SessionState frames(workdir + "/frames");
+  const std::string frameScript = R"piet(
+set obs 1
+frame create work
+frame work: set obs 1
+frame work: generate __000000 = 17
+program define temporary_frame
+    tempvar x
+    generate `x' = 5
+    frame rename default renamed
+    frame change work
+end
+temporary_frame
+assert __000000 == 17
+frame change renamed
+capture confirm variable __000000
+assert _rc == 111
+)piet";
+  const auto frameResult = piet::doexec::executeDoSource(frameScript, frames, piet::dispatch);
+  check(!frameResult.stoppedAtReason && frames.currentFrame == "renamed",
+        "tempvar cleanup follows its frame through rename and preserves a same-named column elsewhere");
 
   fs::remove_all(workdir, ec);
 }

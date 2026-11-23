@@ -1882,6 +1882,14 @@ Frame Frame::expand(int64_t n, int64_t* n_added_out) const {
     return take_rows(*this, idx);
 }
 
+Frame Frame::take(const std::vector<int64_t>& idx) const {
+    for (int64_t i : idx)
+        if (i < 0 || i >= n_)
+            throw EngineError("bad_input", "take: row index " + std::to_string(i + 1) +
+                                               " is outside 1.." + std::to_string(n_));
+    return take_rows(*this, idx);
+}
+
 Frame Frame::fillin(const std::vector<std::string>& varlist, int64_t* n_added_out) const {
     if (varlist.empty()) throw EngineError("bad_input", "fillin: variable list required");
     for (const auto& v : varlist)

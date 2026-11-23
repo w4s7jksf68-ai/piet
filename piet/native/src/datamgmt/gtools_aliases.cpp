@@ -64,6 +64,8 @@
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
 #include "piet/strutil.h"
+#include "engine/scratch_columns.h"
+#include "piet/eval/exprfns.h"
 #include "gtools_internal.h"
 
 namespace piet::handlers {
@@ -182,16 +184,18 @@ const std::unordered_map<std::string, AliasPolicy>& aliasPolicies() {
     // collapse arm, which reads neither but answers either given an argument
     // r(198), as gtools does (BUG-1100, StataBE 19.5: `option fast()
     // incorrectly specified`, `option verbose() incorrectly specified`).
+    // labelformat() reaches the collapse arm, which labels the results with it
+    // (gcollapse's label engine; vs-stata bank 628d43b71ed36933).
     const AliasPolicy collapseLike{
         "collapse",
         {"by", "cw"},
         {},
-        {"fast", "verbose"},
+        {"fast", "verbose", "labelformat"},
         {},
         // How gtools hashes and what it does on a collision change nothing in the result.
         {"hashmethod", "oncollision", "forcestrl"},
         {},
-        {"merge", "labelformat", "labelprogram", "freq", "rawstat", "unsorted", "missing",
+        {"merge", "labelprogram", "freq", "rawstat", "unsorted", "missing",
          "wild", "sumcheck", "double", "pool", "register"}};
     t.emplace("gcollapse", collapseLike);
     // fcollapse (ftools, fcollapse) is its own row (BUG-1100): `fast`
@@ -215,6 +219,9 @@ const std::unordered_map<std::string, AliasPolicy>& aliasPolicies() {
 
     // gegen -> egen. `replace` overwrites an existing target, `counts`/`fill`
     // change what is computed; none of the three is a speed knob.
+    // replace, counts() and fill() are read by runEgen for gegen, spelled in
+    // full only, so they are in no list here: a shorter spelling reaches the
+    // egen net unresolved and is r(198), as gtools answers it.
     t.emplace("gegen", AliasPolicy{"egen",
                                    {"by", "missing", "p"},
                                    {},
@@ -222,15 +229,20 @@ const std::unordered_map<std::string, AliasPolicy>& aliasPolicies() {
                                    {},
                                    {},
                                    {},
-                                   {"replace", "counts", "fill"}});
+                                   {}});
 
+    // gduplicates.ado: `drop varlist` needs force, as duplicates does (it is
+    // passed through, not dropped); tag's Generate() abbreviates to one letter
+    // (`g(t)`, `ge(t)`); `sorted` asks list/examples for the sorted listing,
+    // which is the one this build draws for duplicates (vs-stata bank
+    // ceb5cf0868a4cb96, bdd944a645179994, 45835ae6df51dc45).
     t.emplace("gduplicates", AliasPolicy{"duplicates",
-                                         {"gen", "generate"},
+                                         {"gen", "generate", "force"},
                                          {},
                                          {},
                                          {},
-                                         {"force"},
-                                         {},
+                                         {"sorted"},
+                                         {{"g", "generate"}, {"ge", "generate"}},
                                          {}});
 
     // glevelsof -> levelsof. `numfmt` changes how each level is SPELLED in the
@@ -240,18 +252,22 @@ const std::unordered_map<std::string, AliasPolicy>& aliasPolicies() {
     // colseparate() and silent are glevelsof's own and are read by the levelsof
     // arm when the typed command is glevelsof (runLevelsofCommand): silent is not
     // a speed knob, it suppresses the level line.
+    // numfmt() and nolocalvar are read by the levelsof arm; `c` is glevelsof's
+    // Clean at its one-letter minimum (vs-stata bank 8ce07f5a3cfe2c70).
+    // unsorted (hash order) and gen() stay refused by name.
     t.emplace("glevelsof", AliasPolicy{"levelsof",
                                        {"local", "clean", "missing", "separate"},
                                        {},
-                                       {"colseparate", "silent"},
+                                       {"colseparate", "silent", "numfmt", "nolocalvar"},
                                        {},
                                        {},
-                                       {},
-                                       {"numfmt", "unsorted", "gen"}});
+                                       {{"c", "clean"}},
+                                       {"unsorted", "gen"}});
 
     // gisid -> isid. `missok` makes missing values legal keys, which is the
     // difference between "this is an id" and "this is not".
-    t.emplace("gisid", AliasPolicy{"isid", {}, {}, {}, {}, {"fast"}, {}, {"missok"}});
+    // missok is isid's own (served since stage 4; vs-stata bank d265377a3d3a526b).
+    t.emplace("gisid", AliasPolicy{"isid", {"missok"}, {}, {}, {}, {"fast"}, {}, {}});
 
     // greshape -> reshape. by()/keys() are i()/j() under different names.
     // `dropmiss` silently deletes rows reshape would have kept.
@@ -290,16 +306,22 @@ const std::unordered_map<std::string, AliasPolicy>& aliasPolicies() {
     // from somewhere other than the data, genp/binfreq/minmax create extra
     // variables, method picks a different algorithm, replace overwrites, and
     // dedup drops duplicate cutpoints so the bin COUNT stops matching nq.
+    //
+    // Stage 4 (vs-stata bank): every one of those is now computed by
+    // runGQuantilesExtended (gquantiles_pctile.cpp), which owns the line
+    // whenever one of them is given; only cutby and xmissing stay refused.
     t.emplace("gquantiles",
               AliasPolicy{"xtile",
                           {"nquantiles", "cutpoints"},
-                          {"altdef"},
-                          {"percentiles", "xtile", "_pctile", "pctile", "n", "nq"},
                           {},
-                          {"strict"},
+                          {"percentiles", "xtile", "_pctile", "pctile", "n", "nq", "altdef", "by",
+                           "quantiles", "cutoffs", "cutquantiles", "genp", "binfreq", "method",
+                           "replace", "dedup", "minmax", "strict", "returnlimit", "cutifin",
+                           "groupid"},
+                          {"cutby", "xmissing"},
+                          {},
                           {{"n", "nquantiles"}, {"nq", "nquantiles"}},
-                          {"by", "altdef", "cutpoints", "quantiles", "cutoffs", "cutquantiles",
-                           "genp", "binfreq", "method", "replace", "dedup", "minmax"}});
+                          {}});
 
     // gstats is NOT an alias: it is a multiplex over two different native
     // handlers plus a set of refused sub-commands, and it keeps its own name all
@@ -520,7 +542,19 @@ GtoolsTranslation translateGtoolsAlias(const eval::ParsedCommand& parsed,
   // native xtile arm's reject net knows nothing about a bare `xtile` option and
   // would answer r(198) for it. The _pctile/pctile forms keep it, because it is
   // the only thing that tells runGQuantilesPctile which of the two it is.
-  const bool stripMode = (canonical == "gquantiles" && mode.mode == "xtile");
+  // gquantiles' own options (cutpoints(), by(), binfreq, ...) and the form
+  // without a new variable are computed by the gquantiles arm itself, so the
+  // xtile line keeps its name and its mode word; only the plain
+  // `newvar = exp, xtile [nquantiles(#)] [weight]` form folds onto xtile.
+  bool gquantilesOwnForm = false;
+  if (canonical == "gquantiles" && mode.mode == "xtile") {
+    gquantilesOwnForm = gquantilesNeedsExtended(parsed);
+    std::string head0;
+    for (size_t i = 0; i < parsed.varlist.size(); ++i)
+      if (!(mode.fromVarlist && i == mode.varlistIndex)) head0 += parsed.varlist[i];
+    if (head0.find('=') == std::string::npos) gquantilesOwnForm = true;
+  }
+  const bool stripMode = (canonical == "gquantiles" && mode.mode == "xtile" && !gquantilesOwnForm);
 
   std::vector<std::pair<std::string, eval::OptValue>> translated;
   translated.reserve(parsed.opts.size());
@@ -572,7 +606,7 @@ GtoolsTranslation translateGtoolsAlias(const eval::ParsedCommand& parsed,
     }
   }
   if (canonical == "gquantiles") {
-    if (mode.mode == "xtile") {
+    if (mode.mode == "xtile" && !gquantilesOwnForm) {
       out.canonical = "xtile";
       native = "xtile";
       // BUG-370, stated as a rule rather than a fix: the handler owns the
@@ -635,6 +669,187 @@ GtoolsTranslation translateGtoolsAlias(const eval::ParsedCommand& parsed,
   out.parsed.opts = std::move(translated);
   out.parsed.raw = std::move(raw);
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// (3) gisid: the sample check under if/in, and the r() gtools leaves.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct GisidRows {
+  std::vector<std::string> vars;
+  std::vector<int64_t> rows;                    // the sample, in data order
+  std::vector<std::vector<double>> numeric;    // per var (empty for a string var)
+  std::vector<std::vector<std::string>> text;  // per var (empty for a numeric var)
+};
+
+std::optional<ojson> readGisidRows(const eval::ParsedCommand& parsed, SessionState& session,
+                                   GisidRows* out) {
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return ojson(eval::noDataLoaded());
+  for (const auto& v : parsed.varlist) {
+    if (!ds->has(v)) return gtErr("variable " + v + " not found");
+    out->vars.push_back(v);
+  }
+  const int64_t n = ds->nRows();
+  std::vector<char> keep(static_cast<size_t>(n), 1);
+  std::string qualifier;
+  if (parsed.ifExpr.has_value() && !strutil::trim(*parsed.ifExpr).empty())
+    qualifier += " if " + *parsed.ifExpr;
+  if (parsed.inRange.has_value() && !strutil::trim(*parsed.inRange).empty())
+    qualifier += " in " + *parsed.inRange;
+  if (!qualifier.empty()) {
+    ScratchColumns scratch(session);
+    std::string col;
+    if (auto failed = scratch.add("1", qualifier, &col)) return failed;
+    const std::vector<double> mark = scratch.values(col);
+    for (int64_t i = 0; i < n; ++i) keep[static_cast<size_t>(i)] = std::isnan(mark[static_cast<size_t>(i)]) ? 0 : 1;
+  }
+  ds = session.datastore();
+  for (int64_t i = 0; i < n; ++i)
+    if (keep[static_cast<size_t>(i)]) out->rows.push_back(i);
+  for (const auto& v : out->vars) {
+    const cecon::Column& c = ds->col(v);
+    out->numeric.emplace_back();
+    out->text.emplace_back();
+    if (c.dtype == cecon::DType::Factor) {
+      const int32_t* codes = c.codes();
+      for (int64_t r : out->rows) {
+        const int32_t code = codes[r];
+        out->text.back().push_back(code >= 0 && static_cast<size_t>(code) < c.levels.size()
+                                       ? c.levels[static_cast<size_t>(code)]
+                                       : std::string());
+      }
+    } else {
+      const double* x = c.f64();
+      for (int64_t r : out->rows) {
+        double v2 = x[r];
+        if (std::isnan(v2)) v2 = eval::kStataMissingSentinel;
+        out->numeric.back().push_back(v2);
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Row a sorts before row b (numbers ascending, missing values after them in
+// their own order; strings by bytes).
+int compareGisidRows(const GisidRows& g, size_t a, size_t b) {
+  for (size_t k = 0; k < g.vars.size(); ++k) {
+    if (!g.text[k].empty()) {
+      const int c = g.text[k][a].compare(g.text[k][b]);
+      if (c != 0) return c < 0 ? -1 : 1;
+    } else {
+      const double x = g.numeric[k][a], y = g.numeric[k][b];
+      if (x != y) return x < y ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+std::string joinNames(const std::vector<std::string>& names) {
+  std::string out;
+  for (const auto& n : names) out += (out.empty() ? "" : " ") + n;
+  return out;
+}
+
+}  // namespace
+
+ojson runGisidSample(const eval::ParsedCommand& parsed, SessionState& session, bool missok) {
+  GisidRows g;
+  if (auto failed = readGisidRows(parsed, session, &g)) return *failed;
+  const std::string names = joinNames(g.vars);
+  const bool plural = g.vars.size() > 1;
+  if (!missok) {
+    for (size_t k = 0; k < g.vars.size(); ++k)
+      for (size_t i = 0; i < g.rows.size(); ++i) {
+        const bool miss = g.text[k].empty() ? g.numeric[k][i] >= eval::kStataMissingSentinel
+                                            : g.text[k][i].empty();
+        if (miss)
+          return ojson(eval::errorBlock("engine_error",
+                                        std::string(plural ? "variables " : "variable ") + names +
+                                            " should never be missing",
+                                        std::nullopt, std::nullopt, std::nullopt, "r(459)"));
+      }
+  }
+  std::vector<size_t> order(g.rows.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](size_t a, size_t b) { return compareGisidRows(g, a, b) < 0; });
+  for (size_t i = 1; i < order.size(); ++i)
+    if (compareGisidRows(g, order[i - 1], order[i]) == 0)
+      return ojson(eval::errorBlock("engine_error",
+                                    std::string(plural ? "variables " : "variable ") + names +
+                                        (plural ? " do" : " does") +
+                                        " not uniquely identify the observations",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(459)"));
+  return ojson::array();
+}
+
+// What gtools' internal parser and hash leave in r() after a gisid that
+// succeeds (vs-stata bank c9df1aaeb562fb66, 84b7bac6b4c6696f, 232c15ccdc47a202):
+// the variable counts by kind, the variable lists by kind, a 1 x k zero
+// r(invert), and r(N)/r(J)/r(minJ)/r(maxJ) for the sample -- all four missing
+// when the sample rows are already in key order (gtools then checks the order
+// instead of hashing).
+void gisidPublishResults(const eval::ParsedCommand& parsed, SessionState& session) {
+  GisidRows g;
+  if (readGisidRows(parsed, session, &g)) return;
+  std::vector<std::string> numeric, strings;
+  double kint = 0.0, kstrL = 0.0;
+  for (size_t k = 0; k < g.vars.size(); ++k) {
+    auto it = session.varMeta.find(g.vars[k]);
+    const std::string type = it != session.varMeta.end() && it->second.stataType.has_value()
+                                 ? *it->second.stataType
+                                 : std::string();
+    if (g.text[k].empty() && session.datastore()->dtype(g.vars[k]) == "f64") {
+      numeric.push_back(g.vars[k]);
+      if (type == "byte" || type == "int" || type == "long") kint += 1.0;
+    } else {
+      strings.push_back(g.vars[k]);
+      if (type == "strL") kstrL += 1.0;
+    }
+  }
+  bool sorted = true;
+  for (size_t i = 1; i < g.rows.size() && sorted; ++i)
+    if (compareGisidRows(g, i - 1, i) > 0) sorted = false;
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  const double nObs = sorted ? kNaN : static_cast<double>(g.rows.size());
+  const double one = sorted ? kNaN : 1.0;
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted = {"N", "J", "minJ", "maxJ", "kvar", "knum", "kint", "kstr",
+                                     "kstrL", "byvars", "invert"};
+  session.eval.rValues.set("N", nObs);
+  session.eval.rValues.set("J", nObs);
+  session.eval.rValues.set("minJ", one);
+  session.eval.rValues.set("maxJ", one);
+  session.eval.rValues.set("kvar", static_cast<double>(g.vars.size()));
+  session.eval.rValues.set("knum", static_cast<double>(numeric.size()));
+  session.eval.rValues.set("kint", kint);
+  session.eval.rValues.set("kstr", static_cast<double>(strings.size()));
+  session.eval.rValues.set("kstrL", kstrL);
+  session.eval.rStrings.set("byvars", joinNames(g.vars));
+  if (!numeric.empty()) {
+    session.eval.rStrings.set("bynum", joinNames(numeric));
+    posted.push_back("bynum");
+  }
+  if (!strings.empty()) {
+    session.eval.rStrings.set("bystr", joinNames(strings));
+    posted.push_back("bystr");
+  }
+  eval::EvalMatrix m;
+  m.data.push_back(std::vector<double>(g.vars.size(), 0.0));
+  m.rownames.push_back("r1");
+  for (size_t k = 0; k < g.vars.size(); ++k) m.colnames.push_back("c" + std::to_string(k + 1));
+  m.gen = eval::nextStoreGeneration();
+  for (auto it = session.eval.rMatrices.begin(); it != session.eval.rMatrices.end(); ++it)
+    if (it->first == "invert") {
+      session.eval.rMatrices.erase(it);
+      break;
+    }
+  session.eval.rMatrices.emplace_back("invert", std::move(m));
+  eval::declareRPosted(session.eval, "gisid", posted);
 }
 
 }  // namespace piet::handlers

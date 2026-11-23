@@ -29,7 +29,7 @@ ojson mutationResult(SessionState& session, const std::string& action,
   // (virtual) head. Returns nullopt (falls through to the real rebuild) for
   // a structural change, a §25-only engine, or any non-dispatch call path.
   if (auto resident = session.tryResidentMutationCard(action, newVars, droppedVars, rewrittenVars))
-    return *resident;
+    return std::move(*resident);  // the card, moved out rather than copied
 
   // MUTRES-WIRE (2026-08-22). The fold declined, and the ONLY reason the code
   // below opens a Datastore is to read metadata — the column list, its types,

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -87,34 +88,66 @@ nlohmann::ordered_json runJoinby(const std::vector<std::string>& keylist,
                                   const std::string& usingPathArg, SessionState& session,
                                   const std::string& unmatched = "none",
                                   const std::optional<std::string>& mergeVar = std::nullopt,
-                                  bool nolabel = false);
+                                  bool nolabel = false, bool update = false,
+                                  bool replace = false);
 
 // -- frames (P6 wave, frames.cpp) ----------------------------------
 // Stata `frame`s: additional named datasets beside the current one. A PIET
 // session concept only — each frame is one hbin in the session workdir, and
 // every operation is expressed with engine verbs that already exist (eval,
 // merge, rename), so no contract surface moves. See frames.cpp's
-// header comment for the design and the deliberate scope limits (the current
-// frame is always `default`; frame create/change/pwf are honest rejects).
+// header comment for the design.
 nlohmann::ordered_json runFramePut(const std::vector<std::string>& varlist,
                                    const std::optional<std::string>& ifExpr,
-                                   const std::string& into, SessionState& session);
+                                   const std::string& into, SessionState& session,
+                                   const std::optional<std::string>& inRange = std::nullopt);
+// vs-stata stage 4: the current frame is a session state (SessionState::
+// currentFrame); these are Stata's other `frame` subcommands over it.
+nlohmann::ordered_json runFrameCreate(const std::string& name,
+                                      const std::vector<std::string>& newvars,
+                                      SessionState& session);
+nlohmann::ordered_json runFrameChange(const std::string& name, SessionState& session);
+nlohmann::ordered_json runFramePwf(SessionState& session);
+nlohmann::ordered_json runFrameDir(SessionState& session);
+nlohmann::ordered_json runFrameRename(const std::string& oldName, const std::string& newName,
+                                      SessionState& session);
+nlohmann::ordered_json runFrameCopy(const std::string& from, const std::string& to, bool replace,
+                                    SessionState& session);
+nlohmann::ordered_json runFramePost(const std::string& name, const std::vector<std::string>& exprs,
+                                    SessionState& session);
+nlohmann::ordered_json runFramePutlabel(const std::vector<std::string>& lblnames,
+                                        const std::string& into, SessionState& session);
+nlohmann::ordered_json runFramesDescribe(const std::string& args, SessionState& session);
 nlohmann::ordered_json runFrameDrop(const std::string& name, SessionState& session);
 // `frame NAME: CMD` — runs CMD with NAME as the current dataset, then restores.
 // Mutations persist into the frame, as they do in Stata.
 nlohmann::ordered_json runFramePrefix(const std::string& name, const std::string& innerCmd,
                                       SessionState& session);
+// Runs `fn` with the existing frame NAME current (the `frame change`
+// primitives: park the current frame, adopt NAME), then makes the original
+// frame current again. fn's result, or the error that kept the switch from
+// happening. The preserve unwinder restores another frame's copy with it.
+nlohmann::ordered_json runWithFrameCurrent(const std::string& name, SessionState& session,
+                                           const std::function<nlohmann::ordered_json()>& fn);
 // `frlink m:1|1:1 KEY..., frame(F) generate(G)` — G holds each row's matching
 // observation number in F (missing when unmatched), computed as an m:1 merge
 // against a helper carrying F's row index.
 nlohmann::ordered_json runFrlink(const std::string& linkType,
                                  const std::vector<std::string>& keylist,
                                  const std::string& frameName, const std::string& genName,
-                                 SessionState& session);
+                                 SessionState& session,
+                                 const std::vector<std::string>& keys2 = {},
+                                 const std::string& cmdText = std::string());
+// `frlink dir`, `frlink describe VAR`, `frlink rebuild VAR`.
+nlohmann::ordered_json runFrlinkSub(const std::string& sub, const std::string& var,
+                                    SessionState& session);
 // `frget NEW=VAR [...], from(LINKVAR)` — copies variables out of the frame the
 // link points into, matched through the link.
-nlohmann::ordered_json runFrget(const std::vector<std::pair<std::string, std::string>>& renames,
-                                const std::string& fromLink, SessionState& session);
+nlohmann::ordered_json runFrget(const std::vector<std::string>& srcTokens,
+                                const std::string& renameTo, const std::string& fromLink,
+                                const std::string& prefix, const std::string& suffix,
+                                const std::vector<std::string>& excludeTokens,
+                                SessionState& session);
 
 }  // namespace piet::handlers
 

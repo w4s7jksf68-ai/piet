@@ -23,6 +23,8 @@
 #include "piet/eval/errors.h"
 #include "piet/eval/macros.h"        // hasMacroRefs, tryCaptureDefinition
 #include "piet/eval/pyvalue.h"       // pythonFloatRepr: a round-trippable number for $S_3/$S_6/$S_7
+#include "eval/macro_results_internal.h"  // resolveEScalar (pre-8 lrtest)
+#include "estimation/estimator_command_support.h"  // invsym (pre-8 lrtest: rank of e(V))
 #include "piet/eval/session.h"       // replaceRClass
 #include "piet/eval/tokenizer.h"
 #include "piet/handlers/postestimation.h"
@@ -355,6 +357,145 @@ bool lrSpecTokens(const std::string& text, std::vector<std::string>& toks, bool&
 
 }  // namespace
 
+namespace {
+
+// lrtest under version < 8 (lrtest.ado hands a caller below 8 to its pre-8
+// implementation): models are kept as the global $LRTS<name> = "cmd N ll df
+// vcetype" by `saving(name)` (a name of at most 4 characters); `model(name)` is the
+// restricted model (default: the current results, df = rank of e(V)) and
+// `using(name)` the unrestricted one (default 0). r(df) = df(#) or the difference
+// of the two ranks, r(chi2) = -2*(ll_restricted - ll_unrestricted), r(p) its upper
+// chi2 tail (missing at df 0), also as $S_3 / $S_6 / $S_7. StataBE 19.5 bank
+// 2d19ffb4 `version 6: lrtest, saving(0)` / `logit foreign mpg` / `version 6:
+// lrtest, model(0)` (both models the saved one: chi2(0) 0, p .), 5e961e9b
+// `using(0)` and cccc06a9 `saving(full)` .. `using(full)` (chi2(1) 24.226967765).
+ojson runLrtest7(const eval::ParsedCommand& parsed, SessionState& session) {
+  std::string saving, usingName, model;
+  bool force = false;
+  std::optional<double> dfOpt;
+  for (const auto& [k0, v] : parsed.opts) {
+    const std::string k = strutil::lower(k0);
+    auto is = [&k](const char* full, size_t mn) {
+      return k.size() >= mn && std::string(full).compare(0, k.size(), k) == 0;
+    };
+    const std::string val = v.isBool ? std::string() : strutil::trim(v.strValue);
+    if (is("saving", 1)) saving = val;
+    else if (is("using", 1)) usingName = val;
+    else if (is("model", 1)) model = val;
+    else if (is("force", 5)) force = true;
+    else if (is("df", 1)) {
+      char* end = nullptr;
+      const double d = std::strtod(val.c_str(), &end);
+      if (val.empty() || end == nullptr || *end != '\0') return envError("option df() incorrectly specified", 198);
+      if (d != -9) dfOpt = d;
+    } else {
+      return envError("option " + k0 + " not allowed", 198);
+    }
+  }
+  struct Info {
+    std::string cmd, vcet;
+    double nobs = 0, ll = 0, df = 0;
+  };
+  auto globalOf = [&session](const std::string& n) {
+    const std::string* g = session.eval.globals.find("LRTS" + n);
+    return g != nullptr ? *g : std::string();
+  };
+  auto parseInfo = [](const std::string& text, Info& out) {
+    std::istringstream in(text);
+    std::string nobs, ll, df;
+    in >> out.cmd >> nobs >> ll >> df;
+    std::getline(in, out.vcet);
+    out.vcet = strutil::trim(out.vcet);
+    char* e1 = nullptr;
+    char* e2 = nullptr;
+    char* e3p = nullptr;
+    out.nobs = std::strtod(nobs.c_str(), &e1);
+    out.ll = std::strtod(ll.c_str(), &e2);
+    out.df = std::strtod(df.c_str(), &e3p);
+    return !out.cmd.empty() && *e1 == '\0' && *e2 == '\0' && *e3p == '\0' && !nobs.empty() && !ll.empty() &&
+           !df.empty();
+  };
+  auto eNum = [&session](const char* name) {
+    const std::string t = strutil::trim(eval::macro_detail::resolveEScalar(name, session.eval));
+    char* end = nullptr;
+    const double v = std::strtod(t.c_str(), &end);
+    return (!t.empty() && t[0] != '.' && end != nullptr && *end == '\0') ? v
+                                                                           : std::numeric_limits<double>::quiet_NaN();
+  };
+  Info cur;  // the restricted model
+  if (model.empty()) {
+    const std::string vcetype = session.eval.eStrings.get("vcetype");
+    if (!vcetype.empty() && !force)
+      return envError("lrtest not valid after robust\nspecify force option to perform test anyway", 198);
+    cur.vcet = vcetype;
+    cur.cmd = session.eval.eStrings.get("cmd");
+    cur.nobs = eNum("N");
+    cur.ll = eNum("ll");
+    const auto ev = session.eval.resolveEMatrixFor("V", eval::EvalSession::EReader::kCopy);
+    if (ev.matrix.has_value() && ev.matrix->data.size() == ev.matrix->colnames.size()) {
+      const std::vector<std::vector<double>> inv = e3::invsym(ev.matrix->data);
+      double rank = 0;
+      for (size_t i = 0; i < inv.size(); ++i) rank += inv[i][i] != 0.0 ? 1 : 0;
+      cur.df = rank;
+    } else {
+      if (cur.cmd.empty()) return envError("last estimates not found", 301);
+      cur.df = 0;
+    }
+    if (cur.cmd.empty() || !std::isfinite(cur.nobs) || cur.nobs != std::floor(cur.nobs) || !std::isfinite(cur.ll))
+      return envError("last estimates not found", 301);
+  } else {
+    if (model.size() > 4) return envError("model() name too long", 198);
+    const std::string g = globalOf(model);
+    if (g.empty()) return envError("model " + model + " not found", 302);
+    if (!parseInfo(g, cur)) return envError("last estimates not found", 301);
+  }
+  auto repr = [](double v) { return std::isnan(v) ? std::string(".") : eval::pythonFloatRepr(v); };
+  if (!saving.empty()) {
+    if (saving.size() > 4) return envError("saving() name too long", 198);
+    const std::string text = cur.cmd + " " + repr(cur.nobs) + " " + repr(cur.ll) + " " + repr(cur.df) +
+                             (cur.vcet.empty() ? std::string() : " " + cur.vcet);
+    session.eval.globals.set("LRTS" + saving, text);
+    if (usingName.empty()) return ojson::array();
+  }
+  const std::string user = usingName.empty() ? std::string("0") : usingName;
+  if (user.size() > 4) return envError("using() name too long", 198);
+  Info base;
+  const std::string g = globalOf(user);
+  if (g.empty()) return envError("model " + user + " not found", 302);
+  if (!parseInfo(g, base)) return envError("model " + user + " not found", 302);
+  if (!base.vcet.empty() && !force)
+    return envError("lrtest not valid after robust\nspecify force option to perform test anyway", 198);
+  if (base.cmd != cur.cmd && !force)
+    return envError("cannot compare " + base.cmd + " and " + cur.cmd + " estimates", 402);
+  std::string out;
+  if (base.nobs != cur.nobs)
+    out += "warning: observations differ: " + repr(base.nobs) + " vs. " + repr(cur.nobs) + ".\n";
+  const double df = dfOpt.has_value() ? *dfOpt : base.df - cur.df;
+  const double chi2 = -2.0 * (cur.ll - base.ll) + 0.0;  // + 0.0: no negative zero
+  double p = std::numeric_limits<double>::quiet_NaN();
+  if (df > 0 && df == std::floor(df)) p = chi2UpperTailIntegerDf(df, chi2);
+  else if (df > 0) return ojson(eval::refusedCommand("lrtest, df(" + repr(df) + ")", "fractional_df"));
+  eval::replaceRClass(session.eval);
+  session.eval.rValues.set("df", df);
+  session.eval.rValues.set("chi2", chi2);
+  session.eval.rValues.set("p", p);
+  eval::declareRPosted(session.eval, "lrtest", {"df", "chi2", "p"});
+  for (const auto& [gname, v] : {std::pair<const char*, double>{"S_3", df}, {"S_6", chi2}, {"S_7", p}}) {
+    eval::MacroFnError mfe;
+    eval::tryCaptureDefinition(std::string("global ") + gname + " = " + repr(v), session.eval, &mfe);
+  }
+  std::string name = base.cmd != cur.cmd ? base.cmd + "/" + cur.cmd
+                                         : std::string(1, static_cast<char>(std::toupper(
+                                               static_cast<unsigned char>(cur.cmd[0])))) + cur.cmd.substr(1);
+  std::string l1 = name + ":  likelihood-ratio test";
+  if (l1.size() < 54) l1 += std::string(54 - l1.size(), ' ');
+  out += l1 + "chi2(" + shownNumber(df) + ")     = " + fixedFmt(chi2, 10, 2, false) + "\n" +
+         std::string(54, ' ') + "Prob > chi2 = " + (std::isnan(p) ? std::string(9, ' ') + "." : fixedFmt(p, 10, 4, false));
+  return displayBlock(out);
+}
+
+}  // namespace
+
 nlohmann::ordered_json runLrtest(const eval::ParsedCommand& parsed, SessionState& session) {
   // lrtest is an rclass program: whatever it ends with, the previous r() is
   // gone -- a failed lrtest leaves r() empty (envp3: `return list` after the
@@ -364,6 +505,12 @@ nlohmann::ordered_json runLrtest(const eval::ParsedCommand& parsed, SessionState
   // afterwards is Stata's `.`, never the r-class layer's named r(111) refusal
   // (review l4: `capture lrtest m2 nosuch` then `local pv = r(p)` is `.`).
   eval::declareRPosted(session.eval, "lrtest", {});
+  // A caller below version 8 runs the pre-8 lrtest (runLrtest7 above).
+  if (session.callerVersion > 0 && session.callerVersion < 8) {
+    std::vector<std::string> toks;
+    bool composite = false;
+    if (lrSpecTokens(parsed.argText, toks, composite) && toks.empty()) return runLrtest7(parsed, session);
+  }
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabLrtest.known,
                                             kVocabLrtest.unimplemented))
     return ojson(*err);

@@ -682,16 +682,33 @@ class SessionState {
   // NOT to be confused with the engine's serve-mode "frame use", which is an
   // internal hbin-adoption mechanism with an unrelated meaning.
   //
-  // The current frame is always `default` in this build: `frame create`,
-  // `frame change` and `pwf` are honest-rejected, because "which frame is
-  // current" is a product decision with UI consequences (which frame does
-  // browse show?) that this wave deliberately does not settle. What IS
-  // supported: frame put/drop, the `frame NAME:` prefix, frlink and frget.
+  // The current frame is the session's own dataset (see currentFrame below);
+  // this map holds every OTHER frame.
   std::map<std::string, std::string> frames;  // frame name -> hbin path
   // frlink's generated link variable -> the frame name it links INTO. `frget`
   // needs this to know which frame to copy a variable out of: its own syntax
   // (`frget NEW=VAR, from(LINKVAR)`) names the link, never the frame.
   std::map<std::string, std::string> frameLinks;
+  // vs-stata stage 4 (frame create/change/pwf/dir/rename/copy): the name of the
+  // CURRENT frame (c(frame), `frame pwf`). The current frame's data and
+  // metadata are the session's own; every OTHER frame keeps its data in
+  // `frames` (an empty path = a frame with no data) and its data-describing
+  // layer (labels, formats, chars, c(changed)) in `frameMeta`, captured with
+  // the same fields `preserve` keeps. `frame change` parks the current frame
+  // there and adopts the target's.
+  std::string currentFrame = "default";
+  std::map<std::string, PreserveFrame> frameMeta;
+  // c(filename) of every parked frame, with whether a name-less `save` may
+  // write it (setCurrentFile's two arguments).
+  std::map<std::string, std::pair<std::string, bool>> frameFiles;
+  // The frlink that made each link variable: its command text (`frlink
+  // rebuild`, `frlink describe`) and the key variables' names in the linked
+  // frame (frget never copies them).
+  struct FrameLinkSpec {
+    std::string cmdText;
+    std::vector<std::string> keys2;
+  };
+  std::map<std::string, FrameLinkSpec> frameLinkSpecs;
 
   // -- transient scratch pins (P6 wave) --------------------------------------
   // Files the CURRENTLY RUNNING command still needs, even though the session
@@ -2069,6 +2086,7 @@ class SessionState {
   // one scalar name → cross-scope clobber. The macro NAME still binds to the minted
   // value, so scripts using `\`NAME'` are unaffected.
   long tempSeq = 0;
+  uint64_t tempVarSeq = 0;
 
   // BUG-360 follow-up (contract_A section 38 projections). `fetchColumns` writes a
   // getcols projection into the session workdir, hands back a Datastore over it,
@@ -2158,19 +2176,28 @@ class SessionState {
   // w2ad_prog_preserve_nest pn_tv_do_gone: `confirm variable/scalar` on the
   // names afterwards are r(111)); program::concludeLevel drops the entries
   // deeper than the caller's level.
-  std::vector<std::pair<int, std::string>> mintedTempvars;
+  struct TempVariable {
+    int level;
+    std::string frame;
+    std::string name;
+  };
+  std::vector<TempVariable> mintedTempvars;
   std::vector<std::pair<int, std::string>> mintedTempnames;
 
   // -- preserve/restore LIFO snapshot stack (preserve_restore.py, M3a) -----
   std::vector<PreserveFrame> preserveStack;
-  // BUG-922: `restore, not` -- forget the top preserved copy without putting
-  // it back (its worker stash is released). The caller checks that the copy
-  // is its own (ownPreserveFrame).
-  void discardTopPreserve();
-  // BUG-922: the one reach predicate. The top frame iff the level now running
-  // preserved it, else nullptr. `preserve` (r(621)), `restore`, `restore, not`
-  // and `restore, preserve` (r(622)) all ask this, and nothing else.
+  // BUG-922: `restore, not` -- forget the own preserved copy without putting
+  // it back (its worker stash is released). The caller checks that there is
+  // one (ownPreserveFrame).
+  void discardOwnPreserve();
+  // BUG-922: the one reach predicate. The newest copy of the CURRENT frame
+  // (PreserveFrame::frameName) iff the level now running preserved it, else
+  // nullptr. `preserve` (r(621)), `restore`, `restore, not` and `restore,
+  // preserve` (r(622)) all ask this, and nothing else. Other frames' copies
+  // are never in reach: Stata keeps one preserve per frame.
   const PreserveFrame* ownPreserveFrame() const;
+  // The index of ownPreserveFrame() in preserveStack.
+  std::optional<size_t> ownPreserveIndex() const;
 
   // -- user-defined programs (program.py, M3a S6/S7) -----------------------
   // session._programs: canonical-case name -> ProgramDef. std::map (not
@@ -2207,6 +2234,11 @@ class SessionState {
   // on/off/clear/list state machine this backs.
   std::array<TimerSlot, 101> timers;
 
+  // -- constraint store (`constraint define`, read by an ml estimator's
+  // constraints() option). Stata's numbers 1..1999 -> the constraint's text as
+  // typed after its number; `clear all` drops them (clear.ado's `all` branch).
+  std::map<int, std::string> constraints;
+
   // session._scope_stack: push_scope()/pop_scope() save/restore frames here
   // by swapping `eval.locals` in place (mirrors Python's `session._locals`
   // swap). Each program call pushes the caller's locals dict and installs a
@@ -2222,6 +2254,9 @@ class SessionState {
   // program.cpp's handleReturnStmt), so the round-trip is exact for the
   // values this module ever stages.
   std::map<std::string, std::pair<std::string, std::string>> returnStaging;
+  // The staged names a `return hidden scalar|local` wrote: flushed as hidden r()
+  // (listed only by `return list, all`).
+  std::set<std::string> returnStagingHidden;
 
   // session._prog_call_depth: recursion guard counter for run_program.
   int progCallDepth = 0;

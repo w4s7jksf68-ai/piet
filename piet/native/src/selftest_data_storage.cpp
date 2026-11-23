@@ -1002,7 +1002,7 @@ void testC4L2BRenderPlaneGates() {
         "summarize fatal if beertax > .5\n"
         "forvalues i = 1/2 {\n"
         "gen double q`i\' = beertax + `i\'\n"
-        "summarize q`i\'\n"
+        "summarize q`i\' if beertax > .5\n"
         "}\n",
         pcSession, piet::dispatch);
 
@@ -1016,11 +1016,19 @@ void testC4L2BRenderPlaneGates() {
     const int64_t filtered = touchedOf("summarize|if");
     const int64_t neighbour = touchedOf("display");
 
-    if (whole <= 0) {
+    // 2026-11-20: an unqualified `summarize` of a dirty resident head now reads the frame
+    // the engine holds and moves NO bytes (summarize.cpp summarizeResidentHead), so the
+    // byte-moving form is the qualified one -- in the loop body too, which is what keeps
+    // a nested item with bytes for the completeness leg's child subtraction. Keyed on the
+    // unqualified form, this leg turned into a permanent SKIP the day that fix landed.
+    if (filtered <= 0) {
       skip("INSPECT-2608: per-form counter attribution",
-           "summarize moved no bytes — no frames-capable `cobra serve` in this environment, so "
-           "there is no delta to attribute");
+           "summarize ... if moved no bytes — no frames-capable `cobra serve` in this "
+           "environment, so there is no delta to attribute");
     } else {
+      check(whole >= 0,
+            "INSPECT-2608 (b) the unqualified `summarize` keeps its OWN row (read in place: "
+            "0 bytes since the resident-head path)");
       check(filtered > 0,
             "INSPECT-2608 (b) FORM KEYING: `summarize … if` bills to its OWN row, not to "
             "`summarize` — the two forms are separate work");

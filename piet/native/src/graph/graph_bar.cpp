@@ -33,6 +33,7 @@
 #include "piet/handlers/graph.h"
 #include "piet/loops.h"
 #include "piet/serset.h"
+#include "piet/stata_format.h"
 #include "piet/strutil.h"
 
 namespace piet::handlers {
@@ -48,6 +49,26 @@ constexpr double kMissingKey = std::numeric_limits<double>::infinity();  // a mi
 ojson barRefusal(const std::string& message, int rc) {
   return ojson(eval::errorBlock(rc == 198 ? "syntax_error" : "engine_error", message, std::nullopt,
                                 std::nullopt, std::nullopt, "r(" + std::to_string(rc) + ")"));
+}
+
+// A variable of the bar/dot/box statlist, over() or a pie's varlist, as `set varabbrev on`
+// (Stata's default) reads it: the unique prefix of one variable names it (`graph dot (mean)
+// pri, over(rep)` on auto is price by rep78), several are r(111) "<word> ambiguous
+// abbreviation", none is r(111) "variable <word> not found".
+std::optional<ojson> namedVariable(SessionState& session, Datastore& ds, std::string* word) {
+  if (ds.has(*word)) return std::nullopt;
+  const std::string full = handlers::unabbreviateGraphVar(session, ds, *word);
+  if (full != *word) {
+    *word = full;
+    return std::nullopt;
+  }
+  size_t hits = 0;
+  for (const auto& nm : ds.names()) {
+    if (nm.size() > word->size() && nm.compare(0, word->size(), *word) == 0) ++hits;
+  }
+  const std::string* off = session.eval.globals.find(" __piet_set_varabbrev");
+  if (hits > 1 && !(off != nullptr && *off == "off")) return barRefusal(*word + " ambiguous abbreviation", 111);
+  return barRefusal("variable " + *word + " not found", 111);
 }
 
 std::string lowered(std::string s) {
@@ -515,7 +536,8 @@ struct BarOptions {
 
 BarOptions readBarOptions(const OptionList& opts, const std::string& kind) {
   BarOptions o;
-  o.horizontal = kind == "hbar" || kind == "hbox";
+  // A dot chart is a bar graph drawn with dots, horizontal unless `vertical`.
+  o.horizontal = kind == "hbar" || kind == "hbox" || kind == "dot";
   bool vertical = false;
   for (const auto& [key, v] : opts) {
     const std::string k = lowered(key);
@@ -576,9 +598,9 @@ Statlist readStatlist(SessionState& session, Datastore& ds, const std::vector<st
     const size_t eq = text.find('=');
     if (eq != std::string::npos) {
       const std::string target = trimmed(text.substr(0, eq));
-      const std::string source = trimmed(text.substr(eq + 1));
-      if (!ds.has(source)) {
-        sl.err = barRefusal("variable " + source + " not found", 111);
+      std::string source = trimmed(text.substr(eq + 1));
+      if (auto bad = namedVariable(session, ds, &source)) {
+        sl.err = *bad;
         return false;
       }
       sl.items.push_back({current, source, target});
@@ -590,9 +612,9 @@ Statlist readStatlist(SessionState& session, Datastore& ds, const std::vector<st
       sl.err = ex.error;
       return false;
     }
-    for (const auto& v : ex.tokens) {
-      if (!ds.has(v)) {
-        sl.err = barRefusal("variable " + v + " not found", 111);
+    for (std::string v : ex.tokens) {
+      if (auto bad = namedVariable(session, ds, &v)) {
+        sl.err = *bad;
         return false;
       }
       // In a bar graph a variable repeated in one varlist is plotted once
@@ -1236,6 +1258,48 @@ BarGraphResult runGraphBarBox(SessionState& session, Datastore& ds, const std::s
       return refuse(barRefusal("option " + k + (v.isBool ? "" : "()") + " not allowed", 198));
     }
   }
+  // Every option of the bar / dot / box graph: the bar-graph object's own syntax (statistic
+  // layout, over() groups, bar / dot / box looks), the axis, title, legend, region, added-text
+  // and std graph options it hands on, and by(). A word that abbreviates none of them is
+  // r(198) "option <word> not allowed" (bank: `graph bar (mean) price, over(foreign)
+  // zznotanoption`, `graph dot (mean) price, over(rep78) zznotanoption`). The spellings
+  // StataBE refuses although they begin an option (`n`, `as` ...) are the measured
+  // abbreviation rows the dispatcher applies before this point.
+  {
+    static const char* kBarVocab[] = {
+        // the statistic layout and groups
+        "over", "nofill", "missing", "allcategories", "ascategory", "assecondcategory", "asyvars",
+        "percentages", "stack", "cw", "nolabel", "nooutsides", "curorder", "yvaroptions",
+        "showyvars", "groupyvars", "varsascategories", "shadevar", "cilevel", "ciline", "by",
+        "boxplot", "dotchart",
+        // looks
+        "horizontal", "vertical", "exclude0", "yreverse", "bargap", "boxgap", "outergap",
+        "linegap", "linetype", "ndots", "intensity", "lintensity", "alsize", "capsize", "medtype",
+        "medline", "medmarker", "nocwhiskers", "cwhiskers", "rwidth", "lowextension",
+        "highextension", "noextendlines", "extendlines", "yalternate", "xalternate", "style",
+        "gstyle", "pcycle", "aspectratio", "xoverhangs", "yoverhangs", "bar", "box", "marker",
+        "dots", "lines", "rectangles", "blabel", "outside",
+        // axes, added lines and text
+        "yscale", "ylabel", "ytick", "ymlabel", "ymtick", "ytitle", "yline", "text", "legend",
+        // titles
+        "title", "subtitle", "note", "caption", "t1title", "t2title", "b1title", "b2title",
+        "l1title", "l2title", "r1title", "r2title",
+        // regions and std options
+        "graphregion", "plotregion", "bgcolor", "scale", "scheme", "copyscheme", "refscheme",
+        "xsize", "ysize", "fxsize", "fysize", "name", "saving", "nodraw", "play", "clegend",
+        "plegend"};
+    for (const auto& [key, v] : opts) {
+      const std::string k = lowered(key);
+      bool known = false;
+      for (const char* full : kBarVocab) {
+        if (abbreviates(k, full, 1)) {
+          known = true;
+          break;
+        }
+      }
+      if (!known) return refuse(barRefusal("option " + k + (v.isBool ? "" : "()") + " not allowed", 198));
+    }
+  }
   // yvaroptions() takes the over() suboptions; its label(...) holds the categorical axis' label OPTIONS
   // (labsize(), angle(), nolabels ...), never a label text: a quoted text inside it is read as an option name
   // and refused (bank: `graph bar (mean) price, over(foreign) yvaroptions(label("Avg"))` r(198)
@@ -1476,6 +1540,391 @@ BarGraphResult runGraphBarBox(SessionState& session, Datastore& ds, const std::s
   block["suppressed"] = session.graphicsOff;
   res.block = block;
   res.sets.push_back(std::move(ss));
+  res.ok = true;
+  return res;
+}
+
+// ===========================================================================
+// graph pie
+
+namespace {
+
+// `%w.p[fge][c]` -> the number as Stata's string(x, fmt) prints it (leading blanks dropped).
+std::string pieFormat(double v, const std::string& fmtText) {
+  fmt::StataFmtSpec sp;
+  std::string f = trimmed(fmtText);
+  bool ok = f.size() >= 3 && f[0] == '%';
+  size_t i = 1;
+  int w = 0, p = 0;
+  while (ok && i < f.size() && std::isdigit(static_cast<unsigned char>(f[i]))) w = w * 10 + (f[i++] - '0');
+  if (ok && i < f.size() && f[i] == '.') {
+    ++i;
+    while (i < f.size() && std::isdigit(static_cast<unsigned char>(f[i]))) p = p * 10 + (f[i++] - '0');
+  } else {
+    ok = false;
+  }
+  char conv = ok && i < f.size() ? f[i++] : 0;
+  const bool group = ok && i < f.size() && f[i] == 'c';
+  if (group) ++i;
+  if (!ok || w == 0 || i != f.size() || (conv != 'f' && conv != 'g' && conv != 'e')) {
+    w = 6;
+    p = 0;
+    conv = 'g';
+  }
+  sp.hasWidth = true;
+  sp.width = w;
+  sp.prec = p;
+  sp.conv = conv;
+  sp.groupThousands = group;
+  std::string out = fmt::renderValue(v, sp).value_or(fmtStataDefaultG(v));
+  return trimmed(out);
+}
+
+// The text of a parenthesised option list `a(...) b c(...)`: name -> argument ("" bare).
+OptionList pieSubopts(const std::string& text) { return eval::parseOpts(text); }
+
+std::vector<std::string> splitWs(const std::string& s) {
+  std::istringstream is(s);
+  std::vector<std::string> out;
+  std::string t;
+  while (is >> t) out.push_back(t);
+  return out;
+}
+
+// A whole-text number, or nullopt.
+std::optional<double> pieNumber(const std::string& raw) {
+  const std::string t = trimmed(raw);
+  if (t.empty()) return std::nullopt;
+  char* end = nullptr;
+  const double d = std::strtod(t.c_str(), &end);
+  if (end == nullptr || *end != '\0') return std::nullopt;
+  return d;
+}
+
+}  // namespace
+
+PieGraphResult runGraphPie(SessionState& session, Datastore& ds, const std::vector<std::string>& typedArgs,
+                           const eval::ParsedCommand& parsed, bool ifOrInGiven) {
+  PieGraphResult res;
+  std::vector<std::string> args = typedArgs;  // abbreviated names are expanded below
+  auto refuse = [&res](ojson block) {
+    res.block = std::move(block);
+    res.ok = false;
+    return res;
+  };
+  OptionList opts;
+  if (const long long comma = eval::findUnquotedComma(parsed.raw); comma >= 0) {
+    opts = eval::parseOpts(parsed.raw.substr(static_cast<size_t>(comma) + 1));
+  }
+  // The pie graph's own options (over() groups, wedge order, wedge looks and labels) and
+  // the title, legend, region and std graph options it hands on; a word that abbreviates
+  // none of them is r(198).
+  static const char* kPieVocab[] = {
+      "cw", "over", "missing", "sort", "descending", "allcategories", "noclockwise", "clockwise",
+      "angle0", "pie", "plabel", "ptext", "intensity", "line", "pcycle", "legend", "style",
+      "title", "subtitle", "note", "caption", "t1title", "t2title", "b1title", "b2title",
+      "l1title", "l2title", "r1title", "r2title", "graphregion", "plotregion", "bgcolor", "scale",
+      "scheme", "copyscheme", "refscheme", "xsize", "ysize", "fxsize", "fysize", "name",
+      "saving", "nodraw", "play", "aspectratio", "by", "text", "clegend", "plegend"};
+  std::vector<std::string> overVars;
+  bool cw = false, keepMissing = false, sortTotal = false, descending = false, allCats = false;
+  bool clockwise = true;
+  double angle0 = 90.0;
+  std::vector<std::string> plabelTexts, pieTexts;
+  std::vector<std::string> notApplied;
+  for (const auto& [key, v] : opts) {
+    const std::string k = lowered(key);
+    bool known = false;
+    for (const char* full : kPieVocab) {
+      if (abbreviates(k, full, 1)) {
+        known = true;
+        break;
+      }
+    }
+    if (!known) return refuse(barRefusal("option " + k + (v.isBool ? "" : "()") + " not allowed", 198));
+    if (k == "by") {
+      return refuse(ojson(eval::unsupportedOption(
+          "by()", "graph pie, by() draws one pie per by-group; this version of PIET does not build the "
+                  "by-graph")));
+    }
+    if (k == "over") {
+      for (const std::string& w : splitWs(v.strValue)) overVars.push_back(w);
+    } else if (k == "cw") {
+      cw = true;
+    } else if (abbreviates(k, "missing", 4)) {
+      keepMissing = true;
+    } else if (k == "sort") {
+      if (!v.isBool) {
+        return refuse(ojson(eval::unsupportedOption(
+            "sort()", "graph pie, sort(varname) orders the wedges by a variable's value on the last "
+                      "observation of each group; this version of PIET does not reproduce it")));
+      }
+      sortTotal = true;
+    } else if (abbreviates(k, "descending", 3)) {
+      descending = true;
+    } else if (abbreviates(k, "allcategories", 4)) {
+      allCats = true;
+    } else if (abbreviates(k, "noclockwise", 4)) {
+      clockwise = false;
+    } else if (k == "clockwise") {
+      clockwise = true;
+    } else if (abbreviates(k, "angle0", 3)) {
+      const auto d = pieNumber(trimmed(v.strValue));
+      if (!d) return refuse(barRefusal("option angle0() incorrectly specified", 198));
+      angle0 = *d;
+    } else if (abbreviates(k, "plabel", 2)) {
+      plabelTexts.push_back(v.strValue);
+    } else if (abbreviates(k, "pie", 1)) {
+      pieTexts.push_back(v.strValue);
+    } else if (abbreviates(k, "title", 1) || k == "nodraw" || k == "name" || k == "saving" ||
+               abbreviates(k, "scheme", 3) || abbreviates(k, "xsize", 4) || abbreviates(k, "ysize", 4)) {
+      // drawn (title), or handled by the dispatcher (name, saving, nodraw, scheme, size)
+    } else {
+      notApplied.push_back(k);
+    }
+  }
+  if (args.size() > 1 && !overVars.empty()) {
+    return refuse(barRefusal("option over() invalid with more than one variable", 198));
+  }
+  if (args.empty() && overVars.empty()) return refuse(barRefusal("graph specification required", 198));
+  if (overVars.size() > 1) {
+    return refuse(ojson(eval::unsupportedOption(
+        "over()", "graph pie with more than one over() variable draws a wedge per combination; this "
+                  "version of PIET draws a pie over one variable")));
+  }
+  if (allCats && ifOrInGiven) {
+    return refuse(ojson(eval::unsupportedOption(
+        "allcategories", "graph pie, allcategories with if or in keeps the categories outside the "
+                         "sample; this version of PIET does not reproduce it")));
+  }
+  for (std::string& v : args) {
+    if (auto bad = namedVariable(session, ds, &v)) return refuse(*bad);
+    if (ds.dtype(v) != "f64") {
+      return refuse(barRefusal("string variables not allowed in varlist;\n" + v + " is a string variable", 109));
+    }
+  }
+  for (std::string& v : overVars) {
+    if (auto bad = namedVariable(session, ds, &v)) return refuse(*bad);
+  }
+
+  // The sample and the weights (pweights are iweights here, as Stata reads them).
+  const int64_t nRows = ds.nRows();
+  std::string wtype = fullWeightName(parsed);
+  if (!wtype.empty() && wtype != "aweight" && wtype != "fweight" && wtype != "pweight") {
+    return refuse(barRefusal(wtype + "s not allowed", 101));
+  }
+  std::vector<double> weight(static_cast<size_t>(nRows), 1.0);
+  std::vector<char> touse(static_cast<size_t>(nRows), 1);
+  if (!wtype.empty()) {
+    const std::string wvar = trimmed(parsed.weightVar.value_or(std::string()));
+    if (!ds.has(wvar)) return refuse(barRefusal("variable " + wvar + " not found", 111));
+    if (ds.dtype(wvar) != "f64") return refuse(barRefusal("type mismatch", 109));
+    const double* wcol = ds.col(wvar).f64();
+    for (int64_t i = 0; i < nRows; ++i) {
+      const double wi = wcol[i];
+      weight[static_cast<size_t>(i)] = wi;
+      if (std::isnan(wi) || wi == 0) {
+        touse[static_cast<size_t>(i)] = 0;
+      } else if (wi < 0) {
+        return refuse(barRefusal("negative weights encountered", 402));
+      } else if (wtype == "fweight" && std::floor(wi) != wi) {
+        return refuse(barRefusal("may not use noninteger frequency weights", 401));
+      }
+    }
+  }
+
+  struct Wedge {
+    double total = 0;
+    std::string label;
+  };
+  std::vector<Wedge> wedges;
+  if (!overVars.empty()) {
+    const std::string& over = overVars.front();
+    const double* y = args.empty() ? nullptr : ds.col(args.front()).f64();
+    for (int64_t i = 0; i < nRows; ++i) {
+      if (y != nullptr && std::isnan(y[i])) touse[static_cast<size_t>(i)] = 0;
+    }
+    std::vector<char> overSample(static_cast<size_t>(nRows), 1);
+    if (!keepMissing) {
+      const cecon::Column& col = ds.col(over);
+      const bool numeric = ds.dtype(over) == "f64";
+      for (int64_t i = 0; i < nRows; ++i) {
+        bool missing;
+        if (numeric) {
+          missing = std::isnan(col.f64()[i]);
+        } else {
+          const int32_t c = col.codes()[i];
+          missing = c < 0 || static_cast<size_t>(c) >= col.levels.size() || col.levels[static_cast<size_t>(c)].empty();
+        }
+        if (missing) {
+          touse[static_cast<size_t>(i)] = 0;
+          overSample[static_cast<size_t>(i)] = 0;
+        }
+      }
+    }
+    // aweights are scaled to mean 1 over the sample; the others count as given
+    if (wtype == "aweight") {
+      double sw = 0;
+      int64_t nw = 0;
+      for (int64_t i = 0; i < nRows; ++i) {
+        if (!touse[static_cast<size_t>(i)]) continue;
+        sw += weight[static_cast<size_t>(i)];
+        ++nw;
+      }
+      const double mean = nw > 0 ? sw / static_cast<double>(nw) : 1.0;
+      for (auto& w : weight) w /= mean;
+    }
+    const std::vector<char>& codeSample = allCats ? overSample : touse;
+    const CategoryCoding cc = codeCategories(session, ds, over, codeSample, keepMissing);
+    std::vector<double> totals(cc.labels.size(), 0.0);
+    std::vector<char> present(cc.labels.size(), allCats ? 1 : 0);
+    for (int64_t i = 0; i < nRows; ++i) {
+      if (!touse[static_cast<size_t>(i)]) continue;
+      const double code = cc.code[static_cast<size_t>(i)];
+      if (std::isnan(code)) continue;
+      const size_t g = static_cast<size_t>(code) - 1;
+      totals[g] += (y != nullptr ? y[i] : 1.0) * weight[static_cast<size_t>(i)];
+      present[g] = 1;
+    }
+    for (size_t g = 0; g < cc.labels.size(); ++g) {
+      if (present[g]) wedges.push_back({totals[g], cc.labels[g]});
+    }
+  } else {
+    if (cw) {
+      for (const std::string& v : args) {
+        const double* d = ds.col(v).f64();
+        for (int64_t i = 0; i < nRows; ++i) {
+          if (std::isnan(d[i])) touse[static_cast<size_t>(i)] = 0;
+        }
+      }
+    }
+    for (const std::string& v : args) {
+      const double* d = ds.col(v).f64();
+      double sum = 0, sumW = 0;
+      int64_t n = 0;
+      for (int64_t i = 0; i < nRows; ++i) {
+        if (!touse[static_cast<size_t>(i)] || std::isnan(d[i])) continue;
+        const double w = weight[static_cast<size_t>(i)];
+        sum += w * d[i];
+        sumW += w;
+        ++n;
+      }
+      // summarize's r(sum) is the weighted sum; under aweights the wedge is r(sum)*r(N)/r(sum_w)
+      double total = sum;
+      if (wtype == "aweight") total = sumW > 0 ? sum * static_cast<double>(n) / sumW : 0.0;
+      std::string label = session.eval.varLabels.get(v, std::string());
+      if (label.empty()) label = v;
+      wedges.push_back({total, label});
+    }
+  }
+  for (const Wedge& w : wedges) {
+    if (w.total < 0) return refuse(barRefusal("sum for a pie wedge is negative", 459));
+  }
+  double grand = 0;
+  for (const Wedge& w : wedges) grand += w.total;
+  if (sortTotal) {
+    std::stable_sort(wedges.begin(), wedges.end(), [descending](const Wedge& a, const Wedge& b) {
+      return descending ? a.total > b.total : a.total < b.total;
+    });
+  }
+  const bool positive = grand > 0 && std::isfinite(grand);
+  if (!positive) res.warning = "sum of pie wedges is not positive";
+
+  // plabel(): `_all|# sum|percent|name|none|"text" [, format() ...]`
+  std::vector<std::string> wedgeLabelText(wedges.size());
+  for (const std::string& text : plabelTexts) {
+    std::string lhs = text, rhs;
+    if (const long long c = eval::findUnquotedComma(text); c >= 0) {
+      lhs = text.substr(0, static_cast<size_t>(c));
+      rhs = text.substr(static_cast<size_t>(c) + 1);
+    }
+    std::string format = "%6.0g";
+    for (const auto& [sk, sv] : pieSubopts(rhs)) {
+      if (abbreviates(lowered(sk), "format", 3) && !sv.isBool) format = trimmed(sv.strValue);
+    }
+    lhs = trimmed(lhs);
+    const size_t sp = lhs.find_first_of(" \t");
+    const std::string who = sp == std::string::npos ? lhs : lhs.substr(0, sp);
+    const std::string what = sp == std::string::npos ? std::string() : trimmed(lhs.substr(sp));
+    size_t first = 0, last = wedges.size();
+    if (who != "_all") {
+      const auto d = pieNumber(who);
+      if (!d || std::floor(*d) != *d) return refuse(barRefusal("invalid pie # in plabel(), " + who, 198));
+      if (*d < 1 || *d > static_cast<double>(wedges.size())) continue;  // "larger than number of pie wedges, ignored"
+      first = static_cast<size_t>(*d) - 1;
+      last = first + 1;
+    }
+    const std::string wl = lowered(what);
+    const bool quoted = what.size() >= 2 && what.front() == '"' && what.back() == '"';
+    const bool isSum = abbreviates(wl, "sum", 3), isPct = abbreviates(wl, "percent", 3),
+               isName = abbreviates(wl, "name", 2), isNone = abbreviates(wl, "none", 1);
+    if (!quoted && !isSum && !isPct && !isName && !isNone) {
+      return refuse(barRefusal("not a plabel() type , " + what, 198));
+    }
+    for (size_t j = first; j < last; ++j) {
+      if (wedges[j].total == 0) continue;  // an empty wedge carries no label
+      if (quoted) wedgeLabelText[j] = what.substr(1, what.size() - 2);
+      else if (isSum) wedgeLabelText[j] = pieFormat(wedges[j].total, format);
+      else if (isPct) wedgeLabelText[j] = positive ? pieFormat(100.0 * wedges[j].total / grand, format) + "%" : std::string();
+      else if (isName) wedgeLabelText[j] = wedges[j].label;
+      else wedgeLabelText[j].clear();
+    }
+  }
+  // pie(): `_all|numlist [, explode[()] color() ...]`
+  std::vector<char> explode(wedges.size(), 0);
+  for (const std::string& text : pieTexts) {
+    std::string lhs = text, rhs;
+    if (const long long c = eval::findUnquotedComma(text); c >= 0) {
+      lhs = text.substr(0, static_cast<size_t>(c));
+      rhs = text.substr(static_cast<size_t>(c) + 1);
+    }
+    std::vector<size_t> which;
+    lhs = trimmed(lhs);
+    if (lhs == "_all") {
+      for (size_t j = 0; j < wedges.size(); ++j) which.push_back(j);
+    } else {
+      for (const std::string& tok : splitWs(lhs)) {
+        const auto d = pieNumber(tok);
+        if (!d || std::floor(*d) != *d || *d < 1) {
+          return refuse(barRefusal("invalid wedge numbers in pie(), " + lhs, 198));
+        }
+        if (*d <= static_cast<double>(wedges.size())) which.push_back(static_cast<size_t>(*d) - 1);
+      }
+    }
+    for (const auto& [sk, sv] : pieSubopts(rhs)) {
+      const std::string k = lowered(sk);
+      if (abbreviates(k, "explode", 7)) {
+        for (size_t j : which) explode[j] = 1;
+      } else {
+        notApplied.push_back("pie(" + k + "())");
+      }
+    }
+  }
+
+  ojson slices = ojson::array();
+  for (size_t j = 0; j < wedges.size(); ++j) {
+    ojson sl;
+    sl["label"] = wedges[j].label;
+    sl["value"] = wedges[j].total;
+    sl["angle"] = positive ? 360.0 * wedges[j].total / grand : 0.0;
+    if (!wedgeLabelText[j].empty()) sl["plabel"] = wedgeLabelText[j];
+    if (explode[j]) sl["explode"] = true;
+    slices.push_back(sl);
+  }
+  ojson block;
+  block["type"] = "graph";
+  block["kind"] = "pie";
+  block["title"] = titleText(opts, "title");
+  block["clockwise"] = clockwise;
+  block["angle0"] = angle0;
+  block["slices"] = slices;
+  block["suppressed"] = session.graphicsOff;
+  if (!notApplied.empty()) {
+    std::string list;
+    for (const auto& n : notApplied) list += (list.empty() ? "" : ", ") + n;
+    block["note"] = "(pie: " + list + " accepted and not applied — this build draws the plot without it.)";
+  }
+  res.block = block;
   res.ok = true;
   return res;
 }

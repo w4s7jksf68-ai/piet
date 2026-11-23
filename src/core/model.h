@@ -87,6 +87,9 @@ struct TsMeta;  // fwd (defined below)
 // the way Stata excludes them. A negative weight — or, for `fw`, a non-integer one —
 // is a hard error, never a silently coerced value. Empty (the default) leaves
 // md.weights empty and every existing caller's design byte-identical.
+// aw_negative_drops: Stata's builtin `regress` drops a row whose aweight is
+// negative, as it drops a zero one; every other caller (the default) refuses such
+// a column with r(402) "negative weights encountered", as Stata's marksample does.
 ModelData build_model(const Dataset& ds, const std::string& yname,
                       const std::vector<std::string>& xnames,
                       const std::vector<std::string>& fenames,
@@ -96,7 +99,8 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
                       const TsMeta* ts = nullptr,
                       const std::vector<char>* row_mask = nullptr,
                       const std::string& weight_name = "",
-                      WeightKind weight_kind = WeightKind::None);
+                      WeightKind weight_kind = WeightKind::None,
+                      bool aw_negative_drops = false);
 
 // Drop singleton FE groups (FE levels with exactly one obs), iterated to a fixed
 // point. Rebuilds md in place; returns the number of rows dropped.

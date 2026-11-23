@@ -5,8 +5,11 @@
 #include "piet/handlers/observations.h"
 
 #include <array>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <map>
+#include <regex>
 namespace piet::handlers::data_mutation_detail {
 
 
@@ -222,10 +225,113 @@ std::string collapseLabelStat(const std::string& stat, const std::string& flavor
 }
 
 
+namespace {
+// gcollapse's labelformat() engine: #sourcelabel# (the source's label, else
+// its name; dropped for freq), #sourcelabel:start:len# (a substring of it),
+// #stat:pretty#, #stat#, #Stat#, #STAT#, each replaced throughout unless the
+// replacement itself carries the token. nullopt = #stat:pretty# for a stat
+// with no pretty name here.
+std::optional<std::string> gtoolsLabel(std::string fmt, const std::string& stat,
+                                       const std::string& srcLabel) {
+  auto replaceAll = [](std::string& s, const std::string& tok, const std::string& with) {
+    if (with.find(tok) != std::string::npos) return;
+    for (size_t at = s.find(tok); at != std::string::npos; at = s.find(tok, at + with.size()))
+      s.replace(at, tok.size(), with);
+  };
+  const bool freq = stat == "freq";
+  replaceAll(fmt, "#sourcelabel#", freq ? std::string() : srcLabel);
+  {
+    static const std::regex reSub(R"(#sourcelabel:([0-9]+):([.0-9]+)#)");
+    std::smatch m;
+    while (std::regex_search(fmt, m, reSub)) {
+      std::string piece;
+      if (!freq) {
+        const size_t start = static_cast<size_t>(std::max(1L, std::stol(m.str(1)))) - 1;
+        const std::string lenText = m.str(2);
+        if (start < srcLabel.size())
+          piece = lenText == "." ? srcLabel.substr(start)
+                                 : srcLabel.substr(start, static_cast<size_t>(std::stod(lenText)));
+      }
+      fmt = m.prefix().str() + piece + m.suffix().str();
+    }
+  }
+  if (fmt.find("#stat:pretty#") != std::string::npos) {
+    static const std::map<std::string, std::string> kPretty = {
+        {"sum", "Sum"}, {"nansum", "Sum"}, {"mean", "Mean"}, {"geomean", "Geometric mean"},
+        {"sd", "St Dev."}, {"variance", "Variance"}, {"cv", "Coef. of variation"},
+        {"max", "Max"}, {"min", "Min"}, {"range", "Range"}, {"count", "Count"},
+        {"freq", "Group size"}, {"percent", "Percent"}, {"median", "Median"}, {"iqr", "IQR"},
+        {"first", "First"}, {"firstnm", "First Non-Miss."}, {"last", "Last"},
+        {"lastnm", "Last Non-Miss."}, {"semean", "SE Mean"}, {"sebinomial", "SE Mean (Binom)"},
+        {"sepoisson", "SE Mean (Pois)"}, {"nunique", "N Unique"}, {"nmissing", "N Missing"},
+        {"skewness", "Skewness"}, {"kurtosis", "Kurtosis"}, {"rawsum", "Unweighted sum"},
+        {"rawnansum", "Unweighted sum"}, {"gini", "Gini Coefficient"},
+        {"gini|dropneg", "Gini Coefficient (drop neg)"},
+        {"gini|keepneg", "Gini Coefficient (keep neg)"}};
+    std::string pretty;
+    auto it = kPretty.find(stat);
+    if (it != kPretty.end()) {
+      pretty = it->second;
+    } else {
+      // Quantiles and order statistics: "25th Pctile", "1st Smallest",
+      // "2nd Largest (Unweighted)". The number is spelled as display prints
+      // it; one ending in 11, 12 or 13 gets no number at all ("th Pctile"),
+      // a quirk of gtools' naming rule that is kept, as it is gtools' label.
+      static const std::regex reRawSel(R"(^rawselect(-?)([0-9]+)$)");
+      static const std::regex reSel(R"(^select(-?)([0-9]+)$)");
+      static const std::regex rePct(R"(^p([0-9][0-9]?(\.[0-9]+)?)$)");
+      std::smatch m;
+      std::string kind, numText;
+      if (std::regex_match(stat, m, reRawSel)) {
+        kind = m.str(1) == "-" ? "Largest (Unweighted)" : "Smallest (Unweighted)";
+        numText = m.str(2);
+      } else if (std::regex_match(stat, m, reSel)) {
+        kind = m.str(1) == "-" ? "Largest" : "Smallest";
+        numText = m.str(2);
+      } else if (std::regex_match(stat, m, rePct)) {
+        kind = "Pctile";
+        numText = m.str(1);
+      } else {
+        return std::nullopt;
+      }
+      const double p = std::stod(numText);
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%.15g", p);
+      const std::string pText = buf;
+      const std::string last2 = pText.size() >= 2 ? pText.substr(pText.size() - 2) : pText;
+      const double r = std::fmod(p, 10.0);
+      if (last2 == "11" || last2 == "12" || last2 == "13")
+        pretty = "th " + kind;
+      else if (r == 1.0)
+        pretty = pText + "st " + kind;
+      else if (r == 2.0)
+        pretty = pText + "nd " + kind;
+      else if (r == 3.0)
+        pretty = pText + "rd " + kind;
+      else
+        pretty = pText + "th " + kind;
+    }
+    replaceAll(fmt, "#stat:pretty#", pretty);
+  }
+  std::string proper = stat, upper = stat;
+  for (size_t i = 0; i < proper.size(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(proper[i]);
+    const bool wordStart = i == 0 || !std::isalpha(static_cast<unsigned char>(proper[i - 1]));
+    proper[i] = static_cast<char>(wordStart ? std::toupper(c) : std::tolower(c));
+    upper[i] = static_cast<char>(std::toupper(c));
+  }
+  replaceAll(fmt, "#stat#", stat);
+  replaceAll(fmt, "#Stat#", proper);
+  replaceAll(fmt, "#STAT#", upper);
+  return fmt;
+}
+}  // namespace
+
 std::vector<CollapseResultMeta> collapseResultMeta(const std::vector<CollapseItem>& items,
                                                    const std::vector<std::string>& byVars,
                                                    const std::string& flavor, const std::string& wkind,
-                                                   bool clabel, SessionState& session) {
+                                                   bool clabel, SessionState& session,
+                                                   const std::string& labelFormat) {
   const bool weighted = !wkind.empty();
   std::vector<CollapseResultMeta> out;
   std::vector<VarInfo> fallbackCard;
@@ -316,6 +422,10 @@ std::vector<CollapseResultMeta> collapseResultMeta(const std::vector<CollapseIte
       if (gtools) {
         const std::string sl = sourceLabel(*v);
         m.label = "(" + ls + ") " + (sl.empty() ? item.source : sl);
+        if (!labelFormat.empty()) {
+          if (std::optional<std::string> lf = gtoolsLabel(labelFormat, ls, sl.empty() ? item.source : sl))
+            m.label = *lf;
+        }
       } else if (flavor == "collapse" && stat == "percent" && item.source == "_percent") {
         m.label = "percent";
       } else if (flavor == "collapse" && stat == "count" && item.source == "_freq") {
@@ -687,6 +797,13 @@ ojson runCollapse(const std::string& rawLine, const std::optional<std::string>& 
       // serves first/last/firstnm/lastnm only (collapse: r(109)).
       if (flavor == "gcollapse")
         return rcError("'" + src + "' found where numeric variable expected", "7");
+      // fcollapse hands the string column to its Mata aggregator, which fails
+      // r(3253) (vs-stata bank ca4a1fabe10434ed).
+      if (flavor == "fcollapse" && item.stat != "first" && item.stat != "last" &&
+          item.stat != "firstnm" && item.stat != "lastnm")
+        return rcError("aggregate_" + item.stat + "():  3253  data[" + std::to_string(0) +
+                           "] found where real required",
+                       "3253");
       if (item.stat != "first" && item.stat != "last" && item.stat != "firstnm" &&
           item.stat != "lastnm")
         return rcError("string variable " + src + " not allowed with statistic " + item.stat,
@@ -827,8 +944,15 @@ ojson runCollapse(const std::string& rawLine, const std::optional<std::string>& 
     return block;
   };
 
+  std::string labelFormat;
+  for (const auto& kv : opts)
+    if (lower(kv.first) == "labelformat" && !kv.second.isBool) {
+      labelFormat = kv.second.strValue;
+      if (labelFormat.size() >= 2 && labelFormat.front() == '"' && labelFormat.back() == '"')
+        labelFormat = labelFormat.substr(1, labelFormat.size() - 2);
+    }
   std::vector<CollapseResultMeta> resultMeta = collapseResultMeta(
-      clist.items, byVars, flavorRun, wkind, optWords.count("clabel") != 0, session);
+      clist.items, byVars, flavorRun, wkind, optWords.count("clabel") != 0, session, labelFormat);
   // smart without fast: collapse's checks have run, and the data stay.
   if (smartNoop) return mutationResult(session, "collapse");
 

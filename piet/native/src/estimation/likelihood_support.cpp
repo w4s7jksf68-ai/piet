@@ -29,6 +29,7 @@
 
 #include "estimation_families_internal.h"
 #include "estimation_options.h"
+#include "extended_estimation_internal.h"  // stataRefusalM4b
 
 namespace piet::handlers {
 using ojson = nlohmann::ordered_json;
@@ -61,6 +62,45 @@ void pushLevelIfGivenM4(const eval::ParsedCommand& parsed, std::vector<std::stri
       return;
     }
   }
+}
+
+// `in a/b` on an engine fit that filters with --keepif: the range becomes the
+// observation-number condition `_n >= a & _n <= b` over the dataset in memory
+// (the engine's keepif reads `_n` as the observation number, BUG-364), ANDed
+// with any `if` -- Stata's rule -- so the fit, its e(sample) mask and every
+// later reader see the same rows (vs-stata bank d6434408 `ologit rep78 mpg
+// weight in 1/60`). A malformed or out-of-range bound is Stata's refusal.
+std::optional<ojson> inRangeConditionM4(SessionState& session, const eval::ParsedCommand& parsed,
+                                        std::optional<std::string>& ifOut, const std::string& stataCmd) {
+  ifOut = parsed.ifExpr;
+  if (!parsed.inRange.has_value() || parsed.inRange->empty()) return std::nullopt;
+  Datastore* ds = session.datastore();
+  InRangeBounds rr = parseInRangeBounds(*parsed.inRange, ds != nullptr ? ds->nRows() : 0);
+  if (!rr.ok) {
+    InRangeFilterResult bad;
+    bad.ok = false;
+    bad.negative = rr.negative;
+    bad.refusal = rr.refusal;
+    return inRangeRejectError(bad, *parsed.inRange, stataCmd);
+  }
+  const std::string cond = "(_n >= " + std::to_string(rr.a) + " & _n <= " + std::to_string(rr.b) + ")";
+  ifOut = parsed.ifExpr.has_value() && !parsed.ifExpr->empty() ? cond + " & (" + *parsed.ifExpr + ")" : cond;
+  return std::nullopt;
+}
+
+std::optional<ojson> pushInRangeKeepifM4(SessionState& session, const eval::ParsedCommand& parsed,
+                                         std::vector<std::string>& argv, const std::string& stataCmd) {
+  if (!parsed.inRange.has_value() || parsed.inRange->empty()) return std::nullopt;
+  std::optional<std::string> eff;
+  if (auto err = inRangeConditionM4(session, parsed, eff, stataCmd)) return err;
+  for (size_t i = 0; i + 1 < argv.size(); ++i)
+    if (argv[i] == "--keepif") {  // the `if` buildP7MleArgv forwarded
+      argv[i + 1] = *eff;
+      return std::nullopt;
+    }
+  argv.push_back("--keepif");
+  argv.push_back(*eff);
+  return std::nullopt;
 }
 
 P7MleArgv buildP7MleArgv(const std::string& cobraCmd, const eval::ParsedCommand& parsed,
@@ -169,27 +209,35 @@ P7MleArgv buildP7MleArgv(const std::string& cobraCmd, const eval::ParsedCommand&
 // cutpoints ride in a key the mapper does not carry through.
 // `stataCmd` is the e(cmd) word LastModel records (cacheLastModelM4); empty
 // publishes cobraCmd, as every runP7Mle caller does.
-ojson runP7MleAsM4(const std::string& cobraCmd, std::vector<std::string> cobraArgs,
-                          SessionState& session, ojson* rawOut, const std::string& stataCmd) {
+static ojson runP7MleFitM4(const std::string& cobraCmd, std::vector<std::string> cobraArgs,
+                          SessionState& session, ojson* rawOut, const std::string& stataCmd, bool recordSample) {
   cobraArgs.push_back("--data");
   cobraArgs.push_back(*session.currentHbin());
   cobraArgs.push_back("--tidy");
+  std::vector<std::string> fitArgs = cobraArgs;
+  const std::string sample = recordSample ? esampleFitArgs(session, fitArgs, std::string(), 0) : std::string();
   ojson raw;
   try {
-    raw = runCobraJsonM4(cobraArgs);
+    raw = runCobraJsonM4(fitArgs);
   } catch (const CobraError& ce) {
+    if (!sample.empty()) cecon::native_unlink(sample);
     return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
   }
   if (rawOut) *rawOut = raw;
   ojson block = cobraToEstimationM4(raw, cobraCmd, &session);
   fillCoeftableStatsM4(block);
-  cacheLastModelM4(session, cobraCmd, cobraArgs, block, raw, std::string(), stataCmd);
+  cacheLastModelM4(session, cobraCmd, cobraArgs, block, raw, sample, stataCmd);
   return block;
 }
 
+ojson runP7MleAsM4(const std::string& cobraCmd, std::vector<std::string> cobraArgs,
+                   SessionState& session, ojson* rawOut, const std::string& stataCmd) {
+  return runP7MleFitM4(cobraCmd, std::move(cobraArgs), session, rawOut, stataCmd, false);
+}
+
 ojson runP7Mle(const std::string& cobraCmd, std::vector<std::string> cobraArgs,
-               SessionState& session, ojson* rawOut) {
-  return runP7MleAsM4(cobraCmd, std::move(cobraArgs), session, rawOut, std::string());
+               SessionState& session, ojson* rawOut, bool recordSample) {
+  return runP7MleFitM4(cobraCmd, std::move(cobraArgs), session, rawOut, std::string(), recordSample);
 }
 
 // BUG-1196: the depvar equation of an engine coefficient array as Stata names
@@ -289,6 +337,326 @@ bool postAncillaryEbM4(SessionState& session, const ojson& raw,
   return true;
 }
 
+
+// ---- constraints (Stata's `constraint` command and the ml estimators'
+// constraints() option). A constraint is a linear equation in the model's
+// coefficients: terms `[eq]name`, `_b[eq:name]`, `[eq]_b[name]`, `name`,
+// `/cut1`, each optionally multiplied by a number, and numbers, on either side
+// of one `=`. It is parsed only when an estimator reads it (Stata checks its
+// coefficient names against the model then); `constraint define` stores the text.
+namespace {
+bool cnsNameChar(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.' || c == '#' || c == '~';
+}
+// One side of a constraint: sum of terms -> (terms, constant).
+bool parseCnsSideM4(const std::string& s, double sign, std::vector<CnsTermM4>& terms, double& cst,
+                    std::string& why) {
+  size_t i = 0;
+  const size_t n = s.size();
+  auto skip = [&] { while (i < n && std::isspace(static_cast<unsigned char>(s[i]))) ++i; };
+  bool first = true;
+  for (;;) {
+    skip();
+    if (i >= n) {
+      if (first) { why = "empty side"; return false; }
+      return true;
+    }
+    double tsign = 1.0;
+    if (!first) {
+      if (s[i] == '+') ++i;
+      else if (s[i] == '-') { tsign = -1.0; ++i; }
+      else { why = "expected + or -"; return false; }
+      skip();
+    }
+    while (i < n && (s[i] == '+' || s[i] == '-')) {  // leading unary signs
+      if (s[i] == '-') tsign = -tsign;
+      ++i;
+      skip();
+    }
+    first = false;
+    double coef = 1.0;
+    bool haveRef = false;
+    CnsTermM4 t;
+    for (;;) {  // factor ('*' factor)*
+      skip();
+      if (i >= n) { why = "incomplete term"; return false; }
+      const char c = s[i];
+      if (std::isdigit(static_cast<unsigned char>(c)) || (c == '.' && i + 1 < n &&
+                                                          std::isdigit(static_cast<unsigned char>(s[i + 1])))) {
+        size_t used = 0;
+        double v = 0.0;
+        try {
+          v = std::stod(s.substr(i), &used);
+        } catch (const std::exception&) {
+          why = "bad number";
+          return false;
+        }
+        coef *= v;
+        i += used;
+      } else {
+        if (haveRef) { why = "a term multiplies two coefficients"; return false; }
+        haveRef = true;
+        if (c == '[') {  // [eq]name or [eq]_b[name]
+          const size_t close = s.find(']', i);
+          if (close == std::string::npos) { why = "unmatched ["; return false; }
+          t.eq = s.substr(i + 1, close - i - 1);
+          t.eq.erase(0, t.eq.find_first_not_of(" \t"));
+          t.eq.erase(t.eq.find_last_not_of(" \t") + 1);
+          i = close + 1;
+          skip();
+          if (s.compare(i, 3, "_b[") == 0) {
+            const size_t c2 = s.find(']', i + 3);
+            if (c2 == std::string::npos) { why = "unmatched ["; return false; }
+            t.name = s.substr(i + 3, c2 - i - 3);
+            i = c2 + 1;
+          } else {
+            const size_t st = i;
+            while (i < n && cnsNameChar(s[i])) ++i;
+            t.name = s.substr(st, i - st);
+          }
+        } else if (s.compare(i, 3, "_b[") == 0) {  // _b[eq:name] / _b[name]
+          const size_t close = s.find(']', i + 3);
+          if (close == std::string::npos) { why = "unmatched ["; return false; }
+          std::string in = s.substr(i + 3, close - i - 3);
+          const size_t colon = in.find(':');
+          if (colon != std::string::npos) {
+            t.eq = in.substr(0, colon);
+            in = in.substr(colon + 1);
+          }
+          t.name = in;
+          i = close + 1;
+        } else if (c == '/') {
+          const size_t st = i;
+          ++i;
+          while (i < n && cnsNameChar(s[i])) ++i;
+          t.name = s.substr(st, i - st);
+        } else if (cnsNameChar(c)) {
+          const size_t st = i;
+          while (i < n && cnsNameChar(s[i])) ++i;
+          t.name = s.substr(st, i - st);
+        } else {
+          why = std::string("unexpected '") + c + "'";
+          return false;
+        }
+        t.name.erase(0, t.name.find_first_not_of(" \t"));
+        t.name.erase(t.name.find_last_not_of(" \t") + 1);
+        if (t.name.empty()) { why = "missing coefficient name"; return false; }
+      }
+      skip();
+      if (i < n && s[i] == '*') {
+        ++i;
+        continue;
+      }
+      break;
+    }
+    if (haveRef) {
+      t.coef = sign * tsign * coef;
+      terms.push_back(std::move(t));
+    } else {
+      cst += sign * tsign * coef;
+    }
+  }
+}
+std::vector<int> parseCnsNumlistM4(const std::string& s, bool& ok) {
+  std::vector<int> out;
+  ok = true;
+  std::istringstream is(s);
+  std::string tok;
+  while (is >> tok) {
+    const size_t dash = tok.find_first_of("/-", 1);
+    try {
+      if (dash != std::string::npos) {
+        const int a = std::stoi(tok.substr(0, dash)), b = std::stoi(tok.substr(dash + 1));
+        if (a > b) { ok = false; return out; }
+        for (int v = a; v <= b; ++v) out.push_back(v);
+      } else {
+        size_t used = 0;
+        out.push_back(std::stoi(tok, &used));
+        if (used != tok.size()) { ok = false; return out; }
+      }
+    } catch (const std::exception&) {
+      ok = false;
+      return out;
+    }
+  }
+  return out;
+}
+}  // namespace
+
+bool parseConstraintTextM4(const std::string& text, CnsDefM4& out, std::string& why) {
+  const size_t eq = text.find('=');
+  if (eq == std::string::npos || text.find('=', eq + 1) != std::string::npos) {
+    why = "a constraint is one equation";
+    return false;
+  }
+  double cst = 0.0;
+  out.terms.clear();
+  if (!parseCnsSideM4(text.substr(0, eq), 1.0, out.terms, cst, why)) return false;
+  if (!parseCnsSideM4(text.substr(eq + 1), -1.0, out.terms, cst, why)) return false;
+  out.rhs = cst == 0.0 ? 0.0 : -cst;
+  return true;
+}
+
+bool readConstraintsM4(const eval::ParsedCommand& parsed, const SessionState& session,
+                       std::vector<CnsDefM4>& out, ojson& err) {
+  out.clear();
+  for (const auto& [k, v] : parsed.opts) {
+    if (k != "constraints") continue;
+    bool ok = true;
+    const std::vector<int> nums = parseCnsNumlistM4(v.isBool ? std::string() : v.strValue, ok);
+    if (!ok || nums.empty()) {
+      err = extended_fit_detail::stataRefusalM4b("invalid numlist in constraints()", 121);
+      return false;
+    }
+    for (int num : nums) {
+      const auto it = session.constraints.find(num);
+      if (it == session.constraints.end()) continue;  // Stata skips an undefined number
+      CnsDefM4 d;
+      d.num = num;
+      std::string why;
+      if (!parseConstraintTextM4(it->second, d, why)) {
+        err = extended_fit_detail::stataRefusalM4b("constraint (" + std::to_string(num) + ") is not a linear equation: " + why,
+                              198);
+        return false;
+      }
+      out.push_back(std::move(d));
+    }
+  }
+  return true;
+}
+
+// Stata's display of a number in a constraint (`-.1`, `2`, `1.5e-08`).
+std::string cnsNumberTextM4(double v) {
+  char buf[40];
+  std::snprintf(buf, sizeof(buf), "%.8g", v);
+  std::string s = buf;
+  if (s.rfind("0.", 0) == 0) s.erase(0, 1);
+  else if (s.rfind("-0.", 0) == 0) s.erase(1, 1);
+  return s;
+}
+
+std::string cnsDisplayLineM4(const std::vector<std::pair<double, std::string>>& terms, double rhs) {
+  std::string s;
+  for (size_t i = 0; i < terms.size(); ++i) {
+    double c = terms[i].first;
+    if (i == 0) {
+      if (c < 0) s += "-";
+    } else {
+      s += c < 0 ? " - " : " + ";
+    }
+    c = std::fabs(c);
+    if (c != 1.0) s += cnsNumberTextM4(c) + "*";
+    s += terms[i].second;
+  }
+  return s + " = " + cnsNumberTextM4(rhs);
+}
+
 }  // namespace est_detail
+
+// `constraint [define] # exp`, `constraint drop numlist|_all`,
+// `constraint dir|list [numlist|_all]`, `constraint free`, `constraint get #`.
+ojson runConstraint(const eval::ParsedCommand& parsed, SessionState& session) {
+  using extended_fit_detail::stataRefusalM4b;
+  std::string rest = parsed.raw;
+  {
+    // the text after the command word, as typed
+    const std::string low = piet::strutil::lower(rest);
+    size_t at = low.find(piet::strutil::lower(parsed.cmd));
+    if (at == std::string::npos) at = low.find("cons");
+    if (at == std::string::npos) return stataRefusalM4b("invalid syntax", 198);
+    rest = rest.substr(at + parsed.cmd.size());
+    while (!rest.empty() && est_detail::cnsNameChar(rest[0])) rest.erase(0, 1);  // the rest of an abbreviation
+  }
+  auto trim = [](std::string s) {
+    s.erase(0, s.find_first_not_of(" \t"));
+    s.erase(s.find_last_not_of(" \t") + 1);
+    return s;
+  };
+  rest = trim(rest);
+  std::string word, tail;
+  {
+    const size_t sp = rest.find_first_of(" \t");
+    word = rest.substr(0, sp);
+    tail = sp == std::string::npos ? std::string() : trim(rest.substr(sp));
+  }
+  const std::string w = piet::strutil::lower(word);
+  auto numsOf = [&](const std::string& t, bool& ok) -> std::vector<int> {
+    std::vector<int> v;
+    ok = true;
+    if (trim(t).empty() || trim(t) == "_all") {
+      for (const auto& kv : session.constraints) v.push_back(kv.first);
+      return v;
+    }
+    return est_detail::parseCnsNumlistM4(t, ok);
+  };
+  if (w == "dir" || w == "list" || w == "l" || w == "li" || w == "lis") {
+    bool ok = true;
+    const std::vector<int> nums = numsOf(tail, ok);
+    if (!ok) return stataRefusalM4b("invalid numlist", 121);
+    std::string text;
+    for (int nm : nums) {
+      const auto it = session.constraints.find(nm);
+      if (it == session.constraints.end()) continue;
+      char head[16];
+      std::snprintf(head, sizeof(head), "%6d:  ", nm);
+      text += (text.empty() ? "" : "\n") + std::string(head) + it->second;
+    }
+    if (text.empty()) return ojson::array();
+    ojson out;
+    out["type"] = "echo";
+    out["text"] = text;
+    return out;
+  }
+  if (w == "drop") {
+    bool ok = true;
+    const std::vector<int> nums = numsOf(tail, ok);
+    if (!ok) return stataRefusalM4b("invalid numlist", 121);
+    for (int nm : nums) session.constraints.erase(nm);
+    return ojson::array();
+  }
+  if (w == "free") {
+    int f = 1;
+    while (f <= 1999 && session.constraints.count(f) != 0) ++f;
+    session.eval.rValues = eval::OrderedFloatDict();
+    session.eval.rStrings.clear();
+    session.eval.rValues.set("free", f <= 1999 ? static_cast<double>(f) : eval::kStataMissingSentinel);
+    return ojson::array();
+  }
+  if (w == "get") {
+    int nm = 0;
+    try {
+      nm = std::stoi(tail);
+    } catch (const std::exception&) {
+      return stataRefusalM4b("invalid syntax", 198);
+    }
+    session.eval.rValues = eval::OrderedFloatDict();
+    session.eval.rStrings.clear();
+    const auto it = session.constraints.find(nm);
+    session.eval.rValues.set("defined", it == session.constraints.end() ? 0.0 : 1.0);
+    if (it != session.constraints.end()) session.eval.rStrings.set("contents", it->second);
+    return ojson::array();
+  }
+  std::string body = rest;
+  if (w == "define" || w == "def" || w == "defi" || w == "defin" || w == "de") body = tail;
+  std::string numTok;
+  {
+    body = trim(body);
+    const size_t sp = body.find_first_of(" \t");
+    numTok = body.substr(0, sp);
+    body = sp == std::string::npos ? std::string() : trim(body.substr(sp));
+  }
+  int num = 0;
+  try {
+    size_t used = 0;
+    num = std::stoi(numTok, &used);
+    if (used != numTok.size()) throw std::invalid_argument("n");
+  } catch (const std::exception&) {
+    return stataRefusalM4b("invalid syntax", 198);
+  }
+  if (num < 1 || num > 1999) return stataRefusalM4b("constraint number must be between 1 and 1,999", 198);
+  if (body.empty()) return stataRefusalM4b("invalid syntax", 198);
+  session.constraints[num] = body;
+  return ojson::array();
+}
 
 }  // namespace piet::handlers

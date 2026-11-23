@@ -14,6 +14,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <set>
 #include <memory>
@@ -38,6 +39,7 @@
 #include "piet/strutil.h"
 #include "piet/translate.h"
 #include "engine/engine_call_internal.h"
+#include "descriptive/summarize_prefetch.h"
 
 namespace piet::handlers {
 
@@ -47,6 +49,42 @@ using namespace engine_call_detail;
 
 // ---------------------------------------------------------------------------
 // summarize
+
+// The handed-over `eval --summarize` answer (summarize_prefetch.h says why and when).
+// thread_local: a session's commands run on one thread, and nothing is ever handed
+// from one thread to another.
+namespace {
+struct SummarizePrefetch {
+  bool armed = false;
+  std::string path, var;
+  ojson stats;
+};
+SummarizePrefetch& summarizePrefetchSlot() {
+  static thread_local SummarizePrefetch slot;
+  return slot;
+}
+}  // namespace
+
+void summarizePrefetchSet(const std::string& path, const std::string& var, ojson stats) {
+  SummarizePrefetch& p = summarizePrefetchSlot();
+  p.armed = true;
+  p.path = path;
+  p.var = var;
+  p.stats = std::move(stats);
+}
+
+std::optional<ojson> summarizePrefetchTake(const std::string& path, const std::string& var) {
+  SummarizePrefetch& p = summarizePrefetchSlot();
+  if (!p.armed || p.path != path || p.var != var) return std::nullopt;
+  p.armed = false;
+  return std::move(p.stats);
+}
+
+void summarizePrefetchClear() {
+  SummarizePrefetch& p = summarizePrefetchSlot();
+  p.armed = false;
+  p.stats = ojson();
+}
 
 namespace {
 
@@ -134,21 +172,38 @@ ojson numpyStats(const std::vector<double>& valid, bool detail) {
 // callers (dispatcher.cpp's by-group summarize loop, describe's internal
 // stats pull) — this helper stays file-local (not header-declared) so those
 // two public signatures never change; only their SHARED body moved here.
-ojson summarizeCoreStatsWeighted(Datastore& ds, const std::optional<std::vector<std::string>>& varlist,
-                                  bool detail, const std::optional<std::string>& weightVar,
-                                  const char* weightFlag) {
+namespace {
+
+// What the computation below asks of the dataset: which columns exist, their base type, and the
+// path the engine is to read. A Datastore answers all of it; so does the resident card of a head
+// that is not on disk yet (summarizeResidentHead), which is the point: neither question needs
+// the file. `ds` is the open file when there is one. It is null on the card path, where an
+// engine refusal is not answered here at all: the caller is told to take the Datastore path.
+struct SummarizeCatalog {
+  std::function<bool(const std::string&)> has;
+  std::function<std::string(const std::string&)> dtype;  // "f64" | "factor"
+  std::function<std::vector<std::string>()> names;       // every column, dataset order
+  std::string path;
+  Datastore* ds = nullptr;
+};
+
+// nullopt only when the catalog has no open file and the engine refused the call.
+std::optional<ojson> summarizeCore(const SummarizeCatalog& cat,
+                                   const std::optional<std::vector<std::string>>& varlist,
+                                   bool detail, const std::optional<std::string>& weightVar,
+                                   const char* weightFlag) {
   if (varlist.has_value()) {
     for (const auto& n : *varlist) {
-      if (!ds.has(n)) {
+      if (!cat.has(n)) {
         return engineErrorBlock("variable " + n + " not found");
       }
     }
   }
-  std::vector<std::string> names = varlist.has_value() ? *varlist : ds.names();
+  std::vector<std::string> names = varlist.has_value() ? *varlist : cat.names();
   std::vector<std::string> f64Vars, facVars;
   for (const auto& n : names) {
-    if (!ds.has(n)) continue;
-    (ds.dtype(n) == "f64" ? f64Vars : facVars).push_back(n);
+    if (!cat.has(n)) continue;
+    (cat.dtype(n) == "f64" ? f64Vars : facVars).push_back(n);
   }
 
   ojson stats = ojson::object();
@@ -159,7 +214,7 @@ ojson summarizeCoreStatsWeighted(Datastore& ds, const std::optional<std::vector<
       if (i) joined += ",";
       joined += f64Vars[i];
     }
-    std::vector<std::string> args = {"eval", "--data", ds.path(), "--summarize", joined};
+    std::vector<std::string> args = {"eval", "--data", cat.path, "--summarize", joined};
     if (detail) args.push_back("--detail");
     bool hasWeight = weightVar.has_value() && !weightVar->empty();
     if (hasWeight) {
@@ -168,8 +223,17 @@ ojson summarizeCoreStatsWeighted(Datastore& ds, const std::optional<std::vector<
     }
     bool usedCobra = false;
     try {
-      ojson out = runCobraJson(args);
-      ojson raw = out.value("summarize", ojson::object());
+      // egen's own request may already have asked exactly this (summarize_prefetch.h).
+      std::optional<ojson> handed;
+      if (!detail && !hasWeight && f64Vars.size() == 1) handed = summarizePrefetchTake(cat.path, joined);
+      ojson raw;
+      if (handed.has_value()) {
+        raw = ojson::object();
+        raw[joined] = std::move(*handed);
+      } else {
+        ojson out = runCobraJson(args);
+        raw = out.value("summarize", ojson::object());
+      }
       for (const auto& v : f64Vars) {
         if (raw.contains(v)) {
           stats[v] = raw[v];
@@ -177,6 +241,9 @@ ojson summarizeCoreStatsWeighted(Datastore& ds, const std::optional<std::vector<
       }
       usedCobra = true;
     } catch (const CobraError& ce) {
+      // No open file behind this catalog (summarizeResidentHead): whatever the engine refused,
+      // the ordinary path opens the head and asks again, and ITS answer is the one that stands.
+      if (cat.ds == nullptr) return std::nullopt;
       // gate-①: numpyStats below is UNWEIGHTED. Falling back to it silently
       // when a weight was requested would answer a different question than
       // the one asked (silent-wrong-number parity violation) — worse than
@@ -189,7 +256,7 @@ ojson summarizeCoreStatsWeighted(Datastore& ds, const std::optional<std::vector<
     }
     if (!usedCobra) {
       for (const auto& v : f64Vars) {
-        const cecon::Column& c = ds.col(v);
+        const cecon::Column& c = cat.ds->col(v);
         const double* d = c.f64();
         int64_t count = c.nbytes / static_cast<int64_t>(sizeof(double));
         std::vector<double> valid;
@@ -233,6 +300,63 @@ ojson summarizeCoreStatsWeighted(Datastore& ds, const std::optional<std::vector<
   out["detail"] = detail;
   out["stats"] = stats;
   return out;
+}
+
+// `summarize` of a resident head that is NOT on disk yet, answered without opening it.
+//
+// runSummarize used to start with session.datastore(), which first writes the whole resident
+// frame out, and then read from that Datastore only names, types and a path: the statistics
+// themselves come from the engine, which answers them from the frame it already holds. So every
+// `summarize` that followed a `generate`/`replace` cost one full write of the dataset plus the
+// scratch reclaim that write sets off, and egen pays it on every call because it runs a quiet
+// `summarize` to leave what egen.ado leaves in r(). On the AEA package openICPSR-226844
+// (39 runs of a 1,000-iteration loop with two egen each) that was 78,002 frame snapshots.
+//
+// The resident card carries the same three facts (row_evaluation.cpp factorColumns documents
+// why its name set, order and "f64"|"factor" vocabulary can be relied on), and a virtual head's
+// token is the path the engine expects for the frame it holds. nullopt = take the ordinary
+// path: the head is on disk already (opening it writes nothing), the card is not current, the
+// card spells a type this code does not know, or the engine call failed and the in-process
+// fallback, which reads the file, has to run.
+std::optional<ojson> summarizeResidentHead(SessionState& session,
+                                           const std::optional<std::vector<std::string>>& varlist,
+                                           bool detail, const std::optional<std::string>& weightVar,
+                                           const char* weightFlag) {
+  if (!session.residentHeadDirty() || !session.currentHbin().has_value()) return std::nullopt;
+  const std::vector<VarInfo>* card = session.residentReadCard();
+  if (card == nullptr) return std::nullopt;
+  for (const auto& v : *card)
+    if (v.dtype != "f64" && v.dtype != "factor") return std::nullopt;
+  auto find = [card](const std::string& name) -> const VarInfo* {
+    for (const auto& v : *card)
+      if (v.name == name) return &v;
+    return nullptr;
+  };
+  SummarizeCatalog cat;
+  cat.has = [&find](const std::string& n) { return find(n) != nullptr; };
+  cat.dtype = [&find](const std::string& n) { return find(n)->dtype; };
+  cat.names = [card]() {
+    std::vector<std::string> all;
+    all.reserve(card->size());
+    for (const auto& v : *card) all.push_back(v.name);
+    return all;
+  };
+  cat.path = *session.currentHbin();
+  return summarizeCore(cat, varlist, detail, weightVar, weightFlag);
+}
+
+}  // namespace
+
+ojson summarizeCoreStatsWeighted(Datastore& ds, const std::optional<std::vector<std::string>>& varlist,
+                                  bool detail, const std::optional<std::string>& weightVar,
+                                  const char* weightFlag) {
+  SummarizeCatalog cat;
+  cat.has = [&ds](const std::string& n) { return ds.has(n); };
+  cat.dtype = [&ds](const std::string& n) { return ds.dtype(n); };
+  cat.names = [&ds]() { return ds.names(); };
+  cat.path = ds.path();
+  cat.ds = &ds;
+  return *summarizeCore(cat, varlist, detail, weightVar, weightFlag);
 }
 
 ojson summarizeCoreStats(Datastore& ds, const std::optional<std::vector<std::string>>& varlist,
@@ -315,6 +439,8 @@ ojson runSummarize(const std::optional<std::vector<std::string>>& varlist, bool 
     tempDs = std::make_unique<Datastore>(sumifPath);
     ds = tempDs.get();
   } else {
+    if (auto resident = summarizeResidentHead(session, varlist, detail, weightVar, "--fweight"))
+      return *resident;
     ds = session.datastore();
   }
   if (ds == nullptr) return eval::noDataLoaded();
@@ -363,6 +489,8 @@ ojson runSummarizeAweight(const std::optional<std::vector<std::string>>& varlist
     tempDs = std::make_unique<Datastore>(sumifPath);
     ds = tempDs.get();
   } else {
+    if (auto resident = summarizeResidentHead(session, varlist, detail, weightVar, weightFlag))
+      return *resident;
     ds = session.datastore();
   }
   if (ds == nullptr) return eval::noDataLoaded();

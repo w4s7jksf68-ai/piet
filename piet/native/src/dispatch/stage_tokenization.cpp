@@ -172,6 +172,16 @@ bool tokenizeCommand(std::string& cmd,
             if (!unwrapped.empty()) parsed.varlist = unwrapped;
           }
         }
+        // A `(rule)` word and what follows it is not part of the varlist (recode's
+        // `(12/20=1) (*=0)`, bank c4aa17a2517289ee): only the words before it are
+        // expanded and abbreviated here.
+        std::vector<std::string> ruleTail;
+        for (size_t i = 0; i < parsed.varlist.size(); ++i)
+          if (cmd == "recode" && !parsed.varlist[i].empty() && parsed.varlist[i].front() == '(') {
+            ruleTail.assign(parsed.varlist.begin() + static_cast<long>(i), parsed.varlist.end());
+            parsed.varlist.resize(i);
+            break;
+          }
         bool patterned = false;
         for (const auto& t : parsed.varlist) {
           if (t.find('*') != std::string::npos || t.find('?') != std::string::npos ||
@@ -205,6 +215,7 @@ bool tokenizeCommand(std::string& cmd,
             return true;
           }
         }
+        parsed.varlist.insert(parsed.varlist.end(), ruleTail.begin(), ruleTail.end());
       } else if (spec != nullptr && session.hasData()) {
         // A single-equation fit's `syntax varlist(fv ts)` expands a range or a
         // wildcard like any varlist (`xtreg y x1-x3, fe`: w2d_uncovered.log

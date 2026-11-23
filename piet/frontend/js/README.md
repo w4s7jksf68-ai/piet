@@ -25,6 +25,7 @@ cache-busting queries by the DOM runner, so their state must stay in those files
 | Scrollback/gallery byte and block budgets | `console-budget.js` |
 | Coefficient table and model header/footer text | `estimation-format.js` |
 | correlate / summarize / tabulate / describe / esttab text | `table-format.js` |
+| `list` / `duplicates list` / `missings` listings (Stata's list layout) | `list-format.js` |
 | Plain-language error hint line | `error-hints.js` |
 | Graph block store for the gallery, disk spill | `graphics-gallery-store.js`, `graph_spill.js` |
 | Graph block to SVG | `graph.js` |

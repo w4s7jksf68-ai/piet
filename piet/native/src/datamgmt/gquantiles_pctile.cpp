@@ -24,14 +24,17 @@
 #include "piet/cobra_runner.h"
 #include "piet/column_fetch.h"
 #include "piet/datastore.h"
+#include "piet/display_hardening.h"
 #include "piet/inrange_filter.h"
 #include "piet/dispatcher.h"
 #include "piet/eval/errors.h"
+#include "piet/eval/exprfns.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
 #include "piet/strutil.h"
+#include "engine/scratch_columns.h"
 #include "gtools_internal.h"
 
 namespace piet::handlers {
@@ -242,7 +245,555 @@ void gquantilesPublishXtile(const eval::ParsedCommand& parsed, SessionState& ses
   eval::declareRPosted(session.eval, "gquantiles", {"N", "nquantiles", "nqused", "method_ratio"});
 }
 
+// ---------------------------------------------------------------------------
+// (4) gquantiles with gtools' own options: cutpoints() / cutoffs() /
+// quantiles() / cutquantiles() as the source of the bin edges, by() with
+// groupid(), altdef, binfreq, genp(), minmax, replace, method(), dedup,
+// cutifin, strict and returnlimit(), and an `if` on every form.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// gtools' cost estimate of sorting (m1) against selecting (m2), published as
+// their ratio r(method_ratio). Nread is the rows read (an `in` range shortens
+// it, an `if` does not), nout the number of cuts plus one. A request for
+// quantiles costs one pass per output; a request for cutoffs costs a tenth of
+// one. Creating the xtile variable adds a second sort; counting the bins one
+// more pass. Measured against the bank: xtile nq(4) on 74 rows 1.934688,
+// cutoffs(4000 6000 9000) 8.291522, `xtile nq(4) binfreq` with no variable
+// 1.260813, _pctile p(25 75) 1.768022.
+double gtoolsCostRatio(double nread, double nout, bool quantileRequest, bool generates,
+                       bool countsBins) {
+  const double l = std::log(nread);
+  double m1 = l + 1.0;
+  double m2 = quantileRequest ? nout : 1.0;
+  if (generates) {
+    m1 = 2.0 * l + 3.0;
+    m2 = quantileRequest ? nout + 2.0 : 0.1 * nout + 1.0;
+  } else if (countsBins) {
+    m1 = l + 2.0;
+    m2 = quantileRequest ? nout + 1.0 : 0.1 * nout + 1.0;
+  }
+  return m2 > 0.0 ? m1 / m2 : 0.0;
+}
+
+// The alternative definition (altdef): interpolate at rank (n + 1) p / 100.
+double altdefPctile(const std::vector<double>& sorted, double p) {
+  const double n = static_cast<double>(sorted.size());
+  if (sorted.empty()) return std::numeric_limits<double>::quiet_NaN();
+  const double h = (n + 1.0) * p / 100.0;
+  if (h <= 1.0) return sorted.front();
+  if (h >= n) return sorted.back();
+  const double i = std::floor(h);
+  const size_t k = static_cast<size_t>(i);
+  return sorted[k - 1] + (h - i) * (sorted[k] - sorted[k - 1]);
+}
+
+std::string smallestCategoryType(double largest) {
+  if (largest <= 100.0) return "byte";
+  if (largest <= 32740.0) return "int";
+  return "long";
+}
+
+ojson rc198(const std::string& message) {
+  return ojson(eval::errorBlock("syntax_error", message, std::nullopt, std::nullopt, std::nullopt,
+                                "r(198)"));
+}
+
+ojson rcError(const std::string& message, int rc) {
+  return ojson(eval::errorBlock(rc == 198 ? "syntax_error" : "engine_error", message,
+                                std::nullopt, std::nullopt, std::nullopt,
+                                "r(" + std::to_string(rc) + ")"));
+}
+
+ojson notImplemented(const std::string& what) {
+  return ojson(eval::unsupportedCommand(what, std::nullopt, std::nullopt,
+                                        "refused:gquantiles_extended",
+                                        eval::UnsupportedCommandKind::kNotImplemented));
+}
+
+// Writes one column of the current head: appended when `isNew`, replaced in
+// place otherwise (cobra setcol), stored as `storeType` when it is not empty.
+std::optional<ojson> writeColumn(SessionState& session, const std::string& name,
+                                 const std::vector<double>& values, bool isNew,
+                                 const std::string& storeType) {
+  const std::string csvPath = mintCsvPath(session.workdir(), "gquantiles_vals");
+  if (!writeValuesCsv(csvPath, values)) return gtErr("gquantiles: could not write the values");
+  const std::string outPath = mintScratchPath(session.workdir(), "gquantiles_col");
+  std::vector<std::string> argv = {"setcol", "--data", *session.currentHbin(), "--var", name,
+                                   "--values", csvPath, "--dtype", "f64"};
+  if (isNew) argv.push_back("--new");
+  if (!storeType.empty()) {
+    argv.push_back("--store-type");
+    argv.push_back(storeType);
+  }
+  argv.push_back("--out");
+  argv.push_back(outPath);
+  const CobraRunResult r = runCobra(argv);
+  if (!r.ok) return gtErr("gquantiles: " + cobraFailure(r));
+  if (!cecon::native_exists(outPath))
+    return gtErr("gquantiles: failed writing output dataset (disk full or I/O error)");
+  session.load(outPath);
+  if (!storeType.empty()) session.varMeta[name].stataType = storeType;
+  return std::nullopt;
+}
+
+// A numlist of percentages or cutoffs as typed (blanks or commas between).
+std::optional<ojson> readNumbers(const std::string& option, const std::string& text,
+                                 std::vector<double>* out) {
+  std::string normalised = text;
+  std::replace(normalised.begin(), normalised.end(), ',', ' ');
+  for (const auto& w : splitWords(normalised)) {
+    double v = 0.0;
+    if (!parseDoubleStrict(w, &v)) return rc198("option " + option + "() incorrectly specified");
+    out->push_back(v);
+  }
+  if (out->empty()) return rc198("option " + option + "() incorrectly specified");
+  return std::nullopt;
+}
+
+}  // namespace
+
+bool gquantilesNeedsExtended(const eval::ParsedCommand& parsed) {
+  static const std::unordered_set<std::string> kExtended = {
+      "cutpoints", "cutoffs", "quantiles", "cutquantiles", "by",     "groupid", "altdef",
+      "binfreq",   "genp",    "minmax",    "replace",      "method", "dedup",   "cutifin",
+      "strict",    "returnlimit", "cutby", "xmissing"};
+  for (const auto& kv : parsed.opts)
+    if (kExtended.count(strutil::lower(kv.first)) != 0) return true;
+  return false;
+}
+
+ojson runGQuantilesExtended(const eval::ParsedCommand& parsed, SessionState& session) {
+  if (!session.currentHbin().has_value()) return eval::noDataLoaded();
+  const ModeWord mode = readModeWord(parsed);
+  const bool isXtile = mode.mode == "xtile";
+  const bool isPctile = mode.mode == "pctile";
+  const bool isRPctile = mode.mode == "_pctile";
+  if (!isXtile && !isPctile && !isRPctile)
+    return gtErr("gquantiles: a mode is required -- write one of `xtile`, `_pctile` or `pctile`",
+                 "syntax_error");
+  if (parsed.weightType.has_value() && !parsed.weightType->empty())
+    return notImplemented("gquantiles with weights together with this option combination");
+
+  // `[newvar =] exp`.
+  std::string joined;
+  for (size_t i = 0; i < parsed.varlist.size(); ++i) {
+    if (mode.fromVarlist && i == mode.varlistIndex) continue;
+    if (!joined.empty()) joined += " ";
+    joined += parsed.varlist[i];
+  }
+  std::string target, source;
+  const size_t eq = joined.find('=');
+  if (eq == std::string::npos) {
+    source = strutil::trim(joined);
+  } else {
+    target = strutil::trim(joined.substr(0, eq));
+    source = strutil::trim(joined.substr(eq + 1));
+  }
+  if (source.empty()) return rc198("Invalid syntax. Requried: newvarname = exp");
+  if (isPctile && target.empty()) return rc198("pctile requires a new variable");
+  if (isRPctile && !target.empty()) return rc198("_pctile does not create a variable");
+  if (!target.empty() && !strutil::isValidStataIdentifier(target))
+    return rc198(target + " invalid name");
+
+  // Options.
+  long long nq = 0;
+  bool haveNq = false;
+  std::string pctText, cutoffText, cutVar, cutQuantVar, genp, groupid;
+  bool havePct = false, haveCutoffs = false;
+  bool altdef = false, binfreq = false, minmax = false, replace = false, dedup = false;
+  bool cutifin = false, strict = false;
+  long long returnlimit = 1001;
+  std::vector<std::string> byVars;
+  for (const auto& kv : parsed.opts) {
+    const std::string key = strutil::lower(kv.first);
+    const eval::OptValue& v = kv.second;
+    const std::string text = v.isBool ? std::string() : strutil::trim(v.strValue);
+    if (key == "xtile" || key == "pctile" || key == "_pctile") continue;
+    if (key == "nquantiles") {
+      if (v.isBool || !parseIntStrict(text, &nq)) return rc198("option nquantiles() incorrectly specified");
+      if (nq == 0) nq = 2;
+      haveNq = true;
+    } else if (key == "percentiles" || key == "quantiles") {
+      if (v.isBool) return rc198("option " + key + "() incorrectly specified");
+      pctText = text;
+      havePct = true;
+    } else if (key == "cutoffs") {
+      if (v.isBool) return rc198("option cutoffs() incorrectly specified");
+      cutoffText = text;
+      haveCutoffs = true;
+    } else if (key == "cutpoints" || key == "cutquantiles") {
+      if (v.isBool || text.empty() || text.find_first_of(" \t") != std::string::npos)
+        return rc198("option " + key + "() incorrectly specified");
+      bool ambiguous = false;
+      const auto found = resolveVarName(text, session, &ambiguous);
+      if (!found.has_value()) {
+        // gtools reads the option as a variable name; a number or a name that
+        // is not there is invalid syntax (bank 6d98fa25b86d0f39 `c(4000 ...)`).
+        if (!strutil::isValidStataIdentifier(text)) return rc198("invalid syntax");
+        return rcError("variable " + text + " not found", 111);
+      }
+      (key == "cutpoints" ? cutVar : cutQuantVar) = *found;
+    } else if (key == "by") {
+      if (v.isBool || text.empty()) return rc198("option by() incorrectly specified");
+      for (const auto& w : splitWords(text)) {
+        const auto found = resolveVarName(w, session);
+        if (!found.has_value()) return rcError("variable " + w + " not found", 111);
+        byVars.push_back(*found);
+      }
+    } else if (key == "groupid") {
+      if (v.isBool || !strutil::isValidStataIdentifier(text))
+        return rc198("option groupid() incorrectly specified");
+      groupid = text;
+    } else if (key == "genp") {
+      if (v.isBool || !strutil::isValidStataIdentifier(text))
+        return rc198("option genp() incorrectly specified");
+      genp = text;
+    } else if (key == "binfreq") {
+      if (!v.isBool) return notImplemented("gquantiles, binfreq(newvar)");
+      binfreq = true;
+    } else if (key == "method") {
+      long long m = 0;
+      if (v.isBool || !parseIntStrict(text, &m) || m < 0 || m > 2)
+        return rc198("option method() incorrectly specified");
+      // method() picks the algorithm (sort or select); the answer is the same.
+    } else if (key == "returnlimit") {
+      double lim = 0.0;
+      if (v.isBool || !parseDoubleStrict(text, &lim)) return rc198("option returnlimit() incorrectly specified");
+      returnlimit = lim <= 0 || std::isnan(lim) ? 1001 : static_cast<long long>(lim);
+    } else if (key == "altdef") {
+      altdef = true;
+    } else if (key == "minmax") {
+      minmax = true;
+    } else if (key == "replace") {
+      replace = true;
+    } else if (key == "dedup") {
+      dedup = true;
+    } else if (key == "cutifin") {
+      cutifin = true;
+    } else if (key == "strict") {
+      strict = true;
+    } else if (key == "cutby") {
+      return notImplemented("gquantiles, cutby");
+    } else if (key == "xmissing") {
+      return notImplemented("gquantiles, xmissing");
+    } else {
+      return ojson(eval::errorBlock("unsupported_option", "option " + kv.first + " not allowed",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    }
+  }
+  const int sources = (haveNq ? 1 : 0) + (havePct ? 1 : 0) + (haveCutoffs ? 1 : 0) +
+                      (cutVar.empty() ? 0 : 1) + (cutQuantVar.empty() ? 0 : 1);
+  if (sources > 1)
+    return rc198("specify only one of nquantiles(), percentiles(), cutpoints(), cutoffs() or "
+                 "cutquantiles()");
+  if (sources == 0) {
+    nq = kPctileDefaultNq;
+    haveNq = true;
+  }
+  if (haveNq && nq < 2) return rc198("nquantiles() must be at least 2");
+  const bool byMode = !byVars.empty();
+  if (byMode && isRPctile) return rc198("by() is not allowed with _pctile");
+  if (byMode && minmax) return rc198("minmax is not allowed with by()");
+  if (byMode && isPctile && !strict)
+    return rc198("by() with pctile requires option strict");
+  if (!groupid.empty() && !byMode) return notImplemented("gquantiles, groupid() without by()");
+  if (byMode && !(haveNq || havePct))
+    return notImplemented("gquantiles, by() with cutpoints(), cutoffs() or cutquantiles()");
+  if (!genp.empty() && !isPctile) return notImplemented("gquantiles, genp() outside the pctile form");
+  if (binfreq && (byMode || !(haveNq || havePct || haveCutoffs)))
+    return notImplemented("gquantiles, binfreq with by(), cutpoints() or cutquantiles()");
+  if (!isXtile && (haveCutoffs || !cutVar.empty()))
+    return notImplemented("gquantiles, cutoffs()/cutpoints() outside the xtile form");
+  if (!isXtile && !cutQuantVar.empty())
+    return notImplemented("gquantiles, cutquantiles() outside the xtile form");
+
+  Datastore* ds0 = session.datastore();
+  if (ds0 == nullptr) return eval::noDataLoaded();
+  const bool targetExists = !target.empty() && ds0->has(target);
+  if (targetExists && !replace) return rcError("variable " + target + " already defined", 110);
+  for (const std::string* extra : {&genp, &groupid})
+    if (!extra->empty() && ds0->has(*extra) && !replace)
+      return rcError("variable " + *extra + " already defined", 110);
+  for (const auto& b : byVars)
+    if (ds0->col(b).dtype == cecon::DType::Factor)
+      return notImplemented("gquantiles, by() with a string variable");
+
+  // The sample, the source and the by-values, all evaluated as generate would.
+  std::string qualifier;
+  if (parsed.ifExpr.has_value() && !strutil::trim(*parsed.ifExpr).empty())
+    qualifier += " if " + *parsed.ifExpr;
+  if (parsed.inRange.has_value() && !strutil::trim(*parsed.inRange).empty())
+    qualifier += " in " + *parsed.inRange;
+  const int64_t nRows = ds0->nRows();
+  std::vector<double> x, mark, cutValues;
+  std::vector<std::vector<double>> byValues;
+  {
+    ScratchColumns scratch(session);
+    std::string col;
+    if (auto failed = scratch.add(source, "", &col)) return *failed;
+    x = scratch.values(col);
+    mark.assign(static_cast<size_t>(nRows), 1.0);
+    if (!qualifier.empty()) {
+      if (auto failed = scratch.add("1", qualifier, &col)) return *failed;
+      mark = scratch.values(col);
+    }
+    const std::string& cv = cutVar.empty() ? cutQuantVar : cutVar;
+    if (!cv.empty()) {
+      if (auto failed = scratch.add(cv, "", &col)) return *failed;
+      cutValues = scratch.values(col);
+    }
+    for (const auto& b : byVars) {
+      if (auto failed = scratch.add(b, "", &col)) return *failed;
+      byValues.push_back(scratch.values(col));
+    }
+  }
+  if (session.datastore() == nullptr) return eval::noDataLoaded();
+  // Every missing value (`.`, `.a` .. `.z`) is a NaN below; a by-value keeps
+  // its kind, as the sentinel double, so `.a` and `.b` are separate groups.
+  for (auto* column : {&x, &mark, &cutValues})
+    for (double& v : *column)
+      if (std::fabs(v) >= eval::kStataMissingSentinel) v = std::numeric_limits<double>::quiet_NaN();
+  for (auto& bv : byValues)
+    for (double& v : bv)
+      if (std::isnan(v)) v = eval::kStataMissingSentinel;
+
+  double nread = static_cast<double>(nRows);
+  if (parsed.inRange.has_value() && !strutil::trim(*parsed.inRange).empty()) {
+    const InRangeBounds bounds = parseInRangeBounds(*parsed.inRange, nRows);
+    if (bounds.ok) nread = static_cast<double>(bounds.b - bounds.a + 1);
+  }
+  std::vector<char> inSample(static_cast<size_t>(nRows), 0);
+  long long markedRows = 0, nx = 0;
+  for (int64_t i = 0; i < nRows; ++i) {
+    if (std::isnan(mark[static_cast<size_t>(i)])) continue;
+    ++markedRows;
+    if (std::isnan(x[static_cast<size_t>(i)])) continue;
+    inSample[static_cast<size_t>(i)] = 1;
+    ++nx;
+  }
+  if (nx == 0) return rcError("no observations", 2000);
+
+  auto pctOf = [&](const std::vector<double>& sorted, double p) {
+    return altdef ? altdefPctile(sorted, p) : stataPctile(sorted, p);
+  };
+
+  // Percentages for the quantile requests.
+  std::vector<double> pcts;
+  if (haveNq)
+    for (long long i = 1; i < nq; ++i) pcts.push_back(100.0 * static_cast<double>(i) / static_cast<double>(nq));
+  if (havePct) {
+    if (auto bad = readNumbers(mode.mode == "xtile" ? "quantiles" : "percentiles", pctText, &pcts)) return *bad;
+  }
+  std::vector<double> literalCuts;
+  if (haveCutoffs)
+    if (auto bad = readNumbers("cutoffs", cutoffText, &literalCuts)) return *bad;
+  if (!cutVar.empty() || !cutQuantVar.empty()) {
+    for (int64_t i = 0; i < nRows; ++i) {
+      const double c = cutValues[static_cast<size_t>(i)];
+      if (std::isnan(c)) continue;
+      if (cutifin && std::isnan(mark[static_cast<size_t>(i)])) continue;
+      (cutVar.empty() ? pcts : literalCuts).push_back(c);
+    }
+    std::vector<double>& got = cutVar.empty() ? pcts : literalCuts;
+    std::sort(got.begin(), got.end());
+    if (dedup) got.erase(std::unique(got.begin(), got.end()), got.end());
+    if (got.empty()) return rc198("no non-missing values in " + (cutVar.empty() ? cutQuantVar : cutVar));
+  }
+  for (double p : pcts)
+    if (!(p > 0.0 && p < 100.0)) return rc198("percentiles must be strictly between 0 and 100");
+  if (pcts.size() > kMaxPercentileCount || literalCuts.size() > kMaxPercentileCount)
+    return gtErr("gquantiles: more than " + std::to_string(kMaxPercentileCount) +
+                 " quantiles requested");
+  const bool quantileRequest = !pcts.empty();
+  const size_t nCuts = quantileRequest ? pcts.size() : literalCuts.size();
+  if (strict && haveNq && !byMode && nq > nx + 1)
+    return rc198("nquantiles() must be less than or equal to the number of non-missing "
+                 "observations plus one");
+
+  // Groups (one when there is no by()).
+  std::vector<std::vector<int64_t>> groups;
+  std::vector<double> groupOfRow(static_cast<size_t>(nRows), std::numeric_limits<double>::quiet_NaN());
+  {
+    std::vector<int64_t> rows;
+    for (int64_t i = 0; i < nRows; ++i)
+      if (!std::isnan(mark[static_cast<size_t>(i)])) rows.push_back(i);
+    if (!byMode) {
+      groups.push_back(rows);
+    } else {
+      // A missing by-value is a group of its own, sorted after every number
+      // (bank 321824f7fe83df1f: by(foreign rep78) has J = 10, the eight
+      // observed pairs and one missing-rep78 group per foreign).
+      auto same = [](double a, double b) { return a == b; };
+      auto before = [](double a, double b) { return a < b; };
+      std::stable_sort(rows.begin(), rows.end(), [&](int64_t a, int64_t b) {
+        for (const auto& bv : byValues) {
+          const double va = bv[static_cast<size_t>(a)], vb = bv[static_cast<size_t>(b)];
+          if (!same(va, vb)) return before(va, vb);
+        }
+        return false;
+      });
+      for (size_t k = 0; k < rows.size(); ++k) {
+        bool fresh = groups.empty();
+        if (!fresh)
+          for (const auto& bv : byValues)
+            if (!same(bv[static_cast<size_t>(rows[k])], bv[static_cast<size_t>(groups.back().front())])) fresh = true;
+        if (fresh) groups.emplace_back();
+        groups.back().push_back(rows[k]);
+        groupOfRow[static_cast<size_t>(rows[k])] = static_cast<double>(groups.size());
+      }
+    }
+  }
+
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  std::vector<double> category(static_cast<size_t>(nRows), kNaN);
+  std::vector<double> pctileCol(static_cast<size_t>(nRows), kNaN);
+  std::vector<double> genpCol(static_cast<size_t>(nRows), kNaN);
+  std::vector<double> usedCuts;  // the whole-sample cuts, in the order asked
+  std::vector<double> binCounts(nCuts, 0.0);
+  double sampleMin = std::numeric_limits<double>::infinity();
+  double sampleMax = -std::numeric_limits<double>::infinity();
+  double largest = 0.0;
+  for (const auto& g : groups) {
+    std::vector<double> sorted;
+    for (int64_t r : g)
+      if (inSample[static_cast<size_t>(r)]) sorted.push_back(x[static_cast<size_t>(r)]);
+    if (sorted.empty()) continue;
+    std::sort(sorted.begin(), sorted.end());
+    sampleMin = std::min(sampleMin, sorted.front());
+    sampleMax = std::max(sampleMax, sorted.back());
+    const long long gn = static_cast<long long>(sorted.size());
+    if (byMode && strict && haveNq && (isPctile ? nq > gn : nq > gn + 1)) continue;
+    std::vector<double> cuts;
+    if (quantileRequest)
+      for (double p : pcts) cuts.push_back(pctOf(sorted, p));
+    else
+      cuts = literalCuts;
+    if (!byMode) usedCuts = cuts;
+    std::vector<double> edges = cuts;
+    std::sort(edges.begin(), edges.end());
+    if (isXtile) {
+      for (int64_t r : g) {
+        if (!inSample[static_cast<size_t>(r)]) continue;
+        const double v = x[static_cast<size_t>(r)];
+        const size_t below = static_cast<size_t>(std::lower_bound(edges.begin(), edges.end(), v) - edges.begin());
+        const double cat = static_cast<double>(below + 1);
+        category[static_cast<size_t>(r)] = cat;
+        largest = std::max(largest, cat);
+        if (below < nCuts) binCounts[below] += 1.0;
+      }
+    } else if (isPctile) {
+      // The percentiles land in the group's first rows, in data order; without
+      // by() they fill observations 1..nq-1 whatever the if/in sample's size.
+      const size_t room = byMode ? g.size() : static_cast<size_t>(nRows);
+      for (size_t k = 0; k < cuts.size() && k < room; ++k) {
+        const size_t r = static_cast<size_t>(byMode ? g[k] : static_cast<int64_t>(k));
+        pctileCol[r] = cuts[k];
+        if (!genp.empty()) genpCol[r] = pcts[k];
+      }
+      if (!byMode && cuts.size() > static_cast<size_t>(nRows))
+        return gtErr("gquantiles: " + std::to_string(cuts.size()) +
+                     " percentiles cannot be stored in a dataset of " + std::to_string(nRows) +
+                     " observations");
+    }
+  }
+
+  // Variables.
+  if (isXtile && !target.empty()) {
+    if (auto failed = writeColumn(session, target, category, !targetExists, smallestCategoryType(largest)))
+      return *failed;
+  }
+  if (isPctile) {
+    if (auto failed = writeColumn(session, target, pctileCol, !targetExists, "")) return *failed;
+    if (!genp.empty()) {
+      const bool exists = session.datastore()->has(genp);
+      if (auto failed = writeColumn(session, genp, genpCol, !exists, "")) return *failed;
+    }
+  }
+  if (!groupid.empty()) {
+    const bool exists = session.datastore()->has(groupid);
+    if (auto failed = writeColumn(session, groupid, groupOfRow, !exists,
+                                  smallestCategoryType(static_cast<double>(groups.size()))))
+      return *failed;
+  }
+
+  // r().
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted;
+  auto setR = [&](const std::string& name, double v) {
+    session.eval.rValues.set(name, v);
+    posted.push_back(name);
+  };
+  if (byMode) {
+    double minJ = std::numeric_limits<double>::infinity(), maxJ = 0.0;
+    for (const auto& g : groups) {
+      minJ = std::min(minJ, static_cast<double>(g.size()));
+      maxJ = std::max(maxJ, static_cast<double>(g.size()));
+    }
+    setR("N", static_cast<double>(markedRows));
+    setR("Nx", static_cast<double>(nx));
+    setR("J", static_cast<double>(groups.size()));
+    setR("minJ", minJ);
+    setR("maxJ", maxJ);
+  } else {
+    setR("N", static_cast<double>(nx));
+    setR("nqused", static_cast<double>(nCuts));
+    setR("method_ratio",
+         gtoolsCostRatio(nread, static_cast<double>(nCuts + 1), quantileRequest,
+                         isXtile && !target.empty(), binfreq));
+    if (minmax) {
+      setR("min", sampleMin);
+      setR("max", sampleMax);
+    }
+    if (haveNq) setR("nquantiles", static_cast<double>(nq));
+    if (havePct) {
+      setR("nquantiles_used", static_cast<double>(nCuts));
+      session.eval.rStrings.set("quantiles", pctText);
+      posted.push_back("quantiles");
+      putRMatrixColumn(session, "quantiles_used", usedCuts);
+      posted.push_back("quantiles_used");
+    }
+    if (haveCutoffs) {
+      setR("ncutoffs_used", static_cast<double>(nCuts));
+      session.eval.rStrings.set("cutoffs", cutoffText);
+      posted.push_back("cutoffs");
+      putRMatrixColumn(session, "cutoffs_used", usedCuts);
+      posted.push_back("cutoffs_used");
+    }
+    if (!cutVar.empty()) setR("ncutpoints", static_cast<double>(nCuts));
+    if (!cutQuantVar.empty()) setR("nquantpoints", static_cast<double>(nCuts));
+    if (isRPctile && haveNq) {
+      putRMatrixColumn(session, "quantiles_used", usedCuts);
+      posted.push_back("quantiles_used");
+    }
+    if (isRPctile) {
+      const size_t shown = std::min(usedCuts.size(), static_cast<size_t>(returnlimit));
+      for (size_t i = 0; i < shown; ++i) setR("r" + std::to_string(i + 1), usedCuts[i]);
+    }
+    if (binfreq) {
+      const std::string name = haveCutoffs ? "cutoffs_binfreq" : "quantiles_binfreq";
+      putRMatrixColumn(session, name, binCounts);
+      posted.push_back(name);
+    }
+  }
+  eval::declareRPosted(session.eval, "gquantiles", posted);
+
+  std::vector<std::string> made, rewritten;
+  for (const std::string* v : {&target, &genp, &groupid}) {
+    if (v->empty() || (v == &target && isRPctile) || (v == &target && isXtile && target.empty())) continue;
+    (v == &target && targetExists ? rewritten : made).push_back(*v);
+  }
+  if (made.empty() && rewritten.empty()) return ojson::array();
+  return mutationResult(session, "gen", made, {}, rewritten);
+}
+
 ojson runGQuantilesPctile(const eval::ParsedCommand& parsed, SessionState& session) {
+  if (gquantilesNeedsExtended(parsed) || readModeWord(parsed).mode == "xtile" ||
+      (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()))
+    return runGQuantilesExtended(parsed, session);
+  if (parsed.weightType.has_value() && !parsed.weightType->empty())
+    return notImplemented("gquantiles with weights in the _pctile and pctile forms");
   const eval::OptVocab* vocab = eval::findOptVocab("gquantiles");
   if (vocab != nullptr) {
     // The refused keys were already answered upstream in translateGtoolsAlias,

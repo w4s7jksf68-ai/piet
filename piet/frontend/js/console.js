@@ -12,6 +12,7 @@ import { registerGraph } from './graphics-gallery-store.js';
 import { noviceErrorHint } from './error-hints.js';
 import { formatEstimation } from './estimation-format.js';
 import { formatCorrelate, formatSummarize, formatTabulate, formatDescribe, formatEstimatesTable } from './table-format.js';
+import { formatListing } from './list-format.js';
 
 // Compatibility re-exports: the DOM runner and the browser test pages import these names from console.js.
 export { DEFAULT_MEMORY_BUDGET_MB, setMemoryBudgetMb } from './console-budget.js';
@@ -149,7 +150,9 @@ export function appendBlock(block) {
 
   // BUG-1473: a display continuing an open `_continue` line joins it.
   if (block.type === 'display' && _openDisplayEl && _openDisplayEl.isConnected) {
-    _openDisplayEl.textContent += block.text ?? '';
+    _openDisplayEl.displayText += block.text ?? '';
+    _openDisplayEl.displayWidth ??= block.linesize;
+    _openDisplayEl.textContent = wrapDisplayText(_openDisplayEl.displayText, _openDisplayEl.displayWidth);
     const live = _liveBlocks.find(b => b.el === _openDisplayEl);
     const bytes = estimateBlockBytes(block);
     if (live) { live.bytes += bytes; _liveBytes += bytes; }
@@ -185,6 +188,13 @@ export function appendBlock(block) {
       break;
     case 'error':            el = renderError(block);          break;
     case 'estimates_table':  el = renderEstimatesTable(block); break;
+    // `list` / `duplicates list`: Stata's listing, drawn from the block's
+    // `listing` object (list-format.js). A browse block without one is the
+    // data browser's (execution.js opens the grid for it).
+    case 'browse':
+      el = block.listing ? renderListing(block)
+                         : renderEcho({ type: 'echo', text: JSON.stringify(block) });
+      break;
     default:
       el = renderEcho({ type: 'echo', text: JSON.stringify(block) });
   }
@@ -226,7 +236,8 @@ export function appendBlock(block) {
   // a post-hoc querySelector so a block that merely happens to contain a
   // <pre class="coeftable"> for unrelated reasons never picks this up.
   if (block.type === 'estimation' || block.type === 'summarize' ||
-      block.type === 'tabulate'   || block.type === 'describe') {
+      block.type === 'tabulate'   || block.type === 'describe' ||
+      (block.type === 'browse' && block.listing)) {
     _addCopyBar(el);
   }
 
@@ -379,11 +390,32 @@ function renderEcho(block) {
   return div;
 }
 
+function wrapDisplayText(text, width) {
+  if (!Number.isInteger(width) || width < 3 || text.length <= width) return text;
+  let result = '';
+  let col = 0;
+  for (const char of text) {
+    if (char === '\n') {
+      col = 0;
+    } else {
+      if (col === width) {
+        result += '\n> ';
+        col = 2;
+      }
+      ++col;
+    }
+    result += char;
+  }
+  return result;
+}
+
 function renderDisplay(block) {
   // `display` output is plain result text, NOT a command echo — no '. ' prefix.
   const div = document.createElement('div');
   div.className = 'block block-display';
-  div.textContent = block.text ?? '';
+  div.displayText = block.text ?? '';
+  div.displayWidth = block.linesize;
+  div.textContent = wrapDisplayText(div.displayText, div.displayWidth);
   return div;
 }
 
@@ -435,6 +467,17 @@ function renderSummarize(block) {
   const pre = document.createElement('pre');
   pre.className = 'coeftable';
   pre.textContent = formatSummarize(block);
+  div.appendChild(pre);
+  return div;
+}
+
+function renderListing(block) {
+  const div = document.createElement('div');
+  div.className = 'block block-table block-listing';
+
+  const pre = document.createElement('pre');
+  pre.className = 'coeftable';
+  pre.textContent = formatListing(block.listing);
   div.appendChild(pre);
   return div;
 }

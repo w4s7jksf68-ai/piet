@@ -24,7 +24,12 @@ points are declared in `piet/handlers/descriptive.h`, except `runCentile`
 | `centile` (binomial, normal-theory and mean/sd limits) | `centile_intervals.cpp` |
 | Which route calls a handler; `codebook`, `ds` | `route_describe.cpp`, `route_tabulation.cpp` in `dispatch/` |
 
-This directory has no private header of its own. Its files include private headers
+This directory's one private header is `summarize_prefetch.h`: it carries one engine
+summary of a variable from egen's own request (`datamgmt/egen.cpp`) to the quiet
+`summarize ARG, meanonly` that egen runs for its `r()` right afterwards, so that
+summarize does not ask the engine again. The header says when an answer may be handed
+over (same head path, same variable, plain unweighted summarize) and when it is
+dropped; `summarizeCore` in `summarize.cpp` is the only taker. Its files include private headers
 owned by other directories, and only those directories' files should do so. The list is
 not exhaustive; for example:
 `datamgmt/variable_metadata_support.h` (the `variable_metadata_detail` helpers used by

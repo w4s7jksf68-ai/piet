@@ -686,6 +686,20 @@ bool route_graphics(std::string& cmd,
                                               std::nullopt, "r(101)")));
       return true;
     }
+    // With no margins result to plot, Stata stops at r(301) "previous command was not
+    // margins" before it reads an option (vs-stata bank ff2cfc7e119edba0 `marginsplot ,
+    // zzabbrprobe` r(301)); runMarginsplot owns the message, so it answers here.
+    {
+      const std::string* rcCmd = session.eval.rStrings.find("cmd");
+      const std::string* ecCmd = session.eval.eStrings.find("cmd");
+      const bool live = (rcCmd != nullptr && *rcCmd == "margins") || (ecCmd != nullptr && *ecCmd == "margins");
+      static const std::set<std::string> kSummaries = {"mean", "proportion", "ratio", "total"};
+      const bool summaryFit = ecCmd != nullptr && kSummaries.count(*ecCmd) != 0;
+      if (!session.lastMargins.has_value() || (!live && !summaryFit)) {
+        blocks.push_back(ojson(handlers::runMarginsplot({}, session)));
+        return true;
+      }
+    }
     if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabMarginsplot.known,
                                               kVocabMarginsplot.unimplemented)) {
       blocks.push_back(ojson(*err));
@@ -1073,7 +1087,8 @@ bool route_graphics(std::string& cmd,
       // weights; w2ai gf_bar_aw/fw/pw, gf_box_aw); their handler answers iw.
       if (parsed.weightType.has_value() && !parsed.weightType->empty() &&
           !(sub == "twoway" || sub == "tw" || sub == "two" || sub == "twow" || sub == "twowa" ||
-            sub == "bar" || sub == "hbar" || sub == "box" || sub == "hbox")) {
+            sub == "bar" || sub == "hbar" || sub == "box" || sub == "hbox" || subIs("dotchart", 3) ||
+            sub == "pie")) {
         blocks.push_back(ojson(eval::unsupportedOption(
             "[" + *parsed.weightType + "=" + parsed.weightVar.value_or("") + "]",
             "`graph` does not support weighted estimation in this engine (no "
@@ -1100,11 +1115,10 @@ bool route_graphics(std::string& cmd,
         // Real Stata graphs this build does not draw: refused by name, not as an
         // unknown class (replay re-draws stored graphs, addplot adds to one, dotchart
         // and fp are graph families).
-        if (subIs("replay", 6) || sub == "addplot" || sub == "fp" || subIs("dotchart", 3)) {
+        if (subIs("replay", 6) || sub == "addplot" || sub == "fp") {
           const std::string canon = subIs("replay", 6)   ? "replay"
                                     : sub == "addplot"   ? "addplot"
-                                    : sub == "fp"        ? "fp"
-                                                         : "dotchart";
+                                                         : "fp";
           blocks.push_back(ojson(eval::unsupportedCommand("graph " + canon, std::nullopt, std::nullopt,
                                                           "piet_gap",
                                                           eval::UnsupportedCommandKind::kNotImplemented)));
@@ -1112,7 +1126,7 @@ bool route_graphics(std::string& cmd,
         }
         static const char* kGraphClasses[] = {"bar", "hbar", "box",  "hbox", "pie", "combine",
                                               "by",  "star", "xy",   "yx",   "log"};
-        bool knownSub = ownSub || subIs("twoway", 2) || subIs("matrix", 3);
+        bool knownSub = ownSub || subIs("twoway", 2) || subIs("matrix", 3) || subIs("dotchart", 3);
         for (const char* k : kGraphClasses) {
           if (sub == k) knownSub = true;
         }
@@ -1124,7 +1138,8 @@ bool route_graphics(std::string& cmd,
               std::nullopt, std::nullopt, "r(4023)")));
           return true;
         }
-        gc = sub;
+        // graph dot (DOTchart): the dot chart of the graph bar statistics (graph_bar.cpp).
+        gc = subIs("matrix", 3) ? "matrix" : subIs("dotchart", 3) ? "dot" : sub;
         vl = std::vector<std::string>(parsed.varlist.begin() + 1, parsed.varlist.end());
       } else {
         gc = "scatter";
@@ -1411,6 +1426,11 @@ bool route_graphics(std::string& cmd,
     // start(r(min)); the bin note): w2al tf_kd_n log:3524-3540, tf_hist_082.
     // It takes the layer renderer like the range plots below.
     bool twowayKdHist = false;
+    // `twoway bar y x` (bare, any `twoway`/`graph twoway` spelling) is the twoway
+    // bar PLOT TYPE -- bars at each x -- not the `graph bar` command; it takes
+    // the layer renderer like `twoway (bar y x)` (bank: `twoway bar le year`).
+    bool twowayBarPlot = false;
+    bool twowayWordPlot = false;  // gc is a twoway plot type typed after `twoway`
     // `twoway PLOTTYPE var...` (bare, non-parenthesised form): strip the
     // leading plot-type keyword.
     if (gc == "twoway") {
@@ -1435,10 +1455,29 @@ bool route_graphics(std::string& cmd,
           "lfit",     "qfit",    "lfitci",    "qfitci",
           "rspike",   "rline",   "rconnected", "rscatter",  // serset-twoway RNG
       };
+      // A bare `twoway` (no plot, no option) draws an empty graph at rc 0 (vs-stata bank
+      // eab000dc78111a2a): the unit axes and no plot.
+      if (vl.empty() && parsed.opts.empty()) {
+        ojson empty;
+        empty["type"] = "graph";
+        empty["kind"] = "twoway";
+        empty["title"] = "";
+        empty["x_min"] = 0.0;
+        empty["x_max"] = 1.0;
+        empty["y_min"] = 0.0;
+        empty["y_max"] = 1.0;
+        empty["layers"] = ojson::array();
+        const ojson emptyMeta = graphMetaFor(graphLineTyped, "twoway", parsed.opts);
+        serset::registerGraph(session, empty, std::string(), serset::buildPlotSersets({}), &emptyMeta);
+        blocks.push_back(empty);
+        return true;
+      }
       if (!vl.empty() && kTwowayPlotTypes.count(lower(vl[0]))) {
         gc = lower(vl[0]);
         vl = std::vector<std::string>(vl.begin() + 1, vl.end());
         twowayKdHist = gc == "kdensity" || gc == "histogram" || gc == "hist";
+        twowayBarPlot = gc == "bar";
+        twowayWordPlot = true;
       } else {
         // The word after `twoway` is a plot type; one that is no twoway plot type and
         // no abbreviation of one is r(198) (bank: `twoway zzplot price mpg`).
@@ -1492,7 +1531,8 @@ bool route_graphics(std::string& cmd,
 
     Datastore* dsPtr = session.datastore();
     // `set varabbrev on`: a unique prefix names its variable
-    if (dsPtr != nullptr && gc != "bar" && gc != "hbar" && gc != "box" && gc != "hbox") {
+    if (dsPtr != nullptr && (twowayWordPlot || (gc != "bar" && gc != "dot")) && gc != "hbar" && gc != "box" &&
+        gc != "hbox") {
       for (auto& w : vl) w = handlers::unabbreviateGraphVar(session, *dsPtr, w);
     }
     std::string tmpGraphHbin;
@@ -1593,10 +1633,14 @@ bool route_graphics(std::string& cmd,
     // varlist and is not the dispatched token — and the registration exists so
     // the census can see the vocabulary, not to decide anything here.
     if (kUnsupportedBareGraphTypes.count(gc) == 0 && kBareTwowayLayerRoute.count(gc) == 0 &&
-        !twowayKdHist) {
+        !twowayKdHist && !twowayBarPlot) {
       std::unordered_set<std::string> gknown = kGraphSharedKnown;
       const std::unordered_set<std::string>* gunimpl = &kGraphBaseUnimpl;
-      if (gc == "histogram" || gc == "hist") {
+      if (gc == "matrix") {
+        gknown.insert({"half", "diag", "diagonal"});
+        for (auto& kv : parsed.opts)
+          if (kv.first == "diag") kv.first = "diagonal";
+      } else if (gc == "histogram" || gc == "hist") {
         gknown.insert(kGraphHistExtra.begin(), kGraphHistExtra.end());
         gunimpl = &kGraphHistUnimpl;
       } else if (gc == "kdensity") {
@@ -1792,7 +1836,7 @@ bool route_graphics(std::string& cmd,
     // variables from a to b in data order (bank: `scatter price mpg-weight`); one that matches
     // nothing is "variable X not found". The same varlist grammar holds for histogram and kdensity
     // (bank: `kdensity pri*` runs on price).
-    if ((gc == "scatter" || gc == "line" || gc == "connected" || gc == "tsline" || gc == "kdensity" ||
+    if ((gc == "matrix" || gc == "scatter" || gc == "line" || gc == "connected" || gc == "tsline" || gc == "kdensity" ||
          gc == "histogram" || gc == "hist") &&
         dsPtr != nullptr) {
       std::vector<std::string> expanded;
@@ -1830,7 +1874,7 @@ bool route_graphics(std::string& cmd,
     }
     // serset-twoway REF: a string variable in a scatter/line plot's varlist is
     // r(109) (w2al tf_r_sc_strx, log:5330-5339); it used to plot factor codes.
-    if (gc == "scatter" || gc == "line" || gc == "connected" || gc == "tsline") {
+    if (gc == "matrix" || gc == "scatter" || gc == "line" || gc == "connected" || gc == "tsline") {
       for (const auto& v : vl) {
         if (dsPtr != nullptr && dsPtr->has(v) && dsPtr->dtype(v) == "factor") {
           if (!tmpGraphHbin.empty()) cecon::native_unlink(tmpGraphHbin);
@@ -1841,7 +1885,7 @@ bool route_graphics(std::string& cmd,
         }
       }
     }
-    if (rerouteToLayers || kBareTwowayLayerRoute.count(gc) != 0 || twowayKdHist) {
+    if (rerouteToLayers || kBareTwowayLayerRoute.count(gc) != 0 || twowayKdHist || twowayBarPlot) {
       twoway::LayerSpec spec;
       spec.plottype = gc == "hist" ? std::string("histogram") : gc;
       spec.varlist = vl;
@@ -1935,7 +1979,8 @@ bool route_graphics(std::string& cmd,
       gApplied.insert({"overlay", "i", "t"});
     } else if (gc == "tsline") {
       result = ojson(handlers::runTsline(*dsPtr, vl, session.timevar, parsed.opts));
-    } else if (cmd == "graph" && (gc == "bar" || gc == "hbar" || gc == "box" || gc == "hbox")) {
+    } else if (cmd == "graph" && !twowayWordPlot &&
+               (gc == "bar" || gc == "hbar" || gc == "box" || gc == "hbox" || gc == "dot")) {
       // graph-family AI-1/AI-2/AI-3: the bar/box statistics and serset
       // (graph_bar.cpp). Its options are drawing options except the ones the
       // handler reads; they are accepted (the block notes them).
@@ -1953,6 +1998,24 @@ bool route_graphics(std::string& cmd,
                             "horizontal", "vertical", "noout", "nooutsides", "nofill", "saving",
                             "nodraw", "scheme", "xsize", "ysize"})
         gApplied.insert(k);
+    } else if (cmd == "graph" && !twowayWordPlot && gc == "pie") {
+      // graph pie (graph_bar.cpp): the wedges and their labels; the handler reads its own
+      // options and notes the ones it does not draw.
+      handlers::PieGraphResult pr = handlers::runGraphPie(
+          session, *dsPtr, vl, parsed,
+          (ifExpr.has_value() && !ifExpr->empty()) || bareIn);
+      if (!pr.warning.empty()) {
+        ojson warn;
+        warn["type"] = "display";
+        warn["class"] = "note";
+        warn["text"] = pr.warning;
+        blocks.push_back(warn);
+      }
+      result = pr.block;
+      for (const auto& kv : parsed.opts) gApplied.insert(kv.first);
+    } else if (gc == "matrix") {
+      result = handlers::runScatterMatrix(*dsPtr, vl, parsed, session);
+      gApplied = {"title", "note", "name", "saving", "half", "diagonal", "mcolor", "msize", "msymbol"};
     } else if (kUnsupportedBareGraphTypes.count(gc) != 0) {
       result = ojson(eval::unsupportedCommand("graph " + gc, std::nullopt, std::nullopt, "piet_gap",
                                               eval::UnsupportedCommandKind::kNotImplemented));
@@ -2010,7 +2073,9 @@ bool route_graphics(std::string& cmd,
       // one as "Graph") together with its sersets — the one registration
       // (piet/serset.h registerGraph).
       const ojson bareMeta = graphMetaFor(
-          graphLineTyped, (gc == "bar" || gc == "hbar" || gc == "box" || gc == "hbox") ? "bar" : "twoway",
+          graphLineTyped, gc == "matrix" ? "matrix" :
+                          (gc == "bar" || gc == "hbar" || gc == "box" || gc == "hbox" || gc == "dot" ||
+                           gc == "pie") ? "bar" : "twoway",
           parsed.opts);  // graph-family AI-4 (bar/hbar/box are family `bar`: w2ai gf_box_out_d)
       serset::registerGraph(session, result, bareNameOpt,
                             serset::buildPlotSersets(std::move(barePlots)), &bareMeta);

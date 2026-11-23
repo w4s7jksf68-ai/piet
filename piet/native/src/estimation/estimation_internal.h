@@ -71,7 +71,7 @@ inline constexpr double kZ975 = 1.959963984540054;  // qnorm(0.975)
 VcovResult vcovFromOpts(const eval::ParsedCommand& parsed, bool* sawRobustFlag = nullptr);
 void pushLevelIfGivenM4(const eval::ParsedCommand& parsed, std::vector<std::string>& argv);
 ojson runP7Mle(const std::string& cobraCmd, std::vector<std::string> cobraArgs,
-               SessionState& session, ojson* rawOut = nullptr);
+               SessionState& session, ojson* rawOut = nullptr, bool recordSample = false);
 // BUG-1196 (likelihood_support.cpp, beside runP7Mle): e(b)/e(V) posted for the fits
 // whose Stata stripe the coefficient table does not carry.
 struct AncillaryEbColM4 {

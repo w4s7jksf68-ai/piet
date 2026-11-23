@@ -20,6 +20,8 @@ namespace piet::handlers {
 
 // Bounded, expression-compiled generic lf likelihoods; no evaluator execution.
 nlohmann::ordered_json runMl(const eval::ParsedCommand& parsed, SessionState& session);
+// `constraint define|drop|dir|list|free|get` (estimation/likelihood_support.cpp).
+nlohmann::ordered_json runConstraint(const eval::ParsedCommand& parsed, SessionState& session);
 
 // `regress`/`reg`/`feols`/`reghdfe` y x1 x2 [, robust|cluster(v)|noconstant|
 // level(#)|absorb(...)] — C++ port of the classify()->build_estimation_argv()
@@ -68,6 +70,11 @@ nlohmann::ordered_json runIvreg2(const eval::ParsedCommand& parsed, SessionState
                                   const std::string& stataCmd);
 // E2, computed PIET-side with no engine call.
 nlohmann::ordered_json runSpearman(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runKtau(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runRanksum(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runCi(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runPrtest(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runPrtesti(const eval::ParsedCommand& parsed, SessionState& session);
 nlohmann::ordered_json runSktest(const eval::ParsedCommand& parsed, SessionState& session);
 nlohmann::ordered_json runSignrank(const eval::ParsedCommand& parsed, SessionState& session);
 nlohmann::ordered_json runCentile(const eval::ParsedCommand& parsed, SessionState& session);

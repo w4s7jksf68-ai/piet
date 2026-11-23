@@ -829,14 +829,20 @@ void testBS004JoinbyInnerKeyJoin() {
   // The fixture keeps its original shape for freeze stability, not because this
   // leg's SETUP and mask the joinby behaviour under test. _n==1|_n==3 gives 1,2,1,2.
   (void)piet::dispatch("gen double side = cond(_n==1 | _n==3, 1, 2)", session);
+  // joinby's update is implemented (vs-stata stage 4; bank 2226af525d223e5c
+  // `joinby make using "u.dta", update` rc 0); replace without update is r(198).
   auto optBlocks = piet::dispatch("joinby gid using `bs004using', update", session);
   bool optErr = false;
   for (const auto& b : optBlocks) {
     if (b.is_object() && b.value("type", std::string()) == "error") optErr = true;
   }
-  check(optErr,
-        "BS-004: `joinby ..., update` (an unimplemented option) is an honest reject, not a "
-        "silently-ignored option (D5 — unmatched()/update/_merge()/... -> post-beta WP-18)");
+  check(!optErr, "BS-004: `joinby ..., update` runs (rc 0, as in Stata)");
+  auto repBlocks = piet::dispatch("joinby gid using `bs004using', replace", session);
+  bool repErr = false;
+  for (const auto& b : repBlocks) {
+    if (b.is_object() && b.value("type", std::string()) == "error") repErr = true;
+  }
+  check(repErr, "BS-004: `joinby ..., replace` without update is refused");
 
   fs::remove_all(workdir, ec);
 }

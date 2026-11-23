@@ -3,6 +3,7 @@
 #include "text_support.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/regex_scans.h"
 namespace piet::dispatch_detail {
 
 
@@ -128,11 +129,8 @@ std::string rawArgsAfterCmd(const std::string& raw) {
 // A varlist that no longer matches argText (rewritten after tokenize) keeps the
 // joinVarlist text.
 std::string genExprText(const eval::ParsedCommand& parsed) {
-  std::istringstream iss(parsed.argText);
-  std::vector<std::string> toks;
-  std::string tok;
-  while (iss >> tok) toks.push_back(tok);
-  if (toks != parsed.varlist) return joinVarlist(parsed.varlist);
+  // The words `istringstream >> std::string` reads (piet/regex_scans.h).
+  if (rx::splitWords(parsed.argText) != parsed.varlist) return joinVarlist(parsed.varlist);
   const std::string& a = parsed.argText;
   const std::vector<bool> quoted = eval::quotedSpanMask(a);
   std::string out;

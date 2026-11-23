@@ -131,6 +131,57 @@ bool fitSampleValues(SessionState& session, const std::string& var,
 
 
 
+// estadd keeps r() as it found it (`_return hold` around its work): the summarize runs that
+// estadd mean / summ make to compute their statistics must not leave their r() behind (bank
+// c96588da: after `regress` then `estadd summ, mean`, r(table) is still regress's 9 x 3).
+struct EstaddRHold {
+  explicit EstaddRHold(eval::EvalSession& e)
+      : ev(e), values(e.rValues), hidden(e.rHidden), hiddenMacros(e.rHiddenMacros),
+        hiddenMatrices(e.rHiddenMatrices), strings(e.rStrings), matrices(e.rMatrices),
+        tableGen(e.rTableGen), tableEid(e.rTableEid), tableModel(e.rTableModel),
+        tableRefusal(e.rTableRefusal), tableRefusalEid(e.rTableRefusalEid),
+        tableRefusalGen(e.rTableRefusalGen), classCmd(e.rClassCmd), unposted(e.rUnposted),
+        classSetUnknown(e.rClassSetUnknown), declaredCmd(e.rDeclaredCmd),
+        declaredNames(e.rDeclaredNames) {}
+  ~EstaddRHold() {
+    ev.rValues = values;
+    ev.rHidden = hidden;
+    ev.rHiddenMacros = hiddenMacros;
+    ev.rHiddenMatrices = hiddenMatrices;
+    ev.rStrings = strings;
+    ev.rMatrices = matrices;
+    ev.rTableGen = tableGen;
+    ev.rTableEid = tableEid;
+    ev.rTableModel = tableModel;
+    ev.rTableRefusal = tableRefusal;
+    ev.rTableRefusalEid = tableRefusalEid;
+    ev.rTableRefusalGen = tableRefusalGen;
+    ev.rClassCmd = classCmd;
+    ev.rUnposted = unposted;
+    ev.rClassSetUnknown = classSetUnknown;
+    ev.rDeclaredCmd = declaredCmd;
+    ev.rDeclaredNames = declaredNames;
+  }
+  eval::EvalSession& ev;
+  decltype(eval::EvalSession::rValues) values;
+  decltype(eval::EvalSession::rHidden) hidden;
+  decltype(eval::EvalSession::rHiddenMacros) hiddenMacros;
+  decltype(eval::EvalSession::rHiddenMatrices) hiddenMatrices;
+  decltype(eval::EvalSession::rStrings) strings;
+  decltype(eval::EvalSession::rMatrices) matrices;
+  decltype(eval::EvalSession::rTableGen) tableGen;
+  decltype(eval::EvalSession::rTableEid) tableEid;
+  decltype(eval::EvalSession::rTableModel) tableModel;
+  decltype(eval::EvalSession::rTableRefusal) tableRefusal;
+  decltype(eval::EvalSession::rTableRefusalEid) tableRefusalEid;
+  decltype(eval::EvalSession::rTableRefusalGen) tableRefusalGen;
+  decltype(eval::EvalSession::rClassCmd) classCmd;
+  decltype(eval::EvalSession::rUnposted) unposted;
+  decltype(eval::EvalSession::rClassSetUnknown) classSetUnknown;
+  decltype(eval::EvalSession::rDeclaredCmd) declaredCmd;
+  decltype(eval::EvalSession::rDeclaredNames) declaredNames;
+};
+
 // `r(name)` -> its number, for the expression estadd evaluates itself: the
 // macro layer leaves bare r() on an estadd line alone (eval/macros.cpp), so
 // `estadd r(mean)` and `estadd scalar r(sd)` reach the handler as written.
@@ -370,16 +421,15 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
   // The sub-verbs that are real estadd features this build does not compute.
   // `unsupportedCommand(..., kNotImplemented)` -- NOT a bare engineError, whose
   // default code answers rc 1 instead of 199.
-  static const std::set<std::string> kNotImplementedSubs = {"beta", "vif",
-                                                            "expb",  "summ", "sd",
-                                                            "svy",   "margins"};
+  static const std::set<std::string> kNotImplementedSubs = {"sd", "svy", "margins"};
   if (kNotImplementedSubs.count(sub) != 0) {
     return ojson(eval::unsupportedCommand("estadd " + sub, std::nullopt, std::nullopt,
                                           "refused:not_implemented_sub",
                                           eval::UnsupportedCommandKind::kNotImplemented));
   }
   if (sub != "local" && sub != "scalar" && sub != "matrix" && sub != "ysumm" &&
-      sub != "ysummarize" && sub != "mean") {
+      sub != "ysummarize" && sub != "mean" && sub != "summ" && sub != "beta" && sub != "vif" &&
+      sub != "expb") {
     return ojson(eval::unsupportedCommand("estadd " + sub, std::nullopt, std::nullopt, "piet_gap",
                                           eval::UnsupportedCommandKind::kUnknownSubcommand));
   }
@@ -387,7 +437,8 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
   // estadd confirm_esample: the e(sample) subcommands stop with r(498)
   // when the active results carry none (w2ak ek_ad_ysumm_noest, after
   // `ereturn clear`).
-  if ((sub == "ysumm" || sub == "ysummarize" || sub == "mean") && targets.empty() &&
+  if ((sub == "ysumm" || sub == "ysummarize" || sub == "mean" || sub == "summ" || sub == "beta" ||
+       sub == "vif") && targets.empty() &&
       !session.lastEstBlock.has_value()) {
     return tblErrorRc("e(sample) information not available", 498);
   }
@@ -395,6 +446,57 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
     // Stata answers rc 301 ("last estimates not found") here, which coarseRc's
     // message rules do not know, so it is stated through `reason`.
     return tblErrorRc("estadd: no estimation result in memory. Run a regression first.", 301);
+  }
+
+  // estadd mean / summ compute from each target's own fit: estadd restores every named model in
+  // turn, runs on its e(b) and e(sample), and stores the result with it (bank 2cd4ffdf: `estadd
+  // summ, mean sd: m1 m2` leaves m1 without a foreign column). The active results are put back
+  // afterwards, which PIET can do when they are themselves a stored model. expb reads each
+  // model's own e(b) the same way: `estadd expb: m1 m2` gives m1 exp() of m1's coefficients.
+  if ((sub == "mean" || sub == "summ" || sub == "beta" || sub == "vif" || sub == "expb") &&
+      !targets.empty()) {
+    SessionState::EstNamelist ex = session.expandEstimatesNamelist(targets);
+    if (ex.rc != 0) return tblErrorRc(ex.message, ex.rc);
+    const std::string active = session.activeStoredName();
+    const bool onlyActive = std::all_of(ex.names.begin(), ex.names.end(),
+                                        [&](const std::string& t) { return t == active; });
+    if (!onlyActive) {
+      if (active.empty()) {
+        return ojson(eval::unsupportedCommand(
+            "estadd " + sub + " : namelist", std::nullopt,
+            std::string("estadd ") + sub + " on stored models other than the active results is "
+                "served when the active results are themselves stored (eststo / estimates store)",
+            "refused:not_implemented_sub", eval::UnsupportedCommandKind::kNotImplemented));
+      }
+      const long long rawColon = findUnquotedColon(parsed.raw);
+      const std::string bare = strutil::trim(parsed.raw.substr(0, static_cast<size_t>(rawColon)));
+      ojson out = ojson::array();
+      EstaddRHold hold(session.eval);
+      std::optional<ojson> failure;
+      for (const auto& t : ex.names) {
+        if (t == ".") {
+          failure = tblError("estadd: `.` in the `: namelist` (the active, unstored results) is "
+                             "not supported in this version of PIET; run `estadd` without the "
+                             "colon to add to the active results");
+          break;
+        }
+        for (const std::string& line : {"quietly estimates restore " + t, bare}) {
+          const ojson r = piet::dispatch(line, session);
+          if (r.is_array())
+            for (const auto& b : r) {
+              if (!b.is_object()) continue;
+              const std::string type = b.value("type", std::string());
+              if (type == "error") failure = b;
+              else if (type != "echo" && line == bare) out.push_back(b);
+            }
+          if (failure) break;
+        }
+        if (failure) break;
+      }
+      (void)piet::dispatch("quietly estimates restore " + active, session);
+      if (failure) return *failure;
+      return out;
+    }
   }
 
   const bool replace = hasFlag(parsed.opts, "replace");
@@ -510,7 +612,136 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
     for (const auto& row : mat->data) data.push_back(row);
     m["data"] = data;
     addMatrices.emplace_back(name, m);
-  } else if (sub == "mean") {
+  } else if (sub == "beta" || sub == "vif" || sub == "expb") {
+    // estadd beta: e(<prefix>beta), a copy of e(b) whose column j is b_j * sd(x_j) / sd(y) over
+    // e(sample) (summarize [aw] if e(sample); pweight read as aweight), y the column's equation
+    // or e(depvar) for `_`, .z where the column or its depvar is not a numeric variable.
+    // estadd vif: e(<prefix>vif) = e(b) with each regressor's variance inflation factor from
+    // `estat vif` (r(name_#), r(vif_#)) and .z elsewhere; tolerance adds 1/vif, sqrvif sqrt(vif).
+    // estadd expb: exp(b), .z for _cons under noconstant. Each keeps e(b)'s names.
+    if (sub != "expb" && (!session.lastModel().has_value() ||
+                          session.lastModel()->esample == LastModel::EsampleState::kNone)) {
+      return tblErrorRc("e(sample) information not available", 498);
+    }
+    std::string prefix;
+    if (auto pf = optStr(parsed.opts, "prefix")) prefix = strutil::trim(dequote(*pf));
+    int brc = 0;
+    std::string bwhy;
+    const std::optional<eval::EvalMatrix> eb = session.eval.resolveEMatrix("b", &brc, &bwhy);
+    if (!eb.has_value() || eb->data.empty()) {
+      return tblErrorRc(bwhy.empty() ? std::string("matrix e(b) not found") : bwhy,
+                        brc != 0 ? brc : 111);
+    }
+    const double dotZ = eval::stataMissingWithKind(26);
+    const double dot = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<double>& b = eb->data.front();
+    auto post = [&](const std::string& name, const std::vector<double>& row) {
+      ojson m;
+      m["rownames"] = eb->rownames;
+      m["colnames"] = eb->colnames;
+      ojson data = ojson::array();
+      data.push_back(row);
+      m["data"] = data;
+      addMatrices.emplace_back(name, m);
+    };
+    if (sub == "expb") {
+      const bool nocons = hasFlag(parsed.opts, "noconstant");
+      std::vector<double> row;
+      for (size_t j = 0; j < b.size(); ++j) {
+        const std::string& full = eb->colnames[j];
+        const size_t colon = full.find(':');
+        const std::string nm = colon == std::string::npos ? full : full.substr(colon + 1);
+        row.push_back(nocons && nm == "_cons" ? dotZ : std::exp(b[j]));
+      }
+      post(prefix + "expb", row);
+    } else if (sub == "vif") {
+      EstaddRHold hold(session.eval);
+      const ojson r = piet::dispatch("quietly estat vif", session);
+      if (r.is_array())
+        for (const auto& blk : r)
+          if (blk.is_object() && blk.value("type", std::string()) == "error") return blk;
+      std::vector<double> vif(b.size(), dotZ), tol(b.size(), dotZ), sq(b.size(), dotZ);
+      for (int i = 1;; ++i) {
+        const std::string* nm = session.eval.rStrings.find("name_" + std::to_string(i));
+        const double* v = session.eval.rValues.find("vif_" + std::to_string(i));
+        if (nm == nullptr || nm->empty() || v == nullptr) break;
+        for (size_t j = 0; j < eb->colnames.size(); ++j) {
+          if (eb->colnames[j] != *nm) continue;
+          vif[j] = *v;
+          tol[j] = 1.0 / *v;
+          sq[j] = std::sqrt(*v);
+          break;
+        }
+      }
+      if (hasFlag(parsed.opts, "sqrvif")) post(prefix + "sqrvif", sq);
+      if (hasFlag(parsed.opts, "tolerance")) post(prefix + "tolerance", tol);
+      post(prefix + "vif", vif);
+    } else {
+      std::string wtype;
+      if (const std::string* wt = session.eval.eStrings.find("wtype")) wtype = *wt;
+      if (wtype == "pweight") wtype = "aweight";
+      std::string wexp;
+      if (const std::string* we = session.eval.eStrings.find("wexp")) wexp = *we;
+      const std::string wclause = wtype.empty() ? std::string() : " [" + wtype + wexp + "]";
+      std::string depv;
+      if (const std::string* dv = session.eval.eStrings.find("depvar")) depv = *dv;
+      std::map<std::string, bool> numericOf;
+      if (const std::vector<VarInfo>* card = session.residentReadCard()) {
+        for (const auto& vi : *card) numericOf[vi.name] = vi.dtype != "factor";
+      } else if (session.hasData()) {
+        if (Datastore* ds = session.datastore())
+          for (const auto& nm : ds->names()) numericOf[nm] = ds->dtype(nm) != "factor";
+      }
+      auto isNumeric = [&](const std::string& v) {
+        const auto it = numericOf.find(v);
+        return it != numericOf.end() && it->second;
+      };
+      EstaddRHold hold(session.eval);
+      auto sdOf = [&](const std::string& v) {
+        const ojson r = piet::dispatch("quietly summarize " + v + wclause + " if e(sample)", session);
+        if (r.is_array())
+          for (const auto& blk : r)
+            if (blk.is_object() && blk.value("type", std::string()) == "error") return dot;
+        const double* sd = session.eval.rValues.find("sd");
+        return sd == nullptr ? dot : *sd;
+      };
+      std::vector<double> row;
+      std::string lastDep;
+      double sdDep = dot;
+      for (size_t j = 0; j < b.size(); ++j) {
+        const std::string& full = eb->colnames[j];
+        const size_t colon = full.find(':');
+        std::string dep = colon == std::string::npos ? std::string("_") : full.substr(0, colon);
+        const std::string var = colon == std::string::npos ? full : full.substr(colon + 1);
+        if (dep == "_") dep = depv;
+        if (!isNumeric(dep)) {
+          row.push_back(dotZ);
+          lastDep = dep;
+          continue;
+        }
+        if (dep != lastDep) sdDep = sdOf(dep);
+        lastDep = dep;
+        // A factor-variable or operator column needs summarize to read `1.foreign` / `L.x`,
+        // which PIET's summarize does not: refused by name (see estadd summ).
+        const size_t dot1 = var.find('.');
+        const std::string base = dot1 == std::string::npos ? var : var.substr(dot1 + 1);
+        if (!isNumeric(base)) {
+          row.push_back(dotZ);
+          continue;
+        }
+        if (dot1 != std::string::npos) {
+          return ojson(eval::unsupportedCommand(
+              "estadd beta", std::nullopt,
+              "estadd beta: the column " + var + " of e(b) carries a factor-variable or "
+                  "time-series operator, which this version of PIET does not summarize",
+              "refused:not_implemented_sub", eval::UnsupportedCommandKind::kNotImplemented));
+        }
+        const double sdx = sdOf(var);
+        row.push_back(std::isnan(sdx) || std::isnan(sdDep) ? dot : b[j] * sdx / sdDep);
+      }
+      post(prefix + "beta", row);
+    }
+  } else if (sub == "mean" || sub == "summ") {
     // estadd estadd_mean: e(<prefix>mean) is a copy of e(b) whose
     // column j is the e(sample) mean of variable j (`su VAR [aw] if e(sample),
     // meanonly`, pweight read as aweight), .z where the column is not a
@@ -544,33 +775,116 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
       if (Datastore* ds = session.datastore())
         for (const auto& nm : ds->names()) numericOf[nm] = ds->dtype(nm) != "factor";
     }
-    std::vector<double> means;
+    // estadd summ posts one 1 x k copy of e(b) per statistic asked for (default sd max min mean),
+    // in the order iqr semean cv range, then p99 p95 ... p1 kurtosis skewness var sd max min sum
+    // mean; each column is the statistic of that coefficient's variable over e(sample) from
+    // `summarize VAR [aw] if e(sample)` (meanonly when only sum, mean, min, max are wanted, detail
+    // when a percentile, skewness or kurtosis is), .z for a column that is not a numeric variable
+    // and . where summarize fails. The first matrix keeps e(b)'s row name, the next ones are
+    // r1, r2, ... (bank 3c70ccdf `estadd summ, all`). `estadd mean` is the one-statistic case.
+    std::vector<std::string> stats;
+    std::string sumtype = "meanonly";
+    if (sub == "mean") {
+      stats = {"mean"};
+    } else {
+      auto flag = [&](const char* f) { return hasFlag(parsed.opts, f); };
+      const bool all = flag("all");
+      const std::vector<std::string> kStats = {"p99", "p95", "p90", "p75", "p50", "p25",
+                                               "p10", "p5",  "p1",  "kurtosis", "skewness",
+                                               "var", "sd",  "max", "min", "sum", "mean"};
+      bool p25 = flag("p25"), p50 = flag("p50"), p75 = flag("p75");
+      if (flag("q")) p25 = p50 = p75 = true;
+      if (flag("median")) p50 = true;
+      std::vector<std::string> picked;
+      for (const auto& st : kStats) {
+        bool on = all || flag(st.c_str());
+        if (st == "p25") on = all || p25;
+        if (st == "p50") on = all || p50;
+        if (st == "p75") on = all || p75;
+        if (on) picked.push_back(st);
+      }
+      for (const char* extra : {"iqr", "semean", "cv", "range"})
+        if (all || flag(extra)) stats.push_back(extra);
+      if (stats.empty() && picked.empty()) picked = {"sd", "max", "min", "mean"};
+      // summarize's mode, as estadd chooses it: meanonly when every statistic is a sum, mean, min
+      // or max (range included) and neither cv, semean nor iqr is wanted; the plain table when
+      // they are sum, mean, min, max or sd and no iqr; otherwise detail (var, which estadd reads as
+      // r(Var), takes detail too, as do all).
+      const auto subset = [&](const std::set<std::string>& allowed) {
+        return std::all_of(picked.begin(), picked.end(),
+                           [&](const std::string& st) { return allowed.count(st) != 0; });
+      };
+      const bool iqr = all || flag("iqr");
+      if (all) sumtype = "detail";
+      else if (subset({"sum", "mean", "min", "max"}) && !flag("cv") && !flag("semean") && !iqr)
+        sumtype = "meanonly";
+      else if (subset({"sum", "mean", "min", "max", "sd"}) && !iqr) sumtype.clear();
+      else sumtype = "detail";
+      stats.insert(stats.end(), picked.begin(), picked.end());
+    }
+    std::vector<std::vector<double>> rows(stats.size());
+    std::optional<EstaddRHold> heldR;
+    heldR.emplace(session.eval);
+    const double dotZ = eval::stataMissingWithKind(26);  // .z, the matrix layer's spelling
+    const double dot = std::numeric_limits<double>::quiet_NaN();
     for (const auto& full : eb->colnames) {
       const size_t colon = full.find(':');
       const std::string var = colon == std::string::npos ? full : full.substr(colon + 1);
-      const auto nit = numericOf.find(var);
+      // estadd's confirm_numvar: the name after the first `.` must be a numeric variable
+      // (`1.foreign`, `0b.foreign`, `L.x` pass; `_cons` and an interaction do not, .z); the
+      // column as named is what is summarized (`summarize 1.foreign` is the indicator's mean).
+      const size_t dot = var.find('.');
+      const std::string base = dot == std::string::npos ? var : var.substr(dot + 1);
+      const auto nit = numericOf.find(base);
       const bool numericVar = nit != numericOf.end() && nit->second;
       if (!numericVar) {
-        means.push_back(eval::stataMissingWithKind(26));  // .z, the matrix layer's spelling
+        for (auto& row : rows) row.push_back(dotZ);
         continue;
       }
-      const ojson r =
-          piet::dispatch("quietly summarize " + var + wclause + " if e(sample), meanonly", session);
+      // PIET's summarize takes no factor-variable or time-series operator, so such a column
+      // cannot be summarized the way estadd does it: refused by name rather than posted as . or .z.
+      if (dot != std::string::npos) {
+        heldR.reset();
+        return ojson(eval::unsupportedCommand(
+            "estadd " + sub, std::nullopt,
+            "estadd " + sub + ": the column " + var + " of e(b) carries a factor-variable or "
+                "time-series operator, which this version of PIET does not summarize",
+            "refused:not_implemented_sub", eval::UnsupportedCommandKind::kNotImplemented));
+      }
+      const ojson r = piet::dispatch("quietly summarize " + var + wclause + " if e(sample)" +
+                                         (sumtype.empty() ? std::string() : ", " + sumtype),
+                                     session);
       bool failed = false;
       if (r.is_array()) {
         for (const auto& b : r)
           if (b.is_object() && b.value("type", std::string()) == "error") failed = true;
       }
-      const double* m = session.eval.rValues.find("mean");
-      means.push_back(failed || m == nullptr ? std::numeric_limits<double>::quiet_NaN() : *m);
+      auto rv = [&](const char* name) {
+        const double* v = session.eval.rValues.find(name);
+        return failed || v == nullptr ? dot : *v;
+      };
+      for (size_t i = 0; i < stats.size(); ++i) {
+        const std::string& st = stats[i];
+        double v;
+        if (st == "iqr") v = rv("p75") - rv("p25");
+        else if (st == "semean") v = rv("sd") / std::sqrt(rv("N"));
+        else if (st == "cv") v = rv("sd") / rv("mean");
+        else if (st == "range") v = rv("max") - rv("min");
+        else if (st == "var") v = rv("Var");
+        else v = rv(st.c_str());
+        rows[i].push_back(failed ? dot : v);
+      }
     }
-    ojson m;
-    m["rownames"] = eb->rownames;
-    m["colnames"] = eb->colnames;
-    ojson data = ojson::array();
-    data.push_back(means);
-    m["data"] = data;
-    addMatrices.emplace_back(prefix + "mean", m);
+    heldR.reset();
+    for (size_t i = 0; i < stats.size(); ++i) {
+      ojson m;
+      m["rownames"] = i == 0 ? ojson(eb->rownames) : ojson(std::vector<std::string>{"r" + std::to_string(i)});
+      m["colnames"] = eb->colnames;
+      ojson data = ojson::array();
+      data.push_back(rows[i]);
+      m["data"] = data;
+      addMatrices.emplace_back(prefix + stats[i], m);
+    }
   } else {  // ysumm
     if (!session.lastModel().has_value() && !session.lastEstBlock.has_value()) {
       return tblErrorRc("estadd ysumm: no estimation result in memory", 301);
@@ -816,6 +1130,20 @@ ojson runEstadd(const eval::ParsedCommand& parsedIn, SessionState& session) {
     for (const auto& [n, v] : addLocals) {
       (void)v;
       if (holds(n)) return tblError("estadd: e(" + n + ") already defined; use replace");
+    }
+    // A matrix the fit itself posted: `regress` publishes e(beta), so a bare `estadd beta` after
+    // it is r(110) "e(beta) already defined" (bank 45634fc4).
+    for (const auto& [n, v] : addMatrices) {
+      (void)v;
+      bool fitHas = false;
+      if (const auto names = session.eNameMembersFor("matrices"))
+        fitHas = std::find(names->begin(), names->end(), n) != names->end();
+      if (!fitHas) {
+        int mrc = 0;
+        std::string mwhy;
+        fitHas = session.eval.resolveEMatrix(n, &mrc, &mwhy).has_value();
+      }
+      if (fitHas) return tblError("estadd: e(" + n + ") already defined; use replace");
     }
   }
   if (!replace) {

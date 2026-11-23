@@ -514,6 +514,10 @@ int postest_fit_spec(const std::vector<std::string>& a, const Dataset& ds, const
     // refit applies its exact-fit rule too: `test x` after an exact `regress` then
     // sees V = 0 and answers F and p missing, as StataBE does (F(1,48) = .).
     const bool regress_exact_fit = has(a, "--regress-exact-fit");
+    // The fit was the builtin `regress` under an aweight (cmd_feols
+    // --aw-negative-drops), so the refit drops the negative-weight rows the fit
+    // dropped instead of refusing them with r(402).
+    const bool aw_negative_drops = has(a, "--aw-negative-drops");
     // BUG-1067: the fit kept the earlier term of each collinear set (cmd_feols
     // --collinear-forward: reghdfe, areg, xtreg,fe), so the refit omits the same
     // columns and every verb answers for the coefficients the fit posted.
@@ -699,7 +703,7 @@ int postest_fit_spec(const std::vector<std::string>& a, const Dataset& ds, const
     ModelData md = build_model(ds, y, refit_xs(xcsv), split_csv(fe), split_csv(cluster),
                                /*offset_name=*/"", /*drop_singleton=*/!keep_singletons,
                                tsmeta.timevar.empty() ? nullptr : &tsmeta, row_mask,
-                               weight_var, wkind);
+                               weight_var, wkind, aw_negative_drops);
     md.collinear_forward = collinear_forward;
     if (levels) *levels = sample_factor_levels(ds, refit_xs(xcsv), md.keep);
     fitted = postest_project(feols_fit(md, parse_vcov(vcov_type), /*cluster_index=*/0,

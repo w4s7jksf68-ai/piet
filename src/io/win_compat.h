@@ -114,6 +114,12 @@ inline int native_unlink(const std::string& utf8) {
     return ::_wunlink(to_native_path(utf8).c_str());
 }
 
+// Set a file's length through its descriptor. Same return convention as
+// ::ftruncate (0 on success).
+inline int native_ftruncate(int fd, long long length) {
+    return ::_chsize_s(fd, length) == 0 ? 0 : -1;
+}
+
 // Same-directory replacement is one ReplaceFileW operation. In particular, do
 // not emulate POSIX rename by deleting the destination first: a failed replace
 // must leave the original save target present.
@@ -227,6 +233,10 @@ inline bool native_exists(const std::string& path) {
 
 inline int native_unlink(const std::string& path) {
     return ::unlink(path.c_str());
+}
+
+inline int native_ftruncate(int fd, long long length) {
+    return ::ftruncate(fd, static_cast<off_t>(length));
 }
 
 inline bool native_replace_file(const std::string& replacement, const std::string& destination) {

@@ -4,6 +4,7 @@
 #include "data_combine_internal.h"
 #include "data_io_internal.h"
 #include "piet/handlers/data_combine.h"
+#include "piet/dispatcher.h"  // joinby update: the reconciling replace
 namespace piet::handlers::data_io_detail {
 
 
@@ -84,7 +85,8 @@ using namespace data_combine_detail;
 
 ojson runJoinby(const std::vector<std::string>& keylistIn, const std::string& usingPathArg,
                 SessionState& session, const std::string& unmatched,
-                const std::optional<std::string>& mergeVar, bool nolabel) {
+                const std::optional<std::string>& mergeVar, bool nolabel, bool update,
+                bool replace) {
   std::vector<std::string> keylist = keylistIn;
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   // INSPECT-2608: everything this function asks of the MASTER frame is metadata
@@ -239,6 +241,34 @@ ojson runJoinby(const std::vector<std::string>& keylistIn, const std::string& us
     (void)listStr;
   }
 
+  // update / update replace ([D] joinby; joinby.ado passes them to its
+  // second merge): the using copy of each shared non-key variable comes along
+  // under a temporary name, then fills the master's missing values (update)
+  // or overrides wherever it is not missing (update replace), and goes.
+  std::vector<std::pair<std::string, std::string>> reconcile;  // (var, temp)
+  std::string joinUsingPath = ur.hbinPath;
+  if (update && !overlap.empty()) {
+    std::set<std::string> taken(masterNameList.begin(), masterNameList.end());
+    for (const auto& nm : usingDs.names()) taken.insert(nm);
+    int serial = 0;
+    for (const auto& v : overlap) {
+      std::string tmp;
+      do {
+        tmp = "__jbu" + std::to_string(++serial);
+      } while (taken.count(tmp));
+      taken.insert(tmp);
+      const std::string renamed = nextPath(session.workdir(), "joinby_upd");
+      CobraRunResult rr =
+          runCobra({"rename", "--data", joinUsingPath, "--pairs", v + "=" + tmp, "--out", renamed});
+      if (!rr.ok) {
+        CobraError ce = errorFromRaw(rr);
+        return engineErrorBlock(cobraErrorStr(ce), ce.code);
+      }
+      joinUsingPath = renamed;
+      reconcile.emplace_back(v, tmp);
+    }
+  }
+
   int64_t nMaster = master ? master->nRows() : *cardRows;
   int64_t nUsing = usingDs.nRows();
 
@@ -292,7 +322,7 @@ ojson runJoinby(const std::vector<std::string>& keylistIn, const std::string& us
     SessionState::ResidentEligible residentJoinby(session);
     std::vector<std::string> jargs = {"joinby", "--data",
                                       master ? master->path() : *session.currentHbin(),
-                                      "--using", ur.hbinPath, "--keys", joinedKeys,
+                                      "--using", joinUsingPath, "--keys", joinedKeys,
                                       "--out", outPath};
     if (unmatched != "none") {
       jargs.push_back("--unmatched");
@@ -329,6 +359,7 @@ ojson runJoinby(const std::vector<std::string>& keylistIn, const std::string& us
         "withdrawn from the result; e(sample) is not reliable until the next estimation.");
   }
   adoptUsingOwnVars(session, ur, uMeta, usingExtra, !nolabel);
+
   // A key both files hold is stored wide enough for both: a byte key joined with a
   // double one is a double afterwards (vs-stata bank: joinby `byte g` with `double g`).
   for (const auto& k : keylist) {
@@ -354,17 +385,61 @@ ojson runJoinby(const std::vector<std::string>& keylistIn, const std::string& us
     vm.stataType = std::string("byte");
     vm.format = std::string("%29.0g");
     vm.label.reset();
-    session.labelDefs["__MERGE"] = {{"1", "only in master data"},
-                                    {"2", "only in using data"},
-                                    {"3", "both in master and using data"},
-                                    {"9999", "signature"}};
+    if (update) {
+      // joinby.ado DefLabel: the update spelling of the __MERGE set.
+      session.labelDefs["__MERGE"] = {{"1", "only in master data"},
+                                      {"2", "only in using data"},
+                                      {"3", "in both, master agrees with using data"},
+                                      {"4", "in both, missing in master data updated"},
+                                      {"5", "in both, master disagrees with using data"},
+                                      {"9999", "signature"}};
+      session.valueLabels[marker] = {{1, "only in master data"},
+                                     {2, "only in using data"},
+                                     {3, "in both, master agrees with using data"},
+                                     {4, "in both, missing in master data updated"},
+                                     {5, "in both, master disagrees with using data"},
+                                     {9999, "signature"}};
+    } else {
+      session.labelDefs["__MERGE"] = {{"1", "only in master data"},
+                                      {"2", "only in using data"},
+                                      {"3", "both in master and using data"},
+                                      {"9999", "signature"}};
+      session.valueLabels[marker] = {{1, "only in master data"},
+                                     {2, "only in using data"},
+                                     {3, "both in master and using data"},
+                                     {9999, "signature"}};
+    }
     session.varLblname[marker] = "__MERGE";
-    session.valueLabels[marker] = {{1, "only in master data"},
-                                   {2, "only in using data"},
-                                   {3, "both in master and using data"},
-                                   {9999, "signature"}};
   }
   ojson result = mutationResult(session, "joinby", usingExtra);
+  if (!reconcile.empty()) {
+    // The reconciling commands are joinby's own steps: they leave r() as it was.
+    const auto savedRValues = session.eval.rValues;
+    const auto savedRStrings = session.eval.rStrings;
+    struct RestoreR {
+      SessionState& s;
+      const decltype(savedRValues)& v;
+      const decltype(savedRStrings)& m;
+      ~RestoreR() {
+        s.eval.rValues = v;
+        s.eval.rStrings = m;
+      }
+    } restoreR{session, savedRValues, savedRStrings};
+    (void)session.datastore();
+    std::string temps;
+    for (const auto& [v, tmp] : reconcile) {
+      const std::string cond = replace ? "!missing(" + tmp + ")" : "missing(" + v + ")";
+      ojson r = dispatch("quietly replace " + v + " = " + tmp + " if " + cond, session);
+      for (const auto& b : r)
+        if (b.is_object() && b.value("type", std::string()) == "error") return b;
+      temps += " " + tmp;
+    }
+    SessionState::TempDropScope quiet(session);
+    ojson d = dispatch("quietly drop" + temps, session);
+    for (const auto& b : d)
+      if (b.is_object() && b.value("type", std::string()) == "error") return b;
+  }
+  if (!reconcile.empty()) result = mutationResult(session, "joinby", usingExtra);
   result["n_master"] = nMaster;
   result["n_using"] = nUsing;
   return result;

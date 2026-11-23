@@ -42,6 +42,7 @@
 #include "piet/eval/pyvalue.h"  // pythonFloatRepr -- round-trippable CSV numerics
 #include "piet/eval/session.h"
 #include "piet/eval/tokenizer.h"
+#include "piet/loops.h"  // expandNumlist: splitsample's split() and values() are numlists
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
@@ -185,8 +186,9 @@ ojson runSample(const eval::ParsedCommand& parsed, SessionState& session) {
 // splitsample
 // ===========================================================================
 
-// base/s/splitsample.ado (StataBE 19.5), the path without rround/balance/
-// cluster/split()/values() (those options are refused by the vocabulary):
+// base/s/splitsample.ado (StataBE 19.5), the deterministic-rounding path with split(),
+// values(), cluster(), strok and show/percent (rround and balance() are refused by the
+// vocabulary):
 //  - the sample is the observations with no missing value in the varlist (string
 //    variables are left out of the varlist unless strok); none is r(2000), and
 //    nsplit() above the sample size r(2001);
@@ -227,10 +229,63 @@ ojson runSplitsample(const eval::ParsedCommand& parsed, SessionState& session) {
     ojson guard = newVarGuard(session, "splitsample", gen);
     if (!guard.is_null()) return guard;
   }
+  // nsplit(), split(), values() as splitsample's syntax reads them: split() is a numlist of
+  // positive proportions and sets nsplit to its length, values() non-negative ascending
+  // integers, one per sample.
+  // Both are numlists: blank- or comma-separated numbers and the `a/b`, `a(s)b`
+  // ranges, each element the %15.0g text the numlist expander gives (1/3 is 1 2 3).
+  auto numlistOf = [&](const std::string& text, std::vector<double>* out) -> std::optional<ojson> {
+    std::string spec = text;
+    for (char& c : spec)
+      if (c == ',') c = ' ';
+    std::vector<std::string> elements;
+    if (!loops::expandNumlist(spec, &elements)) return rsErrorRc("invalid numlist", 121);
+    for (const auto& w : elements) {
+      double v = 0;
+      if (!parseStrictDouble(w, &v)) return rsErrorRc("invalid numlist", 121);
+      out->push_back(v);
+    }
+    return std::nullopt;
+  };
   long long nsplit = 2;
-  if (auto v = optStr(parsed.opts, "nsplit")) {
-    if (!parseStrictInt(strutil::trim(*v), &nsplit) || nsplit < 1)
+  const std::optional<std::string> nsplitOpt = optStr(parsed.opts, "nsplit");
+  if (nsplitOpt.has_value()) {
+    if (!parseStrictInt(strutil::trim(*nsplitOpt), &nsplit) || nsplit < 1)
       return rsErrorRc("nsplit() invalid -- invalid numlist", 125);
+  }
+  std::vector<double> split;
+  if (auto sp = optStr(parsed.opts, "split")) {
+    if (auto e = numlistOf(*sp, &split)) return *e;
+    for (double v : split)
+      if (!(v > 0))
+        return rsErrorRc("split() invalid -- invalid numlist has elements outside of allowed range", 125);
+    if (nsplitOpt.has_value() && static_cast<long long>(split.size()) != nsplit)
+      return rsErrorRc("conflict between option split() and option nsplit()", 198);
+    nsplit = static_cast<long long>(split.size());
+  }
+  std::vector<double> values;
+  if (auto vo = optStrAny(parsed.opts, {"values", "value"})) {
+    if (auto e = numlistOf(*vo, &values)) return *e;
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (values[i] < 0)
+        return rsErrorRc("values() invalid -- invalid numlist has elements outside of allowed range", 125);
+      if (values[i] != std::floor(values[i]))
+        return rsErrorRc("values() invalid -- invalid numlist has noninteger elements", 126);
+      if (i > 0 && values[i] < values[i - 1])
+        return rsErrorRc("values() invalid -- invalid numlist has elements out of order", 124);
+    }
+    if (static_cast<long long>(values.size()) != nsplit)
+      return rsErrorRc("option values() must be a numlist with " + std::to_string(nsplit) + " values", 198);
+  }
+  const bool show = hasFlag(parsed.opts, "show");
+  if (hasFlag(parsed.opts, "percent") && !show)
+    return rsErrorRc("percent must be specified with option show", 198);
+  const bool strok = hasFlag(parsed.opts, "strok");
+  std::optional<std::string> cluster = optStrAny(parsed.opts, {"cluster", "cl", "clu", "clus", "clust", "cluste"});
+  if (cluster.has_value()) {
+    std::vector<std::string> one = {strutil::trim(*cluster)};
+    if (auto err = resolveByKeyNames(session, one)) return *err;
+    cluster = one.front();
   }
 
   Datastore* ds = nullptr;
@@ -242,28 +297,73 @@ ojson runSplitsample(const eval::ParsedCommand& parsed, SessionState& session) {
   if (ds == nullptr) return ojson(eval::noDataLoaded());
   const int64_t n = ds->nRows();
 
-  // The sample: marksample over the numeric variables of the varlist.
+  // The sample: marksample over the varlist (string variables leave it unless strok, which
+  // marks out their empty strings), then the cluster variable (strings always allowed).
   std::vector<std::string> vl = parsed.varlist;
   if (auto err = resolveByKeyNames(session, vl)) return *err;
   std::vector<char> touse;
   if (auto err = ifInMask(session, parsed, &touse)) return *err;
   ds = session.datastore();
   if (ds == nullptr) return ojson(eval::noDataLoaded());
+  auto markout = [&](const std::string& v) {
+    if (ds->dtype(v) == "f64") {
+      const double* d = ds->col(v).f64();
+      for (int64_t i = 0; i < n; ++i)
+        if (std::isnan(d[i])) touse[static_cast<size_t>(i)] = 0;
+    } else {
+      const auto& col = ds->col(v);
+      const auto& levels = ds->varinfo(v).levels;
+      for (int64_t i = 0; i < n; ++i) {
+        const int32_t code = col.codes()[i];
+        if (code < 0 || static_cast<size_t>(code) >= levels.size() || levels[static_cast<size_t>(code)].empty())
+          touse[static_cast<size_t>(i)] = 0;
+      }
+    }
+  };
   for (const auto& v : vl) {
     if (!ds->has(v)) return rsErrorRc("variable " + v + " not found", 111);
-    if (ds->dtype(v) != "f64") continue;  // a string variable leaves the varlist (no strok)
-    const double* d = ds->col(v).f64();
-    for (int64_t i = 0; i < n; ++i)
-      if (std::isnan(d[i])) touse[static_cast<size_t>(i)] = 0;
+    if (ds->dtype(v) != "f64" && !strok) continue;  // a string variable leaves the varlist
+    markout(v);
+  }
+  if (cluster.has_value()) {
+    if (!ds->has(*cluster)) return rsErrorRc("variable " + *cluster + " not found", 111);
+    markout(*cluster);
   }
   int64_t nUse = 0;
   for (char t : touse) nUse += t ? 1 : 0;
   if (nUse == 0) return rsErrorRc("no observations", 2000);
-  if (nsplit > nUse)
+  // the cluster of each sample row: an id in ascending cluster order (numbers by value, text
+  // by bytes), as `bysort touse cluster` orders them
+  std::vector<int64_t> clusterId(static_cast<size_t>(n), -1);
+  int64_t nUnits = nUse;
+  if (cluster.has_value()) {
+    std::map<double, int64_t> numIds;
+    std::map<std::string, int64_t> strIds;
+    const bool isNum = ds->dtype(*cluster) == "f64";
+    const double* d = isNum ? ds->col(*cluster).f64() : nullptr;
+    const auto& levels = ds->varinfo(*cluster).levels;
+    for (int64_t i = 0; i < n; ++i) {
+      if (!touse[static_cast<size_t>(i)]) continue;
+      if (isNum) numIds.emplace(d[i], 0);
+      else strIds.emplace(levels[static_cast<size_t>(ds->col(*cluster).codes()[i])], 0);
+    }
+    int64_t k = 0;
+    for (auto& kv : numIds) kv.second = k++;
+    for (auto& kv : strIds) kv.second = k++;
+    for (int64_t i = 0; i < n; ++i) {
+      if (!touse[static_cast<size_t>(i)]) continue;
+      clusterId[static_cast<size_t>(i)] =
+          isNum ? numIds[d[i]] : strIds[levels[static_cast<size_t>(ds->col(*cluster).codes()[i])]];
+    }
+    nUnits = k;
+  }
+  if (nsplit > nUnits) {
+    const std::string units = cluster.has_value() ? "clusters" : "observations";
     return rsErrorRc("too many subsamples requested\nnsplit() must be less than or equal to the "
-                     "number of observations. nsplit() is " + std::to_string(nsplit) +
-                         " and the number of observations is " + std::to_string(nUse) + ".",
+                     "number of " + units + ". nsplit() is " + std::to_string(nsplit) +
+                         " and the number of " + units + " is " + std::to_string(nUnits) + ".",
                      2001);
+  }
 
   if (auto rs = optStr(parsed.opts, "rseed")) {
     const ojson set = dispatch("set seed " + strutil::trim(*rs), session);
@@ -273,35 +373,70 @@ ojson runSplitsample(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   const std::string rngstate = session.seed.stream().state_string();
 
-  // Split: two uniforms per sample row, the rows ranked by them.
+  // Cut points: round(M * units / M[last]) with M the running sum of split() (1..nsplit
+  // without it); a sample whose cut equals the one before it is a gap, noted and dropped,
+  // and values() (1..nsplit by default) loses the same entries.
+  std::vector<double> M;
+  {
+    double run = 0;
+    for (long long s = 1; s <= nsplit; ++s) {
+      run += split.empty() ? 1.0 : split[static_cast<size_t>(s - 1)];
+      M.push_back(split.empty() ? static_cast<double>(s) : run);
+    }
+  }
+  const double scale = static_cast<double>(nUnits) / M.back();
+  std::vector<int64_t> cutAll;
+  for (double m : M) cutAll.push_back(static_cast<int64_t>(std::floor(m * scale + 0.5)));
+  if (values.empty())
+    for (long long s = 1; s <= nsplit; ++s) values.push_back(static_cast<double>(s));
+  std::vector<int64_t> cut = {0};
+  std::vector<double> V;
+  std::vector<double> gaps;
+  for (size_t s = 0; s < cutAll.size(); ++s) {
+    const int64_t prev = s == 0 ? 0 : cutAll[s - 1];
+    if (cutAll.size() > 1 && cutAll[s] - prev == 0) {
+      gaps.push_back(values[s]);
+      continue;
+    }
+    cut.push_back(cutAll[s]);
+    V.push_back(values[s]);
+  }
+  const long long nSamples = static_cast<long long>(V.size());
+
+  // Split: two uniforms per unit (row, or cluster in cluster order), units ranked by them.
   std::vector<int64_t> rows;
   for (int64_t i = 0; i < n; ++i)
     if (touse[static_cast<size_t>(i)]) rows.push_back(i);
-  std::vector<double> r1(rows.size()), r2(rows.size());
+  const size_t nU = static_cast<size_t>(nUnits);
+  std::vector<double> r1(nU), r2(nU);
   cecon::Mt64& g = session.seed.stream();
-  for (size_t k = 0; k < rows.size(); ++k) r1[k] = g.runiform();
-  for (size_t k = 0; k < rows.size(); ++k) r2[k] = g.runiform();
-  std::vector<size_t> ord(rows.size());
+  for (size_t k = 0; k < nU; ++k) r1[k] = g.runiform();
+  for (size_t k = 0; k < nU; ++k) r2[k] = g.runiform();
+  std::vector<size_t> ord(nU);
   std::iota(ord.begin(), ord.end(), size_t{0});
   std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
     if (r1[a] != r1[b]) return r1[a] < r1[b];
     return r2[a] < r2[b];
   });
-  std::vector<int64_t> cut(static_cast<size_t>(nsplit) + 1, 0);
-  const double per = static_cast<double>(nUse) / static_cast<double>(nsplit);
-  for (long long s = 1; s <= nsplit; ++s)
-    cut[static_cast<size_t>(s)] = static_cast<int64_t>(std::floor(static_cast<double>(s) * per + 0.5));
+  std::vector<int64_t> unitGroup(nU, 0);
+  {
+    size_t cur = 1;
+    for (size_t p = 0; p < ord.size(); ++p) {
+      while (cur + 1 < cut.size() && static_cast<int64_t>(p + 1) > cut[cur]) ++cur;
+      unitGroup[ord[p]] = static_cast<int64_t>(cur);
+    }
+  }
   std::vector<int64_t> grp(static_cast<size_t>(n), 0);
-  int64_t cur = 1;
-  for (size_t p = 0; p < ord.size(); ++p) {
-    if (p > 0 && static_cast<int64_t>(p + 1) > cut[static_cast<size_t>(cur)]) ++cur;
-    grp[static_cast<size_t>(rows[ord[p]])] = cur;
+  for (size_t k = 0; k < rows.size(); ++k) {
+    const size_t unit = cluster.has_value() ? static_cast<size_t>(clusterId[static_cast<size_t>(rows[k])]) : k;
+    grp[static_cast<size_t>(rows[k])] = unitGroup[unit];
   }
   std::vector<std::string> cells;
   cells.reserve(static_cast<size_t>(n));
   for (int64_t j = 0; j < n; ++j)
-    cells.push_back(touse[static_cast<size_t>(j)] ? std::to_string(grp[static_cast<size_t>(j)])
-                                                  : std::string());
+    cells.push_back(touse[static_cast<size_t>(j)]
+                        ? numCell(V[static_cast<size_t>(grp[static_cast<size_t>(j)] - 1)])
+                        : std::string());
 
   // `cap drop <generate>`: the variable of that name, else the one it abbreviates.
   {
@@ -325,31 +460,76 @@ ojson runSplitsample(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = appendColumn(session, *session.currentHbin(), gen, cells, "f64", &out)) return *err;
   session.load(out);
   session.varMeta.erase(gen);
-  storage::recordCreateType(session, gen, "byte", "byte");
+  // `gen byte` then `replace = values()`: the narrowest integer type holding the values
+  {
+    const double vmax = *std::max_element(V.begin(), V.end());
+    const std::string t = vmax <= 100 ? "byte" : vmax <= 32740 ? "int" : "long";
+    storage::recordCreateType(session, gen, t, t);
+  }
 
-  eval::replaceRClass(session.eval);
-  session.eval.rValues.set("N", static_cast<double>(nUse));
-  session.eval.rValues.set("n_samples", static_cast<double>(nsplit));
-  session.eval.rStrings.set("rngstate", rngstate);
-  eval::declareRPosted(session.eval, "splitsample", {"N", "n_samples", "rngstate"});
+  auto setR = [&]() {
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", static_cast<double>(nUse));
+    session.eval.rValues.set("n_samples", static_cast<double>(nSamples));
+    session.eval.rStrings.set("rngstate", rngstate);
+    if (cluster.has_value()) {
+      session.eval.rValues.set("N_clust", static_cast<double>(nUnits));
+      session.eval.rStrings.set("clustvar", *cluster);
+      eval::declareRPosted(session.eval, "splitsample",
+                           {"N", "n_samples", "rngstate", "N_clust", "clustvar"});
+    } else {
+      eval::declareRPosted(session.eval, "splitsample", {"N", "n_samples", "rngstate"});
+    }
+  };
+  setR();
 
   ojson blocks = ojson::array();
-  if (hasFlag(parsed.opts, "show")) {
-    std::vector<int64_t> counts(static_cast<size_t>(nsplit) + 1, 0);
-    for (int64_t j = 0; j < n; ++j)
-      if (touse[static_cast<size_t>(j)]) counts[static_cast<size_t>(grp[static_cast<size_t>(j)])] += 1;
-    std::ostringstream oss;
-    oss << gen << "  |      Freq.\n";
-    oss << "------------+------------\n";
-    for (long long g2 = 1; g2 <= nsplit; ++g2) {
-      char buf[128];
-      std::snprintf(buf, sizeof(buf), "%11lld | %10lld\n", g2,
-                    static_cast<long long>(counts[static_cast<size_t>(g2)]));
-      oss << buf;
-    }
-    blocks.push_back(displayBlock(oss.str()));
+  for (size_t gI = 0; gI < gaps.size(); ++gI) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.15g", gaps[gI]);
+    blocks.push_back(displayBlock(std::string(gI == 0 ? "note: " : "      ") + "sample " + buf +
+                                  " has no observations because specified split proportion for "
+                                  "that sample is too small."));
   }
   blocks.push_back(mutationResult(session, "splitsample", {gen}));
+  if (show) {
+    // `tab <generate>`; with cluster(), one observation per cluster and the note under it
+    std::string cmdTab = "tabulate " + gen;
+    std::string firstVar;
+    // The display re-reads cluster(): a cluster variable that `cap drop <generate>` took
+    // with it (generate(g) abbreviating grade) is r(111) there, after the split is stored
+    // (vs-stata bank bad48a790e7427f9).
+    if (cluster.has_value()) {
+      Datastore* now = session.datastore();
+      if (now == nullptr || !now->has(*cluster)) {
+        blocks.push_back(ojson(eval::errorBlock("engine_error",
+                                                "variable " + *cluster + " not found\n(error in option cluster())",
+                                                std::nullopt, std::nullopt, std::nullopt, "r(111)")));
+        return blocks;
+      }
+    }
+    if (cluster.has_value()) {
+      firstVar = "__splitsample_first";
+      std::vector<std::string> fc(static_cast<size_t>(n), "0");
+      std::set<int64_t> seen;
+      for (int64_t j = 0; j < n; ++j)
+        if (touse[static_cast<size_t>(j)] && seen.insert(clusterId[static_cast<size_t>(j)]).second)
+          fc[static_cast<size_t>(j)] = "1";
+      std::string out2;
+      if (auto err = appendColumn(session, *session.currentHbin(), firstVar, fc, "f64", &out2)) return *err;
+      session.load(out2);
+      cmdTab += " if " + firstVar;
+    }
+    ojson tb = dispatch(cmdTab, session);
+    for (const auto& b : tb)
+      if (b.is_object() && b.value("type", std::string()) != "echo") blocks.push_back(b);
+    if (!firstVar.empty()) {
+      ojson dropped = runDrop({firstVar}, session);
+      if (dropped.is_object() && dropped.value("type", std::string()) == "error") return dropped;
+      blocks.push_back(displayBlock("\nTotal is number of clusters."));
+    }
+    setR();
+  }
   return blocks;
 }
 

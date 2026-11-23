@@ -32,6 +32,18 @@ const piet::eval::OptVocab& kVocabHeckman = piet::eval::registerOptVocab(
                    "robust"},
      {"first", "nshazard", "mills", "offset", "constraints", "technique", "difficult", "from",
       "score", "noskip", "collinear", "rhosigma", "rhotrunc", "rholimited", "rhoforce"}});
+// zip / zinb: the options runZeroInflated reads, and zip.ado's / zinb.ado's others
+// that are real but not implemented. Registered so the dispatcher resolves an
+// abbreviation (`cl(v)`, `rob`, `off(v)`, `lev(90)`) BEFORE the handler compares
+// keys; an unregistered net only resolved it inside rejectUnknownOptions, after
+// which the handler's own comparisons missed it and the option was silently
+// dropped (`zip ..., cl(v)` ran unclustered on the whole sample).
+const piet::eval::OptVocab& kVocabZip = piet::eval::registerOptVocab(
+    {"zip", "zinb"}, {{"inflate", "probit", "exposure", "offset", "irr", "level", "vce", "robust",
+                       "cluster", "iterate", "nolog", "log"},
+     {"noconstant", "vuong", "forcevuong", "zip", "constraints", "collinear", "difficult",
+      "technique", "from", "score", "nocnsreport", "tolerance", "ltolerance", "nrtolerance",
+      "coeflegend"}});
 const piet::eval::OptVocab& kVocabQreg = piet::eval::registerOptVocab(
     {"qreg"}, {{"quantile", "level", "vce"},
      {}});

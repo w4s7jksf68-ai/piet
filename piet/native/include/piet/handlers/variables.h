@@ -46,6 +46,11 @@ nlohmann::ordered_json runLabelDefine(const std::string& rawLine, SessionState& 
 nlohmann::ordered_json runLabelList(const std::vector<std::string>& lblnames, SessionState& session);
 nlohmann::ordered_json runLabelDir(SessionState& session);
 nlohmann::ordered_json runLabelDrop(const std::vector<std::string>& lblnames, SessionState& session);
+// `label copy|rename FROM TO [, replace]` and `label save [LBLNAMES] using FILE [, replace]`.
+nlohmann::ordered_json runLabelCopyRename(bool rename, const std::string& from, const std::string& to,
+                                          bool replace, SessionState& session);
+nlohmann::ordered_json runLabelSave(const std::vector<std::string>& names, const std::string& file,
+                                    bool replace, SessionState& session);
 // `label language [NAME] [, new copy delete rename]` (LBL-LANGUAGE).
 nlohmann::ordered_json runLabelLanguage(const std::vector<std::string>& args,
                                          const std::vector<std::pair<std::string, eval::OptValue>>& opts,

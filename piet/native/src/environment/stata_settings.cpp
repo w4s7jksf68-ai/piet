@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "piet/cclass.h"
+#include "piet/serset.h"
 
 namespace piet {
 
@@ -334,6 +335,8 @@ std::optional<SettingRefusal> storeStataSetting(const std::string& word,
         if (hit.empty()) return unkept();  // Stata's wording here is unmeasured
         word = hit;
       }
+      if (full == "scheme" && !serset::hasGraphScheme(word))
+        return SettingRefusal{"scheme " + word + " not found", "111"};
       value = s.lowerValue ? lowerAscii(word) : word;
       break;
     }

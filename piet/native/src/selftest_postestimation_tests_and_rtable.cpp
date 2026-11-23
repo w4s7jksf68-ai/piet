@@ -1545,7 +1545,11 @@ void testW2cPostest() {
     const std::string mainBlock =
         "{\"type\":\"estimation\",\"estimator\":\"hettest\",\"depvar\":\"\",\"n_obs\":60,"
         "\"F\":3.007277856627642,\"chi2\":1.948538271088701,\"p_F\":0.08820398142629103,"
-        "\"df\":1,\"p\":0.16274445304847818,\"df_r\":58.0}";
+        "\"df\":1,\"p\":0.16274445304847818,\"df_r\":58.0,"
+        // vs-stata stage 4: the block names hettest's assumption, as StataBE
+        // prints "Assumption: Normal error terms" for the default test (bank
+        // 6363769f0f32a260); every number above is unchanged.
+        "\"assumption\":\"Normal error terms\"}";
     check(rc == "0" && block == mainBlock,
           "W2C(postest/FU-504): control -- `estat hettest` after `regress y x1 x2` rc 0, block "
           "byte-identical to main's `" + mainBlock + "`. Got rc " + rc + " `" + block + "`");

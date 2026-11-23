@@ -5,6 +5,8 @@
 #include "piet/translate.h"
 
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <regex>
 #include <set>
@@ -143,6 +145,47 @@ std::unique_ptr<Datastore> fetchColumns(SessionState& session,
     std::error_code ec;
     std::filesystem::remove(cecon::to_native_path(out), ec);
     return nullptr;
+  }
+}
+
+std::optional<FetchedCell> fetchCell(SessionState& session, const std::string& col,
+                                     long long row) {
+  piet::CobraSession* cs = session.cobraSessionIfLive();
+  if (cs == nullptr || cs->framesState() != piet::CobraSession::Frames::Yes) return std::nullopt;
+  if (!session.residentFrameLive() || !session.residentHeadDirty()) return std::nullopt;
+  CobraRunResult r = cs->frameGetcell(col, row);
+  if (!r.ok) return std::nullopt;
+  try {
+    const nlohmann::json j = nlohmann::json::parse(r.stdout_text);
+    FetchedCell c;
+    const std::string dtype = j.at("dtype").get<std::string>();
+    if (dtype != "f64" && dtype != "factor") return std::nullopt;
+    c.isString = dtype == "factor";
+    c.nRows = j.at("rows").get<int64_t>();
+    c.inRange = j.at("in").get<bool>();
+    if (c.inRange) {
+      if (c.isString) {
+        const std::string hx = j.at("sx").get<std::string>();  // the cell's bytes, hex
+        if (hx.size() % 2 != 0) return std::nullopt;
+        c.text.reserve(hx.size() / 2);
+        for (size_t i = 0; i < hx.size(); i += 2) {
+          size_t used = 0;
+          const unsigned long b = std::stoul(hx.substr(i, 2), &used, 16);
+          if (used != 2) return std::nullopt;
+          c.text.push_back(static_cast<char>(b));
+        }
+      } else {
+        const std::string hex = j.at("bits").get<std::string>();
+        if (hex.size() != 16) return std::nullopt;
+        size_t used = 0;
+        const unsigned long long bits = std::stoull(hex, &used, 16);
+        if (used != 16) return std::nullopt;
+        std::memcpy(&c.value, &bits, sizeof c.value);
+      }
+    }
+    return c;
+  } catch (const std::exception&) {
+    return std::nullopt;
   }
 }
 

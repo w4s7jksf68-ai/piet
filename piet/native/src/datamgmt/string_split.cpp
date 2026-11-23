@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "piet/handlers/data_values.h"
+#include "piet/handlers/variables.h"  // resolveByKeyNames: split varname
 #include "piet/dispatcher.h"  // dispatch(): cumul marks its if/in sample with generate
 
 #include <algorithm>
@@ -68,18 +69,28 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabSplit.known,
                                             kVocabSplit.unimplemented))
     return ojson(*err);
-  if (auto q = refuseQualifiers(parsed, "split")) return *q;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
-  if (parsed.varlist.empty())
-    return rsSyntax("split: syntax is `split varname [, parse(chars) gen(stub) limit(#) destring]`");
-  if (parsed.varlist.size() > 1)
-    return rsError("split: this build splits ONE variable per command; `" +
-                       joinWith(parsed.varlist, " ") +
-                       "` names " + std::to_string(parsed.varlist.size()) +
-                       ". Run split once per variable.",
-                   "unimplemented");
+  if (parsed.varlist.empty()) return rsErrorRc("varlist required", 100);
+  // `syntax varname(str)`: one variable, an abbreviation or wildcard naming it
+  // (bank 120cc1f510218da5 `split mak*`).
+  std::vector<std::string> named = parsed.varlist;
+  if (auto err = resolveByKeyNames(session, named)) return *err;
+  if (named.size() > 1) return rsErrorRc("too many variables specified", 103);
 
-  const std::string var = parsed.varlist[0];
+  // destring's options need destring (split.ado's first check).
+  const bool destring = hasFlag(parsed.opts, "destring");
+  const bool forceOpt = hasFlag(parsed.opts, "force"), floatOpt = hasFlag(parsed.opts, "float");
+  const bool percentOpt = hasFlag(parsed.opts, "percent");
+  const std::optional<std::string> ignoreOpt = optStr(parsed.opts, "ignore");
+  if (!destring) {
+    for (const auto& [on, name] : std::vector<std::pair<bool, std::string>>{
+             {forceOpt, "force"}, {floatOpt, "float"}, {ignoreOpt.has_value(), "ignore"},
+             {percentOpt, "percent"}})
+      if (on) return rsErrorRc("may not specify " + name + " without specifying destring", 198);
+  }
+  const bool notrim = hasFlag(parsed.opts, "notrim");
+
+  const std::string var = named[0];
   ReadFrame rf(session, {var});
   Datastore* ds = rf.get();
   if (ds == nullptr)
@@ -127,6 +138,7 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
       if (!tok.empty()) seps.push_back(tok);
     }
     if (seps.empty()) {
+      if (notrim) return rsErrorRc("parsing on spaces incompatible with notrim", 198);
       seps.push_back(" ");
       trimParts = true;
     }
@@ -137,13 +149,26 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
     if (!parseStrictInt(*lv, &limit) || limit < 1)
       return rsSyntax("split: limit() requires a positive whole number, got `" + *lv + "'");
   }
-  const bool destring = hasFlag(parsed.opts, "destring");
   std::string stub = optStrAny(parsed.opts, {"gen", "generate"}).value_or(var);
   if (!strutil::isValidStataIdentifier(stub + "1"))
     return rsSyntax("split: `" + stub + "' is not a usable variable-name stub — " +
                     strutil::stataIdentifierRuleText());
 
-  const std::vector<std::string> values = columnAsStrings(*ds, var);
+  std::vector<std::string> values = columnAsStrings(*ds, var);
+  // `marksample touse, strok`: if / in, and a "" value, leave the sample; outside it
+  // every part is "".
+  if ((parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
+      (parsed.inRange.has_value() && !parsed.inRange->empty())) {
+    std::string qual;
+    if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) qual += " if " + *parsed.ifExpr;
+    if (parsed.inRange.has_value() && !parsed.inRange->empty()) qual += " in " + *parsed.inRange;
+    ScratchColumns scratch(session);
+    std::string mark;
+    if (auto failed = scratch.add("1", qual, &mark)) return *failed;
+    const auto m = scratch.values(mark);
+    for (size_t r = 0; r < values.size() && r < m.size(); ++r)
+      if (std::isnan(m[r])) values[r].clear();
+  }
   auto trimBlank = [](const std::string& t) {
     size_t a = 0, b = t.size();
     while (a < b && t[a] == ' ') ++a;
@@ -155,9 +180,12 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
   bool anyObs = false;
   for (const auto& v : values) {
     anyObs = anyObs || !v.empty();
-    rest.push_back(trimBlank(v));
+    rest.push_back(notrim ? v : trimBlank(v));
   }
   if (!anyObs) return rsErrorRc("no observations", 2000);
+  // force / float / ignore() / percent go to destring itself (below), so the parts
+  // stay strings here.
+  const bool destringCommand = destring && (forceOpt || floatOpt || percentOpt || ignoreOpt);
 
   std::vector<std::vector<std::string>> allParts(values.size());
   size_t k = 0;
@@ -222,7 +250,8 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
     // `destring` promotes part j to f64 only when EVERY non-empty value in that
     // part is a number -- per part, not per command, which is what makes
     // `split "1-a"` keep part 2 a string instead of failing the whole call.
-    const std::string dtype = (destring && anyValue && allNumeric) ? "f64" : "factor";
+    const std::string dtype =
+        (destring && !destringCommand && anyValue && allNumeric) ? "f64" : "factor";
     if (dtype == "f64") {
       // read_csv_column parses the f64 payload itself; blanks stay missing.
       // destring's storage rule: the smallest type that holds every value
@@ -260,6 +289,17 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
       session.varMeta[newVars[j]].stataType = partTypes[j];
     }
   }
+  ojson destringBlocks = ojson::array();
+  if (destringCommand && k > 0) {
+    std::string line = "destring " + joinWith(newVars, " ") + ", replace";
+    if (forceOpt) line += " force";
+    if (floatOpt) line += " float";
+    if (percentOpt) line += " percent";
+    if (ignoreOpt) line += " ignore(" + *ignoreOpt + ")";
+    destringBlocks = dispatch(line, session);
+    for (const auto& b : destringBlocks)
+      if (b.is_object() && b.value("type", std::string()) == "error") return b;
+  }
   // split.ado's returns: r(varlist) (the new names, each followed by a blank),
   // r(nvars) (a macro) and r(k_new) (vs-stata bank: `split make` ->
   // "make1 make2 make3 ", "3", 3).
@@ -276,6 +316,12 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
     // Zero parts (an all-empty column, or limit(0)) is not an error: it is a
     // dataset with nothing to add, and r(nvars)=0 says so.
     return silent();
+  }
+  if (destringCommand) {
+    ojson out = ojson::array();
+    out.push_back(mutationResult(session, "split", newVars));
+    for (const auto& b : destringBlocks) out.push_back(b);
+    return out;
   }
   return mutationResult(session, "split", newVars);
 }

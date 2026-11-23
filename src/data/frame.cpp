@@ -4262,7 +4262,12 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
     // posts r(Var) and r(sd) missing for `summarize x [iw=w]` on a single row with
     // w = 2, where Sum w - 1 = 1 would otherwise give 0 (r(N) is the row count).
     const bool single_iw = importance && nrows < 2;
-    if (vdenom >= 1.0 && !single_iw) {
+    // An importance weight may be negative: with Sum w < 0 the divisor Sum w - 1 is
+    // negative too and Stata still posts the variance (`summarize price [iw=-trunk+10]`:
+    // sum_w -278, Var 9903748.855, vs-stata bank cb2f9cd59614a32d; mixed-sign w = +-0.5,
+    // Sum w -15, r(Var) 10659793.04, 04783be0a9ef9211).
+    const bool negative_iw = importance && vdenom < 0.0;
+    if ((vdenom >= 1.0 || negative_iw) && !single_iw) {
         double ss = 0;
         for (int64_t i = 0; i < n_; ++i) {
             if (std::isnan(w[i]) || std::isnan(x[i]) || out(i)) continue;

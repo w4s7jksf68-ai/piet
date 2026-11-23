@@ -8,6 +8,9 @@
 
 #include "estimators/rdlocal.h"
 
+#include "core/distributions.h"
+#include "core/stata_pctile.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -267,11 +270,6 @@ double o_const(const SideData& s, double c, int nu, int p, RdKernel kk) {
     return factorial(nu) * acc;
 }
 
-// The "variance constant" the CCFT19 chain plugs in: n * c^{1+2nu} * V.
-double v_const(const SideData& s, double c, int nu, int p, RdKernel kk) {
-    return static_cast<double>(s.n_all) * std::pow(c, 1 + 2 * nu) * v_nu(s, c, nu, p, kk);
-}
-
 // ---------------------------------------------------------------- NN variance
 // CCT14 Section 5's fixed-J nearest-neighbor variance, with the mass-point
 // adjustment described in rdlocal.h: grow the neighbour set by whole ties
@@ -360,61 +358,7 @@ bool has_ties(const std::vector<double>& x) {
     std::sort(v.begin(), v.end());
     return std::unique(v.begin(), v.end()) != v.end();
 }
-double quantile_sorted(const std::vector<double>& sorted, double p) {
-    if (sorted.empty()) return 0.0;
-    double pos = p * (static_cast<double>(sorted.size()) - 1.0);
-    size_t lo = static_cast<size_t>(std::floor(pos));
-    size_t hi = std::min(lo + 1, sorted.size() - 1);
-    double frac = pos - static_cast<double>(lo);
-    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
-}
-
 // ---------------------------------------------------------------- bandwidth chain
-// CCFT19 supplemental appendix, Part IV Section 12 ("Implementation Details"),
-// the mserd (one common bandwidth, RD-difference target) branch.
-//
-//   Step 1  v-hat = C_K * min(s_X, IQR_X/1.349) * n^{-1/5}   [12.1]
-//           C_K = 2.576 (triangular), 1.843 (uniform).
-//   Step 2  d-hat, then b-hat = [ (3+2p)/(2(q-p)) * (V_- + V_+)/n / D_b ]^{1/(3+2q)}
-//   Step 3  h-hat = [ (1+2nu)/(2(1+p-nu)) * (V_- + V_+)/n / D_h ]^{1/(3+2p)}
-//
-// TWO THINGS THE PAPERS DO NOT SETTLE, both pinned by the oracle instead.
-//
-// (1) REGULARIZATION.  The paper's D_* are the squared bias constants alone.
-//     rdrobust adds an Imbens-Kalyanaraman regularization term (CCFT17 p.379
-//     documents it; scaleregul(1) is the default) that appears in neither
-//     paper's formulas.  It is not optional: dropping it moves h from 1.96 to
-//     3.01 on the oracle fixture.  CCT14's supplement derives its shape by
-//     linearising 1/x-hat around the squared bias, giving
-//     3 * Var(the bias-constant ESTIMATE) -- so the O(.)^2 factor rides along.
-//     CCT14's own printed Step-2 formula omits that O^2, contradicting its own
-//     derivation; measured, the derivation is right and the printed formula is
-//     wrong (without O^2, h collapses to 0.99).  Scales 2.90..3.20 were swept;
-//     3.0 is best and no other value improves both steps.
-//
-// (2) THE EVALUATION BANDWIDTH c-hat.  CCFT19's prose says v-hat supplies the
-//     "design matrices objects" and the variance terms.  Measured, that is
-//     REFUTED: with c-hat = v-hat the h step lands 1.9487 against the oracle's
-//     1.9625 for ANY b and d, so no downstream choice can rescue it.  Sweeping
-//     all 64 combinations of {v-hat, b-hat, self-consistent, support} over the
-//     three slots (bias constant, variance constant, regularization variance)
-//     selects c-hat = b-hat -- the step's own PILOT bandwidth -- for the h
-//     step, and the self-consistent value for the b step.  The paper's own
-//     Step-3 formula already mixes b-hat into that step's bias constant (it
-//     writes gamma-tilde_{Y,p}(b-hat), not (c-hat)), so evaluating the rest of
-//     the step there is not alien to it.  CCT14's separate Step-0 preliminary
-//     c_n was also tried as c-hat and is worse (h 1.9464, b 2.9888).
-//
-// Because the b step's constants are evaluated at b-hat itself, that step is a
-// fixed point rather than a closed form; the map is a contraction here (slope
-// about -0.017) and is iterated with damping below, falling back to v-hat if
-// it ever fails to converge.
-constexpr double kRegScale = 3.0;
-
-struct BwChain {
-    double v = 0, d = 0, b = 0, h = 0;
-    bool ok = false;
-};
 
 double side_max_abs(const SideData& s) {
     double m = 0.0;
@@ -422,114 +366,98 @@ double side_max_abs(const SideData& s) {
     return m;
 }
 
-BwChain select_bandwidths(const SideData& L, const SideData& R,
-                          const std::vector<double>& xall, int p, int q, int nu,
-                          RdKernel kk) {
-    BwChain out;
-    const double n = static_cast<double>(L.n_all);
-    if (n < 10) return out;
+SideData positive_window(const SideData& side, double bandwidth, RdKernel kernel, int nnmatch) {
+    SideData out;
+    out.n_all = side.n_all;
+    for (size_t i = 0; i < side.x.size(); ++i) {
+        if (kern_w(side.x[i] / bandwidth, kernel) <= 0.0) continue;
+        out.x.push_back(side.x[i]);
+        out.y.push_back(side.y[i]);
+    }
+    nn_sigma2(out, nnmatch);
+    return out;
+}
 
-    // --- Step 1: the rule-of-thumb preliminary bandwidth v-hat -------------
-    double mean = 0.0;
-    for (double v : xall) mean += v;
-    mean /= n;
+struct BwComponents {
+    double variance = 0.0;
+    double bias = 0.0;
+    double regularization = 0.0;
+};
+
+// The CCFT19 selector uses the same preliminary window for the variance and
+// kernel moment in every stage. The bias fit uses the previous stage's window.
+BwComponents bw_components(const SideData& side, const SideData& variance_side,
+                           double v, double bias_h, int order, int derivative,
+                           int bias_order, RdKernel kernel, int nnmatch, bool regularize) {
+    const double moment = o_const(variance_side, v, derivative, order, kernel) / factorial(derivative);
+    const double variance = v_nu(variance_side, v, derivative, order, kernel) /
+        std::pow(factorial(derivative), 2);
+    const auto bias_side = positive_window(side, bias_h, kernel, nnmatch);
+    std::vector<double> beta;
+    if (!beta_fit(bias_side, bias_h, bias_order, kernel, beta))
+        return {std::nan(""), std::nan(""), std::nan("")};
+    const double scale = 2 * (order + 1 - derivative);
+    double reg = 0.0;
+    if (regularize) {
+        const double bias_var = v_nu(bias_side, bias_h, order + 1, bias_order, kernel) /
+            std::pow(factorial(order + 1), 2);
+        reg = 3 * scale * moment * moment * bias_var;
+    }
+    return {(2 * derivative + 1) * std::pow(v, 2 * derivative + 1) * variance,
+            std::sqrt(scale) * moment * beta[order + 1], reg};
+}
+
+struct BwChain {
+    double b = 0.0;
+    double h = 0.0;
+    bool ok = false;
+};
+
+BwChain select_bandwidths(const SideData& left, const SideData& right,
+                          const std::vector<double>& xall, int p, int q, int nu,
+                          RdKernel kernel, int nnmatch) {
+    BwChain out;
+    const double n = static_cast<double>(xall.size());
+    if (n < 10.0) return out;
+    const double mean = std::accumulate(xall.begin(), xall.end(), 0.0) / n;
     double ss = 0.0;
-    for (double v : xall) ss += (v - mean) * (v - mean);
-    double sd = std::sqrt(ss / (n - 1.0));
+    for (double value : xall) ss += (value - mean) * (value - mean);
+    const double sd = std::sqrt(ss / (n - 1.0));
     std::vector<double> sorted(xall);
     std::sort(sorted.begin(), sorted.end());
-    double iqr = quantile_sorted(sorted, 0.75) - quantile_sorted(sorted, 0.25);
-    double ck = (kk == RdKernel::Triangular) ? 2.576 : 1.843;
-    double cs = std::min(sd, iqr / 1.349);
-    if (!(cs > 0.0)) return out;
-    const double v = ck * cs * std::pow(n, -0.2);
-    out.v = v;
-
-    // Bandwidths are truncated at the support: a local polynomial cannot see
-    // past max|x-c| on its own side, and the MSE-optimal choice diverges when
-    // the relevant derivative is (near) zero.  CCFT19's Lemma SA-23 discussion
-    // explicitly notes this truncation ("commonly done in practice").
-    const double cap = std::max(side_max_abs(L), side_max_abs(R));
-    auto trunc = [cap](double z) {
-        if (!std::isfinite(z) || z <= 0.0) return cap;
-        return std::min(z, cap);
+    const double iqr = stata_pctile_sorted(sorted, 75) - stata_pctile_sorted(sorted, 25);
+    const double base = std::min(sd, iqr / 1.349);
+    if (!(base > 0.0)) return out;
+    auto distances = [](const SideData& side) {
+        std::vector<double> unique;
+        for (double x : side.x) unique.push_back(std::fabs(x));
+        std::sort(unique.begin(), unique.end());
+        unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+        return unique;
     };
-
-    // --- Step 2a: d-hat, the bandwidth for the (1+q)-th derivative ---------
-    // Ad-hoc, deliberately inconsistent-but-stable constants (CCFT19 12.2):
-    // a global (1+q)-order fit on each side supplies mu^{(1+q)}.
-    std::vector<double> gcL, gcR;
-    double d = cap;
-    if (poly_ls(L.x, L.y, q + 1, gcL) && poly_ls(R.x, R.y, q + 1, gcR)) {
-        double oL = o_const(L, v, q + 1, q + 1, kk);
-        double oR = o_const(R, v, q + 1, q + 1, kk);
-        double bL = gcL[static_cast<size_t>(q + 1)] * oL;
-        double bR = gcR[static_cast<size_t>(q + 1)] * oR;
-        double Vd = v_const(L, v, q + 1, q + 1, kk) + v_const(R, v, q + 1, q + 1, kk);
-        double den = (bR - bL) * (bR - bL);
-        if (den > 0.0 && std::isfinite(Vd))
-            d = trunc(std::pow((3.0 + 2 * q) / 2.0 * Vd / n / den, 1.0 / (5.0 + 2 * q)));
-    }
-    out.d = d;
-
-    // --- Step 2b: b-hat, the bias bandwidth --------------------------------
-    // One evaluation of the b step with every constant taken at bandwidth `c`.
-    // Returns `cap` when the design degenerates, which is also the truncation
-    // value, so a failure here degrades to the widest admissible bandwidth
-    // rather than to a wild one.
-    auto b_at = [&](double c) -> double {
-        double oL = o_const(L, c, p + 1, q, kk), oR = o_const(R, c, p + 1, q, kk);
-        std::vector<double> cL, cR;
-        if (!beta_fit(L, d, q + 1, kk, cL) || !beta_fit(R, d, q + 1, kk, cR)) return cap;
-        double biasL = oL * cL[static_cast<size_t>(q + 1)];
-        double biasR = oR * cR[static_cast<size_t>(q + 1)];
-        double bias = (biasR - biasL) * (biasR - biasL);
-        double fq = factorial(q + 1);
-        double reg = kRegScale * (oL * oL * v_nu(L, d, q + 1, q + 1, kk) / (fq * fq) +
-                                  oR * oR * v_nu(R, d, q + 1, q + 1, kk) / (fq * fq));
-        double Vb = v_const(L, c, p + 1, q, kk) + v_const(R, c, p + 1, q, kk);
-        double den = 2.0 * (q - p) * (bias + reg);
-        if (!(den > 0.0) || !(Vb > 0.0) || !std::isfinite(Vb)) return cap;
-        return trunc(std::pow((3.0 + 2 * p) * Vb / n / den, 1.0 / (3.0 + 2 * q)));
+    const auto dl = distances(left), dr = distances(right);
+    const double cap = std::max(dl.back(), dr.back());
+    const bool concentrated = dl.size() <= 0.8 * left.x.size() || dr.size() <= 0.8 * right.x.size();
+    const double floor = concentrated
+        ? std::max(dl[std::min(size_t{10}, dl.size()) - 1], dr[std::min(size_t{10}, dr.size()) - 1])
+        : 0.0;
+    const double ck = kernel == RdKernel::Triangular ? 2.576 : 1.843;
+    const double v = std::clamp(ck * base * std::pow(dl.size() + dr.size(), -0.2), floor, cap);
+    const auto vl = positive_window(left, v, kernel, nnmatch);
+    const auto vr = positive_window(right, v, kernel, nnmatch);
+    auto select = [&](int order, int derivative, int bias_order, double hl, double hr, bool regularize) {
+        const auto l = bw_components(left, vl, v, hl, order, derivative, bias_order, kernel, nnmatch, regularize);
+        const auto r = bw_components(right, vr, v, hr, order, derivative, bias_order, kernel, nnmatch, regularize);
+        const double bias = r.bias - l.bias;
+        const double ratio = (l.variance + r.variance) / (bias * bias + l.regularization + r.regularization);
+        return ratio > 0 ? std::min(cap, std::pow(ratio, 1.0 / (2 * order + 3))) : 0.0;
     };
-    // Self-consistent b-hat: iterate b = b_at(b), damped, from the rule-of-thumb
-    // start.  Converged within ~40 iterations on every sample tried; the
-    // fallback keeps the paper's literal c-hat = v-hat if it ever does not.
-    double b = b_at(v);
-    {
-        double cur = b;
-        bool converged = false;
-        for (int it = 0; it < 200; ++it) {
-            double nb = b_at(cur);
-            if (!std::isfinite(nb) || nb <= 0.0) break;
-            double next = 0.5 * cur + 0.5 * nb;
-            if (std::fabs(next - cur) < 1e-12) { cur = next; converged = true; break; }
-            cur = next;
-        }
-        if (converged && std::isfinite(cur) && cur > 0.0) b = cur;
-    }
-    out.b = b;
-
-    // --- Step 3: h-hat, with every constant at the pilot bandwidth b-hat ---
-    double h = cap;
-    {
-        double oL = o_const(L, b, nu, p, kk), oR = o_const(R, b, nu, p, kk);
-        std::vector<double> cL, cR;
-        if (beta_fit(L, b, q, kk, cL) && beta_fit(R, b, q, kk, cR)) {
-            double biasL = oL * cL[static_cast<size_t>(p + 1)];
-            double biasR = oR * cR[static_cast<size_t>(p + 1)];
-            double bias = (biasR - biasL) * (biasR - biasL);
-            double fp = factorial(p + 1);
-            double reg = kRegScale * (oL * oL * v_nu(L, b, p + 1, q, kk) / (fp * fp) +
-                                      oR * oR * v_nu(R, b, p + 1, q, kk) / (fp * fp));
-            double Vh = v_const(L, b, nu, p, kk) + v_const(R, b, nu, p, kk);
-            double den = 2.0 * (1 + p - nu) * (bias + reg);
-            if (den > 0.0 && Vh > 0.0 && std::isfinite(Vh))
-                h = trunc(std::pow((1.0 + 2 * nu) * Vh / n / den, 1.0 / (3.0 + 2 * p)));
-        }
-    }
-    out.h = h;
-    out.ok = std::isfinite(out.h) && out.h > 0 && std::isfinite(out.b) && out.b > 0;
+    const double d = std::max(floor, select(q + 1, q + 1, q + 2, dl.back(), dr.back(), false));
+    if (!(d > 0.0)) return out;
+    out.b = select(q, p + 1, q + 1, d, d, true);
+    if (!(out.b > 0.0)) return out;
+    out.h = select(p, nu, q, out.b, out.b, true);
+    out.ok = out.h > 0.0;
     return out;
 }
 
@@ -606,9 +534,6 @@ RdRobustResult rd_robust_run(const double* y, const double* x, int64_t n,
         R.error = "rdrobust: too few observations on one side of the cutoff";
         return R;
     }
-    nn_sigma2(S.L, cfg.nnmatch);
-    nn_sigma2(S.R, cfg.nnmatch);
-
     const int p = cfg.p, q = cfg.q, nu = 0;
     const RdKernel kk = cfg.kernel;
     double h = cfg.h_left, b = cfg.b_left;
@@ -617,7 +542,7 @@ RdRobustResult rd_robust_run(const double* y, const double* x, int64_t n,
         if (!(h > 0)) h = b;
         if (!(b > 0)) b = h;
     } else {
-        BwChain bw = select_bandwidths(S.L, S.R, S.xall, p, q, nu, kk);
+        BwChain bw = select_bandwidths(S.L, S.R, S.xall, p, q, nu, kk, cfg.nnmatch);
         if (!bw.ok) {
             R.ok = false;
             R.error = "rdrobust: bandwidth selection failed (degenerate design)";
@@ -639,19 +564,8 @@ RdRobustResult rd_robust_run(const double* y, const double* x, int64_t n,
     // `rdrobust wage x, h(3)`: N_h_l 408 / N_h_r 560 where |x| <= 3 holds 409 / 563).
     {
         const double hw = std::max(h, b);
-        auto in_window = [&](const SideData& s) {
-            SideData w;
-            w.n_all = s.n_all;
-            for (size_t i = 0; i < s.x.size(); ++i)
-                if (kern_w(s.x[i] / hw, kk) > 0.0) {
-                    w.x.push_back(s.x[i]);
-                    w.y.push_back(s.y[i]);
-                }
-            nn_sigma2(w, cfg.nnmatch);
-            return w;
-        };
-        S.L = in_window(S.L);
-        S.R = in_window(S.R);
+        S.L = positive_window(S.L, hw, kk, cfg.nnmatch);
+        S.R = positive_window(S.R, hw, kk, cfg.nnmatch);
         auto positive = [&](const SideData& s) {
             int64_t c = 0;
             for (double v : s.x)
@@ -741,97 +655,180 @@ RdRobustResult rd_robust_run(const double* y, const double* x, int64_t n,
 // ================================================================= rddensity
 namespace {
 
-// Exact two-sided binomial test of H0: prob = 0.5, by the "sum of outcomes no
-// more likely than the observed one" rule.
-double binom_two_sided(int64_t k, int64_t N) {
-    if (N <= 0) return 1.0;
-    auto lp = [N](int64_t j) {
-        return std::lgamma(static_cast<double>(N) + 1.0) -
-               std::lgamma(static_cast<double>(j) + 1.0) -
-               std::lgamma(static_cast<double>(N - j) + 1.0) -
-               static_cast<double>(N) * std::log(2.0);
-    };
-    double pk = lp(k), tot = 0.0;
-    for (int64_t j = 0; j <= N; ++j) {
-        double v = lp(j);
-        if (v <= pk + 1e-9) tot += std::exp(v);
-    }
-    return std::min(tot, 1.0);
-}
-
-// One side's CJM20 local-polynomial density estimate at the cutoff, together
-// with the per-observation influence contributions that drive the jackknife
-// variance.  `G` is the empirical distribution function evaluated at every
-// observation, `z` the centred running variable (all n of them).
-struct DensSide {
-    double f = 0;
-    std::vector<double> infl;   // length n, mean(infl) == f
+// Unrestricted CJM density fit on one side. See rddensity_fun.do in the
+// authors' Stata package and rdbwdensity.ado for the selector below (v3.0).
+// Sorted ties share the empirical CDF at the last index of each mass point.
+// Only the CDF is computed on the full sample; the jackknife uses observations
+// in the local window and divides by the full N-1.
+struct DensityFit {
+    double coefficient = 0.0;
+    double variance = 0.0;
     bool ok = false;
 };
 
-DensSide density_side(const std::vector<double>& z, const std::vector<double>& G,
-                      bool right, double h, int order, RdKernel kk) {
-    DensSide out;
+DensityFit density_fit(const std::vector<double>& x, size_t first, size_t last,
+                       double h, int order, int derivative, RdKernel kernel,
+                       bool jackknife) {
+    DensityFit out;
+    if (!(h > 0.0) || first == last) return out;
     const int k = order + 1;
-    std::vector<double> zs, gs;
-    for (size_t i = 0; i < z.size(); ++i) {
-        bool in = right ? (z[i] >= 0.0) : (z[i] < 0.0);
-        if (in) { zs.push_back(z[i]); gs.push_back(G[i]); }
+    struct Point { double u; double weight; double cdf; size_t count; };
+    std::vector<Point> points;
+    for (size_t i = first; i < last;) {
+        size_t end = i + 1;
+        while (end < last && x[i] == x[end]) ++end;
+        const double u = x[i] / h;
+        const double weight = kern_w(u, kernel);
+        if (weight > 0.0)
+            points.push_back({u, weight, static_cast<double>(end - 1) /
+                                           static_cast<double>(x.size() - 1), end - i});
+        i = end;
     }
-    if (static_cast<int>(zs.size()) < k + 1) return out;
-    std::vector<double> A(static_cast<size_t>(k) * k, 0.0), rhs(static_cast<size_t>(k), 0.0);
-    std::vector<double> w(zs.size()), pw(static_cast<size_t>(k));
-    for (size_t i = 0; i < zs.size(); ++i) {
-        w[i] = kern_w(zs[i] / h, kk);
-        if (w[i] == 0.0) continue;
-        pw[0] = 1.0;
-        for (int j = 1; j < k; ++j) pw[static_cast<size_t>(j)] = pw[static_cast<size_t>(j - 1)] * zs[i];
-        for (int a = 0; a < k; ++a) {
-            rhs[static_cast<size_t>(a)] += w[i] * pw[static_cast<size_t>(a)] * gs[i];
-            for (int b = 0; b < k; ++b)
-                A[static_cast<size_t>(a) * k + b] += w[i] * pw[static_cast<size_t>(a)] * pw[static_cast<size_t>(b)];
+    if (points.size() < static_cast<size_t>(k)) return out;
+
+    std::vector<double> gram(static_cast<size_t>(k) * k, 0.0), rhs(k, 0.0);
+    std::vector<double> powers(2 * order + 1);
+    for (const auto& point : points) {
+        powers[0] = 1.0;
+        for (int j = 1; j <= 2 * order; ++j) powers[j] = powers[j - 1] * point.u;
+        const double weight = point.count * point.weight;
+        for (int j = 0; j < k; ++j) {
+            rhs[j] += weight * powers[j] * point.cdf;
+            for (int l = 0; l < k; ++l) gram[j * k + l] += weight * powers[j + l];
         }
     }
-    std::vector<double> Ai;
-    if (!mat_inverse(A, k, Ai)) return out;
-    std::vector<double> beta(static_cast<size_t>(k), 0.0);
-    for (int a = 0; a < k; ++a)
-        for (int b = 0; b < k; ++b) beta[static_cast<size_t>(a)] += Ai[static_cast<size_t>(a) * k + b] * rhs[static_cast<size_t>(b)];
-    out.f = beta[1];  // the density is the coefficient on the linear term
-
-    // f = sum_j wt_j G_j with wt_j = w_j * (r(z_j)' A^-1 e_1); and
-    // G_j = (1/n) sum_i 1(z_i <= z_j), so f = (1/n) sum_i infl_i with
-    // infl_i = sum_{j in side, z_j >= z_i} wt_j.  That per-observation
-    // decomposition IS the jackknife influence CJM20 use for the variance.
-    std::vector<double> wt(zs.size(), 0.0);
-    for (size_t i = 0; i < zs.size(); ++i) {
-        if (w[i] == 0.0) continue;
-        pw[0] = 1.0;
-        for (int j = 1; j < k; ++j) pw[static_cast<size_t>(j)] = pw[static_cast<size_t>(j - 1)] * zs[i];
-        double t = 0.0;
-        for (int a = 0; a < k; ++a) t += pw[static_cast<size_t>(a)] * Ai[static_cast<size_t>(a) * k + 1];
-        wt[i] = w[i] * t;
+    std::vector<double> inverse;
+    if (!mat_inverse(gram, k, inverse)) return out;
+    const double* row = inverse.data() + derivative * k;
+    const double scale = std::pow(h, derivative);
+    out.coefficient = std::inner_product(rhs.begin(), rhs.end(), row, 0.0) / scale;
+    if (jackknife) {
+        double prefix = 0.0, sum_square = 0.0;
+        for (const auto& point : points) {
+            double power = 1.0, load = row[0];
+            for (int j = 1; j < k; ++j) {
+                power *= point.u;
+                load += row[j] * power;
+            }
+            load *= point.weight;
+            // Deleting one observation changes the CDF at its own mass point
+            // by one count and at all subsequent mass points by the shared
+            // prefix adjustment. All observations tied here share this load.
+            const double influence = prefix + load;
+            sum_square += point.count * influence * influence;
+            prefix += point.count * load;
+        }
+        const double normalization = (x.size() - 1) * scale;
+        out.variance = sum_square / (normalization * normalization);
     }
-    // aggregate wt by distinct side value, then take suffix sums
-    std::vector<size_t> ord(zs.size());
-    std::iota(ord.begin(), ord.end(), size_t{0});
-    std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return zs[a] < zs[b]; });
-    std::vector<double> val, agg;
-    for (size_t t = 0; t < ord.size(); ++t) {
-        size_t i = ord[t];
-        if (val.empty() || zs[i] != val.back()) { val.push_back(zs[i]); agg.push_back(0.0); }
-        agg.back() += wt[i];
-    }
-    std::vector<double> suf(agg.size(), 0.0);
-    double run = 0.0;
-    for (size_t t = agg.size(); t-- > 0;) { run += agg[t]; suf[t] = run; }
-    out.infl.assign(z.size(), 0.0);
-    for (size_t i = 0; i < z.size(); ++i) {
-        auto it = std::lower_bound(val.begin(), val.end(), z[i]);
-        out.infl[i] = (it == val.end()) ? 0.0 : suf[static_cast<size_t>(it - val.begin())];
-    }
-    out.ok = true;
+    out.ok = std::isfinite(out.coefficient) && std::isfinite(out.variance);
     return out;
+}
+
+double hermite(double x, int order) {
+    double previous = 0.0, value = 1.0;
+    for (int k = 0; k < order; ++k) {
+        const double next = x * value - k * previous;
+        previous = value;
+        value = next;
+    }
+    return value;
+}
+
+// For the unrestricted fit the coefficient on u in the weighted projection
+// of u^(p+1) supplies the bias in the derivative at the cutoff. Integrate
+// the kernel moments analytically instead of approximating the integrals.
+double density_bias_constant(int p, RdKernel kernel) {
+    const int k = p + 1;
+    auto moment = [kernel](int j) {
+        if (kernel == RdKernel::Uniform) return 1.0 / (j + 1);
+        return 1.0 / ((j + 1) * (j + 2));
+    };
+    std::vector<double> gram(k * k), rhs(k), inverse;
+    for (int j = 0; j < k; ++j) {
+        rhs[j] = moment(j + p + 1);
+        for (int l = 0; l < k; ++l) gram[j * k + l] = moment(j + l);
+    }
+    if (!mat_inverse(gram, k, inverse)) return 0.0;
+    return std::fabs(std::inner_product(rhs.begin(), rhs.end(), inverse.data() + k, 0.0));
+}
+
+double order_statistic(const std::vector<double>& values, size_t one_based) {
+    return values[std::min(one_based, values.size()) - 1];
+}
+
+std::pair<double, double> density_bandwidths(const std::vector<double>& z, size_t split,
+                                             int p, RdKernel kernel) {
+    // Gaussian-reference constants for the two pilot fits, rdbwdensity v3.0.
+    // Supported p is 1..4 because the final bias fit has p < q <= 5.
+    constexpr double c_ref[] = {4.800000000000025, 548.5714285715546,
+                                100800.00000020421, 29558225.45810061};
+    constexpr double b_ref[] = {25884.44444449415, 3430865.455123618,
+                                845007948.042626, 330631733667.0381};
+    std::vector<double> left, right(z.begin() + split, z.end());
+    left.reserve(split);
+    for (size_t j = split; j > 0; --j) left.push_back(-z[j - 1]);
+    auto unique = [](const std::vector<double>& v) {
+        auto out = v;
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    };
+    const auto left_unique = unique(left), right_unique = unique(right);
+    const double cap_left = left.back(), cap_right = right.back();
+    const double cap = std::max(cap_left, cap_right);
+    const double mean = std::accumulate(z.begin(), z.end(), 0.0) / z.size();
+    double ss = 0.0;
+    for (double value : z) ss += (value - mean) * (value - mean);
+    const double sd = std::sqrt(ss / (z.size() - 1));
+    const double normal_z = -mean / sd;
+    const double phi = std::exp(-normal_z * normal_z / 2) / std::sqrt(2 * M_PI);
+
+    auto floor_side = [](const auto& raw, const auto& distinct, int order) {
+        const size_t minimum = 20 + order + 1;
+        return std::max(order_statistic(raw, minimum), order_statistic(distinct, minimum));
+    };
+    auto pilot = [&](int order, int power, double multiplier) {
+        const double hpoly = hermite(normal_z, order);
+        const double denominator = phi * hpoly * hpoly * z.size();
+        const double unconstrained = denominator > 0.0
+            ? std::pow(std::pow(sd, power) * multiplier / denominator, 1.0 / power)
+            : cap;
+        return std::max({std::min(unconstrained, cap),
+                         floor_side(left, left_unique, order),
+                         floor_side(right, right_unique, order)});
+    };
+    const double b = pilot(p + 2, 2 * p + 5, (2 * p + 1) * b_ref[p - 1] / 4);
+    const double c = pilot(p, 2 * p + 1, c_ref[p - 1] / (2 * p));
+    const auto bias_left = density_fit(z, 0, split, b, p + 2, p + 1, kernel, false);
+    const auto bias_right = density_fit(z, split, z.size(), b, p + 2, p + 1, kernel, false);
+    const auto variance_left = density_fit(z, 0, split, c, p, 1, kernel, true);
+    const auto variance_right = density_fit(z, split, z.size(), c, p, 1, kernel, true);
+
+    const double min_left = floor_side(left, left_unique, p);
+    const double min_right = floor_side(right, right_unique, p);
+    if (!bias_left.ok || !bias_right.ok || !variance_left.ok || !variance_right.ok) {
+        // If a pilot is unidentified, only use the smallest regularized
+        // window; the caller still checks identification of the final fit.
+        return {min_left, min_right};
+    }
+    const double bias_const = density_bias_constant(p, kernel);
+    const double bl = bias_const * bias_left.coefficient * (p % 2 ? -1.0 : 1.0);
+    const double br = bias_const * bias_right.coefficient;
+    const double vl = variance_left.variance, vr = variance_right.variance;
+    auto select = [p, c](double bias, double variance, double hi, double lo) {
+        double bandwidth = hi;
+        if (bias != 0.0)
+            bandwidth = std::pow(c * variance / (2 * p * bias * bias), 1.0 / (2 * p + 1));
+        return std::max(lo, std::min(bandwidth, hi));
+    };
+    const double common_min = std::max(min_left, min_right);
+    const double diff = select(br - bl, vl + vr, cap, common_min);
+    const double sum = select(br + bl, vl + vr, cap, common_min);
+    auto median = [diff, sum](double value) {
+        return std::clamp(value, std::min(diff, sum), std::max(diff, sum));
+    };
+    return {median(select(bl, vl, cap_left, min_left)),
+            median(select(br, vr, cap_right, min_right))};
 }
 
 }  // namespace
@@ -875,46 +872,34 @@ RdDensityResult rd_density_run(const double* x, int64_t n, const RdLocalConfig& 
         R.error = "rddensity: too few observations on one side of the cutoff";
         return R;
     }
-    const double N = static_cast<double>(z.size());
-
-    // Empirical distribution function, evaluated at every observation.  Ties
-    // share a single value (that is the "adjustment for repeated observations"
-    // this estimator needs: F-hat is right-continuous, so all tied rows get
-    // the same F-hat and the mass point enters once).
-    std::vector<double> sorted(z);
-    std::sort(sorted.begin(), sorted.end());
-    std::vector<double> G(z.size());
-    for (size_t i = 0; i < z.size(); ++i) {
-        auto it = std::upper_bound(sorted.begin(), sorted.end(), z[i]);
-        G[i] = static_cast<double>(it - sorted.begin()) / N;
+    std::sort(z.begin(), z.end());
+    const size_t split = static_cast<size_t>(R.n_left);
+    if (cfg.h_left > 0) {
+        R.bw_method = "manual";
+        R.h_left = cfg.h_left;
+        R.h_right = cfg.h_right > 0 ? cfg.h_right : cfg.h_left;
+    } else {
+        const auto bandwidths = density_bandwidths(z, split, p, cfg.kernel);
+        R.h_left = bandwidths.first;
+        R.h_right = bandwidths.second;
+    }
+    for (double v : z) {
+        if (v < 0.0 && v >= -R.h_left) ++R.n_eff_left;
+        if (v >= 0.0 && v <= R.h_right) ++R.n_eff_right;
     }
 
-    // Bandwidth: the MSE-optimal choice for a density with no curvature
-    // diverges, so like every other bandwidth here it is truncated at the
-    // support.  bwselect(comb) is the only method implemented.
-    double cap = 0.0;
-    for (double v : z) cap = std::max(cap, std::fabs(v));
-    double h = (cfg.h_left > 0) ? cfg.h_left : cap;
-    if (cfg.h_left > 0) R.bw_method = "manual";
-    R.h_left = R.h_right = h;
-    for (double v : z)
-        if (std::fabs(v) <= h) (v < 0.0 ? R.n_eff_left : R.n_eff_right) += 1;
-
-    auto run_order = [&](int order, double& fL, double& fR, double& se, double& t, double& pv) -> bool {
-        DensSide dl = density_side(z, G, false, h, order, cfg.kernel);
-        DensSide dr = density_side(z, G, true, h, order, cfg.kernel);
-        if (!dl.ok || !dr.ok) return false;
-        fL = dl.f;
-        fR = dr.f;
-        double mean = 0.0;
-        std::vector<double> D(z.size());
-        for (size_t i = 0; i < z.size(); ++i) { D[i] = dr.infl[i] - dl.infl[i]; mean += D[i]; }
-        mean /= N;
-        double ss = 0.0;
-        for (double v : D) ss += (v - mean) * (v - mean);
-        double var = ss / (N * N);
-        if (!(var > 0.0)) return false;
-        se = std::sqrt(var);
+    auto run_order = [&](int order, double& fL, double& fR, double& se, double& t, double& pv) {
+        const auto left = density_fit(z, 0, split, R.h_left, order, 1, cfg.kernel, true);
+        const auto right = density_fit(z, split, z.size(), R.h_right, order, 1, cfg.kernel, true);
+        const double variance = left.variance + right.variance;
+        if (!left.ok || !right.ok || !(variance > 0.0)) return false;
+        fL = left.coefficient;
+        fR = right.coefficient;
+        if (order == q) {
+            R.se_left_q = std::sqrt(left.variance);
+            R.se_right_q = std::sqrt(right.variance);
+        }
+        se = std::sqrt(variance);
         t = (fR - fL) / se;
         pv = z_pvalue(t);
         return true;
@@ -928,30 +913,31 @@ RdDensityResult rd_density_run(const double* x, int64_t n, const RdLocalConfig& 
     R.diff = R.f_right - R.f_left;
     R.diff_q = R.f_right_q - R.f_left_q;
 
-    // Binomial table: ten symmetric windows, |x-c| <= w, w = 0.1 ... 1.0 by
-    // default (rddensity's `binomial` output).  The window step is one tenth
-    // of the range that puts ~1% of the sample on each side, but rddensity's
-    // printed default ladder is 0.1*k for k=1..10 scaled to the data; here the
-    // ladder is the ten evenly spaced windows spanning `wmax`.
-    double wmax = 1.0;
-    {
-        // rddensity picks the window ladder so the widest window holds a
-        // workable share of the data; the printed default is 10 evenly spaced
-        // half-widths ending at the half-width that first reaches ~10% of n.
-        std::vector<double> ab;
-        for (double v : z) ab.push_back(std::fabs(v));
-        std::sort(ab.begin(), ab.end());
-        size_t idx = static_cast<size_t>(0.20 * static_cast<double>(ab.size()));
-        if (idx < ab.size() && ab[idx] > 0) wmax = ab[idx];
-    }
-    for (int kwin = 1; kwin <= 10; ++kwin) {
+    // Start with enough observations on each side, then extend each window
+    // toward its estimation bandwidth in at most ten equal increments.
+    constexpr int kWindows = 10;
+    constexpr int kInitialCount = 20;
+    std::vector<double> left;
+    left.reserve(split);
+    for (size_t j = split; j > 0; --j) left.push_back(-z[j - 1]);
+    const std::vector<double> right(z.begin() + split, z.end());
+    const double first = std::max(order_statistic(left, kInitialCount),
+                                  order_statistic(right, kInitialCount));
+    const int windows = first >= std::min(R.h_left, R.h_right) ? 1 : kWindows;
+    const double end_left = std::min(first * kWindows, R.h_left);
+    const double end_right = std::min(first * kWindows, R.h_right);
+    for (int j = 0; j < windows; ++j) {
         RdDensityBinomRow row;
-        row.window = wmax * kwin / 10.0;
-        for (double v : z) {
-            if (std::fabs(v) > row.window) continue;
-            if (v < 0.0) ++row.n_left; else ++row.n_right;
-        }
-        row.p_value = binom_two_sided(row.n_right, row.n_left + row.n_right);
+        auto window = [j, first](double end) {
+            return j == kWindows - 1 ? end : first + j * ((end - first) / (kWindows - 1));
+        };
+        row.window = window(end_left);
+        row.window_right = window(end_right);
+        row.n_left = std::upper_bound(left.begin(), left.end(), row.window) - left.begin();
+        row.n_right = std::upper_bound(right.begin(), right.end(), row.window_right) - right.begin();
+        row.p_lower = row.n_right == 0 ? 1.0 : betai(row.n_right, row.n_left + 1, 0.5);
+        row.p_upper = row.n_left == 0 ? 1.0 : betai(row.n_left, row.n_right + 1, 0.5);
+        row.p_value = std::min(1.0, 2 * std::min(row.p_lower, row.p_upper));
         R.binomial.push_back(row);
     }
     return R;

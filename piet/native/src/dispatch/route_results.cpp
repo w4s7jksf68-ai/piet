@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
+#include <set>
 #include "expression_support.h"
 #include "prefix_support.h"
 #include "results_support.h"
@@ -10,6 +11,7 @@
 #include "piet/handlers/descriptive.h"
 #include "piet/handlers/estimates_tables.h"
 #include "piet/handlers/results.h"
+#include "piet/program.h"
 namespace piet::dispatch_detail {
 bool route_results(std::string& cmd,
     std::string& cmdTyped,
@@ -49,6 +51,12 @@ bool route_results(std::string& cmd,
         shown["smcl"] = typed;
       }
     }
+    // Carry the width to the display and text-log renderers. Keep the
+    // original string in the result block for scripts and other consumers.
+    if (shown.value("type", std::string()) == "display" &&
+        (shown.value("continue", false) || shown.value("text", std::string()).size() >
+                                             static_cast<size_t>(linesize)))
+      shown["linesize"] = linesize;
     shown.erase("asis");
     if (shown.value("type", std::string()) == "error") {
       // The pieces printed before the failing one (handleDisplay's partial_text).
@@ -247,13 +255,15 @@ bool route_results(std::string& cmd,
 
   // ==================== AER-SCOPE1 bundle B (RESULTS) arms ================
   if (cmd == "return") {
-    std::string sub = parsed.varlist.empty() ? "" : lower(parsed.varlist[0]);
+    // li:st, sca:lar, loc:al, mat:rix are the documented abbreviations ([P] return).
+    std::string sub =
+        parsed.varlist.empty() ? "" : program::canonicalReturnSubcommand(parsed.varlist[0]);
     if (sub == "list") {
-      if (auto err = eval::rejectUnknownOptions(parsed.opts, {}, {"all"})) {
+      if (auto err = eval::rejectUnknownOptions(parsed.opts, {"all"}, {})) {
         blocks.push_back(ojson(*err));
         return true;
       }
-      ojson listed = ojson(handlers::runReturnList(session));
+      ojson listed = ojson(handlers::runReturnList(session, !parsed.opts.empty()));
       if (!(listed.is_array() && listed.empty())) blocks.push_back(std::move(listed));
       return true;
     }
@@ -309,7 +319,19 @@ bool route_results(std::string& cmd,
     // `return scalar|local` reaches program::handleReturnStmt long before this
     // arm (dispatcher step (e), above), so anything still here is a form PIET
     // does not implement -- named as an unknown SUBCOMMAND, because the command
-    // itself now exists.
+    // itself now exists. A word that is none of return's subcommands is
+    // Stata's r(198) "invalid syntax" (vs-stata bank `return , zz` 30853e37,
+    // `return zznotasub a = 1` 5d83cfd6).
+    {
+      static const std::set<std::string> kReturnSubs = {"list", "clear", "add", "scalar",
+                                                        "local", "matrix", "hidden",
+                                                        "historical"};
+      if (kReturnSubs.count(sub) == 0) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+    }
     blocks.push_back(ojson(eval::unsupportedCommand(
         "return " + sub, std::nullopt, std::nullopt, "piet_gap",
         eval::UnsupportedCommandKind::kUnknownSubcommand)));
@@ -591,6 +613,38 @@ bool route_results(std::string& cmd,
         return true;
       }
       if (rejectFor({})) return true;
+      // `estimates` with no subcommand replays the active results when there are any and does
+      // nothing otherwise, rc 0 either way (estimates.ado: an empty key runs Replay "." only when
+      // e(cmd) is set). The replay is `estimates replay`, which PIET does not serve: it keeps
+      // that subcommand's named refusal.
+      if (parsed.varlist.empty()) {
+        if (session.eval.eStrings.get("cmd", "").empty()) return true;
+        blocks.push_back(ojson(eval::unsupportedCommand(
+            cmdTyped + " replay", std::nullopt, std::nullopt, "piet_gap",
+            eval::UnsupportedCommandKind::kUnknownSubcommand)));
+        return true;
+      }
+      // A word that opens none of estimates' subcommands is Stata's r(198) "subcommand estimates
+      // zzz is unrecognized" (vs-stata bank c6aee8b5); the real ones PIET does not serve keep
+      // the named refusal below.
+      {
+        std::string word = sub;
+        while (!word.empty() && word.back() == ':') word.pop_back();
+        static const char* const kEstimatesSubs[] = {
+            "store", "restore", "query", "dir", "drop", "clear", "save", "use", "describe",
+            "esample", "table", "stats", "replay", "title", "notes", "for", "change",
+            "selected"};
+        bool opens = false;
+        for (const char* full : kEstimatesSubs)
+          if (!word.empty() && std::string(full).rfind(word, 0) == 0) opens = true;
+        if (!opens) {
+          blocks.push_back(ojson(eval::errorBlock("syntax_error",
+                                                  "subcommand estimates " + sub + " is unrecognized",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(198)")));
+          return true;
+        }
+      }
       blocks.push_back(ojson(eval::unsupportedCommand(
           cmdTyped + " " + sub, std::nullopt, std::nullopt, "piet_gap",
           eval::UnsupportedCommandKind::kUnknownSubcommand)));
@@ -741,7 +795,7 @@ bool route_results(std::string& cmd,
         return true;
       }
     }
-    blocks.push_back(result);
+    if (!result.value("writer_selection", false)) blocks.push_back(result);
     if (!usingPath.empty() && result.value("type", std::string()) != "error") {
       pushEnvResult(blocks, handlers::writeEsttabFile(result, usingPath, parsed.opts, session));
     }

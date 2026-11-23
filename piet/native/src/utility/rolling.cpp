@@ -73,7 +73,111 @@ enum class RangeStat {
   FirstNm, LastNm
 };
 
+// rangestat's flexible statistics (cov, corr, reg): one statistic over the whole group of
+// variables that follows `(cov)`, computed on each window after dropping the rows missing
+// any of them (rangestat's rs_cov / rs_corr / rs_reg: Mata variance(), correlation(), and an
+// OLS with a constant that needs more observations than coefficients).
+struct FlexSpec {
+  std::string name;
+  std::vector<std::string> vars;
+  int seq = 0;
+};
+
+// Solve the symmetric positive-definite system by Gauss-Jordan; false when singular.
+bool invertSym(std::vector<long double>& a, int k) {
+  std::vector<long double> inv(static_cast<size_t>(k * k), 0.0L);
+  for (int i = 0; i < k; ++i) inv[static_cast<size_t>(i * k + i)] = 1.0L;
+  for (int c = 0; c < k; ++c) {
+    int piv = c;
+    for (int r = c + 1; r < k; ++r)
+      if (std::fabs(a[static_cast<size_t>(r * k + c)]) > std::fabs(a[static_cast<size_t>(piv * k + c)])) piv = r;
+    long double scale = 0;
+    for (int r = 0; r < k; ++r) scale = std::max(scale, std::fabs(a[static_cast<size_t>(r * k + c)]));
+    if (a[static_cast<size_t>(piv * k + c)] == 0.0L ||
+        std::fabs(a[static_cast<size_t>(piv * k + c)]) <= 1e-13L * (scale > 0 ? scale : 1.0L))
+      return false;
+    if (piv != c)
+      for (int j = 0; j < k; ++j) {
+        std::swap(a[static_cast<size_t>(c * k + j)], a[static_cast<size_t>(piv * k + j)]);
+        std::swap(inv[static_cast<size_t>(c * k + j)], inv[static_cast<size_t>(piv * k + j)]);
+      }
+    const long double d = a[static_cast<size_t>(c * k + c)];
+    for (int j = 0; j < k; ++j) {
+      a[static_cast<size_t>(c * k + j)] /= d;
+      inv[static_cast<size_t>(c * k + j)] /= d;
+    }
+    for (int r = 0; r < k; ++r) {
+      if (r == c) continue;
+      const long double f = a[static_cast<size_t>(r * k + c)];
+      if (f == 0.0L) continue;
+      for (int j = 0; j < k; ++j) {
+        a[static_cast<size_t>(r * k + j)] -= f * a[static_cast<size_t>(c * k + j)];
+        inv[static_cast<size_t>(r * k + j)] -= f * inv[static_cast<size_t>(c * k + j)];
+      }
+    }
+  }
+  a = inv;
+  return true;
+}
+
+// One window's result row: cov/corr (nobs, statistic); reg (nobs, r2, adj r2, b..., se...),
+// with only nobs when there are not more observations than coefficients or X'X is singular.
+std::vector<double> flexStat(const std::string& name, const std::vector<std::vector<double>>& rows) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const size_t n = rows.size();
+  if (name == "cov" || name == "corr") {
+    std::vector<double> out = {static_cast<double>(n), nan};
+    if (n < 2) return out;
+    long double mx = 0, my = 0;
+    for (const auto& r : rows) { mx += r[0]; my += r[1]; }
+    mx /= n; my /= n;
+    long double sxy = 0, sxx = 0, syy = 0;
+    for (const auto& r : rows) {
+      sxy += (r[0] - mx) * (r[1] - my);
+      sxx += (r[0] - mx) * (r[0] - mx);
+      syy += (r[1] - my) * (r[1] - my);
+    }
+    if (name == "cov") out[1] = static_cast<double>(sxy / (n - 1));
+    else if (sxx > 0 && syy > 0) out[1] = static_cast<double>(sxy / std::sqrt(sxx * syy));
+    return out;
+  }
+  // reg: the first variable on the others and a constant
+  const int k = static_cast<int>(rows.empty() ? 1 : rows[0].size());  // regressors + constant
+  std::vector<double> out = {static_cast<double>(n)};
+  if (static_cast<int>(n) <= k) return out;
+  auto x = [&](const std::vector<double>& r, int j) -> long double { return j + 1 < k ? r[static_cast<size_t>(j + 1)] : 1.0L; };
+  std::vector<long double> xtx(static_cast<size_t>(k * k), 0.0L), xty(static_cast<size_t>(k), 0.0L);
+  for (const auto& r : rows)
+    for (int a = 0; a < k; ++a) {
+      xty[static_cast<size_t>(a)] += x(r, a) * r[0];
+      for (int b = 0; b < k; ++b) xtx[static_cast<size_t>(a * k + b)] += x(r, a) * x(r, b);
+    }
+  if (!invertSym(xtx, k)) return out;
+  std::vector<long double> beta(static_cast<size_t>(k), 0.0L);
+  for (int a = 0; a < k; ++a)
+    for (int b = 0; b < k; ++b) beta[static_cast<size_t>(a)] += xtx[static_cast<size_t>(a * k + b)] * xty[static_cast<size_t>(b)];
+  long double ymean = 0;
+  for (const auto& r : rows) ymean += r[0];
+  ymean /= n;
+  long double sse = 0, tss = 0, mss = 0;
+  for (const auto& r : rows) {
+    long double fit = 0;
+    for (int a = 0; a < k; ++a) fit += x(r, a) * beta[static_cast<size_t>(a)];
+    sse += (r[0] - fit) * (r[0] - fit);
+    tss += (r[0] - ymean) * (r[0] - ymean);
+    mss += (fit - ymean) * (fit - ymean);
+  }
+  const long double r2 = mss / tss;
+  out.push_back(static_cast<double>(r2));
+  out.push_back(static_cast<double>(1.0L - (1.0L - r2) * (n - 1) / (n - k)));
+  for (int a = 0; a < k; ++a) out.push_back(static_cast<double>(beta[static_cast<size_t>(a)]));
+  const long double s2 = sse / (n - k);
+  for (int a = 0; a < k; ++a) out.push_back(static_cast<double>(std::sqrt(s2 * xtx[static_cast<size_t>(a * k + a)])));
+  return out;
+}
+
 struct RangeSpec {
+  int seq = 0;
   RangeStat stat = RangeStat::Mean;
   std::string statName;
   std::string src;
@@ -186,6 +290,8 @@ ojson runRangestat(const eval::ParsedCommand& parsed, SessionState& session) {
   // scanning is the same grammar however the user spaced it.
   const std::string head = joinWith(parsed.varlist, " ");
   std::vector<RangeSpec> specs;
+  std::vector<FlexSpec> flex;
+  int statSeq = 0;
   {
     std::string statName = "mean";
     size_t p = 0;
@@ -197,6 +303,7 @@ ojson runRangestat(const eval::ParsedCommand& parsed, SessionState& session) {
         if (close == std::string::npos)
           return utilSyntax("rangestat: unclosed `(' in `" + head + "'");
         statName = lowerOf(trimOf(head.substr(p + 1, close - p - 1)));
+        ++statSeq;
         p = close + 1;
         continue;
       }
@@ -226,17 +333,19 @@ ojson runRangestat(const eval::ParsedCommand& parsed, SessionState& session) {
         p = q2;
       }
       RangeSpec spec;
+      spec.seq = statSeq;
       if (!parseRangeStatName(statName, &spec.stat)) {
         // Any other word is looked up as a Mata function of that name.
         if (statName != "cov" && statName != "corr" && statName != "reg")
           return utilErrorRc(statName + "() not found", 3499);
-        return ojson(eval::unsupportedOption(
-            "(" + statName + ")",
-            "`rangestat` in this build computes mean, sum, count, min, max, sd, variance, "
-            "skewness, kurtosis, median, missing, obs, first, last, firstnm and lastnm. `" +
-                statName + "` is a real rangestat statistic this build does not implement; "
-                "answering it with another would be a different number under the requested "
-                "name."));
+        if (flex.empty() || flex.back().seq != statSeq) {
+          FlexSpec f;
+          f.name = statName;
+          f.seq = statSeq;
+          flex.push_back(f);
+        }
+        flex.back().vars.push_back(term);
+        continue;
       }
       spec.statName = statName;
       const size_t eq = term.find('=');
@@ -252,7 +361,16 @@ ojson runRangestat(const eval::ParsedCommand& parsed, SessionState& session) {
       specs.push_back(spec);
     }
   }
-  if (specs.empty())
+  for (auto& f : flex) {
+    if (auto err = resolveByKeyNames(session, f.vars)) return *err;
+    if ((f.name == "cov" || f.name == "corr") && f.vars.size() != 2)
+      return utilErrorRc(f.name + " stat requires exactly 2 variables; you included: " +
+                             joinWith(f.vars, " "), 198);
+    if (f.name == "reg" && f.vars.size() < 2)
+      return utilErrorRc("reg requires a depvar and at least one indepvar; you included: " +
+                             joinWith(f.vars, " "), 198);
+  }
+  if (specs.empty() && flex.empty())
     return utilSyntax(
         "rangestat: syntax is `rangestat (stat) var [(stat) var ...], interval(key lo hi) "
         "[by(varlist)]`");
@@ -314,6 +432,7 @@ ojson runRangestat(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!loVar.empty()) readCols.push_back(loVar);
   if (!hiVar.empty()) readCols.push_back(hiVar);
   for (const auto& s : specs) readCols.push_back(s.src);
+  for (const auto& f : flex) readCols.insert(readCols.end(), f.vars.begin(), f.vars.end());
   for (const auto& b : byVars) readCols.push_back(b);
   ReadScope scope(session, parsed, readCols, "rangestat", false);
   if (scope.failed())
@@ -330,6 +449,38 @@ ojson runRangestat(const eval::ParsedCommand& parsed, SessionState& session) {
   for (const auto& s : specs) {
     if (ds.dtype(s.src) == "factor")
       return utilErrorRc("'" + s.src + "' found where numeric variable expected", 7);
+  }
+  for (const auto& f : flex)
+    for (const auto& v : f.vars)
+      if (ds.dtype(v) == "factor")
+        return utilErrorRc("'" + v + "' found where numeric variable expected", 7);
+  // the flexible statistics' result names (rangestat's cov_handler / corr_handler / reg_handler)
+  std::vector<std::vector<std::string>> flexNames(flex.size());
+  std::vector<std::vector<std::string>> flexLabels(flex.size());
+  for (size_t fI = 0; fI < flex.size(); ++fI) {
+    const FlexSpec& f = flex[fI];
+    const std::string pw = joinWith(f.vars, " ");
+    if (f.name == "cov") {
+      flexNames[fI] = {"cov_nobs", "cov_x"};
+      flexLabels[fI] = {"number of observations - cov", "covariance of " + pw};
+    } else if (f.name == "corr") {
+      flexNames[fI] = {"corr_nobs", "corr_x"};
+      flexLabels[fI] = {"number of observations - corr " + pw, "correlation of " + pw};
+    } else {
+      std::string reg = "regress " + pw;
+      if (reg.size() > 50) reg = reg.substr(0, 50) + "...";
+      std::vector<std::string> rv(f.vars.begin() + 1, f.vars.end());
+      rv.push_back("cons");
+      flexNames[fI] = {"reg_nobs", "reg_r2", "reg_adj_r2"};
+      flexLabels[fI] = {"number of obs - regress " + reg, "R-squared - " + reg,
+                        "adj. R-squared - " + reg};
+      for (const auto& v : rv) { flexNames[fI].push_back("b_" + v); flexLabels[fI].push_back("coef - " + reg); }
+      for (const auto& v : rv) { flexNames[fI].push_back("se_" + v); flexLabels[fI].push_back("std err - " + reg); }
+    }
+    for (const auto& nm : flexNames[fI]) {
+      ojson guard = newVarGuard(session, "rangestat", nm);
+      if (!guard.is_null()) return guard;
+    }
   }
   std::set<std::string> targetsSeen;
   for (const auto& s : specs) {
@@ -439,9 +590,94 @@ ojson runRangestat(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
 
+  // the flexible statistics: every in-sample row with a key gets a window over the same
+  // rows (rangestat drops the rows missing any of the group's variables inside each window)
+  std::vector<std::vector<std::vector<double>>> flexRes(flex.size());
+  std::vector<bool> flexAny(flex.size(), false);
+  if (!flex.empty()) {
+    std::vector<std::vector<int64_t>> base(static_cast<size_t>(std::max<int64_t>(nGroups, 1)));
+    for (int64_t i = 0; i < n; ++i)
+      if (inSample[static_cast<size_t>(i)] != 0 && !std::isnan(key[i]))
+        base[static_cast<size_t>(gid[static_cast<size_t>(i)])].push_back(i);
+    for (auto& g : base)
+      std::stable_sort(g.begin(), g.end(), [&](int64_t a, int64_t b) { return key[a] < key[b]; });
+    for (size_t fI = 0; fI < flex.size(); ++fI) {
+      const size_t width = flexNames[fI].size();
+      flexRes[fI].assign(width, std::vector<double>(static_cast<size_t>(n), kNaN));
+      std::vector<const double*> cols;
+      for (const auto& v : flex[fI].vars) cols.push_back(ds.col(v).f64());
+      for (const auto& g : base) {
+        const size_t m = g.size();
+        std::vector<double> gk(m);
+        for (size_t j = 0; j < m; ++j) gk[j] = key[g[j]];
+        for (size_t c = 0; c < m; ++c) {
+          const int64_t row = g[c];
+          const double k = key[row];
+          double lowB = loCol ? loCol[row] : std::isnan(loOff) ? -inf : k + loOff;
+          double highB = hiCol ? hiCol[row] : std::isnan(hiOff) ? inf : k + hiOff;
+          if (std::isnan(lowB)) lowB = -inf;
+          if (std::isnan(highB)) highB = inf;
+          const size_t L = static_cast<size_t>(std::lower_bound(gk.begin(), gk.end(), lowB) - gk.begin());
+          size_t R = static_cast<size_t>(std::upper_bound(gk.begin(), gk.end(), highB) - gk.begin());
+          if (R <= L) continue;
+          std::vector<std::vector<double>> rows;
+          for (size_t j = L; j < R; ++j) {
+            if (excludeSelf && j == c) continue;
+            std::vector<double> r;
+            bool miss = false;
+            for (const double* cp : cols) {
+              const double v = cp[g[j]];
+              if (std::isnan(v)) miss = true;
+              r.push_back(v);
+            }
+            if (!miss) rows.push_back(r);
+          }
+          if (rows.empty()) continue;
+          const std::vector<double> res = flexStat(flex[fI].name, rows);
+          if (res.size() == width) flexAny[fI] = true;
+          for (size_t w = 0; w < res.size() && w < width; ++w)
+            flexRes[fI][w][static_cast<size_t>(row)] = res[w];
+        }
+      }
+    }
+  }
+
   std::string cur = *session.currentHbin();
   std::vector<std::string> newVars;
-  for (size_t sI = 0; sI < specs.size(); ++sI) {
+  ojson notes = ojson::array();
+  // results are written in the order the statistics were typed
+  struct Item { int seq; bool isFlex; size_t idx; };
+  std::vector<Item> items;
+  for (size_t sI = 0; sI < specs.size(); ++sI) items.push_back({specs[sI].seq, false, sI});
+  for (size_t fI = 0; fI < flex.size(); ++fI) items.push_back({flex[fI].seq, true, fI});
+  std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.seq < b.seq; });
+  std::vector<std::pair<std::string, std::string>> flexMeta;  // name -> label
+  for (const Item& it : items) {
+    if (!it.isFlex) continue;
+    if (!flexAny[it.idx]) {
+      ojson nb;
+      nb["type"] = "display";
+      nb["class"] = "error";
+      nb["text"] = "no result for all obs: " + flex[it.idx].name + " " + joinWith(flex[it.idx].vars, " ");
+      notes.push_back(nb);
+    }
+  }
+  for (const Item& it : items) {
+    if (it.isFlex) {
+      if (!flexAny[it.idx]) continue;
+      for (size_t w = 0; w < flexNames[it.idx].size(); ++w) {
+        std::vector<std::string> cells;
+        cells.reserve(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i) cells.push_back(numCell(flexRes[it.idx][w][static_cast<size_t>(i)]));
+        std::string out;
+        if (auto err = writeColumn(session, cur, flexNames[it.idx][w], cells, "f64", true, &out)) return *err;
+        cur = out;
+        newVars.push_back(flexNames[it.idx][w]);
+        flexMeta.push_back({flexNames[it.idx][w], flexLabels[it.idx][w]});
+      }
+      continue;
+    }
+    const size_t sI = it.idx;
     std::vector<std::string> cells;
     cells.reserve(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) cells.push_back(numCell(results[sI][static_cast<size_t>(i)]));
@@ -451,6 +687,13 @@ ojson runRangestat(const eval::ParsedCommand& parsed, SessionState& session) {
     newVars.push_back(specs[sI].target);
   }
   session.load(cur);
+  for (const auto& [nm, lab] : flexMeta) {
+    session.implicitFloatVars.erase(nm);
+    VarMeta& vm = session.varMeta[nm];
+    vm.stataType = "double";
+    vm.format = "%10.0g";
+    vm.label = lab;
+  }
   for (size_t sI = 0; sI < specs.size(); ++sI) {
     // generated as doubles, labelled "<stat> of <var>"
     session.implicitFloatVars.erase(specs[sI].target);
@@ -463,6 +706,7 @@ ojson runRangestat(const eval::ParsedCommand& parsed, SessionState& session) {
   for (const auto& v : newVars) names += (names.empty() ? "" : " ") + v;
   ojson mut = mutationResult(session, "gen", newVars);
   ojson blocks = ojson::array();
+  for (const auto& nb : notes) blocks.push_back(nb);
   blocks.push_back(mut);
   if (hasFlag(parsed.opts, "describe")) {
     ojson desc = dispatch("describe " + names, session);

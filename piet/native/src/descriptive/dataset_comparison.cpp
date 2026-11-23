@@ -53,7 +53,7 @@ namespace {
 
 // cf: `tolerance()` (undocumented) compares by reldif instead of `!=`.
 const piet::eval::OptVocab& kVocabCf =
-    piet::eval::registerOptVocab({"cf"}, {{"verbose", "all"}, {"tolerance"}});
+    piet::eval::registerOptVocab({"cf"}, {{"verbose", "all", "tolerance"}, {}});
 
 }  // namespace
 
@@ -154,6 +154,20 @@ ojson runCf(const eval::ParsedCommand& parsed, SessionState& session) {
     return ojson(*err);
   const bool verbose = hasFlag(parsed, "verbose");
   const bool all = hasFlag(parsed, "all");
+  // tolerance(#): a numeric pair is a mismatch when reldif(using, master) =
+  // |u-m|/(|m|+1) exceeds # (a missing on one side only is a missing reldif,
+  // which exceeds any number); strings still compare with `!=` (cf's
+  // undocumented option; vs-stata bank 89f3c89e365fc41e).
+  std::optional<double> tolerance;
+  for (const auto& [k, v] : parsed.opts) {
+    if (k != "tolerance") continue;
+    const std::string t = v.isBool ? std::string() : strutil::trim(v.strValue);
+    char* end = nullptr;
+    const double d = std::strtod(t.c_str(), &end);
+    if (t.empty() || end == nullptr || *end != '\0')
+      return rcError("tolerance() invalid -- invalid number", 198);
+    tolerance = d;
+  }
   // cf is r-class: a stop before its `return` leaves r() empty (mx3.log CF|novar `.`).
   eval::replaceRClass(session.eval);
   eval::declareRPosted(session.eval, "cf", {});
@@ -270,11 +284,17 @@ ojson runCf(const eval::ParsedCommand& parsed, SessionState& session) {
       dif = true;
       continue;
     }
-    std::vector<int64_t> diffs;
+    std::vector<int64_t> diffs, neq;  // neq: the `!=` rows verbose lists
     for (int64_t i = 0; i < nM; ++i) {
       const Cell& a = m[static_cast<size_t>(i)];
       const Cell& b = u[static_cast<size_t>(i)];
-      const bool differ = mStr ? a.s != b.s : cecon::stata_cmp(a.d, b.d) != 0;
+      bool differ = mStr ? a.s != b.s : cecon::stata_cmp(a.d, b.d) != 0;
+      if (differ) neq.push_back(i);
+      if (tolerance.has_value() && !mStr) {
+        const bool ma = std::isnan(a.d), mb = std::isnan(b.d);
+        if (ma || mb) differ = !(ma && mb && cecon::stata_cmp(a.d, b.d) == 0);
+        else differ = std::fabs(b.d - a.d) / (std::fabs(a.d) + 1.0) > *tolerance;
+      }
       if (differ) diffs.push_back(i);
     }
     if (diffs.empty()) {
@@ -285,7 +305,7 @@ ojson runCf(const eval::ParsedCommand& parsed, SessionState& session) {
     nsum += static_cast<long long>(diffs.size());
     dif = true;
     if (verbose) {
-      for (int64_t i : diffs) {
+      for (int64_t i : neq) {
         const Cell& a = m[static_cast<size_t>(i)];
         const Cell& b = u[static_cast<size_t>(i)];
         const std::string mv = mStr ? a.s : displayNumber(a.d, session);

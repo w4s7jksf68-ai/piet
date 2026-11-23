@@ -322,7 +322,7 @@ ojson runHeckmanFit(const eval::ParsedCommand& parsed, SessionState& session, co
   return block;
 }
 
-ojson runHeckman(const eval::ParsedCommand& parsed, SessionState& session) {
+static ojson runHeckmanM4In(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   if (parsed.varlist.size() < 2) {
     return engineErrorBlockM4(
@@ -347,6 +347,21 @@ ojson runHeckman(const eval::ParsedCommand& parsed, SessionState& session) {
   // default, the two-step estimator under twostep.
   return runHeckmanFit(parsed, session, y, xs, *selectRaw, sawTwostep);
 }
+
+// `in a/b`: folded into the fit's `if` as an observation-number condition
+// (inRangeConditionM4), so every reader of the condition below sees the same rows.
+ojson runHeckman(const eval::ParsedCommand& parsed, SessionState& session) {
+  if (parsed.inRange.has_value() && !parsed.inRange->empty()) {
+    std::optional<std::string> eff;
+    if (auto err = inRangeConditionM4(session, parsed, eff, "heckman")) return *err;
+    eval::ParsedCommand folded = parsed;
+    folded.ifExpr = eff;
+    folded.inRange.reset();
+    return runHeckmanM4In(folded, session);
+  }
+  return runHeckmanM4In(parsed, session);
+}
+
 
 // ===========================================================================
 // qreg (BS-071, BETA D2 batch): `qreg depvar indepvars [if] [, quantile(#)

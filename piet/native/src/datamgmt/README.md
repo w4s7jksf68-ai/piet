@@ -76,7 +76,7 @@ so nested commands never overwrite each other's mask. `row_evaluation.cpp` holds
 write counter and a force-legacy flag that exist for selftests. Frames live as
 files in the session work directory; the preserve stack is `SessionState::preserveStack`.
 `preserve_restore.cpp` pushes and pops it for `preserve` and `restore`, and
-`SessionState::discardTopPreserve()` (`session/session_resident_head.cpp`, called from
+`SessionState::discardOwnPreserve()` (`session/session_resident_head.cpp`, called from
 `dispatch/route_data_rows.cpp` for `restore, not`) also pops it. Keep the two pop paths
 consistent.
 

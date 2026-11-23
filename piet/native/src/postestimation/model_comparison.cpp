@@ -320,7 +320,7 @@ ojson runHausman(const std::string& name1In, const std::string& name2In,
   // EQuations() REVEQ TCONsistent() TEFFicient() df()]: `sig`, `sigm` and
   // `sigma` are sigmamore, the first option they abbreviate.
   bool alleqs = false, constant = false, sigmamore = false, sigmaless = false, force = false;
-  std::optional<std::string> skipeqs, equations, dfText;
+  std::optional<std::string> skipeqs, equations, dfText, tconsistent, tefficient;
   std::vector<std::pair<std::string, eval::OptValue>> rest;
   for (const auto& [k, v] : opts) {
     const std::string lk = lowerM4(k);
@@ -332,12 +332,15 @@ ojson runHausman(const std::string& name1In, const std::string& name2In,
     else if (lk == "skipeqs" && !v.isBool) skipeqs = v.strValue;
     else if (lk == "equations" && !v.isBool) equations = v.strValue;
     else if (lk == "df" && !v.isBool) dfText = v.strValue;
+    // tconsistent()/tefficient() retitle the (b)/(B) columns of the printed
+    // table (bank 30280271c2143616 `tcon(FixedFX)`); the block carries the
+    // titles and the hausman renderer draws them.
+    else if (lk == "tconsistent" && !v.isBool) tconsistent = v.strValue;
+    else if (lk == "tefficient" && !v.isBool) tefficient = v.strValue;
     else rest.emplace_back(k, v);
   }
-  // tconsistent()/tefficient() only retitle the printed table, which the
-  // result block does not draw yet: they keep the named refusal.
   static const std::unordered_set<std::string> kNone;
-  static const std::unordered_set<std::string> kNotBuilt = {"tconsistent", "tefficient", "syminv", "reveq"};
+  static const std::unordered_set<std::string> kNotBuilt = {"syminv", "reveq"};
   if (auto err = eval::rejectUnknownOptions(rest, kNone, kNotBuilt)) return *err;
   std::optional<double> dfOpt;
   if (dfText.has_value()) {
@@ -539,6 +542,24 @@ ojson runHausman(const std::string& name1In, const std::string& name2In,
                           {"se_diff", vd >= 0 ? ojson(std::sqrt(vd)) : ojson(nullptr)}});
   }
   block["coefs"] = coefs;
+  // The column titles are the stored names unless retitled; the footer names
+  // each fit's command.
+  auto unquote = [](std::string t) {
+    t = trimM4(t);
+    if (t.size() >= 2 && t.front() == '"' && t.back() == '"') t = t.substr(1, t.size() - 2);
+    return t;
+  };
+  block["b_title"] = tconsistent.has_value() ? unquote(*tconsistent) : name1;
+  block["B_title"] = tefficient.has_value() ? unquote(*tefficient) : name2;
+  block["b_cmd"] = fits[0].cmd;
+  block["B_cmd"] = fits[1].cmd;
+  {
+    std::vector<std::string> eqs;
+    for (size_t i = 0; i < k; ++i)
+      if (std::find(eqs.begin(), eqs.end(), fits[0].eq[i]) == eqs.end()) eqs.push_back(fits[0].eq[i]);
+    if (eqs.size() > 1)
+      for (size_t i = 0; i < k; ++i) block["coefs"][i]["eq"] = fits[0].eq[i];
+  }
   block["not_pd"] = !posdef;
   std::vector<std::string> notes;
   if (rank != static_cast<int>(k))

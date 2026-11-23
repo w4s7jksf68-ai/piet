@@ -100,6 +100,11 @@ struct Options {
     bool allow_params = true;   // {name} / {name=init}
     bool allow_vars = true;     // bare identifiers, resolved per row by the caller
     bool allow_coefs = true;    // _b[name]
+    // {eq:name} equation-qualified parameters. Only gmm turns this on: its PIET
+    // handler has already expanded every linear combination {eq:varlist} into
+    // {eq:var}*var terms, so what reaches here is a single parameter. nl has no
+    // such expansion and keeps refusing the form.
+    bool allow_eq_params = false;
     // Appended to the "bare identifier" rejection when allow_vars is false. The
     // default is nlcom's exact wording, which is the only caller that turns
     // bare identifiers off.
@@ -493,9 +498,18 @@ struct Parser {
         if (i >= s.size()) p.die("missing '}'");
         std::string nm = trim(s.substr(st, i - st));
         if (nm.empty()) p.die("empty parameter name in '{}'");
-        for (char c : nm)
-            if (!cecon::ident::isIdentByte(c))
-                p.die("bad parameter name '" + nm + "' (letters, digits, _ and non-ASCII characters only)");
+        // `eq:name` is Stata's equation-qualified parameter (gmm's `{xb:mpg}`, and
+        // `{b0:_cons}` for a free parameter); one ':' between two identifiers, and
+        // only for a caller that opted in (Options::allow_eq_params).
+        {
+            const size_t colon = nm.find(':');
+            const bool qualified = p.opts_.allow_eq_params && colon != std::string::npos && colon > 0 &&
+                                   colon + 1 < nm.size() &&
+                                   nm.find(':', colon + 1) == std::string::npos;
+            for (size_t q = 0; q < nm.size(); ++q)
+                if (!cecon::ident::isIdentByte(nm[q]) && !(qualified && q == colon))
+                    p.die("bad parameter name '" + nm + "' (letters, digits, _ and non-ASCII characters only)");
+        }
         bool has_init = false;
         double init = 0.0;
         if (s[i] == '=') {

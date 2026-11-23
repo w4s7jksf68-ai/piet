@@ -119,8 +119,10 @@ export function createExecutionController({ getClient, getGrid, editor, layout, 
       }
 
       // Detect browse/edit command in result — open the overlay
-      if (browseCmds || blocks.some(b => b.type === 'browse')) {
-        const browseBlock = blocks.find(b => b.type === 'browse');
+      // A browse block carrying a `listing` is `list` / `duplicates list` output:
+      // it is drawn in the Results pane (console.js), not opened in the grid.
+      if (browseCmds || blocks.some(b => b.type === 'browse' && !b.listing)) {
+        const browseBlock = blocks.find(b => b.type === 'browse' && !b.listing);
         if (browseBlock && getGrid()) {
           // Echo first
           const echoB = blocks.find(b => b.type === 'echo');

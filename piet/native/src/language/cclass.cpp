@@ -234,6 +234,9 @@ std::optional<CValue> resolveCValue(const std::string& name, SessionState& sessi
   if (name == "changed") {
     return CValue{false, session.datasetChanged ? "1" : "0"};
   }
+  // The current frame's name (`frame change` moves it; StataBE 19.5 prints
+  // c(frame) `default` until then).
+  if (name == "frame") return CValue{true, session.currentFrame};
   // BUG-1463: the edition PIET answers as is Stata/BE, the one its results are
   // measured against: one processor (c(processors_mach) is `.` there), no MP, no
   // SE -- so `set processors `=min(4, c(processors_max))'' reads 1 before it is

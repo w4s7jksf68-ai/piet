@@ -529,6 +529,9 @@ ojson runMatrixDef(const std::string& raw, SessionState& session) {
       if (!rest.empty() && rest.find_first_of(" \t") == std::string::npos)
         return engineErrorBlockRc("matrix " + rest + " not found", 111);
     }
+    // dir, rename, roweq, coleq, symeigen, eigenvalues and svd
+    // (matrix_subcommands.cpp).
+    if (std::optional<ojson> served = runMatrixSubcommand(full, args, session)) return *served;
     size_t words = 0;
     {
       std::istringstream iss(args);

@@ -144,7 +144,8 @@ nlohmann::ordered_json runDuplicates(const std::string& sub,
                                       const std::optional<std::string>& genvar,
                                       SessionState& session,
                                       const std::optional<std::string>& ifExpr = std::nullopt,
-                                      const std::optional<std::string>& inRange = std::nullopt);
+                                      const std::optional<std::string>& inRange = std::nullopt,
+                                      const struct ListLayout* listLayout = nullptr);
 
 // `isid VARLIST` — assert that VARLIST uniquely identifies the observations.
 // Silent (no output, rc 0) when it does; Stata's r(459) with its own wording

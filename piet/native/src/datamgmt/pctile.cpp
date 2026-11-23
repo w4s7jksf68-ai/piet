@@ -217,33 +217,6 @@ std::optional<std::vector<double>> percentileList(
   return out;
 }
 
-// The sorted, missing-free values of a numeric column, or an error block.
-std::optional<std::vector<double>> sortedValues(SessionState& session, const std::string& verb,
-                                                const std::string& var, ojson* err) {
-  ReadFrame rf(session, {var});
-  Datastore* ds = rf.get();
-  if (ds == nullptr) {
-    *err = rsError(verb + ": could not read the data" + (rf.why().empty() ? "" : " — " + rf.why()),
-                   "data_io");
-    return std::nullopt;
-  }
-  if (!ds->has(var)) {
-    *err = rsError("variable " + var + " not found");
-    return std::nullopt;
-  }
-  if (ds->dtype(var) == "factor") {
-    *err = rsError(verb + ": `" + var + "' is a string variable; percentiles need a numeric one.");
-    return std::nullopt;
-  }
-  std::vector<double> v;
-  const double* d = ds->col(var).f64();
-  const int64_t n = ds->nRows();
-  v.reserve(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i)
-    if (!std::isnan(d[i])) v.push_back(d[i]);
-  std::sort(v.begin(), v.end());
-  return v;
-}
 
 // pctile, _pctile and xtile parse "aweight fweight pweight"
 // (pctile's and xtile's weight syntax)
@@ -315,18 +288,72 @@ bool hasWeight(const eval::ParsedCommand& parsed) {
          parsed.weightVar.has_value() && !parsed.weightVar->empty();
 }
 
+// pctile's and _pctile's sample, as their `mark touse [wt] if in` + `markout touse x` draw it:
+// the expression `src` evaluated by generate (so a misspelt name or a string answers as
+// generate does: r(111), r(109) "type mismatch"), on the rows if/in keep, the weight
+// validated on those rows only (a missing or zero weight leaves the sample, a negative one is
+// r(402), a fractional fweight r(401)), and a missing value of `src` leaving the sample.
+// Exactly one of *sorted / *weighted is filled.
+std::optional<ojson> pctileSampleValues(SessionState& session, const eval::ParsedCommand& parsed,
+                                        const std::string& src,
+                                        std::optional<std::vector<double>>* sorted,
+                                        std::optional<WeightedValues>* weighted) {
+  std::string qualifier;
+  if (parsed.ifExpr.has_value() && !trimOf(*parsed.ifExpr).empty())
+    qualifier += " if " + *parsed.ifExpr;
+  if (parsed.inRange.has_value() && !trimOf(*parsed.inRange).empty())
+    qualifier += " in " + *parsed.inRange;
+  ScratchColumns scratch(session);
+  std::string xCol;
+  if (auto failed = scratch.add(src, qualifier, &xCol)) return *failed;
+  std::string mCol;
+  if (!qualifier.empty())
+    if (auto failed = scratch.add("1", qualifier, &mCol)) return *failed;
+  const bool isWeighted = hasWeight(parsed);
+  std::string wCol;
+  if (isWeighted)
+    if (auto failed = scratch.add(*parsed.weightVar, "", &wCol)) return *failed;
+  const std::vector<double> x = scratch.values(xCol);
+  const std::vector<double> mark =
+      mCol.empty() ? std::vector<double>(x.size(), 1.0) : scratch.values(mCol);
+  if (!isWeighted) {
+    std::vector<double> v;
+    v.reserve(x.size());
+    for (size_t i = 0; i < x.size(); ++i)
+      if (!std::isnan(mark[i]) && !std::isnan(x[i])) v.push_back(x[i]);
+    std::sort(v.begin(), v.end());
+    *sorted = std::move(v);
+    return std::nullopt;
+  }
+  const std::vector<double> w = scratch.values(wCol);
+  const std::string wt = lowerOf(*parsed.weightType);
+  const bool isFreq = wt == "fw" || wt == "fweight";
+  WeightedValues out;
+  for (size_t i = 0; i < x.size(); ++i) {
+    if (std::isnan(mark[i]) || std::isnan(w[i])) continue;
+    if (w[i] < 0.0) return rsErrorRc("negative weights encountered", 402);
+    if (isFreq && w[i] != std::floor(w[i]))
+      return rsErrorRc("may not use noninteger frequency weights", 401);
+    if (w[i] == 0.0 || std::isnan(x[i])) continue;
+    out.sorted.emplace_back(x[i], w[i]);
+  }
+  std::stable_sort(out.sorted.begin(), out.sorted.end(),
+                   [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                     return a.first < b.first;
+                   });
+  *weighted = std::move(out);
+  return std::nullopt;
+}
+
 }  // namespace
 
 ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabPctile.known,
                                             kVocabPctile.unimplemented))
     return ojson(*err);
-  // `if`/`in` is refused for the same reason `xtile` refuses it
-  // (data_quantiles.cpp): with a qualifier Stata derives the cutpoints
-  // from the RESTRICTED sample, and forwarding a --keepif would compute them
-  // over every row and then blank the rest -- the same bins with a different
-  // name, which is a wrong number, not a missing feature.
-  if (auto q = refuseQualifiers(parsed, "pctile")) return *q;
+  // `if`/`in` restrict the sample the percentiles are taken over (pctile.ado's
+  // `mark`/`markout`); the new variable still runs over every row, holding
+  // percentile i in row i.
   if (!session.hasData()) return ojson(eval::noDataLoaded());
 
   const std::string joined = joinWith(parsed.varlist, " ");
@@ -365,14 +392,11 @@ ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!pcts.has_value()) return err;
   std::optional<std::vector<double>> sorted;
   std::optional<WeightedValues> weighted;
-  if (hasWeight(parsed)) {
-    weighted = sortedWeightedValues(session, "pctile", src, *parsed.weightVar, *parsed.weightType,
-                                    &err);
-    if (!weighted.has_value()) return err;
-  } else {
-    sorted = sortedValues(session, "pctile", src, &err);
-    if (!sorted.has_value()) return err;
-  }
+  // `pctile newvar = exp`: exp may be any expression (pctile.ado's `syntax ... =/exp`).
+  if (auto failed = pctileSampleValues(session, parsed, src, &sorted, &weighted)) return *failed;
+  // `count if touse` is 0: r(2000) (bank a625f5f37472fbb9 `if price>999999`).
+  if ((sorted.has_value() && sorted->empty()) || (weighted.has_value() && weighted->sorted.empty()))
+    return rsErrorRc("no observations", 2000);
   // A str# declaration creates a string variable the percentiles cannot be
   // stored into (`replace q = r(r1)`: type mismatch).
   if (!typeToken.empty() && !storage::isNumericType(typeToken))
@@ -465,8 +489,9 @@ ojson runPctileR(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabPctileR.known,
                                             kVocabPctileR.unimplemented))
     return ojson(*err);
-  if (auto q = refuseQualifiers(parsed, "_pctile")) return *q;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
+  // `_pctile varname`: a second variable is r(103) (bank 59f3e88f7f8556e4).
+  if (parsed.varlist.size() > 1) return rsErrorRc("too many variables specified", 103);
   if (parsed.varlist.size() != 1)
     return rsSyntax("_pctile: syntax is `_pctile varname, nquantiles(#) | percentiles(list)`");
 
@@ -489,13 +514,15 @@ ojson runPctileR(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   std::optional<std::vector<double>> sorted;
   std::optional<WeightedValues> weighted;
-  if (hasWeight(parsed)) {
-    weighted = sortedWeightedValues(session, "_pctile", parsed.varlist[0], *parsed.weightVar,
-                                    *parsed.weightType, &err);
-    if (!weighted.has_value()) return err;
-  } else {
-    sorted = sortedValues(session, "_pctile", parsed.varlist[0], &err);
-    if (!sorted.has_value()) return err;
+  {
+    // The variable must exist under its own name (a varname, not an expression).
+    const std::string& name = parsed.varlist[0];
+    for (char c : name)
+      if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' ||
+            static_cast<unsigned char>(c) >= 0x80))
+        return rsErrorRc("variable " + name + " not found", 111);
+    if (auto failed = pctileSampleValues(session, parsed, name, &sorted, &weighted))
+      return *failed;
   }
 
   // r(r1)..r(rN) IS this command -- there is no column and no table. The arm

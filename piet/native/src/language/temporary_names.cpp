@@ -3,7 +3,6 @@
 // Temporary names.
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -113,29 +112,30 @@ ojson runTempname(const std::vector<std::string>& names, SessionState& session) 
 // created later by e.g. `gen `tv''`) and auto-drops it at scope end — since
 // BUG-922 a program or nested do/run file drops its own tempvars when it
 // concludes (mintedTempvars); a top-level tempvar still outlives the run.
-// Unlike tempname's arbitrary "__NAME_TIMESTAMP" basename (fine for a FILE
-// path only, never validated as an identifier), a tempvar's minted name
-// must be a LEGAL Stata variable name AND must not collide with any column
-// already in the current dataset — real Stata's own pattern is
-// `__000001`, `__000002`, ...; mirrored here via a per-process monotonic
-// counter, skipping forward past any collision against the loaded dataset
-// (if any — tempvar is legal even before `use`/`sysuse`).
+// Stata starts at __000000 and counts in uppercase base 36. Skip columns
+// already present in the current frame.
 ojson runTempvar(const std::vector<std::string>& names, SessionState& session) {
-  static std::atomic<uint64_t> counter{0};
   Datastore* ds = session.datastore();
+  constexpr char digits[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
   for (const auto& name : names) {
     std::string minted;
-    for (;;) {
-      uint64_t n = counter.fetch_add(1, std::memory_order_relaxed) + 1;
-      char buf[16];
-      std::snprintf(buf, sizeof(buf), "__%06llu", static_cast<unsigned long long>(n));
-      minted = buf;
-      if (ds == nullptr || !ds->has(minted)) break;
-    }
+    do {
+      auto n = session.tempVarSeq++;
+      minted = "__000000";
+      size_t pos = minted.size();
+      do {
+        if (pos == 2) {
+          minted.insert(2, 1, '0');
+          ++pos;
+        }
+        minted[--pos] = digits[n % 36];
+        n /= 36;
+      } while (n != 0);
+    } while (ds != nullptr && ds->has(minted));
     session.eval.locals.set(name, minted);
     // BUG-922: dropped when the minting program or nested do/run file
     // concludes -- program::concludeLevel (pn_tv_do_gone: var=111).
-    session.mintedTempvars.emplace_back(session.preserveLevel(), minted);
+    session.mintedTempvars.push_back({session.preserveLevel(), session.currentFrame, minted});
   }
   return ojson::array();
 }

@@ -235,11 +235,49 @@ bool route_io(std::string& cmd,
         dsLower.compare(dsLower.size() - kDtaSuffix.size(), kDtaSuffix.size(), kDtaSuffix) == 0) {
       dsLower = dsLower.substr(0, dsLower.size() - kDtaSuffix.size());
     }
+    // sysuse looks for NAME.dta along the ado-path, Stata's base directory
+    // first. A name that is none of Stata's own example datasets (the .dta
+    // files its base directory ships, which `sysuse dir, all` lists: vs-stata
+    // bank 2ea8d155a00d7fd9) is looked for on the rest of the path -- the
+    // current directory and any `adopath +` entry -- and loaded as `use` loads
+    // it (`replace` is `clear`); not found there it is Stata's r(601) `file
+    // "NAME.dta" not found` (08203cd5563e4a47). One of Stata's own that PIET
+    // does not ship keeps the honest not-bundled refusal below.
+    static const std::set<std::string> kStataSampleNames = {
+        "__i10v2003", "__i10v2004", "__i10v2006", "__i10v2007", "__i10v2008", "__i10v2009",
+        "__i10v2010", "__i10v2011", "__i10v2012", "__i10v2013", "__i10v2014", "__i10v2016",
+        "__icd10", "__icd10cm", "__icd10pcs", "auto", "auto16", "auto2", "autornd", "bplong",
+        "bpwide", "cancer", "census", "citytemp", "citytemp4", "educ99gdp", "gnp96", "icd9_cod",
+        "icd9_cop", "lifeexp", "network1", "network1a", "nlsw88", "nlswide1", "pop2000",
+        "sandstone", "sp500", "surface", "tsline1", "tsline2", "uslifeexp", "uslifeexp2", "voter",
+        "xtline1"};
+    if (dsLower != "fatalities" && kStataSampleNames.count(dsLower) == 0 &&
+        dsLower.find_first_of("/\\") == std::string::npos) {
+      std::string shown = dsArg;
+      if (shown.size() < kDtaSuffix.size() ||
+          lower(shown.substr(shown.size() - kDtaSuffix.size())) != kDtaSuffix)
+        shown += kDtaSuffix;
+      if (std::optional<std::string> found = handlers::findOnAdopath(session, shown)) {
+        // The options were checked above: each is clear or replace.
+        const bool clearOpt = !parsed.opts.empty();
+        ojson r = piet::dispatch("use `\"" + *found + "\"'" + (clearOpt ? ", clear" : ""), session);
+        if (r.is_array())
+          for (auto& b : r) blocks.push_back(std::move(b));
+        else
+          blocks.push_back(std::move(r));
+        return true;
+      }
+      blocks.push_back(ojson(eval::errorBlock("engine_error", "file \"" + shown + "\" not found",
+                                              std::nullopt, std::nullopt, std::nullopt,
+                                              "r(601)")));
+      return true;
+    }
     if (dsLower != "fatalities") {
-      blocks.push_back(ojson(eval::engineError(
-          "sysuse: unknown dataset `" + dsArg + "` — the only dataset bundled with this version of "
-              "PIET is `fatalities` (run `sysuse dir` to list what's available).",
-          "engine_error")));
+      blocks.push_back(ojson(eval::errorBlock(
+          "engine_error",
+          "sysuse: dataset `" + dsArg + "` is unavailable in PIET. "
+              "PIET includes `fatalities` (run `sysuse dir` to list its samples).",
+          std::nullopt, std::nullopt, std::nullopt, "r(601)")));
       return true;
     }
     std::string sampleCsv;
@@ -586,7 +624,11 @@ bool route_io(std::string& cmd,
         if (k == "clear" && (!v.isBool || v.boolValue)) importClears = true;
         if (k == "describe" && (!v.isBool || v.boolValue)) describeOnly = true;
       }
-      if (!importClears && !describeOnly && session.hasData() && session.datasetChanged &&
+      // import delimited refuses any data in memory, changed or not (vs-stata
+      // bank d61d9443eeba1fcf: `use auto` then `import delimited data.csv` is
+      // r(4)); import excel's rule was measured on changed data only.
+      if (!importClears && !describeOnly && session.hasData() &&
+          (session.datasetChanged || sub == "delimited") &&
           cecon::native_exists(handlers::importSourcePath(session, pathArg, sub != "delimited"))) {
         blocks.push_back(ojson(eval::errorBlock("engine_error", "no; data in memory would be lost",
                                                 std::nullopt, std::nullopt, std::nullopt,

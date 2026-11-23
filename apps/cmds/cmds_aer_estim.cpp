@@ -312,10 +312,9 @@ int cmd_lpoly(const std::vector<std::string>& a) {
     const double* wcol = nullptr;
     if (!wname.empty()) {
         const std::string wtype = opt(a, "--wtype");
-        // Stata's lpoly takes [fw aw]. Only aweight is implemented here: how Stata's
-        // Mata counts r(N) and the ROT's n under fweights is unmeasured, so an
-        // fweight is refused by name rather than guessed.
-        if (wtype != "aweight")
+        // Stata's lpoly takes [fw aw]: an aweight is rescaled to sum N, an fweight
+        // replicates its row (r(N) is the weight sum).
+        if (wtype != "aweight" && wtype != "fweight")
             throw EngineError("unsupported", "lpoly: --wtype " + (wtype.empty() ? std::string("(none)") : wtype) +
                                                  " is not implemented (aweight only)");
         wcol = require_num(ds, "lpoly", wname);
@@ -323,11 +322,14 @@ int cmd_lpoly(const std::vector<std::string>& a) {
     std::vector<const double*> cols = {y, x};
     if (wcol) cols.push_back(wcol);
     std::vector<char> keep = smoothing_sample(a, data, ds, "lpoly", cols);
+    const bool wtype_f = wcol != nullptr && opt(a, "--wtype") == "fweight";
     if (wcol) {
         // marksample: a zero weight leaves the sample; a negative one is r(402).
         for (int64_t i = 0; i < ds.n_rows(); ++i) {
             if (!keep[static_cast<std::size_t>(i)]) continue;
             if (wcol[i] < 0) throw EngineError("bad_input", "lpoly: negative weights encountered");
+            if (wtype_f && wcol[i] != std::floor(wcol[i]))
+                throw EngineError("bad_input", "lpoly: may not use noninteger frequency weights");
             if (wcol[i] == 0) keep[static_cast<std::size_t>(i)] = 0;
         }
     }
@@ -363,10 +365,11 @@ int cmd_lpoly(const std::vector<std::string>& a) {
         ys.push_back(y[i]);
     }
     if (wcol) {
-        // Stata's lpoly: an aweight is rescaled to w*N/sum(w) over the sample.
+        // Stata's lpoly: an aweight is rescaled to w*N/sum(w) over the sample; an
+        // fweight is used as given.
         double sw = 0;
         for (int64_t i : idx) sw += wcol[i];
-        for (int64_t i : idx) ws.push_back(wcol[i] * static_cast<double>(idx.size()) / sw);
+        for (int64_t i : idx) ws.push_back(wtype_f ? wcol[i] : wcol[i] * static_cast<double>(idx.size()) / sw);
         o.weights = &ws;
     }
 
@@ -377,6 +380,23 @@ int cmd_lpoly(const std::vector<std::string>& a) {
         const double* at = require_num(ds, "lpoly", atname);
         atv.assign(at, at + ds.n_rows());
         o.at = &atv;
+    }
+
+    // var(#) | --var-col V (row for row with --at); --bw-col V (row for row with --at)
+    const std::string varOpt = opt(a, "--var");
+    if (!varOpt.empty()) o.var_scalar = std::stod(varOpt);
+    std::vector<double> varv, bwv;
+    const std::string varCol = opt(a, "--var-col"), bwCol = opt(a, "--bw-col");
+    if (!varCol.empty()) {
+        const double* v = require_num(ds, "lpoly", varCol);
+        varv.assign(v, v + ds.n_rows());
+        o.var_at = &varv;
+    }
+    if (!bwCol.empty()) {
+        const double* v = require_num(ds, "lpoly", bwCol);
+        bwv.assign(v, v + ds.n_rows());
+        o.bw_at = &bwv;
+        o.bwidth = 1.0;  // a placeholder: each row's own bandwidth is used
     }
 
     LpolyResult r = lpoly_fit(xs, ys, o);
@@ -402,7 +422,9 @@ int cmd_lpoly(const std::vector<std::string>& a) {
         {"grid", r.grid},
         {"smooth", r.smooth},
         {"se", o.want_se ? json(r.se) : json(nullptr)},
-        {"n_obs", static_cast<int64_t>(xs.size())},
+        {"cvar", o.want_se ? json(r.cvar) : json(nullptr)},
+        {"n_obs", wtype_f ? static_cast<int64_t>(std::llround(std::accumulate(ws.begin(), ws.end(), 0.0)))
+                          : static_cast<int64_t>(xs.size())},
         {"ngrid", r.ngrid},  // SUCCESSFUL fits, which can be < grid.size()
         {"n_capped", r.n_capped},
     };

@@ -68,8 +68,9 @@ constexpr char kInputSep = '\x1F';
 // Appended to a folded block that ran off the end of the file without `end`.
 constexpr char kInputUnterminated = '\x1E';
 
+// `input` and its abbreviations inp and inpu (registry.cpp) open the same block.
 const std::regex& reInputHead() {
-  static const std::regex re(R"(^input\b(.*)$)", std::regex::icase);
+  static const std::regex re(R"(^inp(?:ut|u)?\b(.*)$)", std::regex::icase);
   return re;
 }
 
@@ -346,14 +347,18 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
     }
   }
 
-  if (ds != nullptr) {
-    // With data in memory this build APPENDS to the existing variables, in the
-    // existing order. A varlist of new names is refused rather than silently
-    // creating a second, differently shaped dataset.
-    if (!names.empty())
-      return rsError("input: with data in memory this build appends to the existing variables "
-                     "only (type `input` alone; new variables are not added by `input " +
-                     joinWith(names, " ") + "`).");
+  // With data in memory, a varlist of new names ADDS those variables: the data
+  // lines fill observations 1, 2, ... of them and the rest stay missing (vs-stata
+  // bank 8c327b32e6c6fe34: `input a b` / `1 2` / `end` over the auto data leaves
+  // N 74 with a = 1, b = 2 in observation 1). Input stops by itself once it has
+  // filled observation _N ([D] input, adding a variable to data in memory); the
+  // lines after that are commands again.
+  const bool addNew = ds != nullptr && !names.empty();
+  const size_t addNewLimit = addNew ? static_cast<size_t>(ds->nRows()) : 0;
+  size_t restStart = parts.size();
+  if (ds != nullptr && !addNew) {
+    // Without a varlist, input APPENDS to the existing variables, in the
+    // existing order.
     names = ds->names();
     declaredStr.assign(names.size(), 0);
     declaredNumType.assign(names.size(), std::string());
@@ -376,6 +381,10 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
   std::vector<std::vector<std::string>> goodRows;
   std::vector<std::vector<char>> goodQuoted;
   for (size_t r = 1; r < parts.size(); ++r) {
+    if (addNew && addNewLimit > 0 && goodRows.size() == addNewLimit) {
+      restStart = r;
+      break;
+    }
     std::vector<std::string> lineTokens;
     std::vector<char> lineQuoted;
     size_t p = 0;
@@ -416,6 +425,70 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
     goodQuoted.push_back(std::move(lineQuoted));
   }
   const size_t nNew = goodRows.size();
+  if (addNew) {
+    std::string notesText;
+    for (const auto& n : notes) notesText += (notesText.empty() ? "" : "\n") + n;
+    ojson out = ojson::array();
+    if (!notesText.empty()) {
+      ojson note;
+      note["type"] = "display";
+      note["text"] = notesText;
+      out.push_back(note);
+    }
+    auto run = [&](const std::string& line) -> bool {
+      ojson r = dispatch(line, session);
+      for (const auto& b : r)
+        if (b.is_object() && b.value("type", std::string()) == "error") {
+          out.push_back(b);
+          return false;
+        }
+      return true;
+    };
+    for (size_t c = 0; c < k; ++c) {
+      std::string line = "quietly generate ";
+      if (declaredStr[c]) {
+        line += (declaredStrType[c].empty() ? std::string("str1") : declaredStrType[c]) + " " +
+                names[c] + " = \"\"";
+      } else {
+        line += (declaredNumType[c].empty() ? std::string() : declaredNumType[c] + " ") +
+                names[c] + " = .";
+      }
+      if (!run(line)) return out;
+    }
+    for (size_t r = 0; r < nNew; ++r) {
+      const std::string obs = std::to_string(r + 1);
+      // Only a dataset with no observations grows: otherwise nNew <= _N.
+      if (Datastore* cur = session.datastore())
+        if (static_cast<size_t>(cur->nRows()) < r + 1 && !run("quietly set obs " + obs))
+          return out;
+      for (size_t c = 0; c < k; ++c) {
+        const std::string& cell = goodRows[r][c];
+        std::string value;
+        if (declaredStr[c]) {
+          value = "`\"" + cell + "\"'";
+        } else {
+          if (cell.empty() || cell == ".") continue;
+          value = cell;
+        }
+        if (!run("quietly replace " + names[c] + " = " + value + " in " + obs)) return out;
+      }
+    }
+    out.push_back(ojson(mutationResult(session, "input")));
+    // The lines past observation _N run as the commands they now are; the
+    // first one that fails stops the block, as it stops the do-file.
+    for (size_t r = restStart; r < parts.size(); ++r) {
+      const std::string line = strutil::trim(parts[r]);
+      if (line.empty()) continue;
+      ojson res = dispatch(line, session);
+      bool failed = false;
+      for (const auto& b : res) {
+        out.push_back(b);
+        if (b.is_object() && b.value("type", std::string()) == "error") failed = true;
+      }
+      if (failed) break;
+    }
+    return out;
+  }
   std::vector<std::string> tokens;
   std::vector<char> quoted;
   tokens.reserve(nNew * k);

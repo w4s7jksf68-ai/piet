@@ -111,6 +111,9 @@ const std::map<std::string, Effects>& table() {
       {"local", mk(1, 0, 1, 0, 0, 0, 0, 0)},
       {"global", mk(2, 0, 1, 0, 0, 0, 0, 0)},
       {"scalar", mk(2, 0, 1, 0, 0, 0, 0, 0)},
+      // constraint define/drop: the session constraint store the ml estimators read;
+      // free/get post r()
+      {"constraint", mk(2, 1, 0, 0, 0, 0, 0, 0)},
       {"matrix", mk(2, 0, 1, 0, 0, 0, 0, 0)},
       {"tempfile", mk(1, 0, 0, 0, 0, 0, 0, 0)},
       {"tempname", mk(1, 0, 0, 0, 0, 0, 0, 0)},
@@ -194,6 +197,7 @@ const std::map<std::string, Effects>& table() {
       {"correlate", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"pwcorr", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"ttest", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"ttesti", mk(0, 1, 0, 0, 0, 0, 0, 0)},  // immediate: r() from the typed numbers, no data
       {"centile", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"pctile", mk(0, 1, 0, 1, 1, 0, 0, 0)},
       {"table", mk(0, 1, 0, 1, 0, 0, 0, 0)},
@@ -247,6 +251,7 @@ const std::map<std::string, Effects>& table() {
       // write/read the session matrix store, which is global state.
       {"svmat", mk(0, 0, 1, 1, 1, 0, 0, 0)},
       {"mkmat", mk(2, 0, 0, 1, 0, 0, 0, 0)},
+      {"matname", mk(2, 0, 0, 1, 0, 0, 0, 0)},  // renames a stored matrix's stripes; reads varnames
       {"matlist", mk(0, 0, 1, 0, 0, 0, 0, 0)},
 
       // ---- ml-getmata T4 (2026-09-27) -------------------------------------
@@ -397,6 +402,7 @@ const std::map<std::string, Effects>& table() {
       {"cf", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"renpfix", mk(0, 0, 0, 1, 1, 0, 0, 0)},
       {"markout", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"mark", mk(0, 0, 0, 1, 1, 0, 0, 0)},     // generates the marker variable
       {"postutil", mk(0, 0, 0, 0, 0, 0, 0, 0)},
       {"require", mk(0, 0, 0, 0, 0, 0, 0, 0)},
       {"labvars", mk(0, 0, 0, 1, 1, 0, 0, 0)},
@@ -502,6 +508,20 @@ const std::map<std::string, Effects>& table() {
       {"sktest", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"signrank", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"centile", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      // vs-stata bank stage 4 (s4_io_misc): read the frame, publish r().
+      {"ktau", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"ranksum", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"ci", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"prtest", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"tsreport", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      // the immediate tests read no data at all (ttesti's row is above, with ttest).
+      {"prtesti", mk(0, 1, 0, 0, 0, 0, 0, 0)},
+      // collect: no collection store; export's file-type check reads and writes nothing.
+      {"collect", mk(0, 0, 0, 0, 0, 0, 0, 0)},
+      // expandcl adds rows and a variable, as expand does; xttrans sorts and
+      // restores the data around its tabulate (preserve/restore: control).
+      {"expandcl", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"xttrans", mk(0, 1, 0, 1, 1, 1, 0, 0)},
       {"pca", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       // oaxaca (AER scope-2 B2): reads the frame, posts e() and a LastModel,
       // writes no column and no file. Same shape as pca.

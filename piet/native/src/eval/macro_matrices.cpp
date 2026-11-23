@@ -1311,8 +1311,57 @@ std::string substituteMatrixRefs(const std::string& expr, const EvalSession& ses
     out = total + sign * prod;
     return true;
   };
+  // [FN] Matrix functions that answer a scalar of a stored matrix NAME:
+  // issymmetric(M) (1 when M equals its transpose exactly; b57d87af),
+  // diag0cnt(M) (the zeros on the diagonal; f388192a), and matmissing(M) (1 when
+  // an element is missing; b65c3650). A non-square M is outside det(), trace()
+  // and diag0cnt()'s domain and answers missing (StataBE `scalar d = det(A)` of
+  // a 1 x 3 A is rc 0, 6934363c). det() and trace() of a square M are left for
+  // the det/trace pass below, whose LU is the one StataBE's bits show.
+  static const std::regex reMatScalarFn(
+      R"(\b(det|trace|issymmetric|diag0cnt|matmissing)\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))",
+      std::regex::icase);
+  std::string scalarFnDone = expr;
+  if (expr.find('(') != std::string::npos) {
+    scalarFnDone = regexSubFn(reMatScalarFn, expr, [&session](const std::smatch& m) -> std::string {
+      const EvalMatrix* mat = session.findMatrix(m.str(2));
+      if (mat == nullptr) return m.str(0);
+      std::string fn = m.str(1);
+      for (char& c : fn) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      const size_t nr = mat->data.size(), nc = nr ? mat->data[0].size() : 0;
+      const double kNaN = std::numeric_limits<double>::quiet_NaN();
+      const auto miss = [](double v) { return std::isnan(v) || std::fabs(v) >= kStataMissingSentinel; };
+      if (fn == "matmissing") {
+        for (const auto& r : mat->data)
+          for (double v : r)
+            if (miss(v)) return "1";
+        return "0";
+      }
+      if (fn == "issymmetric") {
+        if (nr != nc) return "0";
+        for (size_t i = 0; i < nr; ++i)
+          for (size_t j = 0; j < i; ++j)
+            if (!(mat->data[i][j] == mat->data[j][i] ||
+                  (miss(mat->data[i][j]) && miss(mat->data[j][i]))))
+              return "0";
+        return "1";
+      }
+      if (fn == "det" || fn == "trace") {
+        // Case as written: the det/trace pass below is case-sensitive.
+        if (m.str(1) != fn || (nr == nc && nr != 0)) return m.str(0);
+        return matrixElementText(kNaN);
+      }
+      if (nr != nc || nr == 0) return matrixElementText(kNaN);
+      if (fn == "diag0cnt") {
+        int zeros = 0;
+        for (size_t i = 0; i < nr; ++i) zeros += mat->data[i][i] == 0.0 ? 1 : 0;
+        return std::to_string(zeros);
+      }
+      return m.str(0);
+    });
+  }
   const std::string folded =
-      regexSubFn(reElArith, expr, [&foldIntArith](const std::smatch& m) -> std::string {
+      regexSubFn(reElArith, scalarFnDone, [&foldIntArith](const std::smatch& m) -> std::string {
         long long i = 0, j = 0;
         if (!foldIntArith(m.str(2), i) || !foldIntArith(m.str(3), j) || i < 0 || j < 0)
           return m.str(0);
@@ -1391,8 +1440,7 @@ std::string substituteMatrixRefs(const std::string& expr, const EvalSession& ses
   // pivoting, the last of a tie), signed by the row exchanges: StataBE 19.5's
   // det((1,2,3\4,5,6\7,8,10)) is -1.7fffffffffffcX+001 to the bit
   // (28bf17920359952b), a singular matrix 0. A missing cell gives `.`. A
-  // matrix that is not square is left unsubstituted, for the parser to refuse
-  // (StataBE's answer for it is unmeasured).
+  // matrix that is not square was answered missing by the pass above.
   static const std::regex reDetTrace(
       R"(\b(det|trace)\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))");
   pre = regexSubFn(reDetTrace, pre, [&session](const std::smatch& m) -> std::string {

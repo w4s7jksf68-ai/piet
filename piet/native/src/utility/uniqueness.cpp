@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "piet/handlers/utility.h"
+#include "piet/dispatcher.h"  // unique, detail: the summary of the record counts
 
 #include <algorithm>
 #include <cctype>
@@ -28,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include "engine/scratch_columns.h"
 #include "piet/datastore.h"
 #include "piet/display_hardening.h"  // piet::fmtStataDefaultG -- Stata's %9.0g default
 #include "piet/eval/errors.h"
@@ -37,6 +39,7 @@
 #include "piet/session_state.h"
 #include "piet/handlers/observations.h"  // runDrop: unique.ado's `cap drop _Unique`
 
+#include "datamgmt/variable_metadata_support.h"
 #include "utility_support.h"
 #include "utility_options.h"
 
@@ -58,6 +61,25 @@ using namespace utility_detail;
 // exact point where `unique` and `distinct` disagree, and it is why they are
 // two commands rather than one with a flag).
 ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
+  // `_all` is every variable, in dataset order (vs-stata bank c052e647680a9488 `unique _all`).
+  if (std::find(parsed.varlist.begin(), parsed.varlist.end(), "_all") != parsed.varlist.end() &&
+      session.hasData()) {
+    std::vector<std::string> names;
+    if (const auto* card = session.shadowVarlistIfCurrent()) {
+      for (const auto& info : *card) names.push_back(info.name);
+    } else if (Datastore* rds = session.datastore()) {
+      names = rds->names();
+    }
+    eval::ParsedCommand expanded = parsed;
+    expanded.varlist.clear();
+    for (const auto& t : parsed.varlist) {
+      if (t != "_all") { expanded.varlist.push_back(t); continue; }
+      for (const auto& nm : names)
+        if (std::find(expanded.varlist.begin(), expanded.varlist.end(), nm) == expanded.varlist.end())
+          expanded.varlist.push_back(nm);
+    }
+    return runUnique(expanded, session);
+  }
   const std::string typed = lowerOf(parsed.cmd);
   const bool gtools = !typed.empty() && typed[0] == 'g';
   const std::string verb = gtools ? "gunique" : "unique";
@@ -67,7 +89,10 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
   // `unimplemented` list), but the net cannot say WHICH command's option it is
   // refusing, and "gunique, replace" replacing the data in memory is a large
   // enough difference to be worth naming.
-  if (hasFlag(parsed.opts, "replace")) {
+  // gunique's replace only lets gen() (or _Unique) overwrite an existing
+  // variable (gunique.ado); unique has no such option of that meaning.
+  const bool replaceGen = gtools && hasFlag(parsed.opts, "replace");
+  if (!gtools && hasFlag(parsed.opts, "replace")) {
     return ojson(eval::unsupportedOption(
         "replace",
         "`" + verb +
@@ -75,7 +100,11 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
             "build's " + verb +
             " only counts; use `duplicates drop` or `contract` to collapse the data."));
   }
-  if (hasFlag(parsed.opts, "detail")) {
+  // gunique, detail (no by()): the group sizes summarized in detail after
+  // the count line (gunique.ado runs gstats sum on its counts); r() is the
+  // count's. With by() it also lists the top levels -- not drawn here.
+  const bool detail = hasFlag(parsed.opts, "detail");
+  if (gtools && detail && optStr(parsed.opts, "by").has_value()) {
     return ojson(eval::unsupportedOption(
         "detail",
         "`" + verb +
@@ -86,9 +115,15 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!gtools && hasFlag(parsed.opts, "missing"))
     return ojson(eval::errorBlock("syntax_error", "option missing not allowed", std::nullopt,
                                   std::nullopt, std::nullopt, "r(198)"));
-  if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabUnique.known,
-                                            kVocabUnique.unimplemented))
-    return ojson(*err);
+  {
+    std::vector<std::pair<std::string, eval::OptValue>> rest;
+    for (const auto& kv : parsed.opts)
+      if (!(detail && kv.first == "detail") && !(replaceGen && kv.first == "replace"))
+        rest.push_back(kv);
+    if (auto err = eval::rejectUnknownOptions(rest, kVocabUnique.known,
+                                              kVocabUnique.unimplemented))
+      return ojson(*err);
+  }
   if (!session.hasData()) return ojson(eval::noDataLoaded());
   if (parsed.varlist.empty())
     return utilSyntax(verb + ": syntax is `" + verb + " varlist [if] [in] [, by(varlist) gen(newvar)]`");
@@ -106,7 +141,7 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
     gen = std::string("_Unique");
     Datastore* hd = session.datastore();
     if (hd != nullptr && hd->has("_Unique")) {
-      if (gtools)
+      if (gtools && !replaceGen)
         return ojson(eval::errorBlock("syntax_error",
                                       "Variable _Unique already exists.\nUse the gen() option to "
                                       "specify a new variable.",
@@ -127,7 +162,21 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
   // have -- and the failure mode would be a plausible-looking, misaligned
   // column. Refused by name instead. The report form has no such problem and
   // honours both qualifiers.
-  if (gen.has_value()) {
+  // gunique by(): the variable is missing outside the if/in sample (its
+  // group id is missing there).
+  std::vector<double> inSample;
+  const bool haveQual = (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
+                        (parsed.inRange.has_value() && !parsed.inRange->empty());
+  if (gen.has_value() && gtools && haveQual) {
+    std::string qualifier;
+    if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) qualifier += " if " + *parsed.ifExpr;
+    if (parsed.inRange.has_value() && !parsed.inRange->empty())
+      qualifier += " in " + *parsed.inRange;
+    ScratchColumns scratch(session);
+    std::string col;
+    if (auto failed = scratch.add("1", qualifier, &col)) return *failed;
+    inSample = scratch.values(col);
+  } else if (gen.has_value()) {
     ojson q = refuseQualifiers(
         parsed, "`" + verb +
             ", gen()` writes a column as long as the dataset, and this build cannot map a "
@@ -161,6 +210,7 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
   // unique.ado counts a missing value as a value (marksample ..., novarlist);
   // gunique drops a row with any missing value unless `missing`.
   auto rowIn = [&](int64_t i) {
+    if (!inSample.empty() && std::isnan(inSample[static_cast<size_t>(i)])) return false;
     if (!gtools || withMissing) return true;
     for (const auto& v : views)
       if (cellMissing(v, i)) return false;
@@ -210,7 +260,87 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
         << "\n";
     oss << "Number of records is  " << nIn << "\n";
   }
-  if (byVars.empty() || (gtools && nIn == 0)) return displayBlock(oss.str());
+  // detail: the number of records of each distinct combination, summarized with
+  // `summarize, detail` (by group with by()) under the title "Records per <varlist>";
+  // unique's own r() is what stays (vs-stata bank 9e9f3bcce8ee0286, b1c9f63b1865f435).
+  std::vector<std::pair<std::string, double>> rSaved;
+  for (const char* k : {"N", "J", "unique", "minJ", "maxJ"})
+    if (const double* v = session.eval.rValues.find(k)) rSaved.emplace_back(k, *v);
+  auto runDetail = [&]() -> ojson {
+    ojson outBlocks = ojson::array();
+    std::string q;
+    if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) q += " if " + *parsed.ifExpr;
+    if (parsed.inRange.has_value() && !parsed.inRange->empty()) q += " in " + *parsed.inRange;
+    const std::string vl = joinWith(parsed.varlist, " ");
+    const std::string bl = joinWith(byVars, " ");
+    // gunique counts its groups over rows with no missing key (unless
+    // missing) and shows the counts under a temporary name.
+    const std::string cv = gtools ? "__000000" : "__unique_records";
+    std::vector<std::string> cmds;
+    if (!q.empty()) cmds.push_back("quietly keep" + q);
+    if (gtools && !withMissing)
+      for (const auto& v : parsed.varlist) cmds.push_back("quietly drop if missing(" + v + ")");
+    cmds.push_back("quietly bysort " + (bl.empty() ? "" : bl + " ") + vl + ": generate long " + cv +
+                   " = _N if _n == 1");
+    if (!gtools) cmds.push_back("label variable " + cv + " \"Records per " + vl + "\"");
+    cmds.push_back((bl.empty() ? std::string() : "by " + bl + ": ") + "summarize " + cv +
+                   ", detail");
+    // unique.ado is a program, and its preserve is that program's own: it does
+    // not touch a copy the caller holds, and the caller's later restore still
+    // finds it. The working copy therefore lives one preserve level deeper than
+    // the code that called unique (a second preserve at the caller's own level
+    // would be r(621), and the restore below would then use up the caller's copy).
+    struct DeeperPreserveLevel {
+      SessionState& s;
+      explicit DeeperPreserveLevel(SessionState& st) : s(st) { ++s.doFileDepth; }
+      ~DeeperPreserveLevel() { --s.doFileDepth; }
+      DeeperPreserveLevel(const DeeperPreserveLevel&) = delete;
+      DeeperPreserveLevel& operator=(const DeeperPreserveLevel&) = delete;
+    } level(session);
+    {
+      ojson kept = dispatch("preserve", session);
+      for (const auto& b : kept)
+        if (b.is_object() && b.value("type", std::string()) == "error") {
+          outBlocks.push_back(b);
+          return outBlocks;
+        }
+    }
+    for (size_t c = 0; c < cmds.size(); ++c) {
+      ojson r = dispatch(cmds[c], session);
+      bool bad = false;
+      for (const auto& b : r)
+        if (b.is_object() && b.value("type", std::string()) == "error") bad = true;
+      if (bad || c + 1 == cmds.size())
+        for (const auto& b : r)
+          if (b.is_object() && b.value("type", std::string()) != "echo") outBlocks.push_back(b);
+      if (bad) break;
+    }
+    {
+      ojson back = dispatch("restore", session);
+      for (const auto& b : back)
+        if (b.is_object() && b.value("type", std::string()) == "error") outBlocks.push_back(b);
+    }
+    if (gtools) {
+      // gunique's r() was set before the summary ran; it is what remains.
+      eval::replaceRClass(session.eval);
+      for (const auto& [k, v] : rSaved) session.eval.rValues.set(k, v);
+      eval::declareRPosted(session.eval, "gunique", {"N", "J", "unique", "minJ", "maxJ"});
+      return outBlocks;
+    }
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("unique", static_cast<double>(nUnique));
+    session.eval.rValues.set("sum", static_cast<double>(nUnique));
+    session.eval.rValues.set("N", static_cast<double>(nIn));
+    eval::declareRPosted(session.eval, "unique", {"unique", "sum", "N"});
+    return outBlocks;
+  };
+  if (byVars.empty() || (gtools && nIn == 0)) {
+    if (!detail) return displayBlock(oss.str());
+    ojson all = ojson::array();
+    all.push_back(displayBlock(oss.str()));
+    for (auto& b : runDetail()) all.push_back(b);
+    return all;
+  }
 
   // by(): the per-group count of distinct varlist values.
   //  unique.ado: on the by-group's FIRST observation, missing elsewhere
@@ -242,6 +372,10 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
     cells.push_back(numCell(static_cast<double>(perGroup[g].size())));
   }
   const std::string newvar = *gen;
+  if (replaceGen && !dropOldUnique) {
+    Datastore* hd = session.datastore();
+    dropOldUnique = hd != nullptr && hd->has(newvar);
+  }
   if (dropOldUnique) {
     ojson dropped = runDrop({newvar}, session);
     if (dropped.is_object() && dropped.value("type", std::string()) == "error") return dropped;
@@ -250,12 +384,19 @@ ojson runUnique(const eval::ParsedCommand& parsed, SessionState& session) {
     if (!guard.is_null()) return guard;
   }
 
+  ojson blocks = ojson::array();
+  blocks.push_back(displayBlock(oss.str()));
+  if (detail) {
+    ojson det = runDetail();
+    for (auto& b : det) {
+      if (b.is_object() && b.value("type", std::string()) == "error") return det;
+      blocks.push_back(b);
+    }
+  }
   std::string out;
   if (auto err = writeColumn(session, *session.currentHbin(), newvar, cells, "f64", true, &out))
     return *err;
   session.load(out);
-  ojson blocks = ojson::array();
-  blocks.push_back(displayBlock(oss.str()));
   blocks.push_back(mutationResult(session, "gen", {newvar}));
   return blocks;
 }
@@ -332,25 +473,62 @@ ojson runDistinct(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
 
-  // Layout: the name column is right-aligned at min(12, longest name), then
-  // ` |`, then two %10.0g-shaped count fields. A name longer than the column
-  // simply widens its own row rather than being truncated -- `abbrev()` is the
-  // option that would shorten names and it is refused, so silently shortening
-  // one here would be that refused option arriving through the back door.
-  size_t nameW = 0;
-  for (const auto& r : rows) nameW = std::max(nameW, r.name.size());
-  nameW = std::min<size_t>(nameW, 12);
-  if (nameW == 0) nameW = 1;
-
+  // distinct.ado (1.2.1, the version the bank ran): abbrev(#) sets the name
+  // column (default the longest name), never below 5, names shortened as
+  // abbrev() does; min()/max() show only the rows whose distinct count lies
+  // in [min, max] (swapped, with a note, when min > max). r() is the last
+  // row's whether shown or not.
+  long long abbrevW = -1, minD = 0;
+  double maxD = std::numeric_limits<double>::infinity();
+  for (const auto& [k, v] : parsed.opts) {
+    if (v.isBool) continue;
+    long long x = 0;
+    try {
+      x = std::stoll(strutil::trim(v.strValue));
+    } catch (...) {
+      return ojson(eval::errorBlock("syntax_error", "option " + k + "() incorrectly specified",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    }
+    if (k == "abbrev") abbrevW = x;
+    if (k == "min" || k == "minimum") minD = x;
+    if (k == "max" || k == "maximum") maxD = static_cast<double>(x);
+  }
+  std::string swapNote;
+  if (static_cast<double>(minD) > maxD) {
+    const long long lo = static_cast<long long>(maxD), hi = minD;
+    swapNote = "min(" + std::to_string(hi) + ") max(" + std::to_string(lo) +
+               ") interpreted as min(" + std::to_string(lo) + ") max(" + std::to_string(hi) + ")\n";
+    minD = lo;
+    maxD = static_cast<double>(hi);
+  }
+  auto shown = [&](const Row& r) {
+    return static_cast<double>(r.distinct) >= static_cast<double>(minD) &&
+           static_cast<double>(r.distinct) <= maxD;
+  };
+  auto g9 = [](int64_t v) { return rightAlign(piet::fmtStataDefaultG(static_cast<double>(v)), 9); };
   std::ostringstream oss;
-  oss << std::string(nameW, ' ') << " |" << rightAlign("Observations", 21) << "\n";
-  oss << std::string(nameW, ' ') << " |" << rightAlign("total", 10) << rightAlign("distinct", 11)
-      << "\n";
-  oss << std::string(nameW + 1, '-') << "+" << std::string(21, '-') << "\n";
-  for (const auto& r : rows) {
-    oss << rightAlign(r.name, nameW) << " |" << rightAlign(piet::fmtStataDefaultG(
-               static_cast<double>(r.total)), 10)
-        << rightAlign(piet::fmtStataDefaultG(static_cast<double>(r.distinct)), 11) << "\n";
+  oss << swapNote;
+  if (joint) {
+    oss << "\n        Observations\n      total   distinct\n";
+    for (const auto& r : rows)
+      if (shown(r))
+        oss << rightAlign(piet::fmtStataDefaultG(static_cast<double>(r.total)), 11) << "  "
+            << g9(r.distinct) << "\n";
+  } else {
+    size_t w = 0;
+    if (abbrevW < 0) {
+      for (const auto& r : rows) w = std::max(w, r.name.size());
+    } else {
+      w = static_cast<size_t>(abbrevW);
+    }
+    w = std::max<size_t>(w, 5);
+    oss << "\n" << std::string(w + 2, ' ') << "|        Observations\n";
+    oss << std::string(w + 2, ' ') << "|      total   distinct\n";
+    oss << std::string(w + 2, '-') << "+" << std::string(22, '-') << "\n";
+    for (const auto& r : rows)
+      if (shown(r))
+        oss << " " << rightAlign(variable_metadata_detail::stataAbbrev(r.name, static_cast<int>(w)), w) << " |  "
+            << g9(r.total) << "  " << g9(r.distinct) << "\n";
   }
 
   // distinct.ado returns the LAST row's numbers (the joint row when joint was

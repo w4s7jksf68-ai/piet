@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core/linalg.h"
+#include "estimators/logit.h"  // MlObjective / ml_newton_path: Stata's ml path
 
 namespace cecon {
 
@@ -104,129 +105,110 @@ XtpoisFeResult xtpoisson_fe(const double* X_in, int64_t n_obs, int k,
         }
     }
 
-    // ---- 3. Newton-Raphson on the conditional log-likelihood ----
-    R.beta.assign(static_cast<size_t>(k), 0.0);
+    // ---- 3. Stata's ml path on the conditional log-likelihood ----
+    // xtpoisson.ado fits the fe model with `ml model d2 xtps_fe ..., search(off)`
+    // from b = 0 under `difficult` (its default): ml_newton_path's step and stop
+    // rules (logit.h), the log likelihood with its constants
+    //   sum_i [lnG(n_i + 1) - sum_t lnG(y_it + 1) + sum_t y_it ln p_it],
+    // so e(ic), e(ilog) and the iterate it stops at are Stata's (bank 8e730ee7
+    // `xtpoisson fatal beertax unemp, fe`: Iteration 0 -2080.7349, e(ic) 3).
     std::vector<double> xb(static_cast<size_t>(n_w), 0.0);
     std::vector<double> p(static_cast<size_t>(n_w), 0.0);
-    std::vector<double> score(static_cast<size_t>(k), 0.0);
-    std::vector<double> negH(static_cast<size_t>(k) * k, 0.0);
-    std::vector<double> negH_inv(static_cast<size_t>(k) * k, 0.0);
-    std::vector<double> step(static_cast<size_t>(k), 0.0);
     std::vector<double> xbar(static_cast<size_t>(k), 0.0);
     std::vector<double> dx(static_cast<size_t>(k), 0.0);
     std::vector<double> per_group_score;  // for robust SE; n_groups * k
-
-    double prev_ll = -1e300;
-    bool converged = false;
-    for (int iter = 0; iter < maxit; ++iter) {
-        // 3a. xb_it = X_it β + offset_it
-        for (int64_t i = 0; i < n_w; ++i) {
-            double s = off[static_cast<size_t>(i)];
-            for (int c = 0; c < k; ++c) s += X[static_cast<size_t>(c) * n_w + i] * R.beta[static_cast<size_t>(c)];
-            xb[static_cast<size_t>(i)] = s;
-        }
-
-        // 3b. For each group: p_it (softmax over t), score, Hessian, log-lik
-        std::fill(score.begin(), score.end(), 0.0);
-        std::fill(negH.begin(), negH.end(), 0.0);
-        double ll = 0.0;
-        for (const auto& g : groups) {
-            // softmax over rows in this group (numerically stable)
-            double m = -1e300;
-            for (int64_t i = g.start; i < g.end; ++i)
-                if (xb[static_cast<size_t>(i)] > m) m = xb[static_cast<size_t>(i)];
-            double denom = 0.0;
-            for (int64_t i = g.start; i < g.end; ++i) {
-                double e = std::exp(xb[static_cast<size_t>(i)] - m);
-                p[static_cast<size_t>(i)] = e;
-                denom += e;
+    double cst = 0;
+    for (const auto& g : groups) {
+        double n_i = 0;
+        for (int64_t i = g.start; i < g.end; ++i) n_i += y[static_cast<size_t>(i)];
+        cst += std::lgamma(n_i + 1.0);
+        for (int64_t i = g.start; i < g.end; ++i) cst -= std::lgamma(y[static_cast<size_t>(i)] + 1.0);
+    }
+    struct FeObjective final : MlObjective {
+        const std::vector<double>& X;
+        const std::vector<double>& y;
+        const std::vector<double>& off;
+        const std::vector<Group>& groups;
+        int64_t n_w;
+        int k;
+        double cst;
+        FeObjective(const std::vector<double>& X_, const std::vector<double>& y_,
+                    const std::vector<double>& off_, const std::vector<Group>& g_, int64_t n_, int k_,
+                    double c_)
+            : X(X_), y(y_), off(off_), groups(g_), n_w(n_), k(k_), cst(c_) {}
+        double run(const std::vector<double>& b, std::vector<double>* g, std::vector<double>* A) {
+            const size_t K = static_cast<size_t>(k);
+            if (g) g->assign(K, 0.0);
+            if (A) A->assign(K * K, 0.0);
+            std::vector<double> xb(static_cast<size_t>(n_w)), p(static_cast<size_t>(n_w)), xbar(K), dx(K);
+            for (int64_t i = 0; i < n_w; ++i) {
+                double s = off[static_cast<size_t>(i)];
+                for (int c = 0; c < k; ++c) s += X[static_cast<size_t>(c) * n_w + i] * b[static_cast<size_t>(c)];
+                xb[static_cast<size_t>(i)] = s;
             }
-            double log_denom = std::log(denom) + m;
-            double n_i = 0.0;
-            for (int64_t i = g.start; i < g.end; ++i) {
-                p[static_cast<size_t>(i)] /= denom;
-                n_i += y[static_cast<size_t>(i)];
-                // Add y_it * log p_it to log-lik (drop constants).
-                ll += y[static_cast<size_t>(i)] * (xb[static_cast<size_t>(i)] - log_denom);
-            }
-            // x̄_i = Σ_t p_it x_t  (k-vector)
-            for (int c = 0; c < k; ++c) {
-                double s = 0;
-                for (int64_t i = g.start; i < g.end; ++i)
-                    s += p[static_cast<size_t>(i)] * X[static_cast<size_t>(c) * n_w + i];
-                xbar[static_cast<size_t>(c)] = s;
-            }
-            // score_i_c = Σ_t (y_it - n_i p_it)(x_itc - x̄_ic)
-            // A11 sibling of the BUG-135 xtlogit fix: the residuals sum to EXACTLY zero
-            // within a panel (Σ_t y_it = n_i and Σ_t p_it = 1), so subtracting the
-            // conditional mean x̄ leaves the score unchanged in exact arithmetic while
-            // removing x̄ × (the rounding residual of Σ_t r_t) in floating point. That
-            // product is pure noise and, on an offset covariate, large enough to hold the
-            // Newton step above tol. The Hessian below was ALREADY written in centred
-            // form ((x−x̄)(x−x̄)'), so this makes the two halves consistent.
-            for (int c = 0; c < k; ++c) {
-                double s = 0;
-                for (int64_t i = g.start; i < g.end; ++i) {
-                    double r = y[static_cast<size_t>(i)]
-                             - n_i * p[static_cast<size_t>(i)];
-                    s += r * (X[static_cast<size_t>(c) * n_w + i] - xbar[static_cast<size_t>(c)]);
+            double ll = cst;
+            for (const auto& gr : groups) {
+                double m = -1e300;
+                for (int64_t i = gr.start; i < gr.end; ++i) m = std::max(m, xb[static_cast<size_t>(i)]);
+                double denom = 0;
+                for (int64_t i = gr.start; i < gr.end; ++i) {
+                    p[static_cast<size_t>(i)] = std::exp(xb[static_cast<size_t>(i)] - m);
+                    denom += p[static_cast<size_t>(i)];
                 }
-                score[static_cast<size_t>(c)] += s;
-            }
-            // -H_g = n_i * Σ_t p_t (x_t - x̄)(x_t - x̄)'
-            // Accumulate by symmetric outer product into negH (k*k column-major).
-            for (int64_t i = g.start; i < g.end; ++i) {
-                double w = n_i * p[static_cast<size_t>(i)];
-                if (w == 0) continue;
-                for (int c = 0; c < k; ++c)
-                    dx[static_cast<size_t>(c)] = X[static_cast<size_t>(c) * n_w + i]
-                                                - xbar[static_cast<size_t>(c)];
-                for (int c = 0; c < k; ++c) {
-                    double wd = w * dx[static_cast<size_t>(c)];
-                    double* col = negH.data() + static_cast<size_t>(c) * k;
-                    for (int r = 0; r < k; ++r)
-                        col[static_cast<size_t>(r)] += wd * dx[static_cast<size_t>(r)];
-                }
-            }
-        }
-
-        // 3c. Solve (-H) step = score, β += step.
-        std::copy(negH.begin(), negH.end(), negH_inv.begin());
-        int info = la::spd_inverse(negH_inv.data(), k);
-        if (info != 0) {
-            R.converged = false;
-            R.iters = iter;
-            return R;
-        }
-        la::matvec(negH_inv.data(), k, score.data(), step.data());
-        double smag = 0;
-        for (int c = 0; c < k; ++c) {
-            R.beta[static_cast<size_t>(c)] += step[static_cast<size_t>(c)];
-            smag += std::fabs(step[static_cast<size_t>(c)]);
-        }
-        R.iters = iter + 1;
-        if (std::fabs(ll - prev_ll) < tol * (std::fabs(ll) + 1.0) && smag < tol) {
-            converged = true;
-            // Final pass to compute log-lik constants too.
-            // L_const = Σ_i [logΓ(n_i + 1) - Σ_t logΓ(y_it + 1)]
-            double cst = 0;
-            for (const auto& g : groups) {
+                const double lden = std::log(denom) + m;
                 double n_i = 0;
-                for (int64_t i = g.start; i < g.end; ++i) n_i += y[static_cast<size_t>(i)];
-                cst += std::lgamma(n_i + 1.0);
-                for (int64_t i = g.start; i < g.end; ++i)
-                    cst -= std::lgamma(y[static_cast<size_t>(i)] + 1.0);
+                for (int64_t i = gr.start; i < gr.end; ++i) {
+                    p[static_cast<size_t>(i)] /= denom;
+                    n_i += y[static_cast<size_t>(i)];
+                    ll += y[static_cast<size_t>(i)] * (xb[static_cast<size_t>(i)] - lden);
+                }
+                if (!g && !A) continue;
+                for (int c = 0; c < k; ++c) {
+                    double s = 0;
+                    for (int64_t i = gr.start; i < gr.end; ++i)
+                        s += p[static_cast<size_t>(i)] * X[static_cast<size_t>(c) * n_w + i];
+                    xbar[static_cast<size_t>(c)] = s;
+                }
+                for (int64_t i = gr.start; i < gr.end; ++i) {
+                    const double r = y[static_cast<size_t>(i)] - n_i * p[static_cast<size_t>(i)];
+                    const double w = n_i * p[static_cast<size_t>(i)];
+                    for (int c = 0; c < k; ++c)
+                        dx[static_cast<size_t>(c)] = X[static_cast<size_t>(c) * n_w + i] - xbar[static_cast<size_t>(c)];
+                    for (int c = 0; c < k; ++c) {
+                        if (g) (*g)[static_cast<size_t>(c)] += r * dx[static_cast<size_t>(c)];
+                        if (A && w != 0)
+                            for (int q = 0; q < k; ++q)
+                                (*A)[static_cast<size_t>(c) * K + q] += w * dx[static_cast<size_t>(c)] * dx[static_cast<size_t>(q)];
+                    }
+                }
             }
-            R.loglik = ll + cst;
-            break;
+            return ll;
         }
-        prev_ll = ll;
+        double loglik(const std::vector<double>& b) override { return run(b, nullptr, nullptr); }
+        double evaluate(const std::vector<double>& b, std::vector<double>& g, std::vector<double>& A) override {
+            return run(b, &g, &A);
+        }
+    };
+    FeObjective obj(X, y, off, groups, n_w, k, cst);
+    MlMaxOptions mo;
+    mo.maxiter = maxit > 0 ? std::max(maxit, 300) : 300;
+    mo.difficult = true;
+    mo.stata_invsym = true;
+    (void)tol;
+    MlPath path = ml_newton_path(obj, std::vector<double>(static_cast<size_t>(k), 0.0), mo);
+    if (path.failed || path.b.size() != static_cast<size_t>(k) || !std::isfinite(path.ll)) {
+        R.converged = false;
+        R.iters = path.ic;
+        return R;
     }
-    R.converged = converged;
-    if (!converged) {
-        // Use last achieved ll for return; not strictly correct but informative.
-        R.loglik = prev_ll;
-    }
+    R.beta = path.b;
+    R.iters = path.ic;
+    R.converged = path.converged;
+    R.loglik = path.ll;
+    R.ilog = path.ilog;
+    R.gradient = path.gradient;
+    std::vector<double> negH(static_cast<size_t>(k) * k, 0.0);
+    std::vector<double> negH_inv(static_cast<size_t>(k) * k, 0.0);
 
     // ---- 4. IID and robust VCE ----
     // Recompute -H, per-group scores at the final β.

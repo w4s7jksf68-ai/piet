@@ -86,6 +86,16 @@ void pushLoopBlock(ojson& allBlocks, bool& truncated, const ojson& b) {
   doexec::appendJoiningBodyContinue(allBlocks, b);
 }
 
+void pushLoopBlock(ojson& allBlocks, bool& truncated, ojson&& b) {
+  if (truncated) return;
+  if (allBlocks.size() >= kMaxLoopBlocks) {
+    allBlocks.push_back(loopTruncatedBlock());
+    truncated = true;
+    return;
+  }
+  doexec::appendJoiningBodyContinue(allBlocks, std::move(b));
+}
+
 }  // namespace loops_detail
 
 namespace {
@@ -262,7 +272,7 @@ BodyRunResult runBody(const std::vector<std::string>& bodyLines, SessionState& s
   }
   doexec::ExecuteResult result = doexec::executeDoSource(source, session, dispatchFn);
   BodyRunResult out;
-  out.blocks = result.blocks;
+  out.blocks = std::move(result.blocks);  // `result` is not read for its blocks again
   // F3: a body aborts its enclosing loop ONLY when execution actually HALTED on
   // an uncaught error (or a cancel) — precisely the condition executeDoSource
   // records in stoppedAtLine. An error consumed by `capture` (BS-127: the
@@ -318,7 +328,7 @@ ojson runForeach(const std::string& varname, const std::vector<std::string>& tok
   for (const auto& tok : tokens) {
     session.eval.locals.set(varname, tok);
     BodyRunResult result = runBody(bodyLines, session, dispatchFn);
-    for (auto& b : result.blocks) pushLoopBlock(allBlocks, truncated, b);
+    for (auto& b : result.blocks) pushLoopBlock(allBlocks, truncated, std::move(b));
     if (result.hasError) break;
     if (result.control == "break") break;
     // control == "continue": fall through to next token.
@@ -363,7 +373,7 @@ ojson runForvaluesRange(const std::string& varname, double start, double step, d
   for (double v = start; (step > 0 && v <= end) || (step < 0 && v >= end); v += step) {
     session.eval.locals.set(varname, eval::stataMacroRealText(v));
     BodyRunResult result = runBody(bodyLines, session, dispatchFn);
-    for (auto& b : result.blocks) pushLoopBlock(allBlocks, truncated, b);
+    for (auto& b : result.blocks) pushLoopBlock(allBlocks, truncated, std::move(b));
     if (result.hasError) break;
     if (result.control == "break") break;
     // control == "continue": fall through to the next value.
@@ -410,7 +420,7 @@ ojson runWhile(const std::string& condition, const std::vector<std::string>& bod
     }
 
     BodyRunResult result = runBody(bodyLines, session, dispatchFn);
-    for (auto& b : result.blocks) pushLoopBlock(allBlocks, truncated, b);
+    for (auto& b : result.blocks) pushLoopBlock(allBlocks, truncated, std::move(b));
     if (result.hasError) break;
     if (result.control == "break") break;
     // control == "continue": loop back to condition re-eval.
@@ -436,7 +446,7 @@ ojson runIf(const std::string& condition, const std::vector<std::string>& bodyLi
 
   BodyRunResult result = truth.value ? runBody(bodyLines, session, dispatchFn)
                                       : runBody(elseBodyLines, session, dispatchFn);
-  ojson out = result.blocks;
+  ojson out = std::move(result.blocks);
   if (result.control.has_value()) {
     ojson ctrl;
     ctrl["type"] = "_control";
@@ -1004,7 +1014,25 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
                                 std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
-      std::vector<std::string> tokens = splitForeachTokens(trim(m.str(2)));
+      std::vector<std::string> tokens;
+      // A new-variable list expands `x1-x5` to x1 x2 ... x5 (the names share
+      // their stem; vs-stata bank `foreach v of newlist x1-x5`), as syntax's
+      // newvarlist does.
+      {
+        static const std::regex reRange(R"(^([A-Za-z_]+)([0-9]+)-([A-Za-z_]+)([0-9]+)$)");
+        for (const auto& t : splitForeachTokens(trim(m.str(2)))) {
+          std::smatch rm;
+          if (std::regex_match(t, rm, reRange) && rm.str(1) == rm.str(3)) {
+            const long long a = std::atoll(rm.str(2).c_str()), b = std::atoll(rm.str(4).c_str());
+            if (a > b)
+              return ojson::array({eval::errorBlock("engine_error", t + " invalid name", std::nullopt,
+                                                    std::nullopt, std::nullopt, "r(198)")});
+            for (long long k = a; k <= b; ++k) tokens.push_back(rm.str(1) + std::to_string(k));
+          } else {
+            tokens.push_back(t);
+          }
+        }
+      }
       // A name that is already a variable is r(110) `variable NAME already
       // defined` before the loop runs (StataBE 19.5 `foreach v of newlist a
       // price`, vs-stata bank 4200f3acfbe4e958).
