@@ -2176,7 +2176,12 @@ class SessionState {
   // w2ad_prog_preserve_nest pn_tv_do_gone: `confirm variable/scalar` on the
   // names afterwards are r(111)); program::concludeLevel drops the entries
   // deeper than the caller's level.
-  std::vector<std::pair<int, std::string>> mintedTempvars;
+  struct TempVariable {
+    int level;
+    std::string frame;
+    std::string name;
+  };
+  std::vector<TempVariable> mintedTempvars;
   std::vector<std::pair<int, std::string>> mintedTempnames;
 
   // -- preserve/restore LIFO snapshot stack (preserve_restore.py, M3a) -----

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <filesystem>   // BUG-360: ScopeGuard reaps this call's tempfiles
 #include <functional>   // std::hash: the program archive's definition key
+#include <map>
 #include <regex>
 #include <sstream>
 #include <system_error>
@@ -22,6 +23,7 @@
 #include "piet/eval/macros.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/datastore.h"
+#include "piet/handlers/data_combine.h"
 #include "piet/handlers/observations.h"
 #include "piet/handlers/results.h"  // noteEContractName
 #include "piet/loops.h"
@@ -411,32 +413,38 @@ void concludeLevel(int callerLevel, SessionState& session, ojson& blocks) {
   restorePreservesDeeperThan(callerLevel, session, blocks);
   dropTempfilesAndNamesDeeperThan(callerLevel, session);
   if (session.mintedTempvars.empty()) return;
-  std::vector<std::string> mine;
+  std::map<std::string, std::vector<std::string>> expiredByFrame;
   auto& tv = session.mintedTempvars;
   auto keep = tv.begin();
   for (auto it = tv.begin(); it != tv.end(); ++it) {
-    if (it->first > callerLevel) {
-      mine.push_back(it->second);
+    if (it->level > callerLevel) {
+      expiredByFrame[it->frame].push_back(std::move(it->name));
     } else {
       if (keep != it) *keep = std::move(*it);
       ++keep;
     }
   }
   tv.erase(keep, tv.end());
-  std::vector<std::string> live;
-  if (!mine.empty() && session.currentHbin().has_value()) {
-    if (Datastore* ds = session.datastore()) {
-      for (const auto& v : mine)
-        if (ds->has(v)) live.push_back(v);
-    }
-  }
-  // Dropping temporary variables is no change to the data: c(changed) and
-  // describe's r(changed) stay as they were (StataBE 19.5, vs-stata bank
-  // fe389cbc6b0d0af5: a program's `tempvar t` + `generate `t'` leaves 0).
-  if (!live.empty()) {
-    const bool changed = session.datasetChanged;
-    (void)handlers::runDrop(live, session);
-    session.datasetChanged = changed;
+  for (const auto& entry : expiredByFrame) {
+    const auto& frame = entry.first;
+    const auto& names = entry.second;
+    if (frame != session.currentFrame && session.frames.count(frame) == 0) continue;
+    ojson cleanup = handlers::runWithFrameCurrent(frame, session, [&]() -> ojson {
+      std::vector<std::string> live;
+      if (session.currentHbin().has_value()) {
+        if (Datastore* ds = session.datastore())
+          for (const auto& name : names)
+            if (ds->has(name)) live.push_back(name);
+      }
+      if (live.empty()) return ojson::array();
+      // Reaping scoped variables leaves the changed flag as it was.
+      const bool changed = session.datasetChanged;
+      ojson result = handlers::runDrop(live, session);
+      session.datasetChanged = changed;
+      return result;
+    });
+    if (cleanup.is_object() && cleanup.value("type", "") == "error")
+      blocks.push_back(std::move(cleanup));
   }
 }
 

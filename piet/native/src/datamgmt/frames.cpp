@@ -409,6 +409,10 @@ ojson runFrameDrop(const std::string& name, SessionState& session) {
   }
   const std::string droppedPath = it->second;
   session.frames.erase(it);
+  auto& temps = session.mintedTempvars;
+  temps.erase(std::remove_if(temps.begin(), temps.end(),
+                             [&](const auto& owned) { return owned.frame == name; }),
+              temps.end());
   session.frameMeta.erase(name);
   session.frameFiles.erase(name);
   // BUG-389 (2026-09-02): `frame drop` used to forget the map entry and leave the
@@ -650,6 +654,8 @@ ojson runFrameRename(const std::string& oldName, const std::string& newName,
   // A preserved copy belongs to the frame, whatever it is called now.
   for (PreserveFrame& p : session.preserveStack)
     if (p.frameName == oldName) p.frameName = newName;
+  for (auto& owned : session.mintedTempvars)
+    if (owned.frame == oldName) owned.frame = newName;
   return ojson::array();
 }
 
@@ -1296,6 +1302,7 @@ nlohmann::ordered_json runFramesReset(SessionState& session) {
     ojson cleared = runClear("", session);
     if (cleared.is_object() && cleared.value("type", "") == "error") return cleared;
     session.currentFrame = "default";
+    session.mintedTempvars.clear();
   }
   return lastError;
 }

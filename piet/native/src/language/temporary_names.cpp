@@ -135,7 +135,7 @@ ojson runTempvar(const std::vector<std::string>& names, SessionState& session) {
     session.eval.locals.set(name, minted);
     // BUG-922: dropped when the minting program or nested do/run file
     // concludes -- program::concludeLevel (pn_tv_do_gone: var=111).
-    session.mintedTempvars.emplace_back(session.preserveLevel(), minted);
+    session.mintedTempvars.push_back({session.preserveLevel(), session.currentFrame, minted});
   }
   return ojson::array();
 }

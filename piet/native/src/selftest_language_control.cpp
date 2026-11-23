@@ -1640,7 +1640,7 @@ void testC3BS037Tempvar() {
         "C3/BS-037: `tempvar tv` no longer trips the macro-reference tripwire (was \"Macro "
         "reference `tempvar` detected\")");
   std::string minted = session.eval.locals.get("tv", "");
-  check(!minted.empty(), "C3/BS-037: `tv' resolves to a non-empty minted name");
+  check(minted == "__000000", "C3/BS-037: the first tempvar is __000000");
   check(minted.size() >= 2 && minted[0] == '_' && minted[1] == '_',
         "C3/BS-037: the minted name follows Stata's own __NNNNNN pattern, got: " + minted);
 
@@ -1667,6 +1667,29 @@ void testC3BS037Tempvar() {
   std::string mintedB = session.eval.locals.get("tvb", "");
   check(!mintedA.empty() && !mintedB.empty() && mintedA != mintedB,
         "C3/BS-037: two tempvar names in one call mint two DISTINCT names");
+
+  fs::create_directories(workdir + "/frames", ec);
+  piet::SessionState frames(workdir + "/frames");
+  const std::string frameScript = R"piet(
+set obs 1
+frame create work
+frame work: set obs 1
+frame work: generate __000000 = 17
+program define temporary_frame
+    tempvar x
+    generate `x' = 5
+    frame rename default renamed
+    frame change work
+end
+temporary_frame
+assert __000000 == 17
+frame change renamed
+capture confirm variable __000000
+assert _rc == 111
+)piet";
+  const auto frameResult = piet::doexec::executeDoSource(frameScript, frames, piet::dispatch);
+  check(!frameResult.stoppedAtReason && frames.currentFrame == "renamed",
+        "tempvar cleanup follows its frame through rename and preserves a same-named column elsewhere");
 
   fs::remove_all(workdir, ec);
 }
