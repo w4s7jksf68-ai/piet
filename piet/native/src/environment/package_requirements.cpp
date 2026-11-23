@@ -144,10 +144,14 @@ nlohmann::ordered_json runRequire(const eval::ParsedCommand& parsed, SessionStat
     return ojson::array();
   }
   const auto* command = registry::findByName(package);
-  // These distributions contain native commands whose names differ from the
-  // distribution name. The registry handles packages with an eponymous command.
-  const bool bundled = package == "gtools" || package == "ftools" ||
-                       (command != nullptr && command->canonical == package);
+  // Community names are explicit in the registry. That includes reghdfe,
+  // whose native implementation is registered as feols. Short command
+  // abbreviations alone do not establish package availability.
+  const bool nativeCommand = command != nullptr &&
+      (command->canonical == package ||
+       std::find(command->communityNames.begin(), command->communityNames.end(), package) !=
+           command->communityNames.end());
+  const bool bundled = nativeCommand || package == "gtools" || package == "ftools";
   if (!bundled) return envError("package " + package + " is not available in PIET", 601);
   return displayBlock("(require " + req +
                       ": PIET bundles its own implementations; installation and version not checked)");
