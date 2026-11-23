@@ -1,0 +1,2030 @@
+{
+ "_source": "vs-stata truth bank 2026-11-10 (StataBE 19.5): each case is the summarize block PIET's handler produced for the cell's factor-variable / time-series-operator summarize, beside the lines Stata printed (blank lines dropped).",
+ "cases": [
+  {
+   "cell": "ee0a353a49018cb8",
+   "cmd": "summarize i.foreign price, nofvlab",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.7027027027027027,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 52,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.2972972972972973,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 22,
+      "sum_w": 74
+     },
+     "__scratch3": {
+      "N": 74,
+      "max": 15906,
+      "mean": 6165.256756756757,
+      "min": 3291,
+      "sd": 2949.495884768919,
+      "sum": 456229,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "header": "foreign"
+     },
+     {
+      "stub": "0",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "1",
+      "key": "__scratch2"
+     },
+     {
+      "blank": true
+     },
+     {
+      "stub": "price",
+      "plain": true,
+      "key": "__scratch3"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "     foreign |",
+    "          0  |         74    .7027027    .4601885          0          1",
+    "          1  |         74    .2972973    .4601885          0          1",
+    "             |",
+    "       price |         74    6165.257    2949.496       3291      15906"
+   ]
+  },
+  {
+   "cell": "06bab1880c0ac2f5",
+   "cmd": "summarize i.foreign price, nofvlabe",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.7027027027027027,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 52,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.2972972972972973,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 22,
+      "sum_w": 74
+     },
+     "__scratch3": {
+      "N": 74,
+      "max": 15906,
+      "mean": 6165.256756756757,
+      "min": 3291,
+      "sd": 2949.495884768919,
+      "sum": 456229,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "header": "foreign"
+     },
+     {
+      "stub": "0",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "1",
+      "key": "__scratch2"
+     },
+     {
+      "blank": true
+     },
+     {
+      "stub": "price",
+      "plain": true,
+      "key": "__scratch3"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "     foreign |",
+    "          0  |         74    .7027027    .4601885          0          1",
+    "          1  |         74    .2972973    .4601885          0          1",
+    "             |",
+    "       price |         74    6165.257    2949.496       3291      15906"
+   ]
+  },
+  {
+   "cell": "af677f7b206326ad",
+   "cmd": "summarize i.foreign price, nofvlabel",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.7027027027027027,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 52,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.2972972972972973,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 22,
+      "sum_w": 74
+     },
+     "__scratch3": {
+      "N": 74,
+      "max": 15906,
+      "mean": 6165.256756756757,
+      "min": 3291,
+      "sd": 2949.495884768919,
+      "sum": 456229,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "header": "foreign"
+     },
+     {
+      "stub": "0",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "1",
+      "key": "__scratch2"
+     },
+     {
+      "blank": true
+     },
+     {
+      "stub": "price",
+      "plain": true,
+      "key": "__scratch3"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "     foreign |",
+    "          0  |         74    .7027027    .4601885          0          1",
+    "          1  |         74    .2972973    .4601885          0          1",
+    "             |",
+    "       price |         74    6165.257    2949.496       3291      15906"
+   ]
+  },
+  {
+   "cell": "966db82932c4ae97",
+   "cmd": "summarize L.price L2.mpg F.weight S.price",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 73,
+      "max": 15906,
+      "mean": 6085.397260273972,
+      "min": 3291,
+      "sd": 2888.2278531409283,
+      "sum": 444234,
+      "sum_w": 73
+     },
+     "__scratch2": {
+      "N": 72,
+      "max": 41,
+      "mean": 21.305555555555557,
+      "min": 12,
+      "sd": 5.827663240265393,
+      "sum": 1534,
+      "sum_w": 72
+     },
+     "__scratch3": {
+      "N": 73,
+      "max": 4840,
+      "mean": 3020.6849315068494,
+      "min": 1760,
+      "sd": 782.5001398067382,
+      "sum": 220510,
+      "sum_w": 73
+     },
+     "__scratch4": {
+      "N": 73,
+      "max": 8995,
+      "mean": 108.16438356164383,
+      "min": -12607,
+      "sd": 3600.7842317631103,
+      "sum": 7896,
+      "sum_w": 73
+     }
+    },
+    "fvrows": [
+     {
+      "header": "price"
+     },
+     {
+      "stub": "L1.",
+      "key": "__scratch1"
+     },
+     {
+      "blank": true
+     },
+     {
+      "header": "mpg"
+     },
+     {
+      "stub": "L2.",
+      "key": "__scratch2"
+     },
+     {
+      "blank": true
+     },
+     {
+      "header": "weight"
+     },
+     {
+      "stub": "F1.",
+      "key": "__scratch3"
+     },
+     {
+      "blank": true
+     },
+     {
+      "header": "price"
+     },
+     {
+      "stub": "S1.",
+      "key": "__scratch4"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "       price |",
+    "         L1. |         73    6085.397    2888.228       3291      15906",
+    "             |",
+    "         mpg |",
+    "         L2. |         72    21.30556    5.827663         12         41",
+    "             |",
+    "      weight |",
+    "         F1. |         73    3020.685    782.5001       1760       4840",
+    "             |",
+    "       price |",
+    "         S1. |         73    108.1644    3600.784     -12607       8995"
+   ]
+  },
+  {
+   "cell": "65246c8589bf293e",
+   "cmd": "summarize L.price",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 73,
+      "max": 15906,
+      "mean": 6085.397260273972,
+      "min": 3291,
+      "sd": 2888.2278531409283,
+      "sum": 444234,
+      "sum_w": 73
+     }
+    },
+    "fvrows": [
+     {
+      "header": "price"
+     },
+     {
+      "stub": "L1.",
+      "key": "__scratch1"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "       price |",
+    "         L1. |         73    6085.397    2888.228       3291      15906"
+   ]
+  },
+  {
+   "cell": "8d7bc5c2ab71d6b9",
+   "cmd": "summarize i.drug age",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 48,
+      "max": 1,
+      "mean": 0.4166666666666667,
+      "min": 0,
+      "sd": 0.4982237954520136,
+      "sum": 20,
+      "sum_w": 48
+     },
+     "__scratch2": {
+      "N": 48,
+      "max": 1,
+      "mean": 0.2916666666666667,
+      "min": 0,
+      "sd": 0.4593396431851038,
+      "sum": 14,
+      "sum_w": 48
+     },
+     "__scratch3": {
+      "N": 48,
+      "max": 1,
+      "mean": 0.2916666666666667,
+      "min": 0,
+      "sd": 0.4593396431851038,
+      "sum": 14,
+      "sum_w": 48
+     },
+     "__scratch4": {
+      "N": 48,
+      "max": 67,
+      "mean": 55.875,
+      "min": 47,
+      "sd": 5.659204515184166,
+      "sum": 2682,
+      "sum_w": 48
+     }
+    },
+    "fvrows": [
+     {
+      "header": "drug"
+     },
+     {
+      "stub": "Placebo",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Other",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "NA",
+      "key": "__scratch3"
+     },
+     {
+      "blank": true
+     },
+     {
+      "stub": "age",
+      "plain": true,
+      "key": "__scratch4"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "        drug |",
+    "    Placebo  |         48    .4166667    .4982238          0          1",
+    "      Other  |         48    .2916667    .4593396          0          1",
+    "         NA  |         48    .2916667    .4593396          0          1",
+    "             |",
+    "         age |         48      55.875    5.659205         47         67"
+   ]
+  },
+  {
+   "cell": "9a892ed6094d1008",
+   "cmd": "summarize i.rep78 if foreign",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 21,
+      "max": 1,
+      "mean": 0.14285714285714285,
+      "min": 0,
+      "sd": 0.3585685828003181,
+      "sum": 3,
+      "sum_w": 21
+     },
+     "__scratch2": {
+      "N": 21,
+      "max": 1,
+      "mean": 0.42857142857142855,
+      "min": 0,
+      "sd": 0.50709255283711,
+      "sum": 9,
+      "sum_w": 21
+     },
+     "__scratch3": {
+      "N": 21,
+      "max": 1,
+      "mean": 0.42857142857142855,
+      "min": 0,
+      "sd": 0.50709255283711,
+      "sum": 9,
+      "sum_w": 21
+     }
+    },
+    "fvrows": [
+     {
+      "header": "rep78"
+     },
+     {
+      "stub": "3",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "4",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "5",
+      "key": "__scratch3"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "       rep78 |",
+    "          3  |         21    .1428571    .3585686          0          1",
+    "          4  |         21    .4285714    .5070926          0          1",
+    "          5  |         21    .4285714    .5070926          0          1"
+   ]
+  },
+  {
+   "cell": "d5ee72740c5830b7",
+   "cmd": "summarize i.rep78",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.028985507246376812,
+      "min": 0,
+      "sd": 0.16899482177531733,
+      "sum": 2,
+      "sum_w": 69
+     },
+     "__scratch2": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.11594202898550725,
+      "min": 0,
+      "sd": 0.32250088390476095,
+      "sum": 8,
+      "sum_w": 69
+     },
+     "__scratch3": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.43478260869565216,
+      "min": 0,
+      "sd": 0.4993602044724246,
+      "sum": 30,
+      "sum_w": 69
+     },
+     "__scratch4": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.2608695652173913,
+      "min": 0,
+      "sd": 0.4423258684646914,
+      "sum": 18,
+      "sum_w": 69
+     },
+     "__scratch5": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.15942028985507245,
+      "min": 0,
+      "sd": 0.36874941299243813,
+      "sum": 11,
+      "sum_w": 69
+     }
+    },
+    "fvrows": [
+     {
+      "header": "rep78"
+     },
+     {
+      "stub": "1",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "2",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "3",
+      "key": "__scratch3"
+     },
+     {
+      "stub": "4",
+      "key": "__scratch4"
+     },
+     {
+      "stub": "5",
+      "key": "__scratch5"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "       rep78 |",
+    "          1  |         69    .0289855    .1689948          0          1",
+    "          2  |         69     .115942    .3225009          0          1",
+    "          3  |         69    .4347826    .4993602          0          1",
+    "          4  |         69    .2608696    .4423259          0          1",
+    "          5  |         69    .1594203    .3687494          0          1"
+   ]
+  },
+  {
+   "cell": "ae6d961aad379f21",
+   "cmd": "summarize i.foreign",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.7027027027027027,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 52,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.2972972972972973,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 22,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "header": "foreign"
+     },
+     {
+      "stub": "Domestic",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Foreign",
+      "key": "__scratch2"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "     foreign |",
+    "   Domestic  |         74    .7027027    .4601885          0          1",
+    "    Foreign  |         74    .2972973    .4601885          0          1"
+   ]
+  },
+  {
+   "cell": "a44ddebb8a4abeae",
+   "cmd": "summarize i.foreign price",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.7027027027027027,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 52,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.2972972972972973,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 22,
+      "sum_w": 74
+     },
+     "__scratch3": {
+      "N": 74,
+      "max": 15906,
+      "mean": 6165.256756756757,
+      "min": 3291,
+      "sd": 2949.495884768919,
+      "sum": 456229,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "header": "foreign"
+     },
+     {
+      "stub": "Domestic",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Foreign",
+      "key": "__scratch2"
+     },
+     {
+      "blank": true
+     },
+     {
+      "stub": "price",
+      "plain": true,
+      "key": "__scratch3"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "     foreign |",
+    "   Domestic  |         74    .7027027    .4601885          0          1",
+    "    Foreign  |         74    .2972973    .4601885          0          1",
+    "             |",
+    "       price |         74    6165.257    2949.496       3291      15906"
+   ]
+  },
+  {
+   "cell": "6bc681e003497336",
+   "cmd": "summarize i.rep78 price mpg, vsquish",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.028985507246376812,
+      "min": 0,
+      "sd": 0.16899482177531733,
+      "sum": 2,
+      "sum_w": 69
+     },
+     "__scratch2": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.11594202898550725,
+      "min": 0,
+      "sd": 0.32250088390476095,
+      "sum": 8,
+      "sum_w": 69
+     },
+     "__scratch3": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.43478260869565216,
+      "min": 0,
+      "sd": 0.4993602044724246,
+      "sum": 30,
+      "sum_w": 69
+     },
+     "__scratch4": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.2608695652173913,
+      "min": 0,
+      "sd": 0.4423258684646914,
+      "sum": 18,
+      "sum_w": 69
+     },
+     "__scratch5": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.15942028985507245,
+      "min": 0,
+      "sd": 0.36874941299243813,
+      "sum": 11,
+      "sum_w": 69
+     },
+     "__scratch6": {
+      "N": 74,
+      "max": 15906,
+      "mean": 6165.256756756757,
+      "min": 3291,
+      "sd": 2949.495884768919,
+      "sum": 456229,
+      "sum_w": 74
+     },
+     "__scratch7": {
+      "N": 74,
+      "max": 41,
+      "mean": 21.2972972972973,
+      "min": 12,
+      "sd": 5.785503209735141,
+      "sum": 1576,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "header": "rep78"
+     },
+     {
+      "stub": "1",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "2",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "3",
+      "key": "__scratch3"
+     },
+     {
+      "stub": "4",
+      "key": "__scratch4"
+     },
+     {
+      "stub": "5",
+      "key": "__scratch5"
+     },
+     {
+      "stub": "price",
+      "plain": true,
+      "key": "__scratch6"
+     },
+     {
+      "stub": "mpg",
+      "plain": true,
+      "key": "__scratch7"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "       rep78 |",
+    "          1  |         69    .0289855    .1689948          0          1",
+    "          2  |         69     .115942    .3225009          0          1",
+    "          3  |         69    .4347826    .4993602          0          1",
+    "          4  |         69    .2608696    .4423259          0          1",
+    "          5  |         69    .1594203    .3687494          0          1",
+    "-------------+---------------------------------------------------------",
+    "       price |         74    6165.257    2949.496       3291      15906",
+    "         mpg |         74     21.2973    5.785503         12         41"
+   ]
+  },
+  {
+   "cell": "4c3589ea7132176f",
+   "cmd": "summarize c.price##c.mpg",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 15906,
+      "mean": 6165.256756756757,
+      "min": 3291,
+      "sd": 2949.495884768919,
+      "sum": 456229,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 74,
+      "max": 41,
+      "mean": 21.2972972972973,
+      "min": 12,
+      "sd": 5.785503209735141,
+      "sum": 1576,
+      "sum_w": 74
+     },
+     "__scratch3": {
+      "N": 74,
+      "max": 334026,
+      "mean": 123415.08108108108,
+      "min": 65820,
+      "sd": 46692.136373447545,
+      "sum": 9132716,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "stub": "price",
+      "plain": true,
+      "key": "__scratch1"
+     },
+     {
+      "stub": "mpg",
+      "plain": true,
+      "key": "__scratch2"
+     },
+     {
+      "blank": true
+     },
+     {
+      "header": "c.price#c.mpg",
+      "key": "__scratch3"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "       price |         74    6165.257    2949.496       3291      15906",
+    "         mpg |         74     21.2973    5.785503         12         41",
+    "             |",
+    "     c.price#|",
+    "       c.mpg |         74    123415.1    46692.14      65820     334026"
+   ]
+  },
+  {
+   "cell": "00d5d585bdf8b906",
+   "cmd": "summarize c.mpg##c.mpg",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 41,
+      "mean": 21.2972972972973,
+      "min": 12,
+      "sd": 5.785503209735141,
+      "sum": 1576,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 74,
+      "max": 1681,
+      "mean": 486.5945945945946,
+      "min": 144,
+      "sd": 282.0662954677047,
+      "sum": 36008,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "stub": "mpg",
+      "plain": true,
+      "key": "__scratch1"
+     },
+     {
+      "blank": true
+     },
+     {
+      "header": "c.mpg#c.mpg",
+      "key": "__scratch2"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "         mpg |         74     21.2973    5.785503         12         41",
+    "             |",
+    " c.mpg#c.mpg |         74    486.5946    282.0663        144       1681"
+   ]
+  },
+  {
+   "cell": "0e775ed86a0a27d0",
+   "cmd": "summarize i.foreign#i.rep78",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.028985507246376812,
+      "min": 0,
+      "sd": 0.16899482177531733,
+      "sum": 2,
+      "sum_w": 69
+     },
+     "__scratch2": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.11594202898550725,
+      "min": 0,
+      "sd": 0.32250088390476095,
+      "sum": 8,
+      "sum_w": 69
+     },
+     "__scratch3": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.391304347826087,
+      "min": 0,
+      "sd": 0.49161771686915634,
+      "sum": 27,
+      "sum_w": 69
+     },
+     "__scratch4": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.13043478260869565,
+      "min": 0,
+      "sd": 0.33924845477392546,
+      "sum": 9,
+      "sum_w": 69
+     },
+     "__scratch5": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.028985507246376812,
+      "min": 0,
+      "sd": 0.16899482177531733,
+      "sum": 2,
+      "sum_w": 69
+     },
+     "__scratch6": {
+      "N": 69,
+      "max": 0,
+      "mean": 0,
+      "min": 0,
+      "sd": 0,
+      "sum": 0,
+      "sum_w": 69
+     },
+     "__scratch7": {
+      "N": 69,
+      "max": 0,
+      "mean": 0,
+      "min": 0,
+      "sd": 0,
+      "sum": 0,
+      "sum_w": 69
+     },
+     "__scratch8": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.043478260869565216,
+      "min": 0,
+      "sd": 0.20542514084466046,
+      "sum": 3,
+      "sum_w": 69
+     },
+     "__scratch9": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.13043478260869565,
+      "min": 0,
+      "sd": 0.33924845477392546,
+      "sum": 9,
+      "sum_w": 69
+     },
+     "__scratch10": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.13043478260869565,
+      "min": 0,
+      "sd": 0.33924845477392546,
+      "sum": 9,
+      "sum_w": 69
+     }
+    },
+    "fvrows": [
+     {
+      "header": "foreign#rep78"
+     },
+     {
+      "stub": "Domestic#1",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Domestic#2",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "Domestic#3",
+      "key": "__scratch3"
+     },
+     {
+      "stub": "Domestic#4",
+      "key": "__scratch4"
+     },
+     {
+      "stub": "Domestic#5",
+      "key": "__scratch5"
+     },
+     {
+      "stub": "Foreign#1",
+      "key": "__scratch6",
+      "empty": true
+     },
+     {
+      "stub": "Foreign#2",
+      "key": "__scratch7",
+      "empty": true
+     },
+     {
+      "stub": "Foreign#3",
+      "key": "__scratch8"
+     },
+     {
+      "stub": "Foreign#4",
+      "key": "__scratch9"
+     },
+     {
+      "stub": "Foreign#5",
+      "key": "__scratch10"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "     foreign#|",
+    "       rep78 |",
+    " Domestic#1  |         69    .0289855    .1689948          0          1",
+    " Domestic#2  |         69     .115942    .3225009          0          1",
+    " Domestic#3  |         69    .3913043    .4916177          0          1",
+    " Domestic#4  |         69    .1304348    .3392485          0          1",
+    " Domestic#5  |         69    .0289855    .1689948          0          1",
+    "-------------+---------------------------------------------------------",
+    "  Foreign#1  |         69   (empty)",
+    "  Foreign#2  |         69   (empty)",
+    "  Foreign#3  |         69    .0434783    .2054251          0          1",
+    "  Foreign#4  |         69    .1304348    .3392485          0          1",
+    "  Foreign#5  |         69    .1304348    .3392485          0          1"
+   ]
+  },
+  {
+   "cell": "d889d3aacad7ed03",
+   "cmd": "summarize i.race, allbaselevels",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 2246,
+      "max": 1,
+      "mean": 0.7288512911843277,
+      "min": 0,
+      "sd": 0.44465167986403076,
+      "sum": 1637,
+      "sum_w": 2246
+     },
+     "__scratch2": {
+      "N": 2246,
+      "max": 1,
+      "mean": 0.25957257346393586,
+      "min": 0,
+      "sd": 0.4384977339274136,
+      "sum": 583,
+      "sum_w": 2246
+     },
+     "__scratch3": {
+      "N": 2246,
+      "max": 1,
+      "mean": 0.01157613535173642,
+      "min": 0,
+      "sd": 0.1069917060267288,
+      "sum": 26,
+      "sum_w": 2246
+     }
+    },
+    "fvrows": [
+     {
+      "header": "race"
+     },
+     {
+      "stub": "White",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Black",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "Other",
+      "key": "__scratch3"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "        race |",
+    "      White  |      2,246    .7288513    .4446517          0          1",
+    "      Black  |      2,246    .2595726    .4384977          0          1",
+    "      Other  |      2,246    .0115761    .1069917          0          1"
+   ]
+  },
+  {
+   "cell": "d465147d8becd940",
+   "cmd": "summarize i.race, baselevels",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 2246,
+      "max": 1,
+      "mean": 0.7288512911843277,
+      "min": 0,
+      "sd": 0.44465167986403076,
+      "sum": 1637,
+      "sum_w": 2246
+     },
+     "__scratch2": {
+      "N": 2246,
+      "max": 1,
+      "mean": 0.25957257346393586,
+      "min": 0,
+      "sd": 0.4384977339274136,
+      "sum": 583,
+      "sum_w": 2246
+     },
+     "__scratch3": {
+      "N": 2246,
+      "max": 1,
+      "mean": 0.01157613535173642,
+      "min": 0,
+      "sd": 0.1069917060267288,
+      "sum": 26,
+      "sum_w": 2246
+     }
+    },
+    "fvrows": [
+     {
+      "header": "race"
+     },
+     {
+      "stub": "White",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Black",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "Other",
+      "key": "__scratch3"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "        race |",
+    "      White  |      2,246    .7288513    .4446517          0          1",
+    "      Black  |      2,246    .2595726    .4384977          0          1",
+    "      Other  |      2,246    .0115761    .1069917          0          1"
+   ]
+  },
+  {
+   "cell": "9382ecbca14155dc",
+   "cmd": "summarize i.race wage",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 2246,
+      "max": 1,
+      "mean": 0.7288512911843277,
+      "min": 0,
+      "sd": 0.44465167986403076,
+      "sum": 1637,
+      "sum_w": 2246
+     },
+     "__scratch2": {
+      "N": 2246,
+      "max": 1,
+      "mean": 0.25957257346393586,
+      "min": 0,
+      "sd": 0.4384977339274136,
+      "sum": 583,
+      "sum_w": 2246
+     },
+     "__scratch3": {
+      "N": 2246,
+      "max": 1,
+      "mean": 0.01157613535173642,
+      "min": 0,
+      "sd": 0.1069917060267288,
+      "sum": 26,
+      "sum_w": 2246
+     },
+     "__scratch4": {
+      "N": 2246,
+      "max": 40.74658966064453,
+      "mean": 7.76694903741006,
+      "min": 1.00495183467865,
+      "sd": 5.755522859382768,
+      "sum": 17444.567538022995,
+      "sum_w": 2246
+     }
+    },
+    "fvrows": [
+     {
+      "header": "race"
+     },
+     {
+      "stub": "White",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Black",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "Other",
+      "key": "__scratch3"
+     },
+     {
+      "blank": true
+     },
+     {
+      "stub": "wage",
+      "plain": true,
+      "key": "__scratch4"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "        race |",
+    "      White  |      2,246    .7288513    .4446517          0          1",
+    "      Black  |      2,246    .2595726    .4384977          0          1",
+    "      Other  |      2,246    .0115761    .1069917          0          1",
+    "             |",
+    "        wage |      2,246    7.766949    5.755523   1.004952   40.74659"
+   ]
+  },
+  {
+   "cell": "2d3b2c4f3cbea0e6",
+   "cmd": "summarize i.race#i.union wage",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.5596379126730564,
+      "min": 0,
+      "sd": 0.4965628014254786,
+      "sum": 1051,
+      "sum_w": 1878
+     },
+     "__scratch2": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.16080937167199147,
+      "min": 0,
+      "sd": 0.36745287336964333,
+      "sum": 302,
+      "sum_w": 1878
+     },
+     "__scratch3": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.18636847710330137,
+      "min": 0,
+      "sd": 0.38950745027103906,
+      "sum": 350,
+      "sum_w": 1878
+     },
+     "__scratch4": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.08040468583599573,
+      "min": 0,
+      "sd": 0.27199111172639284,
+      "sum": 151,
+      "sum_w": 1878
+     },
+     "__scratch5": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.008519701810436636,
+      "min": 0,
+      "sd": 0.09193267547473533,
+      "sum": 16,
+      "sum_w": 1878
+     },
+     "__scratch6": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.004259850905218318,
+      "min": 0,
+      "sd": 0.06514571672363786,
+      "sum": 8,
+      "sum_w": 1878
+     },
+     "__scratch7": {
+      "N": 2246,
+      "max": 40.74658966064453,
+      "mean": 7.76694903741006,
+      "min": 1.00495183467865,
+      "sd": 5.755522859382768,
+      "sum": 17444.567538022995,
+      "sum_w": 2246
+     }
+    },
+    "fvrows": [
+     {
+      "header": "race#union"
+     },
+     {
+      "stub": "White#Nonunion",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "White#Union",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "Black#Nonunion",
+      "key": "__scratch3"
+     },
+     {
+      "stub": "Black#Union",
+      "key": "__scratch4"
+     },
+     {
+      "stub": "Other#Nonunion",
+      "key": "__scratch5"
+     },
+     {
+      "stub": "Other#Union",
+      "key": "__scratch6"
+     },
+     {
+      "blank": true
+     },
+     {
+      "stub": "wage",
+      "plain": true,
+      "key": "__scratch7"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "  race#union |",
+    "      White #|",
+    "   Nonunion  |      1,878    .5596379    .4965628          0          1",
+    "White#Union  |      1,878    .1608094    .3674529          0          1",
+    "      Black #|",
+    "   Nonunion  |      1,878    .1863685    .3895075          0          1",
+    "Black#Union  |      1,878    .0804047    .2719911          0          1",
+    "      Other #|",
+    "   Nonunion  |      1,878    .0085197    .0919327          0          1",
+    "-------------+---------------------------------------------------------",
+    "Other#Union  |      1,878    .0042599    .0651457          0          1",
+    "             |",
+    "        wage |      2,246    7.766949    5.755523   1.004952   40.74659"
+   ]
+  },
+  {
+   "cell": "09bd852f8a330971",
+   "cmd": "summarize i.industry, fvwrapon(width)",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.0076164874551971325,
+      "min": 0,
+      "sd": 0.08695898174523652,
+      "sum": 17,
+      "sum_w": 2232
+     },
+     "__scratch2": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.0017921146953405018,
+      "min": 0,
+      "sd": 0.04230490349065861,
+      "sum": 4,
+      "sum_w": 2232
+     },
+     "__scratch3": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.012992831541218637,
+      "min": 0,
+      "sd": 0.11326855685844399,
+      "sum": 29,
+      "sum_w": 2232
+     },
+     "__scratch4": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.16442652329749105,
+      "min": 0,
+      "sd": 0.37074522813099137,
+      "sum": 367,
+      "sum_w": 2232
+     },
+     "__scratch5": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.04032258064516129,
+      "min": 0,
+      "sd": 0.196758773944469,
+      "sum": 90,
+      "sum_w": 2232
+     },
+     "__scratch6": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.14919354838709678,
+      "min": 0,
+      "sd": 0.3563589895637461,
+      "sum": 333,
+      "sum_w": 2232
+     },
+     "__scratch7": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.08602150537634409,
+      "min": 0,
+      "sd": 0.2804586361683453,
+      "sum": 192,
+      "sum_w": 2232
+     },
+     "__scratch8": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.03853046594982079,
+      "min": 0,
+      "sd": 0.1925161660606012,
+      "sum": 86,
+      "sum_w": 2232
+     },
+     "__scratch9": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.04345878136200717,
+      "min": 0,
+      "sd": 0.2039331965042339,
+      "sum": 97,
+      "sum_w": 2232
+     },
+     "__scratch10": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.0076164874551971325,
+      "min": 0,
+      "sd": 0.08695898174523652,
+      "sum": 17,
+      "sum_w": 2232
+     },
+     "__scratch11": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.36917562724014336,
+      "min": 0,
+      "sd": 0.4826897237462018,
+      "sum": 824,
+      "sum_w": 2232
+     },
+     "__scratch12": {
+      "N": 2232,
+      "max": 1,
+      "mean": 0.07885304659498207,
+      "min": 0,
+      "sd": 0.26956965870835253,
+      "sum": 176,
+      "sum_w": 2232
+     }
+    },
+    "fvrows": [
+     {
+      "header": "industry"
+     },
+     {
+      "stub": "Ag/Forestry/Fisheries",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Mining",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "Construction",
+      "key": "__scratch3"
+     },
+     {
+      "stub": "Manufacturing",
+      "key": "__scratch4"
+     },
+     {
+      "stub": "Transport/Comm/Utility",
+      "key": "__scratch5"
+     },
+     {
+      "stub": "Wholesale/Retail trade",
+      "key": "__scratch6"
+     },
+     {
+      "stub": "Finance/Ins/Real estate",
+      "key": "__scratch7"
+     },
+     {
+      "stub": "Business/Repair svc",
+      "key": "__scratch8"
+     },
+     {
+      "stub": "Personal services",
+      "key": "__scratch9"
+     },
+     {
+      "stub": "Entertainment/Rec svc",
+      "key": "__scratch10"
+     },
+     {
+      "stub": "Professional services",
+      "key": "__scratch11"
+     },
+     {
+      "stub": "Public administration",
+      "key": "__scratch12"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "    industry |",
+    "Ag/Forest~s  |      2,232    .0076165     .086959          0          1",
+    "     Mining  |      2,232    .0017921    .0423049          0          1",
+    "Construct~n  |      2,232    .0129928    .1132686          0          1",
+    "Manufactu~g  |      2,232    .1644265    .3707452          0          1",
+    "Transport~y  |      2,232    .0403226    .1967588          0          1",
+    "-------------+---------------------------------------------------------",
+    "Wholesale..  |      2,232    .1491935     .356359          0          1",
+    "Finance/I..  |      2,232    .0860215    .2804586          0          1",
+    "Business/..  |      2,232    .0385305    .1925162          0          1",
+    "Personal ..  |      2,232    .0434588    .2039332          0          1",
+    "Entertain..  |      2,232    .0076165     .086959          0          1",
+    "-------------+---------------------------------------------------------",
+    "Professio..  |      2,232    .3691756    .4826897          0          1",
+    "Public ad..  |      2,232     .078853    .2695697          0          1"
+   ]
+  },
+  {
+   "cell": "164a7b006a62a6bb",
+   "cmd": "summarize i.race#i.union, noemptycells",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.5596379126730564,
+      "min": 0,
+      "sd": 0.4965628014254786,
+      "sum": 1051,
+      "sum_w": 1878
+     },
+     "__scratch2": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.16080937167199147,
+      "min": 0,
+      "sd": 0.36745287336964333,
+      "sum": 302,
+      "sum_w": 1878
+     },
+     "__scratch3": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.18636847710330137,
+      "min": 0,
+      "sd": 0.38950745027103906,
+      "sum": 350,
+      "sum_w": 1878
+     },
+     "__scratch4": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.08040468583599573,
+      "min": 0,
+      "sd": 0.27199111172639284,
+      "sum": 151,
+      "sum_w": 1878
+     },
+     "__scratch5": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.008519701810436636,
+      "min": 0,
+      "sd": 0.09193267547473533,
+      "sum": 16,
+      "sum_w": 1878
+     },
+     "__scratch6": {
+      "N": 1878,
+      "max": 1,
+      "mean": 0.004259850905218318,
+      "min": 0,
+      "sd": 0.06514571672363786,
+      "sum": 8,
+      "sum_w": 1878
+     }
+    },
+    "fvrows": [
+     {
+      "header": "race#union"
+     },
+     {
+      "stub": "White#Nonunion",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "White#Union",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "Black#Nonunion",
+      "key": "__scratch3"
+     },
+     {
+      "stub": "Black#Union",
+      "key": "__scratch4"
+     },
+     {
+      "stub": "Other#Nonunion",
+      "key": "__scratch5"
+     },
+     {
+      "stub": "Other#Union",
+      "key": "__scratch6"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "  race#union |",
+    "      White #|",
+    "   Nonunion  |      1,878    .5596379    .4965628          0          1",
+    "White#Union  |      1,878    .1608094    .3674529          0          1",
+    "      Black #|",
+    "   Nonunion  |      1,878    .1863685    .3895075          0          1",
+    "Black#Union  |      1,878    .0804047    .2719911          0          1",
+    "      Other #|",
+    "   Nonunion  |      1,878    .0085197    .0919327          0          1",
+    "-------------+---------------------------------------------------------",
+    "Other#Union  |      1,878    .0042599    .0651457          0          1"
+   ]
+  },
+  {
+   "cell": "76a7b3e85f3041c2",
+   "cmd": "summarize D.price L.mpg",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 73,
+      "max": 8995,
+      "mean": 108.16438356164383,
+      "min": -12607,
+      "sd": 3600.7842317631103,
+      "sum": 7896,
+      "sum_w": 73
+     },
+     "__scratch2": {
+      "N": 73,
+      "max": 41,
+      "mean": 21.356164383561644,
+      "min": 12,
+      "sd": 5.803183664099337,
+      "sum": 1559,
+      "sum_w": 73
+     }
+    },
+    "fvrows": [
+     {
+      "header": "price"
+     },
+     {
+      "stub": "D1.",
+      "key": "__scratch1"
+     },
+     {
+      "blank": true
+     },
+     {
+      "header": "mpg"
+     },
+     {
+      "stub": "L1.",
+      "key": "__scratch2"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "       price |",
+    "         D1. |         73    108.1644    3600.784     -12607       8995",
+    "             |",
+    "         mpg |",
+    "         L1. |         73    21.35616    5.803184         12         41"
+   ]
+  },
+  {
+   "cell": "5a85631a15c31d9f",
+   "cmd": "summarize i.foreign price, nof",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.7027027027027027,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 52,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 74,
+      "max": 1,
+      "mean": 0.2972972972972973,
+      "min": 0,
+      "sd": 0.4601884584090189,
+      "sum": 22,
+      "sum_w": 74
+     },
+     "__scratch3": {
+      "N": 74,
+      "max": 15906,
+      "mean": 6165.256756756757,
+      "min": 3291,
+      "sd": 2949.495884768919,
+      "sum": 456229,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "header": "foreign"
+     },
+     {
+      "stub": "Domestic",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Foreign",
+      "key": "__scratch2"
+     },
+     {
+      "blank": true
+     },
+     {
+      "stub": "price",
+      "plain": true,
+      "key": "__scratch3"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "     foreign |",
+    "   Domestic  |         74    .7027027    .4601885          0          1",
+    "    Foreign  |         74    .2972973    .4601885          0          1",
+    "             |",
+    "       price |         74    6165.257    2949.496       3291      15906"
+   ]
+  },
+  {
+   "cell": "06f5fb176ac6c959",
+   "cmd": "summarize i.foreign#c.mpg",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 34,
+      "mean": 13.932432432432432,
+      "min": 0,
+      "sd": 9.948264915257294,
+      "sum": 1031,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 74,
+      "max": 41,
+      "mean": 7.364864864864865,
+      "min": 0,
+      "sd": 11.938856011285196,
+      "sum": 545,
+      "sum_w": 74
+     }
+    },
+    "fvrows": [
+     {
+      "header": "foreign#c.mpg"
+     },
+     {
+      "stub": "Domestic",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "Foreign",
+      "key": "__scratch2"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "     foreign#|",
+    "       c.mpg |",
+    "   Domestic  |         74    13.93243    9.948265          0         34",
+    "    Foreign  |         74    7.364865    11.93886          0         41"
+   ]
+  },
+  {
+   "cell": "6820eb0441cc7001",
+   "cmd": "summarize L(0/3).price",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 74,
+      "max": 15906,
+      "mean": 6165.256756756757,
+      "min": 3291,
+      "sd": 2949.495884768919,
+      "sum": 456229,
+      "sum_w": 74
+     },
+     "__scratch2": {
+      "N": 73,
+      "max": 15906,
+      "mean": 6085.397260273972,
+      "min": 3291,
+      "sd": 2888.2278531409283,
+      "sum": 444234,
+      "sum_w": 73
+     },
+     "__scratch3": {
+      "N": 72,
+      "max": 15906,
+      "mean": 6074.777777777777,
+      "min": 3291,
+      "sd": 2907.0608370801483,
+      "sum": 437384,
+      "sum_w": 72
+     },
+     "__scratch4": {
+      "N": 71,
+      "max": 15906,
+      "mean": 6094.183098591549,
+      "min": 3291,
+      "sd": 2923.0516945228865,
+      "sum": 432687,
+      "sum_w": 71
+     }
+    },
+    "fvrows": [
+     {
+      "header": "price"
+     },
+     {
+      "stub": "--.",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "L1.",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "L2.",
+      "key": "__scratch3"
+     },
+     {
+      "stub": "L3.",
+      "key": "__scratch4"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "       price |",
+    "         --. |         74    6165.257    2949.496       3291      15906",
+    "         L1. |         73    6085.397    2888.228       3291      15906",
+    "         L2. |         72    6074.778    2907.061       3291      15906",
+    "         L3. |         71    6094.183    2923.052       3291      15906"
+   ]
+  },
+  {
+   "cell": "ac836baef4b68438",
+   "cmd": "summarize i.rep78, fvwrap(1)",
+   "block": {
+    "type": "summarize",
+    "stats": {
+     "__scratch1": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.028985507246376812,
+      "min": 0,
+      "sd": 0.16899482177531733,
+      "sum": 2,
+      "sum_w": 69
+     },
+     "__scratch2": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.11594202898550725,
+      "min": 0,
+      "sd": 0.32250088390476095,
+      "sum": 8,
+      "sum_w": 69
+     },
+     "__scratch3": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.43478260869565216,
+      "min": 0,
+      "sd": 0.4993602044724246,
+      "sum": 30,
+      "sum_w": 69
+     },
+     "__scratch4": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.2608695652173913,
+      "min": 0,
+      "sd": 0.4423258684646914,
+      "sum": 18,
+      "sum_w": 69
+     },
+     "__scratch5": {
+      "N": 69,
+      "max": 1,
+      "mean": 0.15942028985507245,
+      "min": 0,
+      "sd": 0.36874941299243813,
+      "sum": 11,
+      "sum_w": 69
+     }
+    },
+    "fvrows": [
+     {
+      "header": "rep78"
+     },
+     {
+      "stub": "1",
+      "key": "__scratch1"
+     },
+     {
+      "stub": "2",
+      "key": "__scratch2"
+     },
+     {
+      "stub": "3",
+      "key": "__scratch3"
+     },
+     {
+      "stub": "4",
+      "key": "__scratch4"
+     },
+     {
+      "stub": "5",
+      "key": "__scratch5"
+     }
+    ]
+   },
+   "stata": [
+    "    Variable |        Obs        Mean    Std. dev.       Min        Max",
+    "-------------+---------------------------------------------------------",
+    "       rep78 |",
+    "          1  |         69    .0289855    .1689948          0          1",
+    "          2  |         69     .115942    .3225009          0          1",
+    "          3  |         69    .4347826    .4993602          0          1",
+    "          4  |         69    .2608696    .4423259          0          1",
+    "          5  |         69    .1594203    .3687494          0          1"
+   ]
+  }
+ ]
+}

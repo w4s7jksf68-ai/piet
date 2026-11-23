@@ -7,6 +7,10 @@
 #include "core/ident.h"
 #include "estimators/nlgmm.h"
 
+#include <algorithm>
+#include <cmath>
+#include <map>
+
 // P7 wave — nl, gmm.
 //
 // Both verbs are driven by a user EXPRESSION rather than a --y/--x varlist, so
@@ -96,6 +100,7 @@ expr::Program compile_body(const std::string& body, const char* cmd) {
     o.allow_params = true;
     o.allow_vars = true;
     o.allow_coefs = false;  // _b[...] refers to a FITTED model; there is none here yet
+    o.allow_eq_params = std::string(cmd) == "gmm";  // {eq:var} reaches gmm already expanded
     try {
         return expr::Program::compile(body, o);
     } catch (const std::runtime_error& ex) {
@@ -341,147 +346,316 @@ int cmd_nl(const std::vector<std::string>& a) {
 }
 
 int cmd_gmm(const std::vector<std::string>& a) {
-    const std::string spec = opt(a, "--expr");
+    const std::vector<std::string> specs = opt_all(a, "--expr");
     std::string data = opt(a, "--data");
-    const std::string instr = opt(a, "--instruments");
+    const std::vector<std::string> instrs = opt_all(a, "--instruments");
     const std::string vce = opt(a, "--vce", "robust");
-    const bool onestep = has(a, "--onestep");
-    if (data_missing(data) || spec.empty() || instr.empty()) {
+    const std::string wmatrix = opt(a, "--wmatrix", vce == "unadjusted" ? "unadjusted"
+                                                    : vce == "cluster" ? "cluster" : "robust");
+    const std::string winit = opt(a, "--winitial", "unadjusted");
+    const std::string clusterVar = opt(a, "--cluster");
+    const std::string wclusterVar = opt(a, "--wcluster", clusterVar);
+    const std::string weightVar = opt(a, "--weight"), wtype = opt(a, "--wtype");
+    const std::string eqnamesArg = opt(a, "--eqnames");
+    const bool onestep = has(a, "--onestep"), igmm = has(a, "--igmm");
+    (void)has(a, "--twostep");
+    const EsampleRequest esreq = esample_request(a, "gmm");
+    if (data_missing(data) || specs.empty() || instrs.empty()) {
         std::fprintf(stderr,
-                     "usage: cobra gmm --data f.hbin --expr \"(<residual in {params} and vars>)\" "
-                     "--instruments Z1,Z2 --onestep [--vce robust] [--level P] [--keepif EXPR] "
-                     "[--out f.json]\n"
-                     "  single-equation GMM (Stata `gmm`). The expression IS the residual.\n"
-                     "  A constant is appended to the instrument list (Stata's `_cons`).\n"
-                     "  e.g. --expr \"(y-{b0=2}-{b1=.5}*x1-{b2=-.2}*x2)\" --instruments x1,x2,z --onestep\n");
+                     "usage: cobra gmm --data f.hbin --expr \"(<residual>)\" [--expr ...] "
+                     "--instruments Z1,Z2 [--instruments ... one per --expr] [--eqnames a,b]\n"
+                     "  [--onestep|--twostep|--igmm] [--winitial unadjusted|identity|"
+                     "unadjusted_independent|identity_independent]\n"
+                     "  [--wmatrix robust|unadjusted|cluster] [--wcluster V] [--vce robust|unadjusted|cluster] "
+                     "[--cluster V]\n"
+                     "  [--weight W --wtype aw|pw|fw|iw] [--level P] [--keepif EXPR] [--out f.json]\n"
+                     "  Stata `gmm` (interactive). Each expression IS a residual; a constant is appended\n"
+                     "  to every instrument list. Parameters {name} / {eq:name}; the default estimator is\n"
+                     "  two-step with an unadjusted initial and a robust weight matrix.\n");
         return 2;
     }
-    // Two-step GMM would re-weight by S(b1)^-1 and change the covariance with it;
-    // nothing in this wave's oracle pins either. Reject rather than emit numbers
-    // no measurement stands behind.
-    if (!onestep)
-        throw EngineError("unsupported",
-            "gmm: only --onestep is implemented (the one-step estimator with the unadjusted "
-            "initial weight matrix); two-step GMM is not in this build");
-    if (vce != "robust")
-        throw EngineError("unsupported",
-            "gmm: --vce " + vce + " is not implemented; the robust sandwich that Stata `gmm` "
-            "reports by default is the only covariance pinned in this build");
+    if (onestep && igmm) throw EngineError("bad_input", "gmm: --onestep and --igmm are exclusive");
+    auto typeOf = [](const std::string& t, const char* what) {
+        if (t == "robust") return 0;
+        if (t == "unadjusted") return 1;
+        if (t == "cluster") return 2;
+        throw EngineError("bad_input", std::string("gmm: --") + what + " must be robust, unadjusted or cluster (got '" + t + "')");
+    };
+    const int vceT = typeOf(vce, "vce"), wmT = typeOf(wmatrix, "wmatrix");
+    if ((vceT == 2 && clusterVar.empty()) || (wmT == 2 && wclusterVar.empty()))
+        throw EngineError("bad_input", "gmm: cluster type needs --cluster VAR");
+    int winitT = 0;
+    bool winitIndep = false;
+    if (winit == "unadjusted") winitT = 0;
+    else if (winit == "identity") winitT = 1;
+    else if (winit == "unadjusted_independent") { winitT = 0; winitIndep = true; }
+    else if (winit == "identity_independent") winitT = 1;
+    else throw EngineError("bad_input", "gmm: --winitial must be unadjusted, identity, unadjusted_independent or identity_independent");
     const bool level_set = has(a, "--level");
     const double level = std::stod(opt(a, "--level", "95"));
     if (level_set && (level < 10.0 || level > 99.99)) {
         std::fprintf(stderr, "gmm: --level must be in [10, 99.99] (got %s).\n", opt(a, "--level").c_str());
         return 2;
     }
+    const int M = static_cast<int>(specs.size());
+    if (instrs.size() != 1 && static_cast<int>(instrs.size()) != M)
+        throw EngineError("bad_input", "gmm: give one --instruments, or one per --expr");
 
-    const std::string body = strip_outer_parens(spec);
-    if (top_level_assign(body) != std::string::npos)
-        throw EngineError("bad_input",
-            "gmm: --expr is the RESIDUAL, not an equation — it must not contain a top-level '=' "
-            "(got \"" + spec + "\")");
-    const expr::Program prog = compile_body(body, "gmm");
-    if (prog.params().empty())
+    // equations: compile, and map each program's parameters onto the global
+    // first-appearance order across the equations (Stata's e(params)).
+    std::vector<expr::Program> progs;
+    std::vector<std::string> pnames;
+    std::vector<double> b0;
+    std::vector<std::vector<int>> pmap;
+    std::vector<std::string> allVars;
+    for (int m = 0; m < M; ++m) {
+        const std::string body = strip_outer_parens(specs[static_cast<size_t>(m)]);
+        if (top_level_assign(body) != std::string::npos)
+            throw EngineError("bad_input",
+                "gmm: --expr is the RESIDUAL, not an equation — it must not contain a top-level '=' "
+                "(got \"" + specs[static_cast<size_t>(m)] + "\")");
+        progs.push_back(compile_body(body, "gmm"));
+        std::vector<int> mp;
+        for (const expr::Param& p : progs.back().params()) {
+            int at = -1;
+            for (size_t q = 0; q < pnames.size(); ++q)
+                if (pnames[q] == p.name) { at = static_cast<int>(q); break; }
+            if (at < 0) {
+                at = static_cast<int>(pnames.size());
+                pnames.push_back(p.name);
+                b0.push_back(p.init);
+            } else if (p.init_set) {
+                b0[static_cast<size_t>(at)] = p.init;
+            }
+            mp.push_back(at);
+        }
+        pmap.push_back(mp);
+        for (const std::string& v : progs.back().variables())
+            if (std::find(allVars.begin(), allVars.end(), v) == allVars.end()) allVars.push_back(v);
+    }
+    if (pnames.empty())
         throw EngineError("bad_input",
             "gmm: the model has no {parameters} to estimate — write them as {name} or {name=init}");
+    std::vector<std::vector<std::string>> zs;
+    std::vector<std::string> zAll;
+    for (int m = 0; m < M; ++m) {
+        zs.push_back(split_vars(instrs[instrs.size() == 1 ? 0 : static_cast<size_t>(m)]));
+        for (const std::string& v : zs.back())
+            if (std::find(zAll.begin(), zAll.end(), v) == zAll.end()) zAll.push_back(v);
+    }
+    std::vector<std::string> eqnames = split_csv(eqnamesArg);
+    if (eqnames.size() != static_cast<size_t>(M)) {
+        eqnames.clear();
+        for (int m = 0; m < M; ++m) eqnames.push_back(std::to_string(m + 1));
+    }
 
-    std::vector<std::string> zs = split_vars(instr);
-    if (zs.empty()) throw EngineError("bad_input", "gmm: --instruments named no variables");
-
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    const std::string original_data = data;
+    const std::string keepif = opt(a, "--keepif");
+    data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
 
-    // STAGE 1 — markout on the INSTRUMENTS only. This is what makes Stata's
-    // "missing values returned ... at initial values" note possible at all: a row
-    // whose expression variable is missing but whose instruments are complete
-    // survives this stage and is caught by stage 2.
-    const ExprData d = gather_expr_vars(ds, "gmm", prog.variables(), zs, /*listwise_vars=*/false);
-    require_sample(d.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
-    const int64_t n_markout = d.n;
-
-    const int nv = d.nv;
-    const double* vals0 = d.vals.data();
-    const std::vector<double> b0 = initial_values(prog);
-
-    // STAGE 2 — evaluate the residual at the INITIAL values and drop the rows
-    // where it comes back missing, counting them for the note.
-    std::vector<int64_t> sel;
-    sel.reserve(static_cast<size_t>(d.n));
+    // STAGE 1 — markout on the instruments, the weight and the cluster variables.
+    std::vector<std::string> lw = zAll;
+    if (!weightVar.empty()) lw.push_back(weightVar);
+    if (vceT == 2) lw.push_back(clusterVar);
+    if (wmT == 2 && wclusterVar != clusterVar) lw.push_back(wclusterVar);
+    const ExprData d = gather_expr_vars(ds, "gmm", allVars, lw, /*listwise_vars=*/false);
+    std::vector<int64_t> keep1;
+    const double* wsrc = weightVar.empty() ? nullptr : require_num(ds, "gmm", weightVar);
     for (int64_t i = 0; i < d.n; ++i) {
-        expr::VarSource vs;
-        vs.values = vals0 + static_cast<size_t>(i) * static_cast<size_t>(nv);
-        if (std::isfinite(prog.eval(b0.data(), vs, nullptr))) sel.push_back(i);
+        const int64_t row = d.keep[static_cast<size_t>(i)];
+        if (wsrc && !(wsrc[row] > 0)) {
+            if (wsrc[row] < 0) throw EngineError("bad_input", "negative weights encountered");
+            continue;  // zero weight: out of the sample
+        }
+        keep1.push_back(i);
     }
-    const int64_t n_init_missing = d.n - static_cast<int64_t>(sel.size());
+    require_sample(static_cast<int64_t>(keep1.size()));
+    const int64_t n_markout = static_cast<int64_t>(keep1.size());
+    const int nv = d.nv;
+    auto varIndex = [&](const std::string& v) {
+        return static_cast<int>(std::find(allVars.begin(), allVars.end(), v) - allVars.begin());
+    };
+    // per-equation variable maps (program variable j -> column of d.vals)
+    std::vector<std::vector<int>> vmap;
+    for (int m = 0; m < M; ++m) {
+        std::vector<int> mp;
+        for (const std::string& v : progs[static_cast<size_t>(m)].variables()) mp.push_back(varIndex(v));
+        vmap.push_back(mp);
+    }
+    auto evalEq = [&](int m, const std::vector<double>& b, const double* rowVals) {
+        thread_local std::vector<double> lb, lv;
+        const auto& pm = pmap[static_cast<size_t>(m)];
+        lb.resize(pm.size());
+        for (size_t q = 0; q < pm.size(); ++q) lb[q] = b[static_cast<size_t>(pm[q])];
+        const auto& vm = vmap[static_cast<size_t>(m)];
+        lv.resize(vm.size() ? vm.size() : 1);
+        for (size_t q = 0; q < vm.size(); ++q) lv[q] = rowVals[vm[q]];
+        expr::VarSource vs;
+        vs.values = lv.data();
+        return progs[static_cast<size_t>(m)].eval(lb.data(), vs, nullptr);
+    };
+
+    // STAGE 2 — drop the rows whose residual is missing at the initial values.
+    std::vector<int64_t> sel;
+    sel.reserve(keep1.size());
+    int64_t n_init_missing = 0;
+    for (int64_t i : keep1) {
+        const double* rv = d.vals.data() + static_cast<size_t>(i) * static_cast<size_t>(nv);
+        bool ok = true;
+        for (int m = 0; m < M && ok; ++m) ok = std::isfinite(evalEq(m, b0, rv));
+        if (ok) sel.push_back(i);
+        else ++n_init_missing;
+    }
     const int64_t n = static_cast<int64_t>(sel.size());
     if (n == 0) {
         std::fprintf(stderr, "gmm: the residual is missing on every row at the initial values.\n");
         return 1;
     }
-
-    // Compact the expression variables onto the surviving rows, and build
-    // Z = [instruments..., 1] in the user's order with the constant LAST, which
-    // is the order Stata's "Instruments for equation 1: x1 x2 z _cons" reports.
     std::vector<double> vals(static_cast<size_t>(n) * static_cast<size_t>(nv > 0 ? nv : 1), 0.0);
-    for (int64_t i = 0; i < n; ++i)
+    std::vector<int64_t> rows(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        rows[static_cast<size_t>(i)] = d.keep[static_cast<size_t>(sel[static_cast<size_t>(i)])];
         for (int j = 0; j < nv; ++j)
             vals[static_cast<size_t>(i) * static_cast<size_t>(nv) + static_cast<size_t>(j)] =
-                d.vals[static_cast<size_t>(sel[static_cast<size_t>(i)]) * static_cast<size_t>(nv) +
-                       static_cast<size_t>(j)];
-
-    const int L = static_cast<int>(zs.size()) + 1;
-    std::vector<double> Z(static_cast<size_t>(n) * static_cast<size_t>(L), 1.0);
-    for (size_t c = 0; c < zs.size(); ++c) {
-        const double* src = require_num(ds, "gmm", zs[c]);
-        double* dst = Z.data() + c * static_cast<size_t>(n);
-        for (int64_t i = 0; i < n; ++i)
-            dst[i] = src[d.keep[static_cast<size_t>(sel[static_cast<size_t>(i)])]];
+                d.vals[static_cast<size_t>(sel[static_cast<size_t>(i)]) * static_cast<size_t>(nv) + static_cast<size_t>(j)];
     }
-
-    const double* valsp = vals.data();
-    const NlResidFn resid = [&](const std::vector<double>& b, int64_t i) {
-        expr::VarSource vs;
-        vs.values = valsp + static_cast<size_t>(i) * static_cast<size_t>(nv);
-        return prog.eval(b.data(), vs, nullptr);
+    // instruments, constant last
+    std::vector<std::vector<double>> Zs(static_cast<size_t>(M));
+    std::vector<int> Ls;
+    std::vector<const double*> Zp;
+    for (int m = 0; m < M; ++m) {
+        const auto& zm = zs[static_cast<size_t>(m)];
+        const int L = static_cast<int>(zm.size()) + 1;
+        Ls.push_back(L);
+        auto& Z = Zs[static_cast<size_t>(m)];
+        Z.assign(static_cast<size_t>(n) * static_cast<size_t>(L), 1.0);
+        for (size_t c = 0; c < zm.size(); ++c) {
+            const double* src = require_num(ds, "gmm", zm[c]);
+            for (int64_t i = 0; i < n; ++i) Z[c * static_cast<size_t>(n) + static_cast<size_t>(i)] = src[rows[static_cast<size_t>(i)]];
+        }
+    }
+    for (auto& Z : Zs) Zp.push_back(Z.data());
+    // weights
+    std::vector<double> wv, omv;
+    double Nw = static_cast<double>(n);
+    const bool freqW = wtype == "fw" || wtype == "fweight" || wtype == "iw" || wtype == "iweight";
+    if (wsrc) {
+        wv.resize(static_cast<size_t>(n));
+        double sw = 0;
+        for (int64_t i = 0; i < n; ++i) sw += (wv[static_cast<size_t>(i)] = wsrc[rows[static_cast<size_t>(i)]]);
+        omv = wv;
+        if (freqW) {
+            Nw = sw;
+        } else {
+            for (double& v : wv) v *= static_cast<double>(n) / sw;
+            for (size_t i = 0; i < wv.size(); ++i) omv[i] = wv[i] * wv[i];
+        }
+    }
+    // clusters
+    auto codes = [&](const std::string& var, std::vector<int64_t>* out) {
+        const double* src = require_num(ds, "gmm", var);
+        std::map<double, int64_t> id;
+        out->resize(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i) {
+            const double v = src[rows[static_cast<size_t>(i)]];
+            auto it = id.find(v);
+            if (it == id.end()) it = id.emplace(v, static_cast<int64_t>(id.size())).first;
+            (*out)[static_cast<size_t>(i)] = it->second;
+        }
     };
+    std::vector<int64_t> vcl, wcl;
+    if (vceT == 2) codes(clusterVar, &vcl);
+    if (wmT == 2) codes(wclusterVar, &wcl);
 
-    std::vector<std::string> pnames;
-    for (const expr::Param& p : prog.params()) pnames.push_back(p.name);
-    const GmmResult r = gmm_fit(resid, Z.data(), n, L, b0, pnames);
-    if (!r.ok) throw EngineError("no_convergence", r.err.empty() ? "gmm: the fit failed" : r.err);
+    GmmExSpec sp;
+    sp.M = M;
+    sp.L = Ls;
+    sp.Z = Zp;
+    sp.n = n;
+    sp.b0 = b0;
+    const double* valsp = vals.data();
+    sp.resid = [&](int m, const std::vector<double>& b, int64_t i) {
+        return evalEq(m, b, valsp + static_cast<size_t>(i) * static_cast<size_t>(nv));
+    };
+    sp.w = wv.empty() ? nullptr : wv.data();
+    sp.omega = omv.empty() ? nullptr : omv.data();
+    sp.Nw = Nw;
+    sp.winit = winitT;
+    sp.winit_independent = winitIndep;
+    sp.estimator = onestep ? 0 : (igmm ? 2 : 1);
+    sp.wmatrix = wmT;
+    sp.wclus = wcl.empty() ? nullptr : wcl.data();
+    sp.vce = vceT;
+    sp.vclus = vcl.empty() ? nullptr : vcl.data();
+    const GmmExResult r = gmm_fit_ex(sp);
+    if (!r.ok) throw EngineError(r.err_code.empty() ? "no_convergence" : r.err_code,
+                                 r.err.empty() ? "gmm: the fit failed" : r.err);
+    const int k = r.k, L = r.Ltot;
 
     // Asymptotic z inference — Stata's `gmm` header reports z, not t.
     const double zc = z_critical(level == 95.0 ? 0.05 : 1.0 - level / 100.0);
     json coefs = json::array();
-    for (int j = 0; j < r.k; ++j) {
-        const double b = r.beta[static_cast<size_t>(j)], se = r.se[static_cast<size_t>(j)];
+    for (int j = 0; j < k; ++j) {
+        const double b = r.beta[static_cast<size_t>(j)];
+        const double se = std::sqrt(std::max(0.0, r.V[static_cast<size_t>(j) * static_cast<size_t>(k) + static_cast<size_t>(j)]));
         const double z = (se > 0) ? b / se : 0.0;
-        coefs.push_back({{"name", "/" + r.names[static_cast<size_t>(j)]},
+        const std::string& nm = pnames[static_cast<size_t>(j)];
+        coefs.push_back({{"name", nm.find(':') == std::string::npos ? "/" + nm : nm},
                          {"b", b}, {"se", se}, {"z", z},
-                         // erfc(|z|/sqrt2) IS the two-sided normal tail. Written
-                         // that way rather than as 2*(1 - Phi(|z|)): the latter
-                         // cancels to a hard 0 past |z| ~ 8, which would report
-                         // p = 0 for this fixture's z = -10.79 (true 3.8e-27).
+                         // erfc(|z|/sqrt2) IS the two-sided normal tail (no 1 - Phi cancellation).
                          {"p", (se > 0) ? std::erfc(std::fabs(z) * 0.7071067811865476) : 1.0},
                          {"ci_lo", b - zc * se}, {"ci_hi", b + zc * se}});
     }
-    std::vector<std::string> znames = zs;
+    std::vector<std::string> znames = zs[0];
     znames.push_back("_cons");
-
-    json out = {{"estimator", "gmm"}, {"expr", spec},
+    auto sq = [](const std::vector<double>& m, int dim) {
+        json rowsJ = json::array();
+        for (int i = 0; i < dim; ++i) {
+            json row = json::array();
+            for (int j = 0; j < dim; ++j) row.push_back(m[static_cast<size_t>(i) * static_cast<size_t>(dim) + static_cast<size_t>(j)]);
+            rowsJ.push_back(row);
+        }
+        return rowsJ;
+    };
+    json Gj = json::array();
+    for (int l = 0; l < L; ++l) {
+        json row = json::array();
+        for (int j = 0; j < k; ++j) row.push_back(r.G[static_cast<size_t>(j) * static_cast<size_t>(L) + static_cast<size_t>(l)]);
+        Gj.push_back(row);
+    }
+    json eqs = json::array();
+    for (int m = 0; m < M; ++m) {
+        json pl = json::array();
+        for (int q : pmap[static_cast<size_t>(m)]) pl.push_back(pnames[static_cast<size_t>(q)]);
+        json il = zs[static_cast<size_t>(m)];
+        il.push_back("_cons");
+        eqs.push_back({{"name", eqnames[static_cast<size_t>(m)]}, {"params", pl}, {"instruments", il}});
+    }
+    const char* estName = onestep ? "onestep" : (igmm ? "igmm" : "twostep");
+    json gm = {{"params", pnames}, {"b", r.beta}, {"init", b0}, {"V", sq(r.V, k)},
+               {"V_modelbased", sq(r.Vmb, k)}, {"S", sq(r.S, L)}, {"W", sq(r.W, L)}, {"G", Gj},
+               {"Q", r.Q}, {"Q_criterion", r.Qcrit}, {"J", r.J}, {"J_df", L - k},
+               // Stata's e(N) is floor(sum of weights) for iweights (as regress); J keeps the unfloored sum
+               {"N", std::floor(Nw)}, {"n_moments", L}, {"rank", k}, {"ic", r.ic}, {"equations", eqs},
+               {"estimator", estName}, {"converged", r.converged}};
+    if (vceT == 2 || wmT == 2) gm["N_clust"] = r.n_clust;
+    json out = {{"estimator", "gmm"}, {"expr", specs[0]},
                 {"n_obs", n}, {"n_dropped_missing", ds.n_rows() - n},
                 {"n_instrument_markout", n_markout},  // rows surviving stage 1 (see the header)
-                {"n_params", r.k}, {"n_moments", r.n_moments},
-                {"instruments", znames}, {"onestep", true},
-                {"winitial", "unadjusted"}, {"vce", vce},
-                {"coefs", coefs}, {"criterion", r.q},
+                {"n_params", k}, {"n_moments", L},
+                {"instruments", znames}, {"onestep", onestep},
+                {"winitial", winit}, {"vce", vce},
+                {"coefs", coefs}, {"criterion", r.Qcrit},
                 {"iterations", iteration_log(r.iters, "criterion")},
-                {"converged", r.converged}};
+                {"converged", r.converged}, {"gmm", gm}};
     if (level_set) out["level"] = level;
     std::vector<std::string> notes;
     if (n_init_missing > 0)
         notes.push_back(std::to_string(static_cast<long long>(n_init_missing)) +
                         " missing values returned for equation 1 at initial values.");
     add_warnings(out, notes);
+    if (esreq.active()) emit_esample(esreq, "gmm", original_data, keepif, false, {rows, &ds}, out);
     emit(out, opt(a, "--out"));
     return 0;
 }

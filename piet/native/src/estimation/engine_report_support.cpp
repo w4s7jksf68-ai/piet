@@ -183,6 +183,7 @@ void postEClass(SessionState& session, const std::string& cobraCmd, const std::s
                 const std::string& weightVar, const std::string& wtype) {
   LastModel lm;
   lm.ePosted = ePosted;
+  if (!ePosted) lm.esample = LastModel::EsampleState::kNone;
   lm.fitWeight = weightVar;  // e(wtype)/e(wexp)
   lm.fitWtype = wtype;
   lm.cobraCmd = cobraCmd;

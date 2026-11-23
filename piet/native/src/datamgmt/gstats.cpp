@@ -182,10 +182,84 @@ ojson runGstats(const eval::ParsedCommand& parsed, SessionState& session) {
     return runSummarize(varsOpt, detail, session, parsed.ifExpr);
   }
 
+  // What gtools checks before it computes, in its order, for the
+  // sub-commands computed nowhere in this build (vs-stata bank):
+  // hdfe/residualize are beta functions and refuse without the global
+  // GTOOLS_BETA (57b533398a4d6009); transform/moving/range take no gen()
+  // (9bdaf3b1cd8cc98f), name their statistics from a fixed list ("Unknown
+  // transformations: lag", cea723f0755175d8) and refuse a target that exists
+  // without replace (fa5bd0cbc944b5f0, `(mean) price` targets price).
+  auto rc198 = [](const std::string& message) {
+    return ojson(eval::errorBlock("syntax_error", message, std::nullopt, std::nullopt,
+                                  std::nullopt, "r(198)"));
+  };
+  if (sub == "hdfe" || sub == "residualize") {
+    if (session.eval.globals.get("GTOOLS_BETA") != "I KNOW WHAT I AM DOING")
+      return rc198("This function is in beta; to use, you must enable beta features via\n"
+                   "    global GTOOLS_BETA = \"I KNOW WHAT I AM DOING\"");
+  }
+  if (sub == "transform" || sub == "moving" || sub == "range") {
+    for (const auto& kv : parsed.opts) {
+      const std::string k = strutil::lower(kv.first);
+      if (k == "gen" || k == "generate") return rc198("option gen() not allowed");
+    }
+    // The target-exists check reads the targets as typed; autorename and
+    // wildparse name them another way, so with those it is not made here.
+    bool replace = false;
+    for (const auto& kv : parsed.opts) {
+      const std::string k = strutil::lower(kv.first);
+      auto abbrev = [&](const std::string& full, size_t minLen) {
+        return k.size() >= minLen && k.size() <= full.size() && full.compare(0, k.size(), k) == 0;
+      };
+      if (k == "replace" || abbrev("autorename", 4) || abbrev("wildparse", 4)) replace = true;
+    }
+    // `(stat [args]) [target=]source ...`, the head as typed.
+    std::string head;
+    for (const auto& w : vars) head += (head.empty() ? "" : " ") + w;
+    static const std::unordered_set<std::string> kTransforms = {
+        "demean", "demedian", "normalize", "standardize", "cumsum", "moving", "range", "rank",
+        "shift"};
+    size_t pos = 0;
+    while (pos < head.size()) {
+      while (pos < head.size() && head[pos] == ' ') ++pos;
+      if (pos >= head.size()) break;
+      if (head[pos] == '(') {
+        const size_t close = head.find(')', pos);
+        if (close == std::string::npos) break;
+        const std::vector<std::string> words = splitWords(head.substr(pos + 1, close - pos - 1));
+        if (sub == "transform" && !words.empty() && kTransforms.count(strutil::lower(words[0])) == 0) {
+          std::string listed;
+          for (const auto& w : words) listed += (listed.empty() ? "" : "|") + w;
+          return rc198("Unknown transformations: " + listed);
+        }
+        pos = close + 1;
+        continue;
+      }
+      size_t end = head.find(' ', pos);
+      if (end == std::string::npos) end = head.size();
+      std::string token = head.substr(pos, end - pos);
+      pos = end;
+      if (token.find('=') != std::string::npos) token = token.substr(0, token.find('='));
+      if (token.empty() || replace) continue;
+      if (session.hasData() && session.datastore() != nullptr && session.datastore()->has(token))
+        return rc198("gstats_transform: target " + token + " exists without replace");
+      // `pd = price` arrives as three words: skip the `=` and the source.
+      while (pos < head.size() && head[pos] == ' ') ++pos;
+      if (pos < head.size() && head[pos] == '=') {
+        ++pos;
+        while (pos < head.size() && head[pos] == ' ') ++pos;
+        while (pos < head.size() && head[pos] != ' ') ++pos;
+      }
+    }
+  }
+
   // Known gtools sub-commands with no native twin here. Named individually so
   // the reason field distinguishes them and so a later wave can find them.
+  // `dir` is one (gtools' own "Unknown stat" message names it, 68c6bf52d2b84e24);
+  // what it prints is not in the bank, so it keeps the not-implemented refusal.
   static const std::unordered_set<std::string> kKnownSubs = {"tab", "transform", "hdfe", "range",
-                                                             "moving"};
+                                                             "moving", "residualize", "tabstat",
+                                                             "dir"};
   if (kKnownSubs.count(sub) != 0) {
     return gstatsRefusal(sub, eval::UnsupportedCommandKind::kNotImplemented);
   }
@@ -193,7 +267,10 @@ ojson runGstats(const eval::ParsedCommand& parsed, SessionState& session) {
   // implemented, this word is not one of its sub-commands", which is a
   // different sentence from "PIET has not built this yet" and the only one that
   // points at a typo.
-  return gstatsRefusal(sub, eval::UnsupportedCommandKind::kUnknownSubcommand);
+  // gtools reads any other word as a statistic name it does not know.
+  return ojson(eval::errorBlock("syntax_error",
+                                "Unknown stat " + parsed.varlist[0] + ". See help gstats or gstats dir.",
+                                std::nullopt, std::nullopt, std::nullopt, "r(198)"));
 }
 
 // gtools' gstats leaves r(J), r(minJ) and r(maxJ) (the sample is one group), and for winsor the

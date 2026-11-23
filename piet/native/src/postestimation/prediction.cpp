@@ -31,6 +31,7 @@
 #include "piet/translate.h"
 #include "piet/scratch_seq.h"
 #include "estimation/estimation_internal.h"
+#include "eval/macro_results_internal.h"  // resolveEScalar (predict after posted-index fits)
 #include "estimators/postest_names.h"  // parse_level_ref (the engine's one resolver)
 #include "estimators/posthest.h"  // margins_grid / margins_parse_at (header-inline)
 
@@ -245,11 +246,23 @@ std::string predictStatisticM4(const std::string& k) {
   if (k == "r" || k == "re" || k == "res" || k == "resi" || k == "resid" || k == "residuals") {
     return "residuals";
   }
-  if (k == "sc" || k == "score") return "score";
+  if (k == "sc" || k == "score" || k == "sco" || k == "scor" || k == "scores") return "score";
   if (k == "rsta" || k == "rstandard") return "rstandard";
   if (k == "rstu" || k == "rstudent") return "rstudent";
   if (k == "lev" || k == "leverage" || k == "hat") return "hat";
   if (k == "dr" || k == "dresid" || k == "dresiduals") return "dresiduals";
+  // regress's {opt l:everage} | {opt h:at}, {opt c:ooksd}, {opt cov:ratio},
+  // {opt dfi:ts}, {opt w:elsch} ([R] regress postestimation; bank 098c8a8b
+  // `predict double h, h`, 4c745632 `predict double h, l`, both rc 0).
+  auto prefixOf = [&k](const char* full, size_t minLen) {
+    const std::string f(full);
+    return k.size() >= minLen && k.size() <= f.size() && f.compare(0, k.size(), k) == 0;
+  };
+  if (prefixOf("leverage", 1) || prefixOf("hat", 1)) return "hat";
+  if (prefixOf("cooksd", 1)) return "cooksd";
+  if (prefixOf("covratio", 3)) return "covratio";
+  if (prefixOf("dfits", 3)) return "dfits";
+  if (prefixOf("welsch", 1)) return "welsch";
   return k;
 }
 
@@ -293,7 +306,7 @@ std::string mlPredictStatisticM4(const std::string& cmd, const std::string& k) {
 bool predictServesM4(PredictFamilyM4 f, const std::string& s) {
   static const std::set<std::string> kRegress = {"xb",   "residuals", "score",    "stdp",    "stdf",
                                                  "stdr", "rstandard", "rstudent", "hat",
-                                                 "cooksd"};
+                                                 "cooksd", "covratio", "dfits", "welsch"};
   static const std::set<std::string> kAreg = {"xb", "stdp", "dresiduals", "xbd", "d", "residuals",
                                               "score"};
   static const std::set<std::string> kXtregFe = {"xb", "stdp", "ue", "xbu", "u", "e", "residuals"};
@@ -353,11 +366,46 @@ std::string predictEngineServedM4(PredictFamilyM4 f, const std::string& s) {
   }
 }
 
+// After a fit whose e(vcetype) is "Robust" or "HAC" (vce(robust), vce(cluster
+// V)), regress's predict refuses its leverage-based and truncated-normal
+// statistics before computing anything: cooksd, covratio, dfbeta(), dfits, e(),
+// hat, leverage, pr(), rstandard, rstudent, stdf, stdr, welsch, ystar(), each
+// r(198) "option <name> not allowed after robust estimation", an option taking
+// an argument named with "()" ([R] regress postestimation; bank 85a4e3c9
+// `predict double sf, stdf` after `regress price mpg weight, vce(robust)`). The
+// first trapped option in that order is the one named. "" = nothing trapped.
+std::string regressRobustTrapM4(const std::vector<std::pair<std::string, eval::OptValue>>& opts) {
+  struct Trap {
+    const char* full;
+    size_t minLen;
+    bool takesArg;
+  };
+  static const Trap kTraps[] = {
+      {"cooksd", 1, false},    {"covratio", 3, false}, {"dfbeta", 3, true},   {"dfits", 3, false},
+      {"e", 1, true},          {"hat", 1, false},      {"leverage", 1, false}, {"pr", 1, true},
+      {"rstandard", 4, false}, {"rstudent", 4, false}, {"stdf", 4, false},    {"stdr", 4, false},
+      {"welsch", 1, false},    {"ystar", 2, true}};
+  for (const Trap& t : kTraps) {
+    const std::string f(t.full);
+    for (const auto& [k, v] : opts) {
+      if (v.isBool != !t.takesArg) continue;
+      if (v.isBool && !v.boolValue) continue;
+      if (k.size() >= t.minLen && k.size() <= f.size() && f.compare(0, k.size(), k) == 0)
+        return "option " + f + (t.takesArg ? "()" : "") + " not allowed after robust estimation";
+    }
+  }
+  return "";
+}
+
 // The one statistic the options name, or the refusal block.
 std::optional<ojson> resolvePredictStatM4(PredictFamilyM4 f, const LastModel& lm,
                                           const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-                                          std::string& stat) {
+                                          std::string& stat, const std::string& eVcetype) {
   stat.clear();
+  if (f == PredictFamilyM4::Regress && (eVcetype == "Robust" || eVcetype == "HAC")) {
+    const std::string trap = regressRobustTrapM4(opts);
+    if (!trap.empty()) return engineErrorBlockM4(trap, "syntax_error");
+  }
   for (const auto& [k, v] : opts) {
     if (k == "quietly" || k == "noisily") continue;
     const std::string s = predictStatisticM4(k);
@@ -371,6 +419,24 @@ std::optional<ojson> resolvePredictStatM4(PredictFamilyM4 f, const LastModel& lm
       if (!stat.empty()) return engineErrorBlockM4("predict: only one statistic may be specified", "syntax_error");
       stat = "e(" + v.strValue + ")";
       continue;
+    }
+    // regress's pr(a,b), ystar(a,b) (regre_p2's CalcP / CalcY) and dfbeta(varname)
+    // ({opt ys:tar}, {opt dfb:eta}; bank aa45aaba `pr(0,5000)`, 78d530d4
+    // `ystar(4000,.)`, 6f216824 `dfb(mpg)`).
+    if (f == PredictFamilyM4::Regress && !v.isBool) {
+      auto prefixOf = [&k](const char* full, size_t minLen) {
+        const std::string fl(full);
+        return k.size() >= minLen && k.size() <= fl.size() && fl.compare(0, k.size(), k) == 0;
+      };
+      std::string head;
+      if (prefixOf("pr", 1)) head = "pr";
+      else if (prefixOf("ystar", 2)) head = "ystar";
+      else if (prefixOf("dfbeta", 3)) head = "dfbeta";
+      if (!head.empty()) {
+        if (!stat.empty()) return engineErrorBlockM4("predict: only one statistic may be specified", "syntax_error");
+        stat = head + "(" + v.strValue + ")";
+        continue;
+      }
     }
     if (!bare || !predictServesM4(f, s)) {
       return engineErrorBlockM4("predict " + k + ": not supported after `" + predictFamilyCmdM4(f, lm) +
@@ -654,7 +720,9 @@ double jsonNumM4(const ojson& o, const char* key) {
 std::optional<ojson> computePredictNativeM4(SessionState& session, const LastModel& lm,
                                             PredictFamilyM4 fam, const std::string& stat,
                                             std::vector<std::string> engineArgs,
-                                            std::vector<double>& vals) {
+                                            std::vector<double>& vals,
+                                            eval::EvalMatrix* dfbTable = nullptr,
+                                            double level = 95.0) {
   const std::string cmd = predictFamilyCmdM4(fam, lm);
   auto refuse = [&](const std::string& why) {
     return engineErrorBlockM4("predict, " + stat + " after `" + cmd +
@@ -676,8 +744,12 @@ std::optional<ojson> computePredictNativeM4(SessionState& session, const LastMod
   // absorbed FE the prediction's variance needs _cons's covariances, which only
   // the iid algebra reaches from here (the engine's lincom cannot address the
   // reconstructed _cons row).
+  // dfbeta(), covratio, dfits and welsch are built from the leverage and the
+  // Studentized residual (regres_p.ado), so they share that restriction.
+  const bool dfbStat = stat.rfind("dfbeta(", 0) == 0;
+  const bool influence = dfbStat || stat == "covratio" || stat == "dfits" || stat == "welsch";
   if (!iid && (stat == "hat" || stat == "stdr" || stat == "stdf" || stat == "rstandard" ||
-               stat == "rstudent" || stat == "cooksd")) {
+               stat == "rstudent" || stat == "cooksd" || influence)) {
     return engineErrorBlockM4("predict, " + stat + " is not available after a `regress` with a "
                               "robust or clustered VCE; Stata computes it only under vce(ols)",
                               "unsupported_option");
@@ -689,10 +761,14 @@ std::optional<ojson> computePredictNativeM4(SessionState& session, const LastMod
   // BUG-1260: regress's e(a,b) = E(xb + u | a < xb + u < b) with u ~ N(0, e(rmse)^2)
   // (regre_p2.ado CalcE); each bound a number or `.` (unbounded). A variable or
   // expression bound is not read here.
-  const bool eStat = stat.rfind("e(", 0) == 0;
+  // pr(a,b) and ystar(a,b) take the same two bounds (regre_p2's CalcP / CalcY).
+  const bool prStat = stat.rfind("pr(", 0) == 0;
+  const bool ystarStat = stat.rfind("ystar(", 0) == 0;
+  const bool eStat = stat.rfind("e(", 0) == 0 || prStat || ystarStat;
   double eLo = std::numeric_limits<double>::quiet_NaN(), eHi = eLo;
   if (eStat) {
-    const std::string in = stat.substr(2, stat.size() - 3);
+    const size_t open = stat.find('(');
+    const std::string in = stat.substr(open + 1, stat.size() - open - 2);
     const size_t comma = in.find(',');
     if (comma == std::string::npos || in.find(',', comma + 1) != std::string::npos)
       return engineErrorBlockM4("option e() incorrectly specified", "syntax_error");
@@ -708,7 +784,9 @@ std::optional<ojson> computePredictNativeM4(SessionState& session, const LastMod
     if (!bound(in.substr(0, comma), eLo) || !bound(in.substr(comma + 1), eHi))
       return refuse("a bound of e(a,b) that is not a number or `.`");
     if (!std::isnan(eLo) && !std::isnan(eHi) && eLo > eHi)
-      return engineErrorBlockM4("option e(a,b) incorrectly specified; b must be >= a", "syntax_error");
+      return engineErrorBlockM4("option " + stat.substr(0, open) +
+                                    "(a,b) incorrectly specified; b must be >= a",
+                                "syntax_error");
   }
 
   // reghdfe answers xbd/d only when the fit kept its residuals (reghdfe_p: r(9)),
@@ -770,7 +848,29 @@ std::optional<ojson> computePredictNativeM4(SessionState& session, const LastMod
 
   // The covariance, before any data is read (lincom never touches the session).
   const bool needV = stat == "stdp" || stat == "hat" || stat == "stdr" || stat == "stdf" ||
-                     stat == "rstandard" || stat == "rstudent" || stat == "cooksd";
+                     stat == "rstandard" || stat == "rstudent" || stat == "cooksd" || influence;
+  // dfbeta(name): the e(b) column it names, and every other non-constant column
+  // a plain variable (the auxiliary regression below reads them as columns).
+  size_t dfbPos = 0;
+  std::string dfbName;
+  if (dfbStat) {
+    dfbName = trimM4(stat.substr(7, stat.size() - 8));
+    bool found = false;
+    for (size_t j = 0; j < names.size(); ++j) {
+      if (j == consIdx) continue;
+      if (names[j].find_first_of(".#:") != std::string::npos)
+        return refuse("dfbeta() after a fit with factor-variable, interaction or "
+                      "time-series terms");
+      if (names[j] == dfbName) {
+        dfbPos = j;
+        found = true;
+      }
+    }
+    if (dfbName.find_first_of(" \t") != std::string::npos)
+      return ojson(eval::errorBlock("syntax_error", "invalid dfbeta() option;\ntoo many variables specified",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(103)"));
+    if (!found) return refuse("dfbeta(" + dfbName + ") does not name a coefficient of the fit");
+  }
   std::vector<std::string> vNames;
   std::vector<double> vB, vSe, V;
   if (needV) {
@@ -788,7 +888,7 @@ std::optional<ojson> computePredictNativeM4(SessionState& session, const LastMod
     }
   }
   if ((stat == "hat" || stat == "stdr" || stat == "stdf" || stat == "rstandard" ||
-       stat == "rstudent" || stat == "cooksd") && !(std::isfinite(sigma2) && sigma2 > 0.0)) {
+       stat == "rstudent" || stat == "cooksd" || influence) && !(std::isfinite(sigma2) && sigma2 > 0.0)) {
     return refuse("the fit reports no residual variance");
   }
 
@@ -853,7 +953,7 @@ std::optional<ojson> computePredictNativeM4(SessionState& session, const LastMod
   const double* y = nullptr;
   if (live->has(lm.y) && live->col(lm.y).dtype == cecon::DType::F64) y = live->col(lm.y).f64();
   const bool needY = fe || stat == "residuals" || stat == "rstandard" || stat == "rstudent" ||
-                     stat == "cooksd";
+                     stat == "cooksd" || influence;
   if (needY && y == nullptr) return refuse("the dependent variable `" + lm.y + "` is not a numeric variable");
 
   const double kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -983,12 +1083,64 @@ std::optional<ojson> computePredictNativeM4(SessionState& session, const LastMod
   auto normalCdf = [](double z) { return 0.5 * std::erfc(-z / std::sqrt(2.0)); };
   auto normalDen = [](double z) { return std::exp(-0.5 * z * z) / std::sqrt(2.0 * 3.14159265358979323846); };
 
+  // The starred statistics read e(sample) itself: the refit's residual covers
+  // every row with data, not only the fitted ones.
+  const double* esMask = nullptr;
+  double esSerial = 0.0;
+  if (influence) {
+    const SessionState::EsampleReading er = session.esampleReading();
+    if (er.kind != SessionState::EsampleReading::Kind::kColumn || !live->has(kEsampleColumn) ||
+        live->col(kEsampleColumn).f64() == nullptr)
+      return refuse("the estimation sample is not on the data in memory");
+    esMask = live->col(kEsampleColumn).f64();
+    esSerial = static_cast<double>(er.serial);
+  }
   vals.assign(n, kNaN);
   for (size_t r = 0; r < n; ++r) {
     const double yr = y != nullptr ? y[r] : kNaN;
     const double res = yr - xb[r];  // NaN wherever either is
     if (stat == "xb") {
       vals[r] = xb[r];
+    } else if (prStat) {
+      // CalcP: 1 with neither bound (whatever xb is), else the normal mass of
+      // (a, b) around xb with scale e(rmse).
+      if (std::isnan(eLo) && std::isnan(eHi)) {
+        vals[r] = 1.0;
+        continue;
+      }
+      if (std::isnan(xb[r])) continue;
+      const double L = (eLo - xb[r]) / eSigma, U = (eHi - xb[r]) / eSigma;
+      double v;
+      if (std::isnan(eHi)) v = normalCdf(-L);
+      else if (std::isnan(eLo)) v = normalCdf(U);
+      else v = normalCdf(U) - normalCdf(L);
+      vals[r] = v;
+    } else if (ystarStat) {
+      // CalcY: E(y*), y* = max(a, min(y, b)): p E + (1-p) a, p E + (1-p) b, or
+      // p E + p2 a + (1-p-p2) b, with E = E(y | a < y < b), p = Pr(a < y < b)
+      // and p2 = Pr(y < a).
+      if (std::isnan(xb[r])) continue;
+      const double L = (eLo - xb[r]) / eSigma, U = (eHi - xb[r]) / eSigma;
+      double E = xb[r], pIn = 1.0;
+      if (!std::isnan(eLo) && std::isnan(eHi)) {
+        E = xb[r] + eSigma * normalDen(L) / normalCdf(-L);
+        pIn = normalCdf(-L);
+      } else if (std::isnan(eLo) && !std::isnan(eHi)) {
+        E = xb[r] - eSigma * normalDen(U) / normalCdf(U);
+        pIn = normalCdf(U);
+      } else if (!std::isnan(eLo)) {
+        E = xb[r] - eSigma * (normalDen(U) - normalDen(L)) / (normalCdf(U) - normalCdf(L));
+        pIn = normalCdf(U) - normalCdf(L);
+      }
+      double v;
+      if (std::isnan(eLo) && std::isnan(eHi)) v = E;
+      else if (std::isnan(eHi)) v = pIn * E + (1.0 - pIn) * eLo;
+      else if (std::isnan(eLo)) v = pIn * E + (1.0 - pIn) * eHi;
+      else {
+        const double pBelow = normalCdf(L);
+        v = pIn * E + pBelow * eLo + (1.0 - pIn - pBelow) * eHi;
+      }
+      vals[r] = std::isfinite(v) ? v : kNaN;
     } else if (eStat) {
       if (std::isnan(xb[r])) continue;
       const double L = (eLo - xb[r]) / eSigma, U = (eHi - xb[r]) / eSigma;
@@ -1029,7 +1181,130 @@ std::optional<ojson> computePredictNativeM4(SessionState& session, const LastMod
         if (h < 1.0 && !std::isnan(res) && kEst > 0.0) {
           vals[r] = res * res * h / (kEst * sigma2 * (1.0 - h) * (1.0 - h));
         }
+      } else if (influence) {
+        // Starred statistics: the estimation sample only (the refit's
+        // residual marks it). t is the Studentized residual, as above.
+        if (esMask[r] != esSerial || !(h < 1.0) || std::isnan(res)) continue;
+        if (stat == "covratio") {
+          // ((N - df_m - t^2 - 1)/(N - df_m - 2))^(df_m + 1) / (1 - h), with
+          // t the residual over e(rmse) sqrt(1 - h).
+          const double dfM = jsonNumM4(*lm.result, "df_m");
+          const double rm = jsonNumM4(*lm.result, "rmse");
+          const double rmse = std::isfinite(rm) ? rm : s;
+          if (!std::isfinite(dfM)) continue;
+          const double t = res / (rmse * std::sqrt(1.0 - h));
+          vals[r] = std::pow((nObs - dfM - t * t - 1.0) / (nObs - dfM - 2.0), dfM + 1.0) / (1.0 - h);
+          continue;
+        }
+        if (!(dfR > 1.0)) continue;
+        const double sj2 = (sigma2 * dfR - res * res / (1.0 - h)) / (dfR - 1.0);
+        if (!(sj2 > 0.0)) continue;
+        const double t = res / (std::sqrt(sj2) * std::sqrt(1.0 - h));
+        if (stat == "dfits") {
+          vals[r] = t * std::sqrt(h / (1.0 - h));
+        } else if (stat == "welsch") {
+          vals[r] = t * std::sqrt(h / (1.0 - h)) * std::sqrt((nObs - 1.0) / (1.0 - h));
+        } else if (dfbStat) {
+          vals[r] = t;  // the Studentized residual; scaled below
+        }
       }
+    }
+  }
+  if (dfbStat) {
+    // DFBETA_j = t * r_j / sqrt((1 - h) * sum r_j^2), r_j the residual of x_j
+    // regressed (with a constant) on the fit's other regressors over the rows
+    // whose Studentized residual exists (regres_p's DFbeta).
+    std::vector<size_t> others;
+    for (size_t j = 0; j < names.size(); ++j)
+      if (j != consIdx && j != dfbPos) others.push_back(j);
+    const size_t p = others.size() + 1;
+    std::vector<long double> XtX(p * p, 0.0L), Xty(p, 0.0L);
+    std::vector<double> row(p);
+    auto fill = [&](size_t r) {
+      row[0] = 1.0;
+      for (size_t a = 0; a < others.size(); ++a) row[a + 1] = designValueM4(design[others[a]], r);
+    };
+    size_t used = 0;
+    for (size_t r = 0; r < n; ++r) {
+      if (std::isnan(vals[r])) continue;
+      fill(r);
+      const double xj = designValueM4(design[dfbPos], r);
+      for (size_t a = 0; a < p; ++a) {
+        Xty[a] += static_cast<long double>(row[a]) * xj;
+        for (size_t c = 0; c < p; ++c) XtX[a * p + c] += static_cast<long double>(row[a]) * row[c];
+      }
+      ++used;
+    }
+    // Solve the normal equations (Gauss-Jordan, partial pivoting); a singular
+    // system (x_j collinear with the others) is refused, not guessed.
+    // Gauss-Jordan on [X'X | I | X'x_j]: the coefficients and (X'X)^-1 for the
+    // auxiliary fit's own table.
+    const size_t w = 2 * p + 1;
+    std::vector<long double> M(p * w, 0.0L);
+    for (size_t a = 0; a < p; ++a) {
+      for (size_t c = 0; c < p; ++c) M[a * w + c] = XtX[a * p + c];
+      M[a * w + p + a] = 1.0L;
+      M[a * w + 2 * p] = Xty[a];
+    }
+    for (size_t c = 0; c < p; ++c) {
+      size_t piv = c;
+      for (size_t r2 = c + 1; r2 < p; ++r2)
+        if (std::fabs(static_cast<double>(M[r2 * w + c])) > std::fabs(static_cast<double>(M[piv * w + c]))) piv = r2;
+      if (!(std::fabs(static_cast<double>(M[piv * w + c])) > 1e-300) || used <= p)
+        return refuse("the regressor named in dfbeta() is collinear with the others");
+      if (piv != c)
+        for (size_t k2 = 0; k2 < w; ++k2) std::swap(M[c * w + k2], M[piv * w + k2]);
+      const long double d0 = M[c * w + c];
+      for (size_t k2 = 0; k2 < w; ++k2) M[c * w + k2] /= d0;
+      for (size_t r2 = 0; r2 < p; ++r2) {
+        if (r2 == c) continue;
+        const long double f = M[r2 * w + c];
+        if (f == 0.0L) continue;
+        for (size_t k2 = 0; k2 < w; ++k2) M[r2 * w + k2] -= f * M[c * w + k2];
+      }
+    }
+    std::vector<long double> beta(p);
+    for (size_t c = 0; c < p; ++c) beta[c] = M[c * w + 2 * p];
+    std::vector<double> rx(n, kNaN);
+    long double sres = 0.0L;
+    for (size_t r = 0; r < n; ++r) {
+      if (std::isnan(vals[r])) continue;
+      fill(r);
+      long double fit = 0.0L;
+      for (size_t a = 0; a < p; ++a) fit += beta[a] * row[a];
+      rx[r] = static_cast<double>(static_cast<long double>(designValueM4(design[dfbPos], r)) - fit);
+      sres += static_cast<long double>(rx[r]) * rx[r];
+    }
+    for (size_t r = 0; r < n; ++r) {
+      if (std::isnan(vals[r])) continue;
+      const double h = q[r] / sigma2;
+      vals[r] = vals[r] * rx[r] / std::sqrt((1.0 - h) * static_cast<double>(sres));
+    }
+    // The auxiliary regression is a regress of its own: it leaves its r(table)
+    // (bank 74e89adf1d2cbde5: 9 x 3 over weight foreign _cons after
+    // `regress price mpg weight foreign` / `predict dfb, dfbeta(mpg)`), the
+    // other regressors in e(b)'s order, then _cons.
+    if (dfbTable != nullptr) {
+      const double dfAux = static_cast<double>(used) - static_cast<double>(p);
+      const double s2 = static_cast<double>(sres) / dfAux;
+      const double alpha = (level == 95.0) ? 0.05 : 1.0 - level / 100.0;
+      const double crit = cecon::t_critical(alpha, dfAux);
+      eval::EvalMatrix t;
+      t.rownames = {"b", "se", "t", "pvalue", "ll", "ul", "df", "crit", "eform"};
+      t.data.assign(9, std::vector<double>());
+      auto addCol = [&](const std::string& nm, size_t idx) {
+        const double bj = static_cast<double>(beta[idx]);
+        const double vjj = s2 * static_cast<double>(M[idx * w + p + idx]);
+        const double sej = vjj > 0 ? std::sqrt(vjj) : kNaN;
+        const double tj = bj / sej;
+        const double col[9] = {bj, sej, tj, cecon::t_twosided_pvalue(tj, dfAux),
+                               bj - crit * sej, bj + crit * sej, dfAux, crit, 0.0};
+        t.colnames.push_back(nm);
+        for (int r = 0; r < 9; ++r) t.data[static_cast<size_t>(r)].push_back(col[r]);
+      };
+      for (size_t a = 0; a < others.size(); ++a) addCol(names[others[a]], a + 1);
+      addCol("_cons", 0);
+      *dfbTable = std::move(t);
     }
   }
   return std::nullopt;
@@ -1675,6 +1950,8 @@ ojson runGlmPredictM4(const std::vector<std::string>& varlist,
   if (famCode < kGaussian || famCode > kNegBin || linkCode < kIdentity || linkCode > kProbit)
     return notBuilt(stat + " for this family and link");
   if (stat == "anscombe" && famCode == kNegBin) return notBuilt("anscombe for the negative binomial family");
+  // the binomial with a denominator m: V(mu) = mu(1 - mu/m), not built here
+  if (gm.contains("binomial_m_var") || gm.contains("binomial_m")) return notBuilt(stat + " for the binomial with a denominator");
 
   std::vector<std::string> names;
   std::vector<double> b, V;
@@ -2175,6 +2452,619 @@ ojson runHeckmanPredictM4(const std::vector<std::string>& varlist,
   return outBlock;
 }
 
+// predict after the fits whose statistics are functions of the posted linear index
+// x*b (plus the fit's offset) and of e() scalars, read off e(b)/e(V) and the data in
+// memory -- no engine refit exists for them:
+//   ivregress (ivregress_p): xb (default), residuals, stdp, stdf = e(rmse)*sqrt(1+h),
+//     h = (stdp/e(rmse))^2 (bank aee9022c/d3cca2c1 after `ivregress gmm`, b957a51a
+//     residuals, 80deedda stdf, 29b1c334 stdp after `ivregress 2sls`);
+//   xtreg, re (xtrere_p): xb (default), stdp, ue = y - xb (every row), and over e(sample)
+//     u_i = sigma_u^2/(T_i*sigma_u^2 + sigma_e^2) * sum_i(y - xb), e = y - xb - u,
+//     xbu = xb + u (bank 8e8e4961 e, 7e04ba53 u, dd813732 ue, 1c564d46 xb, fa6475fd xbu);
+//   xtlogit, fe (clogit_p): pc1 (default) = exp(xb)/sum_group exp(xb), pu0 = invlogit(xb),
+//     xb, stdp (bank 0a768b9a, 17d6299f, 37f88c3f);
+//   xtpoisson, fe (xtcnt_p): xb (default), nu0 = exp(xb), iru0 = exp(xb) without the
+//     offset, stdp (bank 5991d2fd, 78a1633f, b09cd0df);
+//   nbreg (nbreg_p) and poisson with offset()/exposure() (poisso_p): n (default) =
+//     exp(xb + offset), ir = exp(xb), xb, stdp, nooffset (bank 70e71f0a, 61d28bab,
+//     1462f62a, f63db608);
+//   sureg / reg3 (reg3_p): xb (default), stdp, residuals of one equation --
+//     equation(name | #k), the first by default (bank 2ae7ce49 and the abbreviations
+//     2b3e1db4 ... 2bf3c9db `e(weight)` ... `equatio(weight)`).
+// Every statistic is computed where its inputs are nonmissing (Stata's _predict).
+// Any other statistic or option, an `if` qualifier, or a term the design reader
+// cannot evaluate is refused by name; nothing is written then.
+std::optional<ojson> runPostedIndexPredictM4(const std::vector<std::string>& varlist,
+                                             const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                             SessionState& session, const LastModel& lm,
+                                             const std::optional<std::string>& ifExpr) {
+  auto eStr = [&session](const char* name) {
+    const std::string* s = session.eval.eStrings.find(name);
+    return s != nullptr ? *s : std::string();
+  };
+  auto eNum = [&session](const char* name) {
+    const std::string t = strutil::trim(eval::macro_detail::resolveEScalar(name, session.eval));
+    char* end = nullptr;
+    const double v = std::strtod(t.c_str(), &end);
+    return (!t.empty() && t[0] != '.' && end != nullptr && *end == '\0')
+               ? v
+               : std::numeric_limits<double>::quiet_NaN();
+  };
+  enum class Fam { kIv, kXtre, kXtlogitFe, kXtpoisFe, kCount, kSystem };
+  Fam fam;
+  std::string family;
+  if (lm.cobraCmd == "iv" || lm.cobraCmd == "liml") {
+    fam = Fam::kIv;
+    family = "ivregress";
+  } else if (lm.cobraCmd == "xtreg" && eStr("model") == "re") {
+    fam = Fam::kXtre;
+    family = "xtreg, re";
+  } else if (lm.cobraCmd == "xtlogit" && eStr("model") == "fe") {
+    fam = Fam::kXtlogitFe;
+    family = "xtlogit, fe";
+  } else if (lm.cobraCmd == "xtpois" && eStr("model") == "fe") {
+    fam = Fam::kXtpoisFe;
+    family = "xtpoisson, fe";
+  } else if (lm.cobraCmd == "nbreg" || (lm.cobraCmd == "poisson" && postestOffsetFitM4(lm) && lm.fe.empty())) {
+    fam = Fam::kCount;
+    family = lm.cobraCmd;
+  } else if (lm.cobraCmd == "reg3") {
+    fam = Fam::kSystem;
+    family = lm.stataCmd.empty() ? "reg3" : lm.stataCmd;
+  } else {
+    return std::nullopt;
+  }
+  auto refuse = [&](const std::string& why) {
+    return ojson(engineErrorBlockM4("predict after `" + family + "`: " + why +
+                                        " is not implemented in this version of PIET. Nothing was "
+                                        "written to your data.",
+                                    "unsupported_option"));
+  };
+  auto stataErr = [](const std::string& msg, int rc) {
+    return ojson(eval::errorBlock("engine_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(rc) + ")"));
+  };
+  if (ifExpr.has_value() && !ifExpr->empty()) return refuse("an `if` qualifier");
+  // An IV fit is predicted by the program its e(predict) names: ivregress_p (xb,
+  // residuals, stdp, stdf), ivreg2's ivreg2_p (xb, residuals, stdp), or -- after an
+  // ivreghdfe that absorbed fixed effects -- reghdfe_p (xb, stdp, and residuals /
+  // d / xbd / dresiduals, which all read the residual variable the fit saved under
+  // its resid option, e(resid); without it they are r(198)). Any other predictor
+  // (ivreghdfe without absorb() names `reghdfe`) is not served.
+  enum class IvP { kIvregress, kIvreg2, kReghdfe };
+  IvP ivp = IvP::kIvregress;
+  if (fam == Fam::kIv) {
+    const std::string pp = eStr("predict");
+    if (pp == "ivreg2_p") {
+      ivp = IvP::kIvreg2;
+      family = "ivreg2";
+    } else if (pp == "reghdfe_p") {
+      ivp = IvP::kReghdfe;
+      family = "ivreghdfe";
+    } else if (!pp.empty() && pp != "ivregress_p") {
+      family = eStr("cmd").empty() ? family : eStr("cmd");
+      return refuse("a fit whose predictor is " + pp);
+    }
+  }
+  // The statistics each family's predictor takes, with Stata's minimum abbreviations.
+  std::vector<std::pair<std::string, size_t>> stats = {{"xb", 2}, {"stdp", 4}};
+  if (fam == Fam::kIv && ivp == IvP::kIvregress) stats.insert(stats.end(), {{"residuals", 1}, {"stdf", 4}});
+  if (fam == Fam::kIv && ivp == IvP::kIvreg2) stats.insert(stats.end(), {{"residuals", 1}});
+  if (fam == Fam::kIv && ivp == IvP::kReghdfe)
+    stats.insert(stats.end(), {{"residuals", 1}, {"d", 1}, {"xbd", 3}, {"dresiduals", 2}});
+  if (fam == Fam::kXtre) stats.insert(stats.end(), {{"ue", 2}, {"e", 1}, {"u", 1}, {"xbu", 3}});
+  if (fam == Fam::kXtlogitFe) stats.insert(stats.end(), {{"pc1", 1}, {"pu0", 3}});
+  if (fam == Fam::kXtpoisFe) stats.insert(stats.end(), {{"nu0", 3}, {"iru0", 4}});
+  if (fam == Fam::kCount) stats.insert(stats.end(), {{"n", 1}, {"ir", 2}});
+  if (fam == Fam::kSystem) stats.insert(stats.end(), {{"residuals", 1}});
+  std::string type, equation;
+  bool noOffset = false;
+  int nTypes = 0;
+  for (const auto& [k0, v] : opts) {
+    const std::string k = lowerM4(k0);
+    if (fam == Fam::kSystem && k.size() >= 1 && std::string("equation").compare(0, k.size(), k) == 0) {
+      if (v.isBool) return stataErr("option equation() requires an argument", 198);
+      equation = trimM4(v.strValue);
+      continue;
+    }
+    if (k.size() >= 5 && std::string("nooffset").compare(0, k.size(), k) == 0 && v.isBool) {
+      // Only the count and panel predictors take nooffset; reg3_p refuses it by
+      // name and the IV predictors have no such option (r(198) either way).
+      if (fam == Fam::kIv || fam == Fam::kSystem) return stataErr("option nooffset not allowed", 198);
+      noOffset = true;
+      continue;
+    }
+    std::string hit;
+    for (const auto& [full, mn] : stats)
+      if (k.size() >= mn && k.size() <= full.size() && full.compare(0, k.size(), k) == 0) {
+        // the exact spelling wins over a longer statistic it abbreviates (`e` vs `ue`)
+        if (hit.empty() || k == full) hit = full;
+      }
+    // ivreg2_p and reghdfe_p take exactly the statistics above: anything else is
+    // a syntax error (`stdf` after ivreg2).
+    if (hit.empty() && fam == Fam::kIv && ivp != IvP::kIvregress)
+      return stataErr("option " + k + " not allowed", 198);
+    if (hit.empty()) return refuse("option " + k);
+    if (!v.isBool) return refuse("option " + k + "()");
+    if (type != hit) ++nTypes;
+    type = hit;
+  }
+  if (nTypes > 1) return stataErr("only one statistic may be specified", 198);
+  if (fam == Fam::kIv && ivp == IvP::kReghdfe && !type.empty() && type != "xb" && type != "stdp") {
+    if (eStr("resid").empty())
+      return stataErr("you must add the resid option to reghdfe before running this prediction", 198);
+    return refuse(type + " (from the saved residual variable)");
+  }
+  if (fam == Fam::kIv && ivp == IvP::kIvreg2) {
+    const double pct = eNum("partial_ct");
+    if (!std::isnan(pct) && pct > 0) {
+      if (type == "residuals") return refuse("residuals after partial()");
+      return stataErr("Option " + (type.empty() ? std::string("xb") : type) + " not supported with -partial- option",
+                      198);
+    }
+  }
+  const bool assumed = type.empty();
+  if (assumed)
+    type = fam == Fam::kXtlogitFe ? "pc1" : (fam == Fam::kCount ? "n" : "xb");
+  std::vector<std::string> toks = varlist;
+  std::string declaredType;
+  if (toks.size() >= 2 && storage::isNumericType(lowerM4(toks[0]))) {
+    declaredType = lowerM4(toks[0]);
+    toks.erase(toks.begin());
+  }
+  if (toks.empty()) return stataErr("varlist required", 100);
+  if (toks.size() > 1) return stataErr("too many variables specified", 103);
+
+  // The coefficients of the index: e(b) (one equation of a system), or nbreg's
+  // depvar equation off the fit's reply when no e(b) was posted.
+  std::vector<std::string> names;
+  std::vector<double> beta;
+  std::vector<size_t> idx;
+  std::vector<std::vector<double>> Vfull;
+  std::string eqName;
+  const auto eb = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
+  if (eb.matrix.has_value() && eb.matrix->data.size() == 1 &&
+      eb.matrix->data[0].size() == eb.matrix->colnames.size()) {
+    const std::vector<std::string>& cols = eb.matrix->colnames;
+    std::vector<std::string> eqs;
+    for (const auto& c : cols) {
+      const size_t colon = c.find(':');
+      if (colon == std::string::npos) continue;
+      const std::string e = c.substr(0, colon);
+      if (std::find(eqs.begin(), eqs.end(), e) == eqs.end()) eqs.push_back(e);
+    }
+    if (fam == Fam::kSystem) {
+      if (eqs.empty()) return refuse("this fit (its equations were not posted)");
+      eqName = eqs.front();
+      if (!equation.empty()) {
+        std::string want = equation;
+        if (want[0] == '#') {
+          const std::string num = want.substr(1);
+          if (num.empty() || num.find_first_not_of("0123456789") != std::string::npos)
+            return stataErr("equation " + equation + " not found", 303);
+          const size_t k = std::stoul(num);
+          if (k < 1 || k > eqs.size()) return stataErr("equation " + equation + " not found", 303);
+          want = eqs[k - 1];
+        }
+        if (std::find(eqs.begin(), eqs.end(), want) == eqs.end())
+          return stataErr("equation " + equation + " not found", 303);
+        eqName = want;
+      }
+    } else if (!eqs.empty()) {
+      // the depvar equation (`fatal:beertax` after xtpoisson, fe); an ancillary
+      // `/lnalpha` is not part of xb
+      eqName = eqs.front();
+    }
+    for (size_t j = 0; j < cols.size(); ++j) {
+      const size_t colon = cols[j].find(':');
+      if (!eqName.empty()) {
+        if (colon == std::string::npos || cols[j].compare(0, colon, eqName) != 0 || colon != eqName.size())
+          continue;
+      } else if (colon != std::string::npos || (!cols[j].empty() && cols[j][0] == '/')) {
+        continue;
+      }
+      names.push_back(colon == std::string::npos ? cols[j] : cols[j].substr(colon + 1));
+      beta.push_back(eb.matrix->data[0][j]);
+      idx.push_back(j);
+    }
+    const auto ev = session.eval.resolveEMatrixFor("V", eval::EvalSession::EReader::kCopy);
+    if (ev.matrix.has_value() && ev.matrix->data.size() == cols.size()) Vfull = ev.matrix->data;
+  } else if (fam == Fam::kCount && lm.result.has_value() && lm.result->contains("coefs") &&
+             (*lm.result)["coefs"].is_array()) {
+    for (const auto& c : (*lm.result)["coefs"]) {
+      if (!c.is_object() || !c.contains("name") || !c["name"].is_string() || !c.contains("beta") ||
+          !c["beta"].is_number())
+        return refuse("this fit (its coefficient vector was not posted)");
+      const std::string nm = c["name"].get<std::string>();
+      names.push_back(nm == "(intercept)" ? std::string("_cons") : nm);
+      beta.push_back(c["beta"].get<double>());
+    }
+  }
+  if (names.empty()) return refuse("this fit (its coefficient vector was not posted)");
+  const bool needV = type == "stdp" || type == "stdf";
+  if (needV && (Vfull.empty() || idx.size() != names.size()))
+    return refuse(type + " (the variance matrix was not posted)");
+
+  Datastore* live = nullptr;
+  try {
+    live = session.datastore();
+  } catch (const std::exception& e) {
+    return refuse(e.what());
+  }
+  if (live == nullptr) return ojson(eval::noDataLoaded());
+  const std::string& nm = toks[0];
+  if (!strutil::isValidStataIdentifier(nm)) return stataErr(nm + " invalid name", 198);
+  if (live->has(nm)) return stataErr("variable " + nm + " already defined", 110);
+  std::vector<DesignColM4> design;
+  {
+    std::string why;
+    if (!buildDesignM4(*live, names, design, why)) return refuse(why);
+  }
+  const size_t n = static_cast<size_t>(live->nRows());
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  auto colOf = [&](const std::string& var) -> const double* {
+    if (var.empty() || !live->has(var) || live->col(var).dtype != cecon::DType::F64) return nullptr;
+    return live->col(var).f64();
+  };
+  auto val = [](const double* p, size_t r) {
+    const double x = p[r];
+    return (std::isnan(x) || x >= eval::kStataMissingSentinel) ? std::numeric_limits<double>::quiet_NaN() : x;
+  };
+  // The fit's offset: e(offset) is a variable or ln(variable) (exposure()).
+  const double* offCol = nullptr;
+  bool offLog = false;
+  {
+    std::string off = eStr("offset");
+    if (!off.empty()) {
+      if (off.size() > 4 && off.compare(0, 3, "ln(") == 0 && off.back() == ')') {
+        off = off.substr(3, off.size() - 4);
+        offLog = true;
+      }
+      offCol = colOf(off);
+      if (offCol == nullptr) return refuse("this fit (its offset variable " + off + " is not in memory)");
+    }
+  }
+  // The dependent variable (residuals, ue/e/u): the equation's after a system fit.
+  const double* yCol = nullptr;
+  if (type == "residuals" || type == "ue" || type == "e" || type == "u" || type == "xbu") {
+    const std::string dep = !eqName.empty() && fam == Fam::kSystem ? eqName : lm.y;
+    yCol = colOf(dep);
+    if (yCol == nullptr) return refuse("this fit (its dependent variable " + dep + " is not a numeric variable in memory)");
+  }
+  // Linear index (with the offset unless nooffset, as _predict's xb) and stdp.
+  std::vector<double> xb(n, kNaN), sp(n, kNaN);
+  for (size_t r = 0; r < n; ++r) {
+    double s = 0;
+    bool ok = true;
+    std::vector<double> xs(design.size());
+    for (size_t q = 0; q < design.size(); ++q) {
+      const double x = designValueM4(design[q], r);
+      if (std::isnan(x) || x >= eval::kStataMissingSentinel) {
+        ok = false;
+        break;
+      }
+      xs[q] = x;
+      s += x * beta[q];
+    }
+    if (!ok) continue;
+    if (offCol != nullptr && !noOffset && type != "ir" && type != "iru0") {
+      double o = val(offCol, r);
+      if (offLog) o = o > 0 ? std::log(o) : kNaN;
+      if (std::isnan(o)) continue;
+      s += o;
+    }
+    xb[r] = s;
+    if (needV) {
+      double v = 0;
+      for (size_t a = 0; a < xs.size(); ++a)
+        for (size_t c = 0; c < xs.size(); ++c) v += xs[a] * Vfull[idx[a]][idx[c]] * xs[c];
+      sp[r] = std::sqrt(std::max(0.0, v));
+    }
+  }
+  std::vector<double> out(n, kNaN);
+  std::string label, note;
+  bool tsrevarR = false;
+  if (type == "xb") {
+    out = xb;
+    label = "Linear prediction";
+    if (assumed) note = "(option xb assumed; fitted values)";
+  } else if (type == "stdp") {
+    out = sp;
+    label = "S.E. of the prediction";
+  } else if (type == "stdf") {
+    const double rmse = eNum("rmse");
+    if (std::isnan(rmse)) return refuse("stdf (e(rmse) was not posted)");
+    for (size_t r = 0; r < n; ++r)
+      if (!std::isnan(sp[r])) {
+        const double h = (sp[r] / rmse) * (sp[r] / rmse);
+        out[r] = rmse * std::sqrt(1 + h);
+      }
+    label = "S.E. of the forecast";
+  } else if (type == "residuals" || type == "ue") {
+    for (size_t r = 0; r < n; ++r) out[r] = val(yCol, r) - xb[r];
+    label = type == "ue" ? "u[" + eStr("ivar") + "] + e[" + eStr("ivar") + ",t]" : "Residuals";
+  } else if (type == "pu0") {
+    for (size_t r = 0; r < n; ++r) out[r] = 1.0 / (1.0 + std::exp(-xb[r]));
+    label = "Pr(" + lm.y + "|fixed effect is 0)";
+  } else if (type == "n" || type == "ir" || type == "nu0" || type == "iru0") {
+    for (size_t r = 0; r < n; ++r) out[r] = std::exp(xb[r]);
+    label = type == "n"    ? "Predicted number of events"
+            : type == "ir" ? "Predicted incidence rate"
+            : type == "nu0" ? "Predicted number of events (assuming u_i=0)"
+                            : "Predicted incidence rate (assuming u_i=0)";
+    if (assumed) note = "(option n assumed; predicted number of events)";
+  } else if (type == "pc1" || type == "u" || type == "e" || type == "xbu") {
+    // Group sums over the panel variable (e(group) / e(ivar)).
+    std::string gv = eStr(type == "pc1" ? "group" : "ivar");
+    if (gv.empty()) gv = eStr("ivar");
+    if (gv.empty() && session.panelvar.has_value()) gv = *session.panelvar;
+    const double* g = colOf(gv);
+    if (g == nullptr) return refuse(type + " (the panel variable is not a numeric variable in memory)");
+    if (type == "pc1") {
+      // `by group:` sums: rows whose group is missing form a group of their own
+      // (one per missing code), as a sort-then-by over the group variable does.
+      const auto key = [](double x) { return std::isnan(x) ? std::numeric_limits<double>::infinity() : x; };
+      std::map<double, double> denom;
+      for (size_t r = 0; r < n; ++r)
+        if (!std::isnan(xb[r])) denom[key(g[r])] += std::exp(xb[r]);
+      for (size_t r = 0; r < n; ++r)
+        if (!std::isnan(xb[r])) out[r] = std::exp(xb[r]) / denom[key(g[r])];
+      label = "Pr(" + lm.y + "|single outcome w/i " + gv + ")";
+      if (assumed)
+        note = "(option pc1 assumed; probability of success given one success within group)";
+    } else {
+      const auto rows = esampleRowsM4(session, lm);
+      if (!rows.has_value()) return refuse(type + " (the estimation sample is not on the data in memory)");
+      std::vector<char> inS(n, 0);
+      for (int64_t r : *rows)
+        if (r >= 0 && static_cast<size_t>(r) < n) inS[static_cast<size_t>(r)] = 1;
+      const double su = eNum("sigma_u"), se = eNum("sigma_e");
+      if (std::isnan(su) || std::isnan(se)) return refuse(type + " (e(sigma_u) / e(sigma_e) were not posted)");
+      std::map<double, std::pair<double, double>> grp;  // panel -> (T_i, sum(y - xb))
+      for (size_t r = 0; r < n; ++r) {
+        if (!inS[r] || std::isnan(val(g, r))) continue;
+        auto& acc = grp[g[r]];
+        acc.first += 1;
+        const double d = val(yCol, r) - xb[r];
+        if (!std::isnan(d)) acc.second += d;
+      }
+      for (size_t r = 0; r < n; ++r) {
+        if (!inS[r] || std::isnan(val(g, r))) continue;
+        const auto& acc = grp[g[r]];
+        const double u = su * su / (acc.first * su * su + se * se) * acc.second;
+        out[r] = type == "u" ? u : (type == "xbu" ? xb[r] + u : val(yCol, r) - xb[r] - u);
+      }
+      label = type == "u" ? "u[" + gv + "]" : (type == "xbu" ? "Xb + u[" + gv + "]" : "e[" + gv + ",t]");
+      // xtrere_p reads the depvar through tsrevar when a time variable is set, and
+      // that r-class step is the last one: r(varlist) is the depvar (bank 8e8e4961
+      // `predict double ee, e` after `xtreg ..., re`: r(varlist) "y").
+      if (session.timevar.has_value() && !session.timevar->empty() &&
+          strutil::isValidStataIdentifier(lm.y)) {
+        tsrevarR = true;
+      }
+    }
+  }
+
+  const std::string storeType = storage::resolveCreateType(session, declaredType);
+  const std::string outPath = nextPathEst(session.workdir(), "predict");
+  if (auto rej = writePredictColumnM4(session, *session.currentHbin(), nm, out, outPath, storeType))
+    return *rej;
+  session.load(outPath);
+  session.invalidateDatastore();
+  storage::recordCreateType(session, nm, declaredType, storeType);
+  session.varMeta[nm].label = label;
+  session.syncEvalVarLabels();
+  Datastore* ds = session.datastore();
+  session.seedNMissForPureAdd(ds, "gen", toks, /*droppedVars=*/{}, /*rewrittenVars=*/{});
+  ojson outBlock;
+  outBlock["type"] = "data_mutation";
+  outBlock["action"] = "gen";
+  ojson varlistAfter = ojson::array();
+  auto vlist = session.varlistWithMeta(ds);
+  for (const auto& v : vlist) varlistAfter.push_back(v.toJson());
+  session.updateNMissCache(vlist);
+  outBlock["varlist_after"] = varlistAfter;
+  outBlock["n_rows_after"] = ds ? ds->nRows() : 0;
+  outBlock["new_vars"] = toks;
+  if (!note.empty()) outBlock["note"] = note;
+  if (tsrevarR) {
+    eval::replaceRClass(session.eval);
+    session.eval.rStrings.set("varlist", lm.y);
+    eval::declareRPosted(session.eval, "tsrevar", {"varlist"});
+  }
+  return outBlock;
+}
+
+// predict after pca (pca_p): `score` (the default, "(score assumed)") -- component
+// j = sum_v z_v L[v,j], z the variable standardized by e(means)/e(sds) after a
+// correlation pca (centered after a covariance one) -- for as many new variables as
+// named, at most e(f); `fit` -- the variables rebuilt from the e(f) retained
+// components, mean + sd * sum_j L[v,j] score_j, one new variable per variable.
+// r(scoef) is the scoring matrix (e(L)'s retained columns, Comp1 ...). Bank
+// bf3c53cd `predict double pc1 pc2, score` (4 components skipped, r(scoef) 6 x 6),
+// 407f190a `predict double f1-f6, fit` after `components(2)` (r(scoef) 6 x 2); the
+// values match Stata's saved data. A rotated solution, q, residual and the other
+// options are not implemented here.
+std::optional<ojson> runPcaPredictM4(const std::vector<std::string>& varlist,
+                                     const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                     SessionState& session, const std::optional<std::string>& ifExpr) {
+  auto refuse = [](const std::string& why) {
+    return ojson(engineErrorBlockM4("predict after `pca`: " + why +
+                                        " is not implemented in this version of PIET. Nothing was written to your data.",
+                                    "unsupported_option"));
+  };
+  if (ifExpr.has_value() && !ifExpr->empty()) return refuse("an `if` qualifier");
+  bool fit = false, score = false, notable = false;
+  for (const auto& [k0, v] : opts) {
+    const std::string k = lowerM4(k0);
+    if (!v.isBool) return refuse("option " + k + "()");
+    if (k.size() >= 2 && std::string("score").compare(0, k.size(), k) == 0) score = true;
+    else if (k == "f" || k == "fi" || k == "fit") fit = true;
+    else if (k.size() >= 4 && std::string("notable").compare(0, k.size(), k) == 0) notable = true;
+    else return refuse("option " + k);
+  }
+  if (fit && score) return ojson(eval::errorBlock("syntax_error", "only one statistic may be specified",
+                                                  std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+  if (session.eval.findClassMatrix('e', "r_L") != nullptr) return refuse("a rotated solution");
+  std::vector<std::string> toks = varlist;
+  std::string declaredType;
+  if (toks.size() >= 2 && storage::isNumericType(lowerM4(toks[0]))) {
+    declaredType = lowerM4(toks[0]);
+    toks.erase(toks.begin());
+  }
+  if (toks.empty()) return ojson(eval::errorBlock("syntax_error", "varlist required", std::nullopt, std::nullopt,
+                                                  std::nullopt, "r(100)"));
+  using Reader = eval::EvalSession::EReader;
+  const auto eL = session.eval.resolveEMatrixFor("L", Reader::kCopy);
+  const auto eM = session.eval.resolveEMatrixFor("means", Reader::kCopy);
+  const auto eS = session.eval.resolveEMatrixFor("sds", Reader::kCopy);
+  if (!eL.matrix.has_value() || !eM.matrix.has_value() || !eS.matrix.has_value())
+    return refuse("this fit (e(L), e(means) or e(sds) was not posted)");
+  const eval::EvalMatrix& L = *eL.matrix;
+  const size_t k = L.rownames.size();
+  if (k == 0 || L.data.size() != k || eM.matrix->data.size() != 1 || eM.matrix->data[0].size() != k ||
+      eS.matrix->data.size() != 1 || eS.matrix->data[0].size() != k)
+    return refuse("this fit (its matrices do not conform)");
+  const double* fp = session.eval.eScalars.find("f");
+  const size_t f = fp != nullptr && *fp >= 1 ? static_cast<size_t>(*fp) : L.colnames.size();
+  if (f > L.colnames.size()) return refuse("this fit (e(f) exceeds e(L))");
+  const std::string* ct = session.eval.eStrings.find("Ctype");
+  const bool corr = ct == nullptr || *ct != "covariance";
+  for (const auto& t : toks)
+    if (!strutil::isValidStataIdentifier(t)) return refuse("a variable stub or range");
+  if (!fit && toks.size() > f) return refuse("more new variables than retained components");
+  Datastore* live = nullptr;
+  try {
+    live = session.datastore();
+  } catch (const std::exception& e) {
+    return refuse(e.what());
+  }
+  if (live == nullptr) return ojson(eval::noDataLoaded());
+  for (const auto& t : toks)
+    if (live->has(t))
+      return ojson(eval::errorBlock("engine_error", "variable " + t + " already defined", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(110)"));
+  std::vector<const double*> X(k);
+  for (size_t v = 0; v < k; ++v) {
+    const std::string& nm = L.rownames[v];
+    if (!live->has(nm) || live->col(nm).dtype != cecon::DType::F64 || live->col(nm).f64() == nullptr)
+      return refuse("this fit (variable " + nm + " is not numeric in memory)");
+    X[v] = live->col(nm).f64();
+  }
+  const size_t n = static_cast<size_t>(live->nRows());
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  const std::vector<double>& mu = eM.matrix->data[0];
+  const std::vector<double>& sd = eS.matrix->data[0];
+  const size_t nComp = fit ? f : toks.size();
+  std::vector<std::vector<double>> sc(nComp, std::vector<double>(n, kNaN));
+  for (size_t r = 0; r < n; ++r) {
+    std::vector<double> z(k);
+    bool ok = true;
+    for (size_t v = 0; v < k && ok; ++v) {
+      const double x = X[v][r];
+      if (std::isnan(x) || x >= eval::kStataMissingSentinel) ok = false;
+      else z[v] = corr ? (x - mu[v]) / sd[v] : x - mu[v];
+    }
+    if (!ok) continue;
+    for (size_t j = 0; j < nComp; ++j) {
+      double s = 0;
+      for (size_t v = 0; v < k; ++v) s += z[v] * L.data[v][j];
+      sc[j][r] = s;
+    }
+  }
+  std::vector<std::vector<double>> outv;
+  std::vector<std::string> labels;
+  if (fit) {
+    if (toks.size() != k)
+      return ojson(eval::errorBlock("syntax_error", "number of new variables should equal number of variables in pca",
+                                    std::nullopt, std::nullopt, std::nullopt, toks.size() > k ? "r(103)" : "r(102)"));
+    for (size_t v = 0; v < k; ++v) {
+      std::vector<double> col(n, kNaN);
+      for (size_t r = 0; r < n; ++r) {
+        if (std::isnan(sc[0][r])) continue;
+        double s = 0;
+        for (size_t j = 0; j < f; ++j) s += L.data[v][j] * sc[j][r];
+        col[r] = mu[v] + (corr ? sd[v] : 1.0) * s;
+      }
+      outv.push_back(std::move(col));
+      labels.push_back("Fitted " + L.rownames[v]);
+    }
+  } else {
+    for (size_t j = 0; j < nComp; ++j) {
+      outv.push_back(sc[j]);
+      labels.push_back("Scores for component " + std::to_string(j + 1));
+    }
+  }
+  const std::string storeType = storage::resolveCreateType(session, declaredType);
+  std::string head = *session.currentHbin();
+  std::vector<std::string> written;
+  for (size_t i = 0; i < toks.size(); ++i) {
+    const std::string out = nextPathEst(session.workdir(), "predict");
+    if (auto rej = writePredictColumnM4(session, head, toks[i], outv[i], out, storeType)) {
+      for (const auto& w : written) cecon::native_unlink(w);
+      return *rej;
+    }
+    written.push_back(out);
+    head = out;
+  }
+  session.load(head);
+  session.invalidateDatastore();
+  for (size_t i = 0; i < toks.size(); ++i) {
+    storage::recordCreateType(session, toks[i], declaredType, storeType);
+    session.varMeta[toks[i]].label = labels[i];
+  }
+  session.syncEvalVarLabels();
+  eval::EvalMatrix scoef;
+  scoef.rownames = L.rownames;
+  for (size_t j = 0; j < f; ++j) scoef.colnames.push_back("Comp" + std::to_string(j + 1));
+  for (size_t v = 0; v < k; ++v) scoef.data.emplace_back(L.data[v].begin(), L.data[v].begin() + static_cast<long>(f));
+  eval::replaceRClass(session.eval);
+  session.eval.rMatrices.emplace_back("scoef", std::move(scoef));
+  eval::declareRPosted(session.eval, "predict", {"scoef"});
+  // The display: the scoring coefficients after score (pca_p's table).
+  std::string text;
+  if (!fit) {
+    if (score == false) text += "(score assumed)\n";
+    if (toks.size() < f)
+      text += "(" + std::to_string(f - toks.size()) + " component" + (f - toks.size() == 1 ? "" : "s") + " skipped)\n";
+    if (!notable) {
+      auto padL = [](const std::string& x, size_t w) { return x.size() >= w ? x : std::string(w - x.size(), ' ') + x; };
+      const std::string rule(14 + 10 * f, '-');
+      text += "\nScoring coefficients\n    sum of squares(column-loading) = 1\n\n    " + rule + "\n    " +
+              padL("Variable", 12) + " |";
+      for (size_t j = 0; j < f; ++j) text += padL("Comp" + std::to_string(j + 1), 9) + " ";
+      text += "\n    " + std::string(13, '-') + "+" + std::string(10 * f, '-') + "\n";
+      for (size_t v = 0; v < k; ++v) {
+        text += "    " + padL(L.rownames[v].substr(0, 12), 12) + " |";
+        for (size_t j = 0; j < f; ++j) {
+          char buf[32];
+          std::snprintf(buf, sizeof buf, "%9.4f", L.data[v][j]);
+          text += std::string(buf) + " ";
+        }
+        text += "\n";
+      }
+      text += "    " + rule + "\n";
+    }
+  }
+  Datastore* ds = session.datastore();
+  session.seedNMissForPureAdd(ds, "gen", toks, /*droppedVars=*/{}, /*rewrittenVars=*/{});
+  ojson outBlock;
+  outBlock["type"] = "data_mutation";
+  outBlock["action"] = "gen";
+  ojson varlistAfter = ojson::array();
+  auto vlist = session.varlistWithMeta(ds);
+  for (const auto& vv : vlist) varlistAfter.push_back(vv.toJson());
+  session.updateNMissCache(vlist);
+  outBlock["varlist_after"] = varlistAfter;
+  outBlock["n_rows_after"] = ds ? ds->nRows() : 0;
+  outBlock["new_vars"] = toks;
+  if (text.empty()) return outBlock;
+  ojson arr = ojson::array();
+  arr.push_back(ojson{{"type", "display"}, {"text", text}});
+  arr.push_back(outBlock);
+  return arr;
+}
+
 // ologit / oprobit / mlogit (ologit_p.ado, mlogit_p.ado): xb, stdp, and pr --
 // one outcome (outcome(#), `#k`, or the first outcome when one variable is named)
 // or every outcome (as many new variables as outcomes). Read off the posted e(b)
@@ -2226,8 +3116,32 @@ ojson runCategoricalPredictM4(const std::vector<std::string>& varlist,
     toks.erase(toks.begin());
   }
   if (toks.empty()) return stataErr("varlist required", 100);
-  for (const auto& t : toks)
-    if (t.find_first_of("*?~-") != std::string::npos) return refuse("a variable stub");
+  // A new-variable range `p1-p5` names p1 p2 p3 p4 p5 (bank 2c327ea6 after mlogit,
+  // ecb7a5d1 after ologit: `predict double p1-p5`); `stub*` is resolved below,
+  // once the number of outcomes is known (stub1 ... stubK).
+  std::string starStub;
+  {
+    static const std::regex reRange(R"(^([A-Za-z_][A-Za-z0-9_]*?)([0-9]+)-([A-Za-z_][A-Za-z0-9_]*?)([0-9]+)$)");
+    std::vector<std::string> expanded;
+    for (const auto& t : toks) {
+      std::smatch m;
+      if (std::regex_match(t, m, reRange) && m.str(1) == m.str(3) && m.str(2).size() < 9 && m.str(4).size() < 9) {
+        const long a = std::stol(m.str(2)), b = std::stol(m.str(4));
+        if (b < a || b - a > 1000) return stataErr(t + " invalid name", 198);
+        for (long i = a; i <= b; ++i) expanded.push_back(m.str(1) + std::to_string(i));
+        continue;
+      }
+      if (toks.size() == 1 && t.size() > 1 && t.back() == '*' &&
+          t.find_first_of("*?~-") == t.size() - 1 && strutil::isValidStataIdentifier(t.substr(0, t.size() - 1))) {
+        starStub = t.substr(0, t.size() - 1);
+        expanded.push_back(t);
+        continue;
+      }
+      if (t.find_first_of("*?~-") != std::string::npos) return refuse("a variable stub");
+      expanded.push_back(t);
+    }
+    toks = std::move(expanded);
+  }
 
   const auto eb = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
   if (!eb.matrix.has_value() || eb.matrix->data.size() != 1)
@@ -2313,13 +3227,37 @@ ojson runCategoricalPredictM4(const std::vector<std::string>& varlist,
       if (pick == 0) return stataErr("outcome " + outcome + " not found", 111);
     }
   }
+  if (!starStub.empty()) {
+    // stub*: always one new variable per outcome (stub1 ... stubK), whatever the
+    // statistic -- the multiple-variable checks below then apply to it.
+    toks.clear();
+    for (size_t i = 1; i <= K; ++i) toks.push_back(starStub + std::to_string(i));
+  }
   const size_t nvars = toks.size();
   if (nvars > 1) {
-    if (hasOutcome) return stataErr("option outcome() is not allowed when multiple new variables are specified", 198);
-    if (type != "pr") return stataErr("option " + type + " requires that you specify 1 new variable", 103);
-    if (nvars != K) return stataErr(lm.y + " has " + std::to_string(K) + " outcomes and so you must specify " +
-                                        std::to_string(K) + " new variables, or you can use the outcome() option and specify variables one at a time",
-                                    nvars < K ? 102 : 103);
+    const auto countErr = [&]() {
+      return stataErr(lm.y + " has " + std::to_string(K) + " outcomes and so you must specify " +
+                          std::to_string(K) +
+                          " new variables, or you can use the outcome() option and specify variables one at a time",
+                      nvars < K ? 102 : 103);
+    };
+    const auto oneVar = [&](const std::string& what) {
+      return stataErr("option " + what + " requires that you specify 1 new variable", 103);
+    };
+    if (ordered) {
+      // ologit_p / oprobit_p: the count against the outcomes first, then
+      // outcome() is r(198), then a one-variable statistic is r(103).
+      if (nvars != K) return countErr();
+      if (hasOutcome)
+        return stataErr("option outcome() is not allowed when multiple new variables are specified", 198);
+      if (type != "pr") return oneVar(type);
+    } else {
+      // mlogit_p: with outcome() the statistic wants one variable (r(103)),
+      // else the count, then a one-variable statistic.
+      if (hasOutcome) return oneVar(type == "pr" ? std::string("pr with outcome()") : type);
+      if (nvars != K) return countErr();
+      if (type != "pr") return oneVar(type);
+    }
   } else if (!hasOutcome) {
     pick = 1;  // the first outcome (#1)
   }
@@ -2528,6 +3466,439 @@ ojson runCategoricalPredictM4(const std::vector<std::string>& varlist,
 
 }  // namespace
 
+// stcox (stcox_p.ado): xb, the linear prediction x*b (no constant), and hr, its
+// exponential -- the default, "(option hr assumed; predicted hazard ratio)" --
+// from the posted e(b) at every row whose covariates are nonmissing (_predict).
+// The baseline functions, residuals, scores and dfbeta re-run the Cox fit and
+// are refused by name (vs-stata bank ec856988 `predict double xb1, xb`, 2481af20
+// `predict double hr1, hr`).
+ojson runStcoxPredictM4(const std::vector<std::string>& varlist,
+                        const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                        SessionState& session, const std::optional<std::string>& ifExpr) {
+  auto refuse = [&](const std::string& why) {
+    return engineErrorBlockM4("predict after `stcox`: " + why +
+                                  " is not implemented in this version of PIET. Nothing was "
+                                  "written to your data.",
+                              "unsupported_option");
+  };
+  auto stataErr = [](const std::string& msg, int rc) {
+    return ojson(eval::errorBlock("engine_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(rc) + ")"));
+  };
+  if (ifExpr.has_value() && !ifExpr->empty()) return refuse("an `if` qualifier");
+  std::string type;
+  for (const auto& [k0, v] : opts) {
+    const std::string k = lowerM4(k0);
+    std::string hit;
+    if (k == "xb") hit = "xb";
+    else if (k == "hr") hit = "hr";
+    if (hit.empty()) return refuse("option " + k);
+    if (!v.isBool) return refuse("option " + k + "()");
+    if (!type.empty() && type != hit) return stataErr("only one statistic may be specified", 198);
+    type = hit;
+  }
+  const bool assumed = type.empty();
+  if (assumed) type = "hr";
+  std::vector<std::string> toks = varlist;
+  std::string declaredType;
+  if (toks.size() >= 2 && storage::isNumericType(lowerM4(toks[0]))) {
+    declaredType = lowerM4(toks[0]);
+    toks.erase(toks.begin());
+  }
+  if (toks.empty()) return stataErr("varlist required", 100);
+  if (toks.size() > 1) return stataErr("too many variables specified", 103);
+  const auto eb = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
+  if (!eb.matrix.has_value() || eb.matrix->data.size() != 1)
+    return refuse("this fit (its coefficient vector was not posted)");
+  std::vector<std::string> names = eb.matrix->colnames;
+  const std::vector<double>& bv = eb.matrix->data[0];
+  for (auto& c : names) {
+    const size_t colon = c.find(':');
+    if (colon != std::string::npos) c = c.substr(colon + 1);
+  }
+  Datastore* live = nullptr;
+  try {
+    live = session.datastore();
+  } catch (const std::exception& e) {
+    return refuse(e.what());
+  }
+  if (live == nullptr) return ojson(eval::noDataLoaded());
+  const std::string& nm = toks[0];
+  if (!strutil::isValidStataIdentifier(nm)) return stataErr(nm + " invalid name", 198);
+  if (live->has(nm)) return stataErr("variable " + nm + " already defined", 110);
+  std::vector<DesignColM4> design;
+  std::string why;
+  if (!buildDesignM4(*live, names, design, why)) return refuse(why);
+  const size_t n = static_cast<size_t>(live->nRows());
+  std::vector<double> out(n, std::numeric_limits<double>::quiet_NaN());
+  for (size_t r = 0; r < n; ++r) {
+    double xb = 0.0;
+    bool ok = true;
+    for (size_t q = 0; q < design.size(); ++q) {
+      const double x = designValueM4(design[q], r);
+      if (std::isnan(x) || x >= eval::kStataMissingSentinel) {
+        ok = false;
+        break;
+      }
+      xb += x * bv[q];
+    }
+    if (ok) out[r] = type == "xb" ? xb : std::exp(xb);
+  }
+  const std::string storeType = storage::resolveCreateType(session, declaredType);
+  const std::string outPath = nextPathEst(session.workdir(), "predict");
+  if (auto rej = writePredictColumnM4(session, *session.currentHbin(), nm, out, outPath, storeType))
+    return *rej;
+  session.load(outPath);
+  session.invalidateDatastore();
+  storage::recordCreateType(session, nm, declaredType, storeType);
+  session.varMeta[nm].label = type == "xb" ? "Linear prediction" : "Predicted hazard ratio";
+  session.syncEvalVarLabels();
+  Datastore* ds = session.datastore();
+  session.seedNMissForPureAdd(ds, "gen", toks, /*droppedVars=*/{}, /*rewrittenVars=*/{});
+  ojson outBlock;
+  outBlock["type"] = "data_mutation";
+  outBlock["action"] = "gen";
+  ojson varlistAfter = ojson::array();
+  auto vlist = session.varlistWithMeta(ds);
+  for (const auto& v : vlist) varlistAfter.push_back(v.toJson());
+  session.updateNMissCache(vlist);
+  outBlock["varlist_after"] = varlistAfter;
+  outBlock["n_rows_after"] = ds ? ds->nRows() : 0;
+  outBlock["new_vars"] = toks;
+  if (assumed) outBlock["note"] = "(option hr assumed; predicted hazard ratio)";
+  return outBlock;
+}
+
+// streg, distribution(weibull) in the hazard metric (weibul_p.ado): with
+// lambda = exp(x*b) and p = exp(/ln_p), S(t) = exp(-lambda t^p). xb; hr, the
+// relative hazard; surv, S(_t | _t0) = S(_t)/S(_t0); median time
+// (ln 2 / lambda)^(1/p) and mean time Gamma(1 + 1/p) lambda^(-1/p), both from
+// t = 0. From the posted e(b) at every row with nonmissing covariates that is
+// in the st analysis (_st == 1; rows stset excluded stay missing for every
+// statistic). csnell is the cumulative Cox-Snell residual (streg_p turns
+// csnell into ccsnell unless partial is typed): the record's
+// H = lambda (_t^p - _t0^p) on e(sample) rows only, and with stset id() one
+// value per subject -- the sum of its records' H on the subject's last record
+// (by _t), every other record missing. `partial` (or no id()) keeps the
+// per-record H, there on every _st row. hr leaves out the constant: StataBE's saved hr is exp(x*b - _b[_cons])
+// to 1e-14 (bank 0d116d74). Other distributions, metrics and statistics keep a named refusal
+// (vs-stata bank 0d116d74 `predict double h1, hr`, 8d190911 `surv`, 4e9b1b35
+// `median time`, b7fca0dc `mean time`, a8ab577a `csnell`).
+// predict after gmm (gmm_p): the linear prediction of one parameter equation,
+// x*b over that equation's variables (its _cons coefficient included), on every
+// observation whose variables are present. The default and equation(#1) are the
+// first parameter equation ("option xb assumed; fitted values", vs-stata bank
+// bcebc875 / 6538e839); equation(#k) or equation(name) choose another. The
+// residuals and scores of the moment expressions are refused by name.
+ojson runGmmPredictM4(const std::vector<std::string>& varlist,
+                      const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                      SessionState& session, const std::optional<std::string>& ifExpr) {
+  auto refuse = [&](const std::string& why) {
+    return engineErrorBlockM4("predict after `gmm`: " + why +
+                                  " is not implemented in this version of PIET. Nothing was "
+                                  "written to your data.",
+                              "unsupported_option");
+  };
+  auto stataErr = [](const std::string& msg, int rc) {
+    return ojson(eval::errorBlock("engine_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(rc) + ")"));
+  };
+  if (ifExpr.has_value() && !ifExpr->empty()) return refuse("an `if` qualifier");
+  std::string eqSel;
+  for (const auto& [k0, v] : opts) {
+    const std::string k = lowerM4(k0);
+    if (k == "xb" && v.isBool) continue;
+    if (k.size() >= 2 && std::string("equation").compare(0, k.size(), k) == 0 && !v.isBool) {
+      eqSel = strutil::trim(v.strValue);
+      continue;
+    }
+    return refuse("option " + k);
+  }
+  std::vector<std::string> toks = varlist;
+  std::string declaredType;
+  if (toks.size() >= 2 && storage::isNumericType(lowerM4(toks[0]))) {
+    declaredType = lowerM4(toks[0]);
+    toks.erase(toks.begin());
+  }
+  if (toks.empty()) return stataErr("varlist required", 100);
+  if (toks.size() > 1) return stataErr("too many variables specified", 103);
+  const auto eb = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
+  if (!eb.matrix.has_value() || eb.matrix->data.size() != 1)
+    return refuse("this fit (its coefficient vector was not posted)");
+  std::vector<std::string> eqs;
+  for (const auto& c : eb.matrix->colnames) {
+    const std::string e = c.substr(0, c.find(':'));
+    if (std::find(eqs.begin(), eqs.end(), e) == eqs.end()) eqs.push_back(e);
+  }
+  std::string eq = eqs.empty() ? std::string() : eqs[0];
+  if (!eqSel.empty()) {
+    if (eqSel[0] == '#') {
+      char* end = nullptr;
+      const long q = std::strtol(eqSel.c_str() + 1, &end, 10);
+      if (end == eqSel.c_str() + 1 || *end != '\0' || q < 1 || static_cast<size_t>(q) > eqs.size())
+        return stataErr("equation " + eqSel + " not found", 303);
+      eq = eqs[static_cast<size_t>(q - 1)];
+    } else {
+      if (std::find(eqs.begin(), eqs.end(), eqSel) == eqs.end())
+        return stataErr("equation " + eqSel + " not found", 303);
+      eq = eqSel;
+    }
+  }
+  std::vector<std::string> names;
+  std::vector<double> bx;
+  double bcons = 0.0;
+  for (size_t j = 0; j < eb.matrix->colnames.size(); ++j) {
+    const std::string& c = eb.matrix->colnames[j];
+    if (c.rfind(eq + ":", 0) != 0) continue;
+    const std::string v = c.substr(eq.size() + 1);
+    if (v == "_cons") bcons = eb.matrix->data[0][j];
+    else {
+      names.push_back(v);
+      bx.push_back(eb.matrix->data[0][j]);
+    }
+  }
+  Datastore* live = nullptr;
+  try {
+    live = session.datastore();
+  } catch (const std::exception& e) {
+    return refuse(e.what());
+  }
+  if (live == nullptr) return ojson(eval::noDataLoaded());
+  const std::string& nm = toks[0];
+  if (!strutil::isValidStataIdentifier(nm)) return stataErr(nm + " invalid name", 198);
+  if (live->has(nm)) return stataErr("variable " + nm + " already defined", 110);
+  std::vector<DesignColM4> design;
+  std::string why;
+  if (!buildDesignM4(*live, names, design, why)) return refuse(why);
+  const size_t n = static_cast<size_t>(live->nRows());
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  std::vector<double> out(n, kNaN);
+  const auto miss = [](double x) { return std::isnan(x) || x >= eval::kStataMissingSentinel; };
+  for (size_t r = 0; r < n; ++r) {
+    double xb = 0.0;
+    bool ok = true;
+    for (size_t q = 0; q < design.size() && ok; ++q) {
+      const double x = designValueM4(design[q], r);
+      if (miss(x)) ok = false;
+      else xb += x * bx[q];
+    }
+    if (ok) out[r] = xb + bcons;
+  }
+  const std::string storeType = storage::resolveCreateType(session, declaredType);
+  const std::string outPath = nextPathEst(session.workdir(), "predict");
+  if (auto rej = writePredictColumnM4(session, *session.currentHbin(), nm, out, outPath, storeType))
+    return *rej;
+  session.load(outPath);
+  session.invalidateDatastore();
+  storage::recordCreateType(session, nm, declaredType, storeType);
+  session.varMeta[nm].label = "Fitted values";
+  session.syncEvalVarLabels();
+  Datastore* ds = session.datastore();
+  session.seedNMissForPureAdd(ds, "gen", toks, /*droppedVars=*/{}, /*rewrittenVars=*/{});
+  ojson outBlock;
+  outBlock["type"] = "data_mutation";
+  outBlock["action"] = "gen";
+  ojson varlistAfter = ojson::array();
+  auto vlist = session.varlistWithMeta(ds);
+  for (const auto& v : vlist) varlistAfter.push_back(v.toJson());
+  session.updateNMissCache(vlist);
+  outBlock["varlist_after"] = varlistAfter;
+  outBlock["n_rows_after"] = ds ? ds->nRows() : 0;
+  outBlock["new_vars"] = toks;
+  return outBlock;
+}
+
+ojson runStregPredictM4(const std::vector<std::string>& varlist,
+                        const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                        SessionState& session, const std::optional<std::string>& ifExpr) {
+  auto refuse = [&](const std::string& why) {
+    return engineErrorBlockM4("predict after `streg`: " + why +
+                                  " is not implemented in this version of PIET. Nothing was "
+                                  "written to your data.",
+                              "unsupported_option");
+  };
+  auto stataErr = [](const std::string& msg, int rc) {
+    return ojson(eval::errorBlock("engine_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(rc) + ")"));
+  };
+  if (session.eval.eStrings.get("cmd") != "weibull" || session.eval.eStrings.get("frm2") != "hazard")
+    return refuse("a model other than distribution(weibull) in the hazard metric");
+  if (ifExpr.has_value() && !ifExpr->empty()) return refuse("an `if` qualifier");
+  bool median = false, mean = false, time = false, partial = false, cumulative = false;
+  std::string type;
+  for (const auto& [k0, v] : opts) {
+    const std::string k = lowerM4(k0);
+    if (!v.isBool) return refuse("option " + k + "()");
+    std::string hit;
+    if (k == "xb") hit = "xb";
+    else if (k == "hr") hit = "hr";
+    else if (k == "surv") hit = "surv";
+    else if (k.size() >= 3 && std::string("csnell").compare(0, k.size(), k) == 0) hit = "csnell";
+    else if (k.size() >= 3 && std::string("ccsnell").compare(0, k.size(), k) == 0) {
+      hit = "csnell";
+      cumulative = true;
+    } else if (k.size() >= 4 && std::string("partial").compare(0, k.size(), k) == 0) partial = true;
+    else if (k == "median") median = true;
+    else if (k == "mean") mean = true;
+    else if (k == "time") time = true;
+    else return refuse("option " + k);
+    if (!hit.empty()) {
+      if (!type.empty() && type != hit) return stataErr("only one statistic may be specified", 198);
+      type = hit;
+    }
+  }
+  if ((median || mean) && !time) return refuse("median / mean without time");
+  if (median && mean) return stataErr("only one statistic may be specified", 198);
+  if (median || mean) {
+    if (!type.empty()) return stataErr("only one statistic may be specified", 198);
+    type = median ? "median" : "mean";
+  } else if (time) {
+    return refuse("time without median or mean");
+  }
+  if (type.empty()) return refuse("the default statistic");
+  if (partial && (type != "csnell" || cumulative))
+    return stataErr("option partial not allowed", 198);
+  cumulative = type == "csnell" && !partial;
+  std::vector<std::string> toks = varlist;
+  std::string declaredType;
+  if (toks.size() >= 2 && storage::isNumericType(lowerM4(toks[0]))) {
+    declaredType = lowerM4(toks[0]);
+    toks.erase(toks.begin());
+  }
+  if (toks.empty()) return stataErr("varlist required", 100);
+  if (toks.size() > 1) return stataErr("too many variables specified", 103);
+  const auto eb = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
+  if (!eb.matrix.has_value() || eb.matrix->data.size() != 1)
+    return refuse("this fit (its coefficient vector was not posted)");
+  std::vector<std::string> names;
+  std::vector<double> bx;
+  double lnp = std::numeric_limits<double>::quiet_NaN();
+  for (size_t j = 0; j < eb.matrix->colnames.size(); ++j) {
+    const std::string& c = eb.matrix->colnames[j];
+    if (c == "/ln_p") {
+      lnp = eb.matrix->data[0][j];
+    } else if (c.rfind("_t:", 0) == 0) {
+      names.push_back(c.substr(3));
+      bx.push_back(eb.matrix->data[0][j]);
+    } else {
+      return refuse("this fit (an equation other than _t and /ln_p)");
+    }
+  }
+  if (!std::isfinite(lnp)) return refuse("this fit (its /ln_p was not posted)");
+  double bcons = 0.0;  // hr is the hazard relative to the baseline: exp(x*b - _b[_cons])
+  for (size_t q = 0; q < names.size(); ++q)
+    if (names[q] == "_cons") bcons = bx[q];
+  const double p = std::exp(lnp);
+  Datastore* live = nullptr;
+  try {
+    live = session.datastore();
+  } catch (const std::exception& e) {
+    return refuse(e.what());
+  }
+  if (live == nullptr) return ojson(eval::noDataLoaded());
+  const std::string& nm = toks[0];
+  if (!strutil::isValidStataIdentifier(nm)) return stataErr(nm + " invalid name", 198);
+  if (live->has(nm)) return stataErr("variable " + nm + " already defined", 110);
+  std::vector<DesignColM4> design, tcols;
+  std::string why;
+  if (!buildDesignM4(*live, names, design, why)) return refuse(why);
+  const bool needT = type == "surv" || type == "csnell";
+  if (needT && !buildDesignM4(*live, {"_t", "_t0"}, tcols, why)) return refuse(why);
+  std::vector<DesignColM4> stcol;
+  if (!buildDesignM4(*live, {"_st"}, stcol, why)) return refuse(why);
+  const size_t n = static_cast<size_t>(live->nRows());
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  std::vector<double> out(n, kNaN);
+  const auto miss = [](double x) { return std::isnan(x) || x >= eval::kStataMissingSentinel; };
+  // the cumulative residual is an estimation-sample statistic
+  std::vector<char> inSample;
+  if (cumulative) {
+    const auto& lmOpt = session.lastModel();
+    const auto rows = lmOpt.has_value() ? esampleRowsM4(session, *lmOpt) : std::nullopt;
+    if (!rows.has_value()) return refuse("this fit (its estimation sample is not on the data in memory)");
+    inSample.assign(n, 0);
+    for (const int64_t r : *rows)
+      if (r >= 0 && static_cast<size_t>(r) < n) inSample[static_cast<size_t>(r)] = 1;
+  }
+  for (size_t r = 0; r < n; ++r) {
+    if (designValueM4(stcol[0], r) != 1.0) continue;
+    if (cumulative && !inSample[r]) continue;
+    double xb = 0.0;
+    bool ok = true;
+    for (size_t q = 0; q < design.size() && ok; ++q) {
+      const double x = designValueM4(design[q], r);
+      if (miss(x)) ok = false;
+      else xb += x * bx[q];
+    }
+    if (!ok) continue;
+    const double lam = std::exp(xb);
+    double v = kNaN;
+    if (type == "xb") v = xb;
+    else if (type == "hr") v = std::exp(xb - bcons);
+    else if (type == "median") v = std::pow(std::log(2.0) / lam, 1.0 / p);
+    else if (type == "mean") v = std::exp(std::lgamma(1.0 + 1.0 / p)) * std::pow(lam, -1.0 / p);
+    else {
+      const double t = designValueM4(tcols[0], r), t0 = designValueM4(tcols[1], r);
+      if (miss(t) || miss(t0)) continue;
+      const double H = lam * (std::pow(t, p) - std::pow(t0, p));
+      v = type == "surv" ? std::exp(-H) : H;
+    }
+    out[r] = v;
+  }
+  const std::string stId = session.stContext ? session.stContext->idvar : std::string();
+  if (cumulative && !stId.empty()) {
+    // one value per subject: the sum of its records' residuals, on the record
+    // with the latest _t (sorted by subject, then _t)
+    std::vector<DesignColM4> idcol;
+    if (!buildDesignM4(*live, {stId}, idcol, why)) return refuse(why);
+    std::map<double, std::pair<size_t, double>> last;  // id -> (last record, sum)
+    for (size_t r = 0; r < n; ++r) {
+      if (!inSample[r] || designValueM4(stcol[0], r) != 1.0) continue;
+      const double id = designValueM4(idcol[0], r);
+      const double t = designValueM4(tcols[0], r);
+      auto it = last.find(id);
+      if (it == last.end()) {
+        last.emplace(id, std::make_pair(r, miss(out[r]) ? 0.0 : out[r]));
+        continue;
+      }
+      if (!miss(out[r])) it->second.second += out[r];
+      if (!(t < designValueM4(tcols[0], it->second.first))) it->second.first = r;
+    }
+    std::vector<double> cum(n, kNaN);
+    for (const auto& [id, a] : last) cum[a.first] = a.second;
+    out.swap(cum);
+  }
+  const std::string storeType = storage::resolveCreateType(session, declaredType);
+  const std::string outPath = nextPathEst(session.workdir(), "predict");
+  if (auto rej = writePredictColumnM4(session, *session.currentHbin(), nm, out, outPath, storeType))
+    return *rej;
+  session.load(outPath);
+  session.invalidateDatastore();
+  storage::recordCreateType(session, nm, declaredType, storeType);
+  session.varMeta[nm].label = type == "xb" ? "Linear prediction"
+                              : type == "hr" ? "Predicted hazard"
+                              : type == "surv" ? "Predicted S(t|t0)"
+                              : type == "csnell" ? (partial && !stId.empty()
+                                                        ? "Partial Cox\u2013Snell residual"
+                                                        : "Cox\u2013Snell residual")
+                              : type == "median" ? "Predicted median _t"
+                                                 : "Predicted mean _t";
+  session.syncEvalVarLabels();
+  Datastore* ds = session.datastore();
+  session.seedNMissForPureAdd(ds, "gen", toks, /*droppedVars=*/{}, /*rewrittenVars=*/{});
+  ojson outBlock;
+  outBlock["type"] = "data_mutation";
+  outBlock["action"] = "gen";
+  ojson varlistAfter = ojson::array();
+  auto vlist = session.varlistWithMeta(ds);
+  for (const auto& v : vlist) varlistAfter.push_back(v.toJson());
+  session.updateNMissCache(vlist);
+  outBlock["varlist_after"] = varlistAfter;
+  outBlock["n_rows_after"] = ds ? ds->nRows() : 0;
+  outBlock["new_vars"] = toks;
+  return outBlock;
+}
+
 ojson runPredict(const std::vector<std::string>& varlist,
                   const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                   SessionState& session, const std::optional<std::string>& ifExpr,
@@ -2568,6 +3939,10 @@ ojson runPredict(const std::vector<std::string>& varlist,
     return runCategoricalPredictM4(varlist, opts, session, lm, ifExpr);
   if (lm.cobraCmd == "heckman_ml" || lm.cobraCmd == "heckman" || lm.cobraCmd == "tobit")
     return runHeckmanPredictM4(varlist, opts, session, lm, ifExpr, nullptr);
+  if (auto served = runPostedIndexPredictM4(varlist, opts, session, lm, ifExpr)) return *served;
+  if (lm.cobraCmd == "stcox") return runStcoxPredictM4(varlist, opts, session, ifExpr);
+  if (lm.cobraCmd == "streg") return runStregPredictM4(varlist, opts, session, ifExpr);
+  if (lm.cobraCmd == "gmm") return runGmmPredictM4(varlist, opts, session, ifExpr);
   // predict after pca: the refusals pca's predictor makes before computing anything are
   // Stata's -- no components retained r(321); `fit` / `residual` naming fewer (r(102))
   // or more (r(103)) new variables than pca analysed (vs-stata bank d010f056 `predict
@@ -2595,6 +3970,7 @@ ojson runPredict(const std::vector<std::string>& varlist,
     if (fitOrResid && !stub && C != nullptr && nNew != C->data.size())
       return pcaRefuse("number of new variables should equal number of variables in pca",
                        nNew > C->data.size() ? 103 : 102);
+    if (auto served = runPcaPredictM4(varlist, opts, session, ifExpr)) return *served;
   }
   // BUG-204 (BUG-203's sibling, and the worse half): `predict` never read the
   // estimator either. The argv built below carries --data/--y/--x and no model,
@@ -2752,7 +4128,24 @@ ojson runPredict(const std::vector<std::string>& varlist,
     // vocabulary (the block above computePredictNativeM4). The engine keeps the
     // two it already writes as Stata defines them; everything else is computed
     // below from e(b), e(V) and the engine refit's estimation sample.
-    if (auto rej = resolvePredictStatM4(family, lm, opts, predictStat)) return *rej;
+    if (auto rej = resolvePredictStatM4(family, lm, opts, predictStat,
+                                            session.eval.eStrings.get("vcetype")))
+      return *rej;
+    // A regress/areg fit with depname(name): e(depvar) is `name`, and Stata's residual
+    // family is then a deviation from that variable rather than from the fitted
+    // depvar (help regress, depname()). Not computed here: the statistics that read
+    // the dependent variable are refused by name; xb and the variance statistics
+    // need only e(b) and e(V) and are served.
+    if ((lm.stataCmd == "regress" || lm.stataCmd == "areg") && !lm.depvar.empty() &&
+        lm.depvar != lm.y) {
+      static const std::set<std::string> kNoDepvar = {"xb", "stdp", "stdf", "stdr", "hat"};
+      if (!kNoDepvar.count(predictStat) && predictStat.rfind("e(", 0) != 0)
+        return engineErrorBlockM4("predict, " + predictStat + " after `" + lm.stataCmd +
+                                      ", depname(" + lm.depvar + ")` is not supported in this "
+                                      "version of PIET (the statistic would be computed from `" +
+                                      lm.depvar + "`). Nothing was written to your data.",
+                                  "unsupported_option");
+    }
     if (restrictedAbsorbed && !predictServesRestrictedM4(family, predictStat)) {
       return engineErrorBlockM4("predict, " + predictStat + " after a restricted `" +
                                     predictFamilyCmdM4(family, lm) + " ... if` fit is not supported "
@@ -2849,6 +4242,12 @@ ojson runPredict(const std::vector<std::string>& varlist,
     storeType = storage::resolveCreateType(session, declaredType);
   }
   std::string newvar = nameToks.empty() ? std::string() : nameToks[0];
+  // regress has one equation: `predict sc*, scores` writes its score as sc1
+  // (regres_p's GenScores through _score_spec; bank 532334a3af72d0f8).
+  if (family == PredictFamilyM4::Regress && predictStat == "score" && nameToks.size() == 1 &&
+      newvar.size() > 1 && newvar.back() == '*' &&
+      newvar.find_first_of("*?~-") == newvar.size() - 1)
+    newvar = newvar.substr(0, newvar.size() - 1) + "1";
   if (newvar.empty()) {
     return engineErrorBlockM4("predict: a new variable name is required, e.g. `predict yhat`.",
                               "syntax_error");
@@ -3134,13 +4533,22 @@ ojson runPredict(const std::vector<std::string>& varlist,
     if (translate::hasTsToken(tsTokens)) args = translate::injectTsContext(args, session);
   }
   std::string outPath = nextPathEst(session.workdir(), "predict");
+  eval::EvalMatrix dfbTable;  // dfbeta()'s auxiliary regression table (r(table))
   if (nativeStat || !mlStat.empty()) {
     std::vector<double> vals;
     if (weightedFit) {
       // BUG-1260 (nativeStat is set): no engine refit after a weighted fit.
       if (auto rej = computePredictWeightedM4(session, lm, family, predictStat, vals)) return *rej;
     } else if (nativeStat) {
-      if (auto rej = computePredictNativeM4(session, lm, family, predictStat, args, vals)) return *rej;
+      // dfbeta()'s auxiliary regression runs over predict's own if/in sample in
+      // Stata (regres_p's touse); this build fits it over e(sample) only.
+      if (predictStat.rfind("dfbeta(", 0) == 0 && ifExpr.has_value() && !ifExpr->empty())
+        return engineErrorBlockM4("predict, dfbeta() with an if qualifier is not supported in this "
+                                  "version of PIET. Nothing was written to your data.",
+                                  "unsupported_option");
+      if (auto rej = computePredictNativeM4(session, lm, family, predictStat, args, vals,
+                                            &dfbTable, static_cast<double>(session.level)))
+        return *rej;
     } else if (auto rej = computePredictMlM4(session, lm, mlStat, args, vals)) {
       return *rej;
     }
@@ -3226,14 +4634,23 @@ ojson runPredict(const std::vector<std::string>& varlist,
         label = "Predicted incidence rate";
     } else if (family == PredictFamilyM4::Other) {
       if (lm.stataCmd == "reghdfe") label = wantXb ? "Linear prediction" : "Residuals";  // noabsorb
-    } else if (s.rfind("e(", 0) == 0) {
-      const std::string in = s.substr(2, s.size() - 3);
+    } else if (s.rfind("e(", 0) == 0 || s.rfind("pr(", 0) == 0 || s.rfind("ystar(", 0) == 0) {
+      // regre_p2's titles: CalcE E(y|ttl), CalcP Pr(ttl), CalcY E(y*|ttl), and
+      // E(y) / Pr(y) / E(y) with neither bound.
+      const size_t open = s.find('(');
+      const std::string head = s.substr(0, open);
+      const std::string in = s.substr(open + 1, s.size() - open - 2);
       const size_t comma = in.find(',');
       const std::string lo = trimM4(in.substr(0, comma)), hi = trimM4(in.substr(comma + 1));
-      if (lo == "." && hi == ".") label = "E(" + dv + ")";
-      else if (lo == ".") label = "E(" + dv + "|" + dv + "<" + hi + ")";
-      else if (hi == ".") label = "E(" + dv + "|" + dv + ">" + lo + ")";
-      else label = "E(" + dv + "|" + lo + "<" + dv + "<" + hi + ")";
+      std::string ttl;
+      if (lo == "." && hi != ".") ttl = dv + "<" + hi;
+      else if (lo != "." && hi == ".") ttl = dv + ">" + lo;
+      else if (lo != "." && hi != ".") ttl = lo + "<" + dv + "<" + hi;
+      if (head == "pr") label = "Pr(" + (ttl.empty() ? dv : ttl) + ")";
+      else if (head == "ystar") label = ttl.empty() ? "E(" + dv + ")" : "E(" + dv + "*|" + ttl + ")";
+      else label = ttl.empty() ? "E(" + dv + ")" : "E(" + dv + "|" + ttl + ")";
+    } else if (s.rfind("dfbeta(", 0) == 0) {
+      label = "DFBETA, " + trimM4(s.substr(7, s.size() - 8));
     } else if (family == PredictFamilyM4::Regress) {
       static const std::map<std::string, std::string> kRegressLabels = {
           {"xb", "Linear prediction"},
@@ -3245,7 +4662,10 @@ ojson runPredict(const std::vector<std::string>& varlist,
           {"hat", "Leverage"},
           {"cooksd", "Cook's D"},
           {"rstandard", "Standardized residuals"},
-          {"rstudent", "Studentized residuals"}};
+          {"rstudent", "Studentized residuals"},
+          {"covratio", "COVRATIO"},
+          {"dfits", "DFITS"},
+          {"welsch", "Welsch distance"}};
       const auto it = kRegressLabels.find(s);
       if (it != kRegressLabels.end()) label = it->second;
     } else if (family == PredictFamilyM4::Areg && !lm.fe.empty()) {
@@ -3289,6 +4709,25 @@ ojson runPredict(const std::vector<std::string>& varlist,
   // `sc1`); xb and stdp after logit, logistic and probit leave r(N), the count of
   // missing values the new variable got (their predict programs count them for the
   // "(# missing values generated)" note when output is on: 0fa88111 / f1aab38e r(N) 0).
+  // After regress: pr() / e() / ystar() run through regre_p2, whose last
+  // r-class step (ParseUbase, no target()) leaves r(nvars) "0" (bank 07bb6518
+  // `e(4000,.)`, aa45aaba `pr(0,5000)`, 78d530d4 `ystar(4000,.)`); residuals
+  // and score run through GenScores, which returns r(scorevars) (bank 532334a3
+  // `predict double sc*, scores`: sc1).
+  if (family == PredictFamilyM4::Regress && !weightedFit) {
+    const std::string& ps = predictStat;
+    if (ps.rfind("e(", 0) == 0 || ps.rfind("pr(", 0) == 0 || ps.rfind("ystar(", 0) == 0) {
+      eval::replaceRClass(session.eval);
+      session.eval.rStrings.set("nvars", "0");
+      eval::declareRPosted(session.eval, "regre_p2", {"nvars"});
+    } else if (ps.rfind("dfbeta(", 0) == 0 && !dfbTable.colnames.empty()) {
+      eval::replaceRClass(session.eval);
+      session.eval.rMatrices.emplace_back("table", std::move(dfbTable));
+      session.eval.rStrings.set("citype", "normal");
+      session.eval.rValues.set("k_eform", 1.0);
+      eval::declareRPosted(session.eval, "regress", {"table", "citype", "k_eform"});
+    }
+  }
   if (glmPredict && ds != nullptr) {
     if (mlStat == "score") {
       eval::replaceRClass(session.eval);

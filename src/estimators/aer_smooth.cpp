@@ -611,7 +611,15 @@ double lpoly_rot_bandwidth(const std::vector<double>& x, const std::vector<doubl
     std::vector<double> beta;
     double rss = 0;
     if (!rot_poly_fit(xs, ys, w ? &ws : nullptr, p + 3, &beta, &rss)) return -1;
-    const double sigma2 = rss / static_cast<double>(n);  // RSS/n, not RSS/(n-p-4)
+    // The sample size is the sum of the weights: N under aweights (rescaled to sum N)
+    // and the replicated count under fweights (vs-stata bank 2163f0f3893727d6
+    // `lpoly price weight [fw=rep78]`: r(N) 235, r(bwidth) 40.463465948900144).
+    double nEff = static_cast<double>(n);
+    if (w) {
+        nEff = 0.0;
+        for (double wi : ws) nEff += wi;
+    }
+    const double sigma2 = rss / nEff;  // RSS/n, not RSS/(n-p-4)
 
     // d^(p+1)m/dx^(p+1) = d0 + d1 x + d2 x^2, d_e = b_(p+1+e) (p+1+e)!/e!
     double d[3] = {0, 0, 0};
@@ -634,7 +642,7 @@ double lpoly_rot_bandwidth(const std::vector<double>& x, const std::vector<doubl
         return v;
     };
     const double integral = anti(hi) - anti(lo);
-    const double denom = static_cast<double>(n) * integral;
+    const double denom = nEff * integral;
     if (!(denom > 0)) return -1;
 
     const double num = sigma2 * 0.9 * range;
@@ -688,19 +696,42 @@ LpolyResult lpoly_fit(const std::vector<double>& x, const std::vector<double>& y
     }
     const std::size_t ng = r.grid.size();
     r.smooth.assign(ng, kNaN);
-    if (o.want_se) r.se.assign(ng, kNaN);
+    if (o.want_se) {
+        r.se.assign(ng, kNaN);
+        r.cvar.assign(ng, kNaN);
+    }
 
     for (std::size_t g = 0; g < ng; ++g) {
         const double x0 = r.grid[g];
         if (std::isnan(x0)) continue;
-        const LocalFit f = local_fit(x, y, w, o.kernel, x0, h, o.degree, o.want_se, false);
+        // a bandwidth or variance variable leaves its missing rows out of the grid
+        double hg = h;
+        if (o.bw_at != nullptr) {
+            hg = g < o.bw_at->size() ? (*o.bw_at)[g] : kNaN;
+            if (std::isnan(hg)) continue;
+        }
+        if (o.var_at != nullptr && (g >= o.var_at->size() || std::isnan((*o.var_at)[g]))) continue;
+        const LocalFit f = local_fit(x, y, w, o.kernel, x0, hg, o.degree, o.want_se, false);
         if (!f.ok) continue;
         r.smooth[g] = f.b0;
         ++r.ngrid;
         if (o.want_se) {
-            const LocalFit pf =
-                local_fit(x, y, w, o.kernel, x0, r.pwidth, o.degree + 2, false, true);
-            if (f.var_ok && pf.ok && pf.var_ok && f.var_factor >= 0) r.se[g] = std::sqrt(f.var_factor * pf.sigma2);
+            double sigma2 = kNaN;
+            bool ok = f.var_ok && f.var_factor >= 0;
+            if (o.var_at != nullptr) {
+                sigma2 = (*o.var_at)[g];
+            } else if (o.var_scalar > 0) {
+                sigma2 = o.var_scalar;
+            } else {
+                const LocalFit pf =
+                    local_fit(x, y, w, o.kernel, x0, r.pwidth, o.degree + 2, false, true);
+                ok = ok && pf.ok && pf.var_ok;
+                sigma2 = pf.sigma2;
+            }
+            if (ok) {
+                r.se[g] = std::sqrt(f.var_factor * sigma2);
+                r.cvar[g] = sigma2;
+            }
         }
     }
     return r;

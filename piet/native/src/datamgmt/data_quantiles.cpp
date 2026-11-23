@@ -349,7 +349,9 @@ ojson runXtileStata(const std::string& newvar, const std::string& expText,
     ++markedRows;
     if (!std::isnan(sourceCells[row])) ++usableRows;
   }
-  if (cutOption == nullptr) {
+  // Only an explicit nquantiles() is checked against the sample; the default 2 is not, so an
+  // empty sample is r(2000) "no observations" (bank 2920dd61e01975bf).
+  if (cutOption == nullptr && countOption != nullptr) {
     if (quantileCount < 2)
       return rcErrorBlock("nquantiles() must be greater than or equal to 2", 198);
     if (quantileCount > markedRows + 1)

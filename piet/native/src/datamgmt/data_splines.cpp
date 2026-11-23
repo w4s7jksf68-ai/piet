@@ -4,6 +4,7 @@
 #include "piet/handlers/data_values.h"
 #include "dataset_shape_support.h"
 #include "piet/mutation_result.h"
+#include "piet/dispatcher.h"  // dispatch(): displayknots draws r(knots) with matlist
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -108,6 +109,17 @@ void postKnots(SessionState& session, const std::vector<double>& knots, const st
   eval::declareRPosted(session.eval, "mkspline", {"N_knots", "knots"});
 }
 
+// displayknots: the ado's `matlist` of the knot matrix it returns (r(knots)), drawn as every
+// matlist is (vs-stata bank 6f0ca3dea08825dd: `knot1` over `mpg | 20`).
+ojson withKnotTable(SessionState& session, ojson mut, bool displayKnots) {
+  if (!displayKnots || (mut.is_object() && mut.value("type", std::string()) == "error")) return mut;
+  ojson out = ojson::array();
+  out.push_back(std::move(mut));
+  for (auto& b : dispatch("matlist r(knots)", session))
+    if (!(b.is_object() && b.value("type", std::string()) == "echo")) out.push_back(b);
+  return out;
+}
+
 }  // namespace
 
 // `mkspline v1 k1 v2 k2 ... vK = x` and `mkspline stub # = x [, pctile]`: linear splines,
@@ -120,12 +132,9 @@ ojson runMksplineSegments(SessionState& session, const std::string& lhs, const s
   using dataset_shape_detail::numCell;
   using dataset_shape_detail::nextPath;
   if (auto err = eval::rejectUnknownOptions(opts, kVocabMkspline.known)) return *err;
+  bool displayKnots = false;
   for (const auto& [k, v] : opts)
-    if (k == "displayknots")
-      return engineErrorBlockM4(
-          "Option `displayknots` is a valid Stata option that this version of PIET does not yet "
-          "implement for `mkspline` (the knot table it prints is not drawn).",
-          "unsupported_option");
+    if (k == "displayknots" && v.isBool && v.boolValue) displayKnots = true;
   bool marginal = false, pctile = false;
   for (const auto& [k, v] : opts) {
     if (k == "marginal") marginal = true;
@@ -248,7 +257,7 @@ ojson runMksplineSegments(SessionState& session, const std::string& lhs, const s
   }
   ojson mut = mutationResult(session, "gen", names);
   postKnots(session, postedKnots, postedRow);
-  return mut;
+  return withKnotTable(session, std::move(mut), displayKnots);
 }
 
 ojson runMkspline(const std::string& stubIn, const std::string& srcVarIn,
@@ -315,15 +324,9 @@ ojson runMkspline(const std::string& stubIn, const std::string& srcVarIn,
         "result.",
         "unsupported_option");
   }
-  for (const auto& [k, v] : opts) {
-    if (k == "displayknots" && v.isBool && v.boolValue) {
-      return engineErrorBlockM4(
-          "Option `displayknots` is a valid Stata option that this version of PIET does not yet "
-          "implement for `mkspline` (no engine CLI equivalent — knot positions are never "
-          "surfaced back to PIET).",
-          "unsupported_option");
-    }
-  }
+  bool displayKnots = false;
+  for (const auto& [k, v] : opts)
+    if (k == "displayknots" && v.isBool && v.boolValue) displayKnots = true;
 
   std::optional<std::string> nknotsVal, knotsVal;
   for (const auto& [k, v] : opts) {
@@ -472,7 +475,7 @@ ojson runMkspline(const std::string& stubIn, const std::string& srcVarIn,
         }
         out["new_vars"] = newVars;
         if (!cubicKnots.empty()) postKnots(session, cubicKnots, srcVar);
-        return out;
+        return withKnotTable(session, std::move(out), displayKnots && !cubicKnots.empty());
       }
     }
   }
@@ -508,7 +511,7 @@ ojson runMkspline(const std::string& stubIn, const std::string& srcVarIn,
   out["n_rows_after"] = dsAfter ? dsAfter->nRows() : 0;
   out["new_vars"] = newVars;
   if (!cubicKnots.empty()) postKnots(session, cubicKnots, srcVar);
-  return out;
+  return withKnotTable(session, std::move(out), displayKnots && !cubicKnots.empty());
 }
 
 

@@ -48,6 +48,25 @@ int cmd_corr(const std::vector<std::string>& a) {
     const bool analytic = !aweight.empty();
     const double* w = wvar.empty() ? nullptr : require_num(ds, "corr", wvar);
     const double NA = std::numeric_limits<double>::quiet_NaN();
+    // The weights of the sample (every variable present for correlate, the
+    // weight alone for pwcorr): a fractional fweight is r(401) "may not use
+    // noninteger frequency weights", then a negative weight r(402) "negative
+    // weights encountered" (vs-stata bank 6b1bcabf9f92a643 `correlate price mpg
+    // [fw=gear_ratio]`), as regress judges them.
+    if (w != nullptr) {
+        bool frac = false, neg = false;
+        for (int64_t r = 0; r < N; ++r) {
+            if (std::isnan(w[r])) continue;
+            bool full = true;
+            if (!pairwise)
+                for (int j = 0; j < k && full; ++j) full = !std::isnan(col[j][r]);
+            if (!full) continue;
+            if (!analytic && w[r] != std::floor(w[r])) frac = true;
+            if (w[r] < 0) neg = true;
+        }
+        if (frac) throw EngineError("bad_input", "may not use noninteger frequency weights", "r(401)");
+        if (neg) throw EngineError("bad_input", "negative weights encountered", "r(402)");
+    }
     // A row is usable when its weight is present and positive.
     auto wOk = [&](int64_t r) { return w == nullptr || (!std::isnan(w[r]) && w[r] > 0); };
     auto wAt = [&](int64_t r) { return w == nullptr ? 1.0 : w[r]; };

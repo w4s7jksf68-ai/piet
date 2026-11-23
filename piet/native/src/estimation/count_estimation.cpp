@@ -260,7 +260,7 @@ bool esampleInstallMlMask(SessionState& session, LastModel& lm, ojson& raw,
   // mpg weight`: count if e(sample) 69 = e(N)).
   static const std::set<std::string> kMl = {"logit", "probit", "poisson", "tobit", "nbreg",
                                             "mlogit", "fepois", "fracreg", "ologit", "oprobit",
-                                            "xtpois_re", "xtlogit"};
+                                            "xtpois_re", "xtlogit", "xtpois"};
   if (kMl.count(lm.cobraCmd) == 0) return false;
   if (!lm.fe.empty() && lm.cobraCmd != "fepois") return false;
   if (!lm.fitDataPath.empty() || lm.cluster.size() > 1) return false;
@@ -1365,11 +1365,15 @@ ojson runXtPoissonReM4(const eval::ParsedCommand& parsed, SessionState& session)
     argv.push_back(*parsed.ifExpr);
   }
   static const std::regex rePlainVar(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
-  bool irr = false, robust = false;
+  bool irr = false, robust = false, clusterOpt = false;
   std::string clusterVar;
   for (const auto& [k, v] : parsed.opts) {
     const std::string val = v.isBool ? std::string() : trimM4(v.strValue);
     if (k == "re" || k == "nolog" || k == "log") continue;
+    if (k == "cluster") {
+      clusterOpt = true;
+      continue;
+    }
     if (k == "irr") {
       irr = true;
       continue;
@@ -1430,6 +1434,13 @@ ojson runXtPoissonReM4(const eval::ParsedCommand& parsed, SessionState& session)
                               "does not implement for `xtpoisson, re`.",
                               "unsupported_option");
   }
+  // The random-effects model reads a cluster() option as the cluster variable only
+  // through vce(cluster V): with cluster(V) alone (or beside vce(robust)) Stata's
+  // re path hands its cluster parser no variable, "varlist required" r(100)
+  // (vs-stata bank a7ec1a11 `xtpoisson fatal beertax unemp, cluster(sid)`).
+  if (clusterOpt && clusterVar.empty())
+    return ojson(eval::errorBlock("engine_error", "varlist required", std::nullopt, std::nullopt,
+                                  std::nullopt, "r(100)"));
   // vce(robust) / robust / vce(cluster panelvar): xtpoisson.ado's own robust VCE
   // (XTPOISSON_FE_ROBUST, re; the engine's xtpoisson_re_stata_robust).
   if (robust) {
@@ -1609,6 +1620,85 @@ ojson runXtPoissonLogit(const std::string& cobraCmd, const std::string& stataCmd
       }
     }
   }
+  // An iweight must be constant within each panel of the estimation sample:
+  // xtpoisson checks it before either the fe or the re fit, xtlogit before its
+  // random-effects fit, with "weight must be constant within <panelvar>" r(199)
+  // (vs-stata bank cc03e30c `xtlogit hi beertax unemp [iweight=w]`, 20ff3911
+  // `xtpoisson fatal beertax unemp [iweight=w]`, w = 1 + mod(_n,3)). fweights and
+  // pweights are refused before this outside pa (tokenizer), aweights always.
+  if (!paPresent && (cobraCmd == "xtpois" || !isFe) && parsed.weightType.has_value() &&
+      parsed.weightVar.has_value() && parsed.varlist.size() >= 2) {
+    const std::string wt = lowerM4(*parsed.weightType);
+    static const std::regex rePlainW(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
+    if ((wt == "iw" || wt == "iweight") && std::regex_match(*parsed.weightVar, rePlainW)) {
+      std::vector<std::string> vars = {*session.panelvar, *parsed.weightVar};
+      bool plain = true;
+      for (const auto& v : parsed.varlist) {
+        plain = plain && std::regex_match(v, rePlainW);
+        vars.push_back(v);
+      }
+      ojson filterErr;
+      const std::string basePath = *session.currentHbin();
+      const auto filtered =
+          plain ? applyIfFilterM4(session, basePath, parsed.ifExpr, filterErr) : std::nullopt;
+      if (filtered.has_value()) {
+        const bool madeTemp = *filtered != basePath;
+        std::optional<Datastore> tempDs;
+        Datastore* ds = nullptr;
+        try {
+          if (madeTemp) {
+            tempDs.emplace(*filtered);
+            ds = &*tempDs;
+          } else {
+            ds = session.datastore();
+          }
+        } catch (const std::exception&) {
+          ds = nullptr;
+        }
+        bool varies = false;
+        if (ds != nullptr) {
+          std::vector<const double*> cols;
+          for (const auto& v : vars) {
+            if (!ds->has(v) || ds->dtype(v) != "f64") {
+              cols.clear();
+              break;
+            }
+            cols.push_back(ds->col(v).f64());
+          }
+          if (cols.size() == vars.size()) {
+            std::map<double, double> firstW;
+            const int64_t n = ds->nRows();
+            for (int64_t i = 0; i < n && !varies; ++i) {
+              bool complete = true;
+              for (const double* c : cols)
+                complete = complete && !std::isnan(c[i]) && c[i] < eval::kStataMissingSentinel;
+              if (!complete) continue;
+              const auto [it, fresh] = firstW.emplace(cols[0][i], cols[1][i]);
+              if (!fresh && it->second != cols[1][i]) varies = true;
+            }
+          }
+        }
+        if (madeTemp) {
+          tempDs.reset();
+          cecon::native_unlink(*filtered);
+        }
+        if (varies)
+          return ojson(eval::errorBlock("engine_error",
+                                        "weight must be constant within " + *session.panelvar,
+                                        std::nullopt, std::nullopt, std::nullopt, "r(199)"));
+      }
+    }
+  }
+  // Past that check no fit of these commands takes a weight in this version (the
+  // registry lets the weight through only so that the check above can run).
+  if (parsed.weightType.has_value())
+    return engineErrorBlockM4(
+        "Option `[" + *parsed.weightType + "=" + parsed.weightVar.value_or("") +
+            "]` is not supported in this version of PIET. `" + stataCmd +
+            "` does not support weighted estimation in this engine (no [aw=]/[fw=]/[pw=]/[iw=] "
+            "support for this command). Remove the weight specification — unweighted estimation "
+            "will differ from weighted results.",
+        "unsupported_option");
   if (!isFe && cobraCmd == "xtpois" && !paPresent && !fePresent && parsed.varlist.size() >= 2)
     return runXtPoissonReM4(parsed, session);
   if (!isFe) {
@@ -1836,12 +1926,28 @@ ojson runXtPoissonLogit(const std::string& cobraCmd, const std::string& stataCmd
   return block;
 }
 
+// `in a/b`: folded into the fit's `if` as an observation-number condition
+// (inRangeConditionM4), so every reader of the condition sees the same rows
+// (vs-stata bank 037b467c `xtlogit ... in 1/60`).
+static ojson runXtInFoldM4(const std::string& cobraCmd, const std::string& stataCmd,
+                           const eval::ParsedCommand& parsed, SessionState& session) {
+  if (parsed.inRange.has_value() && !parsed.inRange->empty()) {
+    std::optional<std::string> eff;
+    if (auto err = inRangeConditionM4(session, parsed, eff, stataCmd)) return *err;
+    eval::ParsedCommand folded = parsed;
+    folded.ifExpr = eff;
+    folded.inRange.reset();
+    return runXtPoissonLogit(cobraCmd, stataCmd, folded, session);
+  }
+  return runXtPoissonLogit(cobraCmd, stataCmd, parsed, session);
+}
+
 ojson runXtPoisson(const eval::ParsedCommand& parsed, SessionState& session) {
-  return runXtPoissonLogit("xtpois", "xtpoisson", parsed, session);
+  return runXtInFoldM4("xtpois", "xtpoisson", parsed, session);
 }
 
 ojson runXtLogitFe(const eval::ParsedCommand& parsed, SessionState& session) {
-  return runXtPoissonLogit("xtlogit", "xtlogit", parsed, session);
+  return runXtInFoldM4("xtlogit", "xtlogit", parsed, session);
 }
 
 // drdid (BS-076): the classic 2-period/2-group doubly-robust DiD estimator

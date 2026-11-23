@@ -100,6 +100,9 @@ struct LpolyResult {
     std::vector<double> grid;
     std::vector<double> smooth;
     std::vector<double> se;  // empty unless requested
+    // generatevar(): the conditional variance sigma^2(x0) each SE uses (the pilot fit's
+    // estimate, or var()'s value), empty unless SEs were requested.
+    std::vector<double> cvar;
     double bwidth = 0;
     double pwidth = 0;
     int ngrid = 0;  // grid points where the local fit SUCCEEDED, which can be < grid.size()
@@ -157,6 +160,12 @@ struct LpolyOpts {
     // at(): evaluate at these points instead of the n-point grid. NaN entries
     // are not evaluated and stay missing; the result vectors keep this length.
     const std::vector<double>* at = nullptr;
+    // var(#) / var(varname): the conditional variance the SEs use instead of the pilot
+    // fit's estimate -- one number (var_scalar > 0), or one per at() row (var_at).
+    double var_scalar = -1;
+    const std::vector<double>* var_at = nullptr;
+    // bwidth(varname) with at(): the bandwidth of each at() row.
+    const std::vector<double>* bw_at = nullptr;
 };
 
 // Empty result (grid empty) when the bandwidth could not be determined; the

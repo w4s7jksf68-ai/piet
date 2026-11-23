@@ -93,11 +93,16 @@ bool commandNeedsNoData(const std::string& cmd) {
       "ado",     "adopath", "sysdir",  "findfile", "sleep",   "pause",
       "cls",     "gr_edit", "error",   "bcal",     "twoway__histogram_gen",
       "frames",
+      // `frame` runs from an empty current frame too: `frame change default`
+      // after `frame change f2`, `frame f2: set obs 3` (vs-stata stage 4).
+      "frame",
       // AER-SCOPE1 bundle B: `return`, `svmat` and `matlist` read the session's
       // r()/matrix stores, never the dataset -- `svmat A` on an empty session is
       // how Stata builds a dataset FROM a matrix. `mkmat` is deliberately absent
       // for the mirror reason: it reads variables, so no data is a real error.
       "return",  "sreturn", "svmat",   "matlist",
+      // ttesti works from the numbers typed, never the data (vs-stata stage 4).
+      "ttesti",
       // W2D-T01: `ereturn clear/post/local` act on e(), never the dataset;
       // `ereturn clear` opens the golden do-file's helpers before any data
       // exist (w2d_uncovered.log 211-212). The `list` arm re-checks hasData()
@@ -107,6 +112,8 @@ bool commandNeedsNoData(const std::string& cmd) {
       // it is how the dataset comes into existence (getmata: an empty dataset
       // implies force; oracle arm getmata_nodata).
       "getmata", "ml",
+      // `constraint` defines session state the estimators read later.
+      "constraint",
       // `matrix`/`mat` join them: a matrix is session state, not data. Stata
       // accepts `matrix A = (1,2\\3,4)` with nothing in memory, and `svmat A`
       // on an empty session is the documented way to build a dataset FROM a
@@ -181,6 +188,9 @@ bool commandNeedsNoData(const std::string& cmd) {
       // `misstable summarize` with no variable at all is rc 0 (its varlist is
       // empty); the handler answers that itself.
       "misstable",
+      // vs-stata bank stage 4: the immediate tests read their numbers off the
+      // line, never the dataset (887b544d197bb526 `prtesti 20 0.3 30 0.5`).
+      "ttesti", "prtesti",
   };
 return kNoDataCommands.count(cmd) != 0;
 }

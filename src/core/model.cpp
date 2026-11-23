@@ -1166,7 +1166,8 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
                       const std::vector<std::string>& clusternames,
                       const std::string& offset_name, bool drop_singleton,
                       const TsMeta* ts, const std::vector<char>* row_mask,
-                      const std::string& weight_name, WeightKind weight_kind) {
+                      const std::string& weight_name, WeightKind weight_kind,
+                      bool aw_negative_drops) {
     const int64_t N = ds.n_rows();
     // Time-series pre-pass: materialize any L./F./D./S. tokens (panel/time-aware)
     // into a side-table, rewriting them to plain names the factor expander resolves.
@@ -1206,6 +1207,8 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
     // narrows which of those already-correct rows enter the design.
     std::vector<int64_t> keep;
     keep.reserve(N);
+    bool bad_fw = false, bad_neg = false;
+    double bad_fw_value = 0.0, bad_neg_value = 0.0;
     for (int64_t i = 0; i < N; ++i) {
         if (row_mask && !(*row_mask)[static_cast<size_t>(i)]) continue;
         if (std::isnan(yp[i])) continue;
@@ -1216,14 +1219,28 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
             // (it matters: under aw/pw the reported N is the ROW count, so a kept
             // zero-weight row would inflate N and every dof derived from it).
             if (std::isnan(wp[i]) || wp[i] == 0.0) continue;
-            if (wp[i] < 0.0)
-                throw EngineError("bad_input",
-                    "weight '" + weight_name + "' has a negative value (" +
-                    std::to_string(wp[i]) + "); weights must be non-negative");
-            if (weight_kind == WeightKind::Frequency && wp[i] != std::floor(wp[i]))
-                throw EngineError("bad_input",
-                    "fweight '" + weight_name + "' has a non-integer value (" +
-                    std::to_string(wp[i]) + "); Stata requires integer frequency weights");
+            // Under Stata's builtin `regress` only (aw_negative_drops), a negative
+            // aweight leaves the sample as a zero one does: `regress price mpg
+            // [aw=w]` with w = +-0.5 fits the 22 rows of weight .5, "(sum of wgt
+            // is 11)" (vs-stata bank bf3a397b1ed2f096). Every command that marks
+            // its sample with the weight (areg, tobit, reghdfe, mean, summarize:
+            // bank 0364c489f733be11, a768421f89762257) stops with r(402) instead,
+            // below.
+            if (aw_negative_drops && weight_kind == WeightKind::Analytic && wp[i] < 0.0)
+                continue;
+            // Stata judges the whole weight column, integrality of a frequency
+            // weight first (r(401)) and then the sign (r(402) "negative weights
+            // encountered"): `regress price mpg [fw=w]` with w = +-0.5 is r(401)
+            // (vs-stata bank bd247cc2451bc07e), so the first bad row no longer
+            // decides which refusal is given.
+            if (weight_kind == WeightKind::Frequency && wp[i] != std::floor(wp[i])) {
+                if (!bad_fw) bad_fw_value = wp[i];
+                bad_fw = true;
+            }
+            if (wp[i] < 0.0) {
+                if (!bad_neg) bad_neg_value = wp[i];
+                bad_neg = true;
+            }
         }
         bool ok = true;
         for (const double* p : xsrc)
@@ -1232,6 +1249,17 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
             for (const auto& k : keys)
                 if (!valid(k, i)) { ok = false; break; }
         if (ok) keep.push_back(i);
+    }
+    if (bad_fw)
+        throw EngineError("bad_input",
+            "fweight '" + weight_name + "' has a non-integer value (" +
+            std::to_string(bad_fw_value) + "); Stata requires integer frequency weights");
+    if (bad_neg) {
+        if (weight_kind == WeightKind::Importance)
+            throw EngineError("bad_input",
+                "weight '" + weight_name + "' has a negative value (" +
+                std::to_string(bad_neg_value) + "); weights must be non-negative");
+        throw EngineError("bad_input", "negative weights encountered", "r(402)");
     }
 
     ModelData md;

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include <cstring>
+#include <map>
+#include <memory>
+#include <set>
+#include <sstream>
 #include "data_support.h"
 #include "expression_support.h"
 #include "prefix_support.h"
@@ -9,11 +13,15 @@
 #include "pipeline.h"
 #include "options.h"
 #include "handler_declarations.h"
+#include "piet/eval/exprfns.h"
 #include "piet/handlers/data_values.h"
+#include "piet/handlers/descriptive.h"  // ListLayout / buildListing: by-group list
+#include "piet/loops.h"                 // expandVarlist: by-group list
 #include "piet/handlers/descriptive.h"
 #include "piet/handlers/gtools_aliases.h"
 #include "piet/handlers/observations.h"
 #include "piet/handlers/variables.h"
+#include "piet/program.h"
 namespace piet::dispatch_detail {
 bool executeByPrefix(std::string& cmd,
     eval::ParsedCommand& parsed,
@@ -62,6 +70,20 @@ bool executeByPrefix(std::string& cmd,
       const size_t sp = raw.find_first_of(" \t");
       if (colon != std::string::npos && sp != std::string::npos && sp < colon) {
         auto [keysPart, prefixOpts] = splitTopLevelComma(raw.substr(sp, colon - sp));
+        // by's options are sort and rc0; any other word is r(198) "option W
+        // not allowed" (vs-stata bank 36a25c35 `bysort foreign, stable:`).
+        if (prefixOpts.has_value()) {
+          std::istringstream ow(lower(trimWs(*prefixOpts)));
+          for (std::string w; ow >> w;) {
+            const std::string head = w.substr(0, w.find('('));
+            if (head != "sort" && head != "rc0") {
+              blocks.push_back(ojson(eval::errorBlock("syntax_error", "option " + head + " not allowed",
+                                                      std::nullopt, std::nullopt, std::nullopt,
+                                                      "r(198)")));
+              return true;
+            }
+          }
+        }
         if (prefixOpts.has_value() && lower(trimWs(*prefixOpts)) == "sort" &&
             !trimWs(keysPart).empty()) {
           try {
@@ -82,6 +104,16 @@ bool executeByPrefix(std::string& cmd,
           "bysort/by: no subcommand found after colon in `" + byParsed->raw + "`")));
       return true;
     }
+    // A by-variable with a time-series operator is r(101) "time-series
+    // operators not allowed" (vs-stata bank 5f227ad3 `bysort L.x:`).
+    for (const std::vector<std::string>* names : {&bp.byVars, &bp.sortVars})
+      for (const auto& k : *names)
+        if (k.find('.') != std::string::npos) {
+          blocks.push_back(ojson(eval::errorBlock("syntax_error", "time-series operators not allowed",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(101)")));
+          return true;
+        }
     // BUG-532: abbreviated / wildcard keys resolve before any branch reads them.
     for (std::vector<std::string>* names : {&bp.byVars, &bp.sortVars}) {
       if (std::optional<ojson> err = handlers::resolveByKeyNames(session, *names)) {
@@ -112,6 +144,56 @@ bool executeByPrefix(std::string& cmd,
     // recursive dispatch of the inner command then passes the main translation
     // point above, so options are still translated exactly once.
     subCmdLower = handlers::gtoolsCanonicalName(subCmdLower);
+
+    // A command that is not byable is refused by the prefix itself, before any
+    // sort, as r(190) "NAME may not be combined with by". The names below are
+    // the ones the vs-stata bank recorded so (StataBE 19.5): the prefixes
+    // capture/quietly/noisily/version (0152d124, faca8032, bf5c3740, 20eb1ff5),
+    // the language commands display/local/scalar/matrix/matlist/error/timer/
+    // _dots/cls (fc7086e1, 100b0a5b, 8ec6ecfc, 8d922009, ee607b20, 8b733e35,
+    // edcc622c, 41b9b968, bc723e9b), and mean/collapse/sort/preserve/restore/
+    // notes/numlabel/labvars/tolower/mkmat/matselrc/matsort/xi/require
+    // (8c5e1ce2, 397f8cf2, 2fbb2a49, 4ac6ce2a, 3b055348, d1c73b2b, 64ee73a0,
+    // 6b40fe96, b95bc804, f6e1c32d, 7cae5922, 11c889d1, 49e12db6, 0d12f1e3).
+    // Rows flagged byIllegalInStata (describe, codebook, ...) answer the same.
+    // A user program is byable only when its `program define` line says
+    // byable(); otherwise it is refused the same way (b6e3e8ab).
+    {
+      static const std::set<std::string> kNotByable = {
+          "capture", "quietly", "noisily", "version", "display", "local", "global",
+          "scalar", "matrix", "matlist", "error", "timer", "_dots", "cls", "mean",
+          "collapse", "sort", "preserve", "restore", "notes", "numlabel", "labvars",
+          "tolower", "mkmat", "matselrc", "matsort", "xi", "require"};
+      static const std::map<std::string, std::string> kPrefixAbbrev = {
+          {"cap", "capture"}, {"capt", "capture"}, {"captu", "capture"}, {"captur", "capture"},
+          {"qui", "quietly"}, {"quie", "quietly"}, {"quiet", "quietly"}, {"quietl", "quietly"},
+          {"n", "noisily"}, {"no", "noisily"}, {"noi", "noisily"}, {"nois", "noisily"},
+          {"noisi", "noisily"}, {"noisil", "noisily"}, {"vers", "version"},
+          {"versi", "version"}, {"versio", "version"}, {"loc", "local"}, {"loca", "local"},
+          {"gl", "global"}, {"glo", "global"}, {"glob", "global"}, {"globa", "global"},
+          {"note", "notes"}};
+      std::string stem = subCmdLower;
+      if (auto it = kPrefixAbbrev.find(subCmdTyped); it != kPrefixAbbrev.end()) stem = it->second;
+      const registry::CommandSpec* stemSpec = registry::findByName(stem);
+      bool refuse = kNotByable.count(stem) > 0 || (stemSpec && stemSpec->byIllegalInStata);
+      std::string shownName = stemSpec ? stemSpec->canonical : stem;
+      if (!refuse && !registry::isStataCommandAbbreviation(bp.subCmd) && stemSpec == nullptr) {
+        if (std::optional<std::string> prog = program::findProgram(session, rstripColon(bp.subCmd))) {
+          const ProgramDef& pd = session.programs.at(*prog);
+          if (pd.byable.empty()) {
+            refuse = true;
+            shownName = pd.name;
+          }
+        }
+      }
+      if (refuse && !bp.byVars.empty()) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error",
+                                                shownName + " may not be combined with by",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(190)")));
+        return true;
+      }
+    }
 
     if (subCmdLower == "gen" || subCmdLower == "generate" || subCmdLower == "g" ||
         subCmdLower == "replace") {
@@ -599,6 +681,196 @@ bool executeByPrefix(std::string& cmd,
       return true;
     }
 
+    // by/bysort with the tabulate family (tabulate, tab, ta, tab1, tab2). Stata runs the command
+    // once for each by-group, each table under a `-> G = value` heading (the value label when the
+    // variable has one), and r() is the last group's (bank fea60afe `bysort foreign: tab rep78`,
+    // 41a9b22e `bysort foreign: tab2 rep78` then `display r(N)`). The data are in by-order here
+    // (bysort sorts them in place; plain by requires it, r(5)), so each group is a contiguous run of
+    // observations and the command runs as typed on that run, `in first/last`, through the ordinary
+    // tabulate route with all of its options, weights and `if`.
+    // xtsum and xttab are byable the same way (bank 5d68d221 `bysort jail: xtsum`).
+    if ((subCmdLower == "tabulate" || subCmdLower == "tab" || subCmdLower == "ta" ||
+         subCmdLower == "tab1" || subCmdLower == "tab2" || subCmdLower == "xtsum" ||
+         subCmdLower == "xttab") &&
+        !bp.byVars.empty()) {
+      eval::ParsedCommand subParsed;
+      try {
+        subParsed = eval::tokenize(bp.subRaw);
+      } catch (const eval::TokenizerError& te) {
+        blocks.push_back(ojson(te.block));
+        return true;
+      }
+      if (subParsed.inRange.has_value()) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "in may not be combined with by",
+                                                std::nullopt, std::nullopt, std::nullopt, "r(190)")));
+        return true;
+      }
+      // tabulate is a built-in: its `if` counts `_n`, `_N` and x[k] within the by-group, and its
+      // generate() is refused under by before any group runs ("The generate() option may not be
+      // used with the by prefix", tabulate oneway's help). tab1, tab2, xtsum and xttab are
+      // byable(recall) ados: each group's call marks its sample from the `if` over the whole
+      // data, so their `_n` stays the frame's, and an option the ado hands to tabulate is that
+      // inner tabulate's, which is not by-prefixed.
+      const bool builtinTab =
+          subCmdLower == "tabulate" || subCmdLower == "tab" || subCmdLower == "ta";
+      if (builtinTab) {
+        for (const auto& [k, v] : subParsed.opts) {
+          if (resolveOptionKeyForCommand("tabulate", lower(k), v.isBool ? 1 : 2).resolved ==
+              "generate") {
+            blocks.push_back(ojson(eval::errorBlock(
+                "syntax_error", "generate() may not be combined with by", std::nullopt,
+                std::nullopt, std::nullopt, "r(190)")));
+            return true;
+          }
+        }
+      }
+      Datastore* tds = session.datastore();
+      if (tds == nullptr) {
+        blocks.push_back(ojson(eval::noDataLoaded()));
+        return true;
+      }
+      std::vector<std::string> keys = bp.byVars;
+      keys.insert(keys.end(), bp.sortVars.begin(), bp.sortVars.end());
+      for (const auto& k : keys) {
+        if (!tds->has(k)) {
+          blocks.push_back(ojson(eval::errorBlock("engine_error", "variable " + k + " not found",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(111)")));
+          return true;
+        }
+      }
+      if (bp.sortFirst) {
+        if (std::optional<ojson> sortErr = handlers::sortInStataOrder(session, keys)) {
+          blocks.push_back(*sortErr);
+          return true;
+        }
+        tds = session.datastore();
+      } else {
+        const std::vector<std::string> claim = engineSortClaim(*tds);
+        const bool inOrder = claim.empty() ? keysAlreadyGrouped(*tds, keys, true)
+                                          : keysLeadClaim(keys, claim);
+        if (!inOrder) {
+          blocks.push_back(ojson(eval::errorBlock(
+              "not_sorted", "not sorted — `by " + joinSpace(bp.byVars) +
+                  ":` requires the data to already be sorted by " + joinSpace(keys) + ".",
+              std::nullopt, std::nullopt, std::nullopt, "r(5)")));
+          return true;
+        }
+      }
+      const int64_t nRows = tds->nRows();
+      // The group keys and headings, read once: the inner tabulates never move a row.
+      std::vector<std::vector<std::string>> keyText(static_cast<size_t>(nRows));
+      for (const auto& bv : bp.byVars) {
+        const bool isFactor = tds->dtype(bv) != "f64";
+        const cecon::Column& c = tds->col(bv);
+        const std::vector<std::string> levels =
+            isFactor ? tds->varinfo(bv).levels : std::vector<std::string>{};
+        const auto vl = session.valueLabels.find(bv);
+        const std::string keyFormat = isFactor ? std::string() : session.displayFormat(tds->varinfo(bv));
+        for (int64_t r = 0; r < nRows; ++r) {
+          std::string text;
+          if (isFactor) {
+            const int32_t code = c.codes()[r];
+            text = code >= 0 && static_cast<size_t>(code) < levels.size()
+                       ? levels[static_cast<size_t>(code)] : std::string();
+          } else {
+            const double x = c.f64()[r];
+            if (std::isnan(x)) {
+              text = cecon::missing_text(cecon::missing_kind(x));
+            } else {
+              bool labelled = false;
+              if (vl != session.valueLabels.end() && x == std::floor(x) && std::fabs(x) < 2e9) {
+                auto it = vl->second.find(static_cast<int>(x));
+                if (it != vl->second.end()) {
+                  text = it->second;
+                  labelled = true;
+                }
+              }
+              // An unlabelled value is shown in the variable's display format (bank
+              // c155c25af604378d: float dry under %9.0g is `-> dry = 39.5696`, `.03692`).
+              if (!labelled) text = trimWs(eval::applyStataFmt(x, keyFormat));
+            }
+          }
+          keyText[static_cast<size_t>(r)].push_back(bv + " = " + text);
+        }
+      }
+      // Each missing kind and each labelled code is its own group: compare the raw keys.
+      auto sameGroup = [&](int64_t a, int64_t b) {
+        for (const auto& bv : bp.byVars) {
+          const cecon::Column& c = tds->col(bv);
+          if (tds->dtype(bv) != "f64") {
+            if (c.codes()[a] != c.codes()[b]) return false;
+          } else if (cecon::stata_cmp(c.f64()[a], c.f64()[b]) != 0) {
+            return false;
+          }
+        }
+        return true;
+      };
+      const long long comma = eval::findUnquotedComma(bp.subRaw);
+      const std::string head =
+          comma >= 0 ? bp.subRaw.substr(0, static_cast<size_t>(comma)) : bp.subRaw;
+      const std::string tail = comma >= 0 ? bp.subRaw.substr(static_cast<size_t>(comma)) : "";
+      // The group boundaries are fixed before the first inner command runs: it may replace the
+      // session's datastore (r() posting, generate()), so no column view outlives this scan.
+      std::vector<std::pair<int64_t, int64_t>> groups;
+      for (int64_t g0 = 0; g0 < nRows;) {
+        int64_t g1 = g0 + 1;
+        while (g1 < nRows && sameGroup(g0, g1)) ++g1;
+        groups.emplace_back(g0, g1);
+        g0 = g1;
+      }
+      tds = nullptr;
+      std::string innerHead = trimWs(head);
+      if (builtinTab && subParsed.ifExpr.has_value() && !subParsed.ifExpr->empty() &&
+          (std::regex_search(*subParsed.ifExpr, std::regex(R"(\b_[nN]\b)")) ||
+           subParsed.ifExpr->find('[') != std::string::npos)) {
+        // The `if` is evaluated once, numbered within each group, into a hidden 0/1 column the
+        // group runs then read in its place (`bysort foreign: tab rep78 if _n <= 5` tabulates
+        // each group's first five observations, as `by: summarize` does).
+        strmutate::ConditionMaskInstall mi =
+            strmutate::installGroupConditionMask(session, *subParsed.ifExpr, bp.byVars);
+        if (!mi.ok) {
+          blocks.push_back(mi.error);
+          return true;
+        }
+        conditionMask.columns.push_back(mi.column);
+        innerHead = subParsed.cmd + " " + trimWs(subParsed.argText) + " if " + mi.condition;
+        if (subParsed.weightType.has_value())
+          innerHead += " [" + *subParsed.weightType + "=" +
+                       subParsed.weightExp.value_or(subParsed.weightVar.value_or("")) + "]";
+      }
+      for (const auto& [g0, g1] : groups) {
+        std::string heading = "-> ";
+        for (size_t i = 0; i < keyText[static_cast<size_t>(g0)].size(); ++i)
+          heading += (i ? " " : "") + keyText[static_cast<size_t>(g0)][i];
+        ojson header;
+        header["type"] = "display";
+        header["text"] = heading;
+        blocks.push_back(header);
+        const std::string inner = innerHead + " in " + std::to_string(g0 + 1) + "/" +
+                                  std::to_string(g1) + (tail.empty() ? "" : tail);
+        ojson innerBlocks = dispatch(inner, session);
+        bool failed = false;
+        for (const auto& b : innerBlocks) {
+          if (b.is_object() && b.value("type", "") == "echo") continue;
+          // A group with no observations prints "no observations" and the loop goes on, ending
+          // rc 0 (bank 6e19cab3: `bysort sv: xttab jl`, the sv = . group).
+          if (b.is_object() && b.value("type", "") == "error" &&
+              b.value("message", std::string()) == "no observations") {
+            ojson note;
+            note["type"] = "display";
+            note["text"] = "no observations";
+            blocks.push_back(note);
+            continue;
+          }
+          if (b.is_object() && b.value("type", "") == "error") failed = true;
+          blocks.push_back(b);
+        }
+        if (failed) return true;
+      }
+      return true;
+    }
+
     // BS-092 (BETA campaign, Phase G): `by:`/`bysort: summarize` — the ONE
     // OTHER subcommand (besides gen/replace/egen above) that gets a genuine
     // PIET-side per-group implementation this phase; the other 7
@@ -645,7 +917,43 @@ bool executeByPrefix(std::string& cmd,
     // `count` joins the same driver (FU-163): it takes no varlist and no options,
     // and Stata leaves r(N) = the LAST group's count.
     const bool byIsCount = (subCmdLower == "count");
-    if (byIsSummarize || byIsRegress || byIsTabstat || byIsCount) {
+    // vs-stata stage 4: r-class tests and descriptive estimators that read the
+    // data and change nothing but r()/e(). Stata's `by G: CMD` runs CMD once per
+    // group on that group's rows (bank: `bysort foreign: ttest mpg == 20` leaves
+    // the Foreign group's r(N_1) 22, r(t) 3.386090207522228; `bysort foreign:
+    // pca ...` the last group's e()). After the sort each group is a contiguous
+    // row range, so each group's run is the ordinary command restricted with
+    // `in FIRST/LAST`, dispatched as typed (its own if, weights and options
+    // included). A by-line whose `if` counts rows (`_n`, `_N`, a subscript) is
+    // within-group in Stata and frame-relative under `in`: those keep the
+    // refusal below, as do a line that already carries `in` and one whose text
+    // would be macro-expanded a second time by the re-dispatch.
+    const bool byIsGeneric = [&] {
+      static const char* const kGenericBy[] = {"corr", "pwcorr", "ttest", "sdtest",
+                                               "signrank", "spearman", "pca"};
+      if (std::find(std::begin(kGenericBy), std::end(kGenericBy), subCmdLower) ==
+          std::end(kGenericBy))
+        return false;
+      if (bp.subRaw.find('`') != std::string::npos || bp.subRaw.find('$') != std::string::npos)
+        return false;
+      eval::ParsedCommand probe;
+      try {
+        probe = eval::tokenize(bp.subRaw);
+      } catch (const eval::TokenizerError&) {
+        return true;  // the per-group dispatch reports the command's own syntax error
+      }
+      if (probe.inRange.has_value()) return false;
+      if (probe.ifExpr.has_value() &&
+          std::regex_search(*probe.ifExpr, std::regex(R"(\b_[nN]\b|\[)")))
+        return false;
+      return true;
+    }();
+    // `list` is byable too: each group's rows in its own table, numbered within the
+    // group (absolute: in the whole data), its `if` seeing the group's `_n` (bank
+    // e37d8f995c91d0e5 `bysort foreign: list make price if _n<=3`).
+    const bool byIsList = (subCmdLower == "list" || subCmdLower == "l" || subCmdLower == "li" ||
+                           subCmdLower == "lis");
+    if (byIsSummarize || byIsRegress || byIsTabstat || byIsCount || byIsList || byIsGeneric) {
       if (bp.byVars.empty()) {
         blocks.push_back(ojson(eval::engineError("bysort/by: no group variable(s) given")));
         return true;
@@ -686,7 +994,8 @@ bool executeByPrefix(std::string& cmd,
         else if (wt == "fw" || wt == "fweight") byWeightFlag = "--fweight";
         else if (byIsSummarize && (wt == "iw" || wt == "iweight")) byWeightFlag = "--iweight";
       }
-      if (!byIsRegress && subParsed.weightType.has_value() && byWeightFlag.empty()) {
+      if (!byIsRegress && !byIsGeneric && subParsed.weightType.has_value() &&
+          byWeightFlag.empty()) {
         blocks.push_back(ojson(eval::unsupportedOption(
             "[" + *subParsed.weightType + "=" + subParsed.weightVar.value_or("") + "]",
             "a weight on a by-prefixed `" + subCmdTyped +
@@ -705,7 +1014,7 @@ bool executeByPrefix(std::string& cmd,
       // REGRESS replaces e() after each group, so a later group's `if` reads the
       // previous group's fit in Stata; that is not followed here and is refused
       // by name (r(198)) instead of answered with the pre-loop results.
-      if (subParsed.ifExpr.has_value()) {
+      if (subParsed.ifExpr.has_value() && !byIsGeneric) {
         const std::string ie = *subParsed.ifExpr;  // a copy: the `if` is replaced below
         // BUG-1518: a `_b[`/`_se[` that ends a longer name (`g_b[1]`) is that
         // variable's subscript, not a coefficient.
@@ -800,6 +1109,7 @@ bool executeByPrefix(std::string& cmd,
           return true;
         }
       }
+      long bySummarizeSeparator = -1;
       if (byIsSummarize) {
         for (const auto& [k, v] : subParsed.opts) {
           if ((k == "detail" || k == "d") && v.isBool && v.boolValue) detail = true;
@@ -809,8 +1119,21 @@ bool executeByPrefix(std::string& cmd,
         // — detail/d/meanonly only, anything else an honest r(198)-parity
         // reject naming the token.
         for (const auto& [k, v] : subParsed.opts) {
-          (void)v;
           if (k == "detail" || k == "d" || k == "meanonly") continue;
+          // separator(#): the rule every # variables, in each group's table (bank
+          // aeb2486cb3f8544f `by foreign: summarize price mpg weight, separator(1)`).
+          if ((k == "separator" || k == "sep" || k == "sepa" || k == "separ" || k == "separa" ||
+               k == "separat" || k == "separato") && !v.isBool) {
+            try {
+              size_t used = 0;
+              const long sepv = std::stol(v.strValue, &used);
+              if (used == v.strValue.size()) {
+                bySummarizeSeparator = sepv < 0 ? 0 : sepv;
+                continue;
+              }
+            } catch (const std::exception&) {
+            }
+          }
           blocks.push_back(
               ojson(eval::engineError("option `" + k + "` not allowed", "unsupported_option")));
           return true;
@@ -882,7 +1205,27 @@ bool executeByPrefix(std::string& cmd,
       // never inferred from a stored flag: a flag can be stale after any verb
       // that reorders rows, and a wrong "already sorted" answer would put rows
       // from two different groups into one fit.
-      if (!bp.sortFirst) {
+      // The engine file's sort claim, where it has one, is Stata's sort marker
+      // (engineSortClaim: never false where present), and Stata's `by:` reads
+      // the marker, not the rows: keys that do not lead it are r(5) even on rows
+      // that happen to be grouped (bank e74318c52a02c617: `generate g=foreign`
+      // on auto, sorted by foreign, then `by g: summarize price`). With no claim
+      // the rows are measured, as before.
+      std::vector<std::string> byClaim;
+      if (!bp.sortFirst) byClaim = engineSortClaim(*baseDs);
+      if (!bp.sortFirst && !byClaim.empty()) {
+        std::vector<std::string> keys = bp.byVars;
+        keys.insert(keys.end(), bp.sortVars.begin(), bp.sortVars.end());
+        if (!keysLeadClaim(keys, byClaim)) {
+          blocks.push_back(ojson(eval::errorBlock(
+              "not_sorted",
+              "not sorted — `by " + joinSpace(bp.byVars) + ":` requires the data to already be "
+              "sorted by " + joinSpace(keys) + ". Use `bysort " + joinSpace(bp.byVars) +
+              ":` to sort first, or run `sort " + joinSpace(keys) + "` before this command.",
+              std::nullopt, std::nullopt, std::nullopt, "r(5)")));
+          return true;
+        }
+      } else if (!bp.sortFirst) {
         std::string unsortedOn;
         const int64_t nBase = baseDs->nRows();
         for (const auto& bv : bp.byVars) {
@@ -977,7 +1320,21 @@ bool executeByPrefix(std::string& cmd,
       // hand back a byte-identical frame and the whole round trip is dead work.
       // Any doubt at all — a key that dips — falls through to the sort, so
       // this can only ever remove a no-op.
-      const bool alreadyGrouped = keysAlreadyGrouped(*baseDs, bp.byVars);
+      // The generic per-group run reads the session's own rows by `in`, so the
+      // groups must be contiguous there (bysort has just sorted them; a plain
+      // `by` on data sorted by the first key only is Stata's r(5)). bysort leaves
+      // a string key in Stata's byte order, which a dictionary whose codes are
+      // not byte-ordered does not follow, so the session's rows are also taken
+      // as they stand when they are in that order (`gen s = cond(foreign,"a","b")`
+      // + `bysort s: ttest mpg == 20` runs, as `bysort s: summarize` does).
+      const bool alreadyGrouped =
+          keysAlreadyGrouped(*baseDs, bp.byVars) ||
+          (byIsGeneric && keysAlreadyGrouped(*baseDs, bp.byVars, /*stataStringOrder=*/true));
+      if (byIsGeneric && !alreadyGrouped) {
+        blocks.push_back(ojson(eval::errorBlock(
+            "not_sorted", "not sorted", std::nullopt, std::nullopt, std::nullopt, "r(5)")));
+        return true;
+      }
 
       std::string sortedPath;
       std::optional<Datastore> sortedOwned;
@@ -1059,10 +1416,12 @@ bool executeByPrefix(std::string& cmd,
           const ByColView& v = byCols[i];
           out += v.name + " = ";
           if (v.isFactor) {
+            // A string variable: a row with no level is the empty string, and its
+            // header names nothing after `=` (StataBE 19.5 `-> ks = `, BUGLOG BUG-1774).
             int32_t code = v.codes[row];
             out += (code >= 0 && static_cast<size_t>(code) < v.levels.size())
                        ? v.levels[static_cast<size_t>(code)]
-                       : ".";
+                       : "";
           } else {
             double x = v.f64[row];
             if (std::isnan(x)) {
@@ -1070,7 +1429,18 @@ bool executeByPrefix(std::string& cmd,
             } else if (x == std::floor(x) && std::fabs(x) < 1e15) {
               char buf[32];
               std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(x));
-              out += buf;
+              // A value label names the group as Stata's header does (`-> foreign =
+              // Domestic`, vs-stata bank b1c9f63b1865f435).
+              std::string text = buf;
+              auto ln = session.varLblname.find(v.name);
+              if (ln != session.varLblname.end()) {
+                auto defs = session.labelDefs.find(ln->second);
+                if (defs != session.labelDefs.end()) {
+                  auto hit = defs->second.find(buf);
+                  if (hit != defs->second.end()) text = hit->second;
+                }
+              }
+              out += text;
             } else {
               out += eval::pythonFloatRepr(x);
             }
@@ -1097,7 +1467,7 @@ bool executeByPrefix(std::string& cmd,
         byRegressors.assign(subParsed.varlist.begin() + 1, subParsed.varlist.end());
       const bool tsRegress = byIsRegress && translate::hasTsToken(byRegressors);
       try {
-        rowIdx = handlers::buildRowIndexCache(session, sortedPath);
+        if (!byIsGeneric) rowIdx = handlers::buildRowIndexCache(session, sortedPath);
       } catch (const CobraError& ce) {
         blocks.push_back(ojson(eval::engineError(cobraErrorMessage(ce), ce.code)));
         return true;
@@ -1123,11 +1493,11 @@ bool executeByPrefix(std::string& cmd,
                                                      *tabstatIfAfterRows, {});
         if (!ifAfterRowsError) tabstatIfAfterRows = rowIdxAfterRows.maskVar;
       }
-      if (subParsed.ifExpr.has_value() && !subParsed.ifExpr->empty() &&
-          (byIsSummarize || byIsCount || tsRegress ||
+      if (!byIsGeneric && subParsed.ifExpr.has_value() && !subParsed.ifExpr->empty() &&
+          (byIsSummarize || byIsCount || byIsList || tsRegress ||
            strmutate::needsConditionMask(session, *subParsed.ifExpr))) {
         const std::vector<std::string> groupKeys =
-            (byIsSummarize || byIsCount) ? bp.byVars : std::vector<std::string>{};
+            (byIsSummarize || byIsCount || byIsList) ? bp.byVars : std::vector<std::string>{};
         ifError = handlers::addIfMaskColumn(session, rowIdx, *subParsed.ifExpr, groupKeys);
         if (!ifError) subParsed.ifExpr = rowIdx.maskVar;
       }
@@ -1136,13 +1506,103 @@ bool executeByPrefix(std::string& cmd,
       // per-group SLICE, never against the session's head. Routing those to the
       // resident plane evicts the head and resyncs it once per group; say so
       // once, here, for the whole loop.
-      SessionState::StatelessRead statelessGroupReads(session);
+      // The generic per-group run reads the session's head itself (by `in`).
+      std::optional<SessionState::StatelessRead> statelessGroupReads;
+      if (!byIsGeneric) statelessGroupReads.emplace(session);
 
       // The LAST group's results are what Stata leaves in r() when the loop ends.
       std::optional<ojson> lastSummBlock;
       std::optional<int64_t> lastCountN;
       std::optional<ojson> lastTabstatBlock;
       bool tabstatSawRows = false;  // a group's tabstat has run on rows: `_rc` is 0
+
+      if (byIsGeneric) {
+        // Group ranges and headers are read before the first run: a group's
+        // command may replace the session's frame (e(sample) after pca), which
+        // the raw column views above point into.
+        std::vector<std::pair<int64_t, int64_t>> groupRanges;
+        std::vector<std::string> groupHeaders;
+        for (int64_t a = 0; a < nRowsSorted;) {
+          int64_t b = a + 1;
+          while (b < nRowsSorted && rowKeyEqual(a, b)) ++b;
+          groupRanges.emplace_back(a, b);
+          groupHeaders.push_back("-> " + formatGroupHeader(a));
+          a = b;
+        }
+        for (size_t gi = 0; gi < groupRanges.size(); ++gi) {
+          const int64_t g0 = groupRanges[gi].first, g1 = groupRanges[gi].second;
+          ojson header;
+          header["type"] = "display";
+          header["text"] = groupHeaders[gi];
+          blocks.push_back(header);
+          // `CMD VARLIST in FIRST/LAST [if ...] [weight] [, options]`: the range
+          // goes after the command's own words, before its first top-level
+          // `if`, weight bracket or option comma.
+          const std::string& raw = bp.subRaw;
+          size_t cut = raw.size();
+          int depth = 0;
+          bool inQuote = false;
+          for (size_t i = 0; i < raw.size(); ++i) {
+            const char ch = raw[i];
+            if (ch == '"') inQuote = !inQuote;
+            if (inQuote) continue;
+            if (ch == '(') ++depth;
+            else if (ch == ')') --depth;
+            if (depth != 0) continue;
+            if (ch == ',' || ch == '[') { cut = i; break; }
+            if (ch == 'i' && raw.compare(i, 2, "if") == 0 && i > 0 &&
+                std::isspace(static_cast<unsigned char>(raw[i - 1])) &&
+                (i + 2 == raw.size() || !cecon::ident::isIdentByte(raw[i + 2]))) {
+              cut = i;
+              break;
+            }
+          }
+          std::string head = raw.substr(0, cut);
+          while (!head.empty() && std::isspace(static_cast<unsigned char>(head.back())))
+            head.pop_back();
+          const std::string line = head + " in " + std::to_string(g0 + 1) + "/" +
+                                   std::to_string(g1) + (cut < raw.size() ? " " : "") +
+                                   raw.substr(cut);
+          const ojson groupBlocks = dispatch(line, session);
+          bool failed = false;
+          for (const auto& b : groupBlocks) {
+            if (b.is_object() && b.value("type", std::string()) == "echo") continue;
+            blocks.push_back(b);
+            if (b.is_object() && b.value("type", std::string()) == "error") failed = true;
+          }
+          if (failed) return true;  // Stata's by stops at the first group that fails
+        }
+        return true;
+      }
+      // list: its layout options and the sorted, indexed frame every group reads.
+      handlers::ListLayout byListLayout;
+      std::unique_ptr<Datastore> byListData;
+      std::vector<std::string> byListVars;
+      if (byIsList) {
+        eval::canonicalizeForCommand(subParsed.opts, "list");
+        if (auto err = eval::rejectUnknownOptions(subParsed.opts, kVocabList.known,
+                                                  kVocabList.unimplemented)) {
+          blocks.push_back(ojson(*err));
+          return true;
+        }
+        if (auto bad = handlers::parseListLayout(subParsed.opts, subParsed.raw, &byListLayout)) {
+          blocks.push_back(*bad);
+          return true;
+        }
+        byListData = std::make_unique<Datastore>(rowIdx.path);
+        if (!subParsed.varlist.empty()) {
+          std::string spec;
+          for (const auto& t : subParsed.varlist) spec += (spec.empty() ? "" : " ") + t;
+          auto lvr = piet::loops::expandVarlist(spec, session);
+          if (lvr.isError) {
+            blocks.push_back(lvr.error);
+            return true;
+          }
+          byListVars = lvr.tokens;
+        } else if (Datastore* cur = session.datastore()) {
+          byListVars = cur->names();
+        }
+      }
 
       int64_t g0 = 0;
       while (g0 < nRowsSorted) {
@@ -1156,6 +1616,35 @@ bool executeByPrefix(std::string& cmd,
         if (ifError) {
           blocks.push_back(*ifError);
           return true;
+        }
+        if (byIsList) {
+          const double* mask =
+              rowIdx.maskVar.empty() ? nullptr : byListData->col(rowIdx.maskVar).f64();
+          std::vector<int64_t> rows, obs;
+          for (int64_t r = g0; r < g1; ++r) {
+            if (mask != nullptr && !(mask[r] == 1.0)) continue;
+            rows.push_back(r);
+            obs.push_back(byListLayout.absolute ? r + 1 : r - g0 + 1);
+          }
+          if (!rows.empty()) {
+            ojson err;
+            ojson listing = handlers::buildListing(session, *byListData, rows, obs, byListVars,
+                                                   byListLayout, &err);
+            if (listing.is_null()) {
+              blocks.push_back(err);
+              return true;
+            }
+            listing["omitted"] = 0;
+            ojson b;
+            b["type"] = "browse";
+            b["editable"] = false;
+            b["columns"] = ojson::array();
+            b["rows"] = ojson::array();
+            b["listing"] = std::move(listing);
+            blocks.push_back(std::move(b));
+          }
+          g0 = g1;
+          continue;
         }
 
         // Slice this group's own contiguous [g0+1, g1] row range (1-based,
@@ -1210,6 +1699,8 @@ bool executeByPrefix(std::string& cmd,
                   ? handlers::summarizeCoreStats(groupDs, vl, detail, std::nullopt)
                   : handlers::summarizeCoreStatsWeighted(groupDs, vl, detail, subParsed.weightVar,
                                                          byWeightFlag.c_str()));
+          if (bySummarizeSeparator >= 0 && lastSummBlock->value("type", "") != "error")
+            (*lastSummBlock)["separator"] = bySummarizeSeparator;
           blocks.push_back(*lastSummBlock);
         } else if (byIsCount) {
           // The slice already carries this group's rows AND the `if`.
@@ -1305,22 +1796,65 @@ bool executeByPrefix(std::string& cmd,
       // found-but-not-flagged keeps the ORIGINAL "not supported yet"
       // wording unchanged.
       const registry::CommandSpec* subSpec = registry::findByName(subCmdLower);
+      // The gtools fold above maps e.g. greshape onto reshape; the flag is
+      // read on the typed (pre-fold) row too, so a gtools row carries its own
+      // measured verdict.
+      const registry::CommandSpec* typedSpec =
+          registry::findByName(registry::resolveCanonical(subCmdTyped));
       std::string msg;
       // BUG-105/WS-K: the LOOKUP uses the canonical spelling (so an
       // abbreviation gets the right verdict), the MESSAGE quotes what the user
       // typed (so today's bytes are unchanged for every non-abbreviated line).
-      if (subSpec && subSpec->byIllegalInStata) {
-        msg = "`" + prefixWord + " " + byVarsJoined + ": " + subCmdTyped +
-              "` is not allowed — `" + subCmdTyped + "` may not be combined with a `by`/`bysort` "
-              "prefix. This is a structural restriction in Stata itself, not a PIET version "
-              "limitation, and will not become available in a later milestone. Remove the `" +
-              prefixWord + "` prefix and run `" + subCmdTyped + "` on its own.";
+      // Stata's answer for a non-byable command is the command's own
+      // "<cmd> may not be combined with by", r(190), whatever the sort order
+      // (vs-stata bank ab684d8dd4e3db69 `by foreign: codebook`,
+      // 6df7b0c9ad98ab0b `bysort foreign: glevelsof`, b7971446 esttab, b49d7ab0bf968d9e `bysort foreign:
+      // scatter`, 9e1e81f9bba79933 `hist` -- the program is named as typed); table's is its
+      // Stata 17 note (8c5b6946 `bysort foreign: table rep78`); c4e0a1066a17b3d4 `bysort
+      // foreign: margins`, e7fcf06457bc321e `... mean` (s4_post); 92020bf71d0804da compress,
+      // 29f1e114ea34c258 format, 4006519450d75a6b label, 386ab1fe9e41d315 notes (s4_io_misc).
+      if ((subSpec && subSpec->byIllegalInStata) || (typedSpec && typedSpec->byIllegalInStata)) {
+        const std::string stataMsg =
+            subCmdLower == "table"
+                ? std::string("prefix by: not allowed since Stata 17; see help table for updated syntax")
+                : subCmdTyped + " may not be combined with by";
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", stataMsg, std::nullopt,
+                                                std::nullopt, std::nullopt, "r(190)")));
+        return true;
       } else {
+        // A plain `by:` over data not sorted by its keys is r(5) "not sorted"
+        // in Stata before the command runs at all (vs-stata bank
+        // 8ad2062fa3e4bdd1 `by race: svyset ...` on unsorted data), so that
+        // answer does not depend on PIET's by-group support.
+        if (!bp.sortFirst && subSpec != nullptr) {
+          std::vector<std::string> keys = bp.byVars;
+          keys.insert(keys.end(), bp.sortVars.begin(), bp.sortVars.end());
+          if (Datastore* ds = session.datastore()) {
+            const std::vector<std::string> claim = engineSortClaim(*ds);
+            const bool inOrder = claim.empty() ? keysAlreadyGrouped(*ds, keys, true)
+                                               : keysLeadClaim(keys, claim);
+            if (!inOrder) {
+              blocks.push_back(ojson(eval::errorBlock(
+                  "not_sorted", "not sorted — `by " + joinSpace(bp.byVars) +
+                      ":` requires the data to already be sorted by " + joinSpace(keys) + ".",
+                  std::nullopt, std::nullopt, std::nullopt, "r(5)")));
+              return true;
+            }
+          }
+        }
         msg = "`" + prefixWord + " " + byVarsJoined + ": " + subCmdTyped +
               "` is not supported yet — `by:`/`bysort:` grouped dispatch is only "
               "implemented for `gen`/`replace`/`egen`/`summarize`/`count`/`regress`/`tabstat`/`keep if`/`drop if` "
               "(and `carryforward`/`tsspell`) in this version of PIET. Run `" +
               subCmdTyped + "` separately for each group instead.";
+      }
+      // Stata's own refusal is r(190) "<cmd> may not be combined with by" (bank: every
+      // `bysort foreign: pctile|xtile|recode|merge|reshape|...` cell, d282ade8b76a830c).
+      if (subSpec && subSpec->byIllegalInStata) {
+        blocks.push_back(ojson(eval::errorBlock(
+            "by_not_allowed", subCmdTyped + " may not be combined with by\n" + msg,
+            std::nullopt, std::nullopt, std::nullopt, "r(190)")));
+        return true;
       }
       blocks.push_back(ojson(eval::errorBlock("unsupported_command", msg, std::nullopt, std::nullopt,
                                               std::nullopt, "piet_gap")));

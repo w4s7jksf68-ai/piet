@@ -599,6 +599,14 @@ ojson runRecode(const std::string& rawLine, SessionState& session,
 
   const std::string created = storage::resolveCreateType(session, "");
   double lastChanges = 0;
+  // generate()/prefix(): Stata counts the differences of EVERY source first
+  // and only then creates the new variables, recasting each one to its
+  // source's storage type. A recast that really changes the type leaves r(N)
+  // = the values it changed; a same-type recast leaves r() alone. So r(N) is
+  // the last real recast's count when there was one, else the last source's
+  // difference count (bank 52f8d3f70996b827: wage float, hours byte, tenure
+  // float -> r(N)=0 from hours; 6fd472db37100a2a: wage alone -> the count).
+  std::optional<double> lastRecastN;
   bool overlapNote = false, unusedNote = false;
   // Every source is recoded from its values as they were when the command
   // started: a variable named twice is counted twice from those values and
@@ -746,7 +754,8 @@ ojson runRecode(const std::string& rawLine, SessionState& session,
       }
       fits = misfits == 0;
     }
-    lastChanges = target == created ? changes : misfits;
+    lastChanges = changes;
+    if (target != created) lastRecastN = misfits;
     if (target != created && fits) {
       VarMeta& vm = session.varMeta[nv];
       vm.stataType = target;
@@ -784,7 +793,7 @@ ojson runRecode(const std::string& rawLine, SessionState& session,
   }
 
   eval::replaceRClass(session.eval);
-  session.eval.rValues.set("N", lastChanges);
+  session.eval.rValues.set("N", lastRecastN.has_value() ? *lastRecastN : lastChanges);
   eval::declareRPosted(session.eval, "recode", {"N"});
 
   ojson result = inPlace ? mutationResult(session, "recode") : mutationResult(session, "recode", newNames);

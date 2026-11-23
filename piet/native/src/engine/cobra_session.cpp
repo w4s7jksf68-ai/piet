@@ -5,9 +5,15 @@
 #include <chrono>
 #include "piet/counters.h"
 #include "piet/datastore.h"
+#include "engine/serve_response.h"
 
 #include <atomic>
+#include <climits>
+#include <cstdint>
 #include <cstdio>
+#include <optional>
+#include <string_view>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 
@@ -190,6 +196,389 @@ void fillFrameMeta(CobraFrameMeta* meta, const nlohmann::json& resp) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// serve_response (engine/serve_response.h): the fast reading of a response line
+// and the general one it stands in for.
+namespace serve_response {
+namespace {
+
+// A cursor over the line that reads exactly the JSON the fast reading accepts.
+class Cursor {
+ public:
+  explicit Cursor(const std::string& s) : s_(s) {}
+  void ws() {
+    while (i_ < s_.size() && (s_[i_] == ' ' || s_[i_] == '\t' || s_[i_] == '\n' || s_[i_] == '\r')) ++i_;
+  }
+  bool eat(char c) {
+    ws();
+    if (i_ < s_.size() && s_[i_] == c) {
+      ++i_;
+      return true;
+    }
+    return false;
+  }
+  bool atEnd() {
+    ws();
+    return i_ == s_.size();
+  }
+  // A key: a string with no escape (every key the engine writes is plain).
+  bool key(std::string_view* out) {
+    ws();
+    if (i_ >= s_.size() || s_[i_] != '"') return false;
+    const size_t a = ++i_;
+    while (i_ < s_.size()) {
+      const auto c = static_cast<unsigned char>(s_[i_]);
+      if (c == '"') {
+        *out = std::string_view(s_).substr(a, i_ - a);
+        ++i_;
+        return true;
+      }
+      if (c == '\\' || c < 0x20 || c >= 0x80) return false;
+      ++i_;
+    }
+    return false;
+  }
+  // A string value: the simple escapes only; no \u, no control byte, no byte >= 0x80.
+  bool str(std::string* out) {
+    ws();
+    if (i_ >= s_.size() || s_[i_] != '"') return false;
+    ++i_;
+    out->clear();
+    size_t run = i_;
+    while (i_ < s_.size()) {
+      const auto c = static_cast<unsigned char>(s_[i_]);
+      if (c == '"') {
+        out->append(s_, run, i_ - run);
+        ++i_;
+        return true;
+      }
+      if (c < 0x20 || c >= 0x80) return false;
+      if (c != '\\') {
+        ++i_;
+        continue;
+      }
+      out->append(s_, run, i_ - run);
+      if (i_ + 1 >= s_.size()) return false;
+      switch (s_[i_ + 1]) {
+        case '"': out->push_back('"'); break;
+        case '\\': out->push_back('\\'); break;
+        case '/': out->push_back('/'); break;
+        case 'b': out->push_back('\b'); break;
+        case 'f': out->push_back('\f'); break;
+        case 'n': out->push_back('\n'); break;
+        case 'r': out->push_back('\r'); break;
+        case 't': out->push_back('\t'); break;
+        default: return false;  // \u and anything invalid: the general reading's
+      }
+      i_ += 2;
+      run = i_;
+    }
+    return false;
+  }
+  // An integer literal that fits int64 (no fraction, no exponent, no leading 0).
+  bool i64(int64_t* out) {
+    ws();
+    bool neg = false;
+    if (i_ < s_.size() && s_[i_] == '-') {
+      neg = true;
+      ++i_;
+    }
+    if (i_ >= s_.size() || s_[i_] < '0' || s_[i_] > '9') return false;
+    if (s_[i_] == '0' && i_ + 1 < s_.size() && s_[i_ + 1] >= '0' && s_[i_ + 1] <= '9') return false;
+    uint64_t v = 0;
+    while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') {
+      const uint64_t d = static_cast<uint64_t>(s_[i_] - '0');
+      if (v > (UINT64_MAX - d) / 10) return false;
+      v = v * 10 + d;
+      ++i_;
+    }
+    if (i_ < s_.size() && (s_[i_] == '.' || s_[i_] == 'e' || s_[i_] == 'E')) return false;
+    if (neg) {
+      if (v > static_cast<uint64_t>(INT64_MAX) + 1) return false;
+      *out = v == static_cast<uint64_t>(INT64_MAX) + 1 ? INT64_MIN : -static_cast<int64_t>(v);
+    } else {
+      if (v > static_cast<uint64_t>(INT64_MAX)) return false;
+      *out = static_cast<int64_t>(v);
+    }
+    return true;
+  }
+  bool boolean(bool* out) {
+    ws();
+    if (s_.compare(i_, 4, "true") == 0) {
+      i_ += 4;
+      *out = true;
+      return true;
+    }
+    if (s_.compare(i_, 5, "false") == 0) {
+      i_ += 5;
+      *out = false;
+      return true;
+    }
+    return false;
+  }
+  // `{` key `:` value (`,` ...)* `}`, `onKey` reading each value; a key seen
+  // twice declines (the general reading keeps the last, this one would not know).
+  template <class F>
+  bool object(F onKey) {
+    if (!eat('{')) return false;
+    if (eat('}')) return true;
+    std::vector<std::string_view> seen;
+    for (;;) {
+      std::string_view k;
+      if (!key(&k) || !eat(':')) return false;
+      for (const auto& s : seen)
+        if (s == k) return false;
+      seen.push_back(k);
+      if (!onKey(k)) return false;
+      if (eat(',')) continue;
+      return eat('}');
+    }
+  }
+  template <class F>
+  bool array(F onItem) {
+    if (!eat('[')) return false;
+    if (eat(']')) return true;
+    for (;;) {
+      if (!onItem()) return false;
+      if (eat(',')) continue;
+      return eat(']');
+    }
+  }
+
+ private:
+  const std::string& s_;
+  size_t i_ = 0;
+};
+
+struct VarRaw {
+  std::optional<std::string> name, type, format, label;
+  std::optional<int64_t> nMissing, nLevels;
+};
+
+bool readVar(Cursor& c, VarRaw* v) {
+  return c.object([&](std::string_view k) {
+    std::string s;
+    int64_t n = 0;
+    if (k == "name") return c.str(&s) && (v->name = std::move(s), true);
+    if (k == "type") return c.str(&s) && (v->type = std::move(s), true);
+    if (k == "format") return c.str(&s) && (v->format = std::move(s), true);
+    if (k == "label") return c.str(&s) && (v->label = std::move(s), true);
+    if (k == "n_missing") return c.i64(&n) && (v->nMissing = n, true);
+    if (k == "n_levels") return c.i64(&n) && (v->nLevels = n, true);
+    return false;
+  });
+}
+
+bool readStrings(Cursor& c, std::optional<std::vector<std::string>>* out) {
+  out->emplace();
+  return c.array([&] {
+    std::string s;
+    if (!c.str(&s)) return false;
+    (*out)->push_back(std::move(s));
+    return true;
+  });
+}
+
+bool readVars(Cursor& c, std::optional<std::vector<VarRaw>>* out) {
+  out->emplace();
+  return c.array([&] {
+    VarRaw v;
+    if (!readVar(c, &v)) return false;
+    (*out)->push_back(std::move(v));
+    return true;
+  });
+}
+
+struct FrameRaw {
+  std::optional<int64_t> rows, cols;
+  std::optional<std::vector<std::string>> changed, added, dropped;
+  std::optional<bool> structure, cardStable;
+  bool haveMerge = false;
+  std::optional<int64_t> masterOnly, usingOnly, matched;
+  std::optional<std::vector<VarRaw>> varsDelta, vars;
+};
+
+bool readFrame(Cursor& c, FrameRaw* f) {
+  return c.object([&](std::string_view k) {
+    int64_t n = 0;
+    bool b = false;
+    std::string s;
+    if (k == "rows") return c.i64(&n) && (f->rows = n, true);
+    if (k == "cols") return c.i64(&n) && (f->cols = n, true);
+    if (k == "changed") return readStrings(c, &f->changed);
+    if (k == "added") return readStrings(c, &f->added);
+    if (k == "dropped") return readStrings(c, &f->dropped);
+    if (k == "structure") return c.boolean(&b) && (f->structure = b, true);
+    if (k == "card_stable") return c.boolean(&b) && (f->cardStable = b, true);
+    if (k == "vars_delta") return readVars(c, &f->varsDelta);
+    if (k == "vars") return readVars(c, &f->vars);
+    if (k == "path") return c.str(&s);  // read by no field reader
+    if (k == "merge_counts") {
+      f->haveMerge = true;
+      return c.object([&](std::string_view m) {
+        int64_t v = 0;
+        if (!c.i64(&v)) return false;
+        if (m == "master_only") return (f->masterOnly = v, true);
+        if (m == "using_only") return (f->usingOnly = v, true);
+        if (m == "matched") return (f->matched = v, true);
+        return false;
+      });
+    }
+    return false;
+  });
+}
+
+struct EstRaw {
+  std::optional<std::string> handle, vcovType;
+  std::optional<int64_t> k, nObs, fits;
+};
+
+bool readEst(Cursor& c, EstRaw* e) {
+  return c.object([&](std::string_view k) {
+    std::string s;
+    int64_t n = 0;
+    if (k == "handle") return c.str(&s) && (e->handle = std::move(s), true);
+    if (k == "vcov_type") return c.str(&s) && (e->vcovType = std::move(s), true);
+    if (k == "k") return c.i64(&n) && (e->k = n, true);
+    if (k == "n_obs") return c.i64(&n) && (e->nObs = n, true);
+    if (k == "fits") return c.i64(&n) && (e->fits = n, true);
+    return false;
+  });
+}
+
+// fillFrameVar, on what readVar read.
+CobraFrameVar frameVarOf(VarRaw& r) {
+  CobraFrameVar v;
+  v.name = r.name ? std::move(*r.name) : std::string();
+  v.type = r.type ? std::move(*r.type) : std::string();
+  v.nMissing = r.nMissing.value_or(0);
+  if (r.nLevels) v.nLevels = *r.nLevels;
+  v.format = r.format ? std::move(*r.format) : std::string();
+  v.label = r.label ? std::move(*r.label) : std::string();
+  return v;
+}
+
+// fillFrameMeta, on what readFrame read.
+void commitFrame(CobraFrameMeta* meta, FrameRaw& f) {
+  *meta = CobraFrameMeta{};
+  meta->valid = true;
+  meta->rows = f.rows.value_or(0);
+  meta->cols = f.cols.value_or(0);
+  auto countOf = [](const std::optional<std::vector<std::string>>& names) -> int64_t {
+    if (!names) return 0;
+    int64_t n = 0;
+    for (const auto& e : *names)
+      if (!piet::isHiddenColumn(e)) ++n;
+    return n;
+  };
+  meta->changed = countOf(f.changed);
+  meta->added = countOf(f.added);
+  meta->dropped = countOf(f.dropped);
+  if (f.dropped)
+    for (const auto& d : *f.dropped)
+      if (!piet::isHiddenColumn(d)) meta->droppedNames.push_back(d);
+  meta->structure = f.structure.value_or(false);
+  meta->card_stable = f.cardStable.value_or(!meta->structure);
+  meta->mergeCountsValid = false;
+  if (f.haveMerge) {
+    meta->mergeMasterOnly = f.masterOnly.value_or(0);
+    meta->mergeUsingOnly = f.usingOnly.value_or(0);
+    meta->mergeMatched = f.matched.value_or(0);
+    meta->mergeCountsValid = true;
+  }
+  const int64_t rawCols = meta->cols;
+  int64_t hiddenInVars = 0, hiddenInDelta = 0, rawDelta = 0;
+  if (f.varsDelta) {
+    for (auto& r : *f.varsDelta) {
+      CobraFrameVar v = frameVarOf(r);
+      ++rawDelta;
+      if (piet::isHiddenColumn(v.name)) {
+        ++hiddenInDelta;
+        continue;
+      }
+      meta->varsDelta.push_back(std::move(v));
+    }
+  }
+  bool haveVars = false;
+  if (f.vars) {
+    haveVars = true;
+    for (auto& r : *f.vars) {
+      CobraFrameVar v = frameVarOf(r);
+      if (piet::isHiddenColumn(v.name)) {
+        ++hiddenInVars;
+        continue;
+      }
+      meta->vars.push_back(std::move(v));
+    }
+  }
+  if (haveVars) {
+    meta->cols = rawCols - hiddenInVars;
+  } else if (rawDelta == rawCols) {
+    meta->cols = rawCols - hiddenInDelta;
+  }
+}
+
+}  // namespace
+
+bool readFast(const std::string& line, CobraFrameMeta* meta, CobraEstMeta* est,
+              CobraRunResult* result) {
+  Cursor c(line);
+  std::optional<int64_t> exitCode;
+  std::string out, err;
+  FrameRaw frame;
+  bool haveFrame = false;
+  EstRaw e;
+  bool haveEst = false;
+  const bool ok = c.object([&](std::string_view k) {
+    int64_t n = 0;
+    if (k == "id") return c.i64(&n);
+    if (k == "exit") return c.i64(&n) && n >= INT_MIN && n <= INT_MAX && (exitCode = n, true);
+    if (k == "stdout") return c.str(&out);
+    if (k == "stderr") return c.str(&err);
+    if (k == "frame") return readFrame(c, &frame) && (haveFrame = true);
+    if (k == "est") return readEst(c, &e) && (haveEst = true);
+    return false;
+  });
+  if (!ok || !c.atEnd()) return false;
+  // Committed only now, the whole line read: fillFrameMeta, fillEstMeta and
+  // resultFromResponse on the same values.
+  if (meta != nullptr) {
+    if (haveFrame) {
+      commitFrame(meta, frame);
+    } else {
+      *meta = CobraFrameMeta{};
+    }
+  }
+  *est = CobraEstMeta{};
+  if (haveEst) {
+    est->handle = e.handle ? *e.handle : std::string();
+    if (!est->handle.empty()) {
+      est->valid = true;
+      est->k = e.k.value_or(0);
+      est->nObs = e.nObs.value_or(0);
+      est->vcovType = e.vcovType ? *e.vcovType : std::string();
+      est->fits = e.fits.value_or(-1);
+    }
+  }
+  CobraRunResult r;
+  r.exit_code = exitCode ? static_cast<int>(*exitCode) : -1;
+  r.stdout_text = std::move(out);
+  r.stderr_text = std::move(err);
+  r.ok = (r.exit_code == 0);
+  *result = std::move(r);
+  return true;
+}
+
+void readGeneral(const std::string& line, CobraFrameMeta* meta, CobraEstMeta* est,
+                 CobraRunResult* result) {
+  nlohmann::json resp = nlohmann::json::parse(line);
+  fillFrameMeta(meta, resp);
+  fillEstMeta(*est, resp);
+  *result = resultFromResponse(resp);
+}
+
+}  // namespace serve_response
 
 long engineSettingsEpoch() { return g_engineSettingsEpoch.load(std::memory_order_relaxed); }
 void bumpEngineSettingsEpoch() { g_engineSettingsEpoch.fetch_add(1, std::memory_order_relaxed); }
@@ -650,6 +1039,14 @@ CobraRunResult CobraSession::request(nlohmann::json req, CobraFrameMeta* metaOut
     if (writeLine(line) && readLine(respLine)) {
       consecutiveDeaths_ = 0;
       try {
+        // The fast reading first (engine/serve_response.h): it writes nothing
+        // unless it read the whole line, and then exactly what the lines below
+        // would have written. A line it declines takes those lines unchanged.
+        CobraRunResult fastResult;
+        if (serve_response::readFast(respLine, metaOut, &lastEst_, &fastResult)) {
+          ++responseSeq_;
+          return fastResult;
+        }
         nlohmann::json resp = nlohmann::json::parse(respLine);
         fillFrameMeta(metaOut, resp);
         // §31: rewrite the retained est block on EVERY response (clearing it
@@ -715,8 +1112,13 @@ CobraRunResult CobraSession::frameVars(CobraFrameMeta* metaOut) {
 }
 
 CobraRunResult CobraSession::frameRun(const std::vector<std::string>& argv, CobraFrameMeta* metaOut) {
-  nlohmann::json req;
-  req["frame"] = {{"op", "run"}, {"argv", argv}};
+  // Built member by member: the initializer-list form copied argv twice (into
+  // the list, then out of it), and this is every resident mutation's request.
+  nlohmann::json frame = nlohmann::json::object();
+  frame["op"] = "run";
+  frame["argv"] = argv;
+  nlohmann::json req = nlohmann::json::object();
+  req["frame"] = std::move(frame);
   CobraRunResult r = request(std::move(req), metaOut);
   // Capability detection (frames Yes/No) is frameUse's job — a §25-only engine
   // rejects the FIRST frame op with exit 2. Once frames_ is Yes, a frame-run's
@@ -741,6 +1143,12 @@ CobraRunResult CobraSession::frameGetcols(const std::vector<std::string>& cols,
                                           const std::string& out) {
   nlohmann::json req;
   req["frame"] = {{"op", "getcols"}, {"cols", cols}, {"out", out}};
+  return request(std::move(req), nullptr);
+}
+
+CobraRunResult CobraSession::frameGetcell(const std::string& col, long long row) {
+  nlohmann::json req;
+  req["frame"] = {{"op", "getcell"}, {"col", col}, {"row", row}};
   return request(std::move(req), nullptr);
 }
 

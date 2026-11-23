@@ -3,6 +3,8 @@
 #include "selftest_support.h"
 #include "selftest_cases.h"
 
+#include <set>
+
 
 // ── COUNCIL-20260710 pre-wave sprint P2/P3/P4: native dispatch honesty fixes
 // (BUG-055/BUG-056/BUG-060) ───────────────────────────────────────────────
@@ -169,14 +171,25 @@ void testClusterVceAndUnknownOptionFixes() {
     check(errBad.value("message", std::string()).find("not allowed") != std::string::npos,
           "BUG-060: a genuinely-invalid token reads as Stata's own r(198) 'not allowed' wording");
 
-    // (b) a real-Stata-but-PIET-unimplemented option reads as an honest
-    // gap, not an r(198) typo-reject (oracle: `regress ,beta` is valid
-    // Stata — standardized-coefficient display — just not implemented).
+    // (b) `regress ,beta` is valid Stata (the standardized-coefficient column) and is
+    // now implemented: the table carries the Beta column, never a silent no-op
+    // (vs-stata bank 23a1222407b860c9 `regress price mpg weight, beta`: rc 0, the
+    // table's last column Beta, e() as the plain fit's). With vce(cluster) Stata
+    // refuses it, r(198).
     auto jBeta = runCmd(session, "regress fatal beertax, beta");
-    auto errBeta = firstBlockOfType(jBeta, "error");
-    check(!errBeta.is_null(), "BUG-060: `regress ..., beta` is rejected (not silently ignored)");
-    check(errBeta.value("message", std::string()).find("not yet implement") != std::string::npos,
-          "BUG-060: `beta` (a real Stata option) reads as an honest gap, not 'not allowed'");
+    auto estBeta = firstBlockOfType(jBeta, "estimation");
+    check(firstBlockOfType(jBeta, "error").is_null() && !estBeta.is_null() &&
+              estBeta.value("beta", false),
+          "BUG-060: `regress ..., beta` fits and draws the Beta column (not silently ignored)");
+    bool betaRow = false;
+    if (!estBeta.is_null() && estBeta.contains("coeftable") && estBeta["coeftable"].is_array())
+      for (const auto& r : estBeta["coeftable"])
+        if (r.is_object() && r.value("name", std::string()) == "beertax" && r.contains("beta") &&
+            r["beta"].is_number())
+          betaRow = true;
+    check(betaRow, "BUG-060: `beta`: the beertax row carries its standardized coefficient");
+    auto errBetaCl = firstBlockOfType(runCmd(session, "regress fatal beertax, beta vce(cluster state)"), "error");
+    check(!errBetaCl.is_null(), "BUG-060: `beta` with vce(cluster) is refused (Stata r(198))");
 
     // (c) OVER-REJECTION GUARD: a representative regress using ONLY options
     // this version of PIET has always accepted must still succeed
@@ -1330,24 +1343,53 @@ void testBS096QualifierPolicyTable() {
   // confirmed-illegal rows and nothing else — a drift guard for this new
   // field, same spirit as testRegistryRoutes() above. ------------------
   {
-    int illegalCount = 0;
     // T7 (package-007 unblock) adds `lookfor`: StataBE answers a by-prefixed
     // lookfor with r(190) (lane L1 probe), so it is the fifth stem.
-    bool codebookOk = false, describeOk = false, levelsofOk = false, tableOk = false;
-    bool lookforOk = false;
+    // Stage 4 (s4_data_a) adds the data-management stems StataBE answers
+    // "<cmd> may not be combined with by", r(190), in the vs-stata bank
+    // (e.g. 6856ad490d635326 collapse, b1dbf424fce06313 isid,
+    // 6df7b0c9ad98ab0b glevelsof, 29135713c06f70fc gquantiles); s4_esttab_tab adds
+    // esttab, estout, estadd, estpost and tabout (b7971446, 975265f6, bb85d7d6, 5b9b595f,
+    // 61a18e0a); s4_graph adds the fifteen graph commands (b49d7ab0bf968d9e scatter,
+    // 168ff9e934a3caae histogram, 945cec2df12882f2 kdensity, ef9bc6d122ffc6e3 line,
+    // bcb7258b13726456 xtline, 961d53b494bec352 tsline, 8c53ebc103529818 twoway,
+    // 23e23d03a86cfd1b graph, ef9edd1a853269cf rdplot, 0e9b61b267767e72 binscatter,
+    // 4fe8b02a137e06ad twoway__histogram_gen, a162d09e768ebba0 grstyle, 309ab19c82eb47b7
+    // cdfplot, 1dbb2e6f225b1aa4 lpoly, b6fcf023d01b683b lowess); s4_post adds ten
+    // (`bysort foreign: margins` c4e0a1066a17b3d4, `... mean` e7fcf06457bc321e,
+    // `... predict` 26c4291feb9c5d9f, `... proportion` 3dbcaaaf13919c8d, `...
+    // dfuller` d891845c486da05f, `... pperron` 4c3f7a0d19834cac, `... wntestq`
+    // 026472f6f17bf70f, `... sktest` 7996c07a3143c128, `... swindex`
+    // 08a7ede2217fad94, `bysort breathcode: sdid` 814a5f260522161b); s4_data_b adds the
+    // data commands of its bank cells (956c3d133a9dbe71 pctile, 13c8aebae37c40b1 xtile,
+    // 8057dfd7fe3b5034 recode, ...); s4_io_misc adds eleven (compress 92020bf7,
+    // datasignature 97a623aa, format 29f1e114, label 40065194, labelbook 70e9abc9, notes
+    // 386ab1fe, recast 3691f5ac, renvarlab a6bff1da, renvars 44d4e836, splitvallabels
+    // 95a4efd9, labmask 6c443314).
+    const std::set<std::string> expected = {
+        "codebook", "describe", "levelsof", "table", "lookfor",
+        "cross", "gsort", "_pctile", "bsample", "clonevar", "collapse", "contract", "decode",
+        "drawnorm", "ds", "encode", "expand", "fcollapse", "fillin", "findname", "gcollapse",
+        "gduplicates", "geodist", "gisid", "glevelsof", "gquantiles", "greshape", "gunique",
+        "ihstrans", "insobs", "isid", "joinby",
+        "esttab", "estout", "estadd", "estpost", "tabout",
+        "scatter", "histogram", "kdensity", "line", "xtline", "tsline", "twoway", "graph",
+        "rdplot", "binscatter", "twoway__histogram_gen", "grstyle", "cdfplot", "lpoly", "lowess",
+        "dfuller", "pperron", "wntestq", "margins", "mean", "predict", "proportion", "sdid",
+        "sktest", "swindex",
+        "mi", "duplicates", "markout", "mata", "merge", "mkspline", "mvdecode", "mvencode",
+        "pctile", "rangestat", "recode", "reshape", "sctorezone", "sencode", "separate", "sort",
+        "split", "splitsample", "stack", "strdist", "tostring", "tset", "tsfill", "tsfilter",
+        "tsset", "tssmooth", "unique", "winsor", "winsor2", "xi", "xtile",
+        "compress", "datasignature", "format", "label", "labelbook", "notes", "recast",
+        "renvarlab", "renvars", "splitvallabels", "labmask"};
+    std::set<std::string> got;
     for (const auto& spec : piet::registry::commandRegistry()) {
-      if (!spec.byIllegalInStata) continue;
-      ++illegalCount;
-      if (spec.canonical == "codebook") codebookOk = true;
-      else if (spec.canonical == "describe") describeOk = true;
-      else if (spec.canonical == "levelsof") levelsofOk = true;
-      else if (spec.canonical == "table") tableOk = true;
-      else if (spec.canonical == "lookfor") lookforOk = true;
+      if (spec.byIllegalInStata) got.insert(spec.canonical);
     }
-    check(illegalCount == 5 && codebookOk && describeOk && levelsofOk && tableOk && lookforOk,
-          "A3: registry byIllegalInStata is set on exactly {codebook, describe, levelsof, table, "
-          "lookfor} (audit G3's 4 Stata-structurally-illegal-with-by stems, plus lookfor from T7), "
-          "nothing more/less");
+    check(got == expected,
+          "A3: registry byIllegalInStata is set on exactly the measured r(190) stems "
+          "(audit G3's 4, lookfor from T7, the stage-4 bank stems), nothing more/less");
   }
 
   // --- weight policy: LEGAL cells pass through unchanged ----------------
@@ -1456,13 +1498,16 @@ void testBS096QualifierPolicyTable() {
   // repointed at `tabstat` and, once tabstat took `in` (bank bb041b080), at `tobit`, deliberately left OUT of BS-090's flip list
   // (tabstat/tobit share applyIfFilterM4 with corr/ttest but their call
   // sites still pass no inRange argument — registry.cpp's own comment).
+  // vs-stata bank stage 4 (2026-11-23): tobit takes `in` now (bank ffbb7112 `tobit
+  // mpg weight in 1/60` rc 0, folded into its if); the leg names nbreg, whose
+  // syntax takes `in` (nbreg.ado `[if] [in]`) and whose PIET arm does not yet.
   try {
-    tokenize("tobit wage in 1/5");
-    check(false, "A3/D7 in: tobit+in must still throw (freeze-preservation; BS-090 left it "
+    tokenize("nbreg wage in 1/5");
+    check(false, "A3/D7 in: nbreg+in must still throw (freeze-preservation; BS-090 left it "
                  "out of scope)");
   } catch (const TokenizerError& e) {
     std::string msg = e.block.at("message").get<std::string>();
-    check(msg.find("tobit") != std::string::npos,
+    check(msg.find("nbreg") != std::string::npos,
           "A3/D7 in: reject message NAMES the command (was command-blind pre-A3) — got: " + msg);
   }
   // BS-090: egen's allowInRange is now TRUE (flipped this phase — real
@@ -2827,12 +2872,14 @@ void testBUG105AbbrevArc() {
               std::string::npos,
           "W4: a real Stata graph option PIET does not implement still says so "
           "(unimplemented), rather than being silently dropped");
-    // ORDERING: `graph pie` is a COMMAND gap (graph bar, this leg's first
-    // subject, is implemented: graph-family AI-1). If the option net ran first
-    // this would answer 'option over not allowed' — the bug this leg catches.
-    const std::string barSig = fitOf("graph pie beertax, over(state)");
-    check(barSig.find("ERR:unsupported_option") == std::string::npos,
-          "BUG-336: `graph pie, over(...)` is still reported as a COMMAND gap, not an option "
+    // ORDERING: `graph fp` is a COMMAND gap (graph bar and graph pie, this leg's
+    // earlier subjects, are implemented: graph-family AI-1, vs-stata bank
+    // be8eeae95146260d). If the option net ran first this would answer 'option
+    // over not allowed' — the bug this leg catches.
+    const std::string barSig = fitOf("graph fp beertax, over(state)");
+    check(barSig.find("ERR:unsupported_option") == std::string::npos &&
+              barSig.find("ERR:unsupported_command") != std::string::npos,
+          "BUG-336: `graph fp, over(...)` is still reported as a COMMAND gap, not an option "
           "problem — the option net must run AFTER the unsupported-plot-type reject");
   }
 
@@ -2920,8 +2967,10 @@ void testBUG105AbbrevArc() {
             "BUG-105 optnet: typo `" + t.substr(t.find(',') + 2) + "` is still rejected");
     }
 
-    // An unimplemented REAL Stata option keeps the honest wording (BUG-148).
-    check(fitOf("regress income beertax, beta").find("valid Stata option") != std::string::npos,
+    // An unimplemented REAL Stata option keeps the honest wording (BUG-148). (`beta`
+    // is implemented now, vs-stata bank 23a1222407b860c9; vce(hc2) is not.)
+    // (fitOf keeps the first 40 characters of the message: "valid Stata" fits.)
+    check(fitOf("regress income beertax, vce(hc2)").find("valid Stata") != std::string::npos,
           "BUG-105 optnet: an unimplemented real option still gets the honest message");
   }
 
@@ -3171,7 +3220,11 @@ void testBUG233OptNetVocabularySweep() {
         // plot-type heads beside it are what the option census resolves a `||`
         // chain segment against.
         "twoway_layer", "connected", "lfit",  "rarea",  "rcap",   "area",
-        "function",     "coefplot",  "marginsplot", "binscatter"};
+        "function",     "coefplot",  "marginsplot", "binscatter",
+        // zip / zinb: unregistered, `cl(v)` was resolved only inside the net and the
+        // handler then ran unclustered on the whole sample (review of vs-stata lane
+        // s4_ml_a; zip.ado's CLuster() takes two letters).
+        "zip",          "zinb"};
     for (const auto& c : kMustBeRegistered) {
       check(piet::eval::findOptVocab(c) != nullptr,
             "BUG-233: `" + c + "`'s option vocabulary is registered at the resolution point");

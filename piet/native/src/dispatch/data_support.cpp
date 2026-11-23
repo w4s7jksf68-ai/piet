@@ -20,8 +20,11 @@ StorageTypeInfo stripStorageType(const std::string& raw) {
   std::string trimmed = beforeEq.substr(start);
   // tokens: byte|int|long|float|double|str#|str#L|strL (case-insensitive),
   // followed by whitespace.
-  size_t sp = trimmed.find_first_of(" \t");
+  // `generate double(a) = 1`: the type may also be followed by the name in
+  // parentheses (StataBE 19.5, vs-stata bank `generate double(a)=1`).
+  size_t sp = trimmed.find_first_of(" \t(");
   if (sp == std::string::npos) return info;
+  const bool parenName = trimmed[sp] == '(';
   std::string tok = lower(trimmed.substr(0, sp));
   bool isNumericType = (tok == "byte" || tok == "int" || tok == "long" || tok == "float" ||
                         tok == "double");
@@ -37,6 +40,15 @@ StorageTypeInfo stripStorageType(const std::string& raw) {
       }
     }
     isStrType = ok;
+  }
+  if ((isNumericType || isStrType) && parenName) {
+    const size_t close = trimmed.find(')', sp);
+    if (close == std::string::npos) return info;
+    const std::string name = trimmed.substr(sp + 1, close - sp - 1);
+    info.expr = name + raw.substr(start + close + 1);
+    info.stringTyped = isStrType;
+    info.typeToken = tok;
+    return info;
   }
   if (isNumericType || isStrType) {
     size_t consumed = (start + sp);

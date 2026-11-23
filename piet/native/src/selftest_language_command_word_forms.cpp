@@ -218,12 +218,13 @@ void testW2LabelGlued() {
             "oracle (\"(language english now current language)\"). Main: r(199). Got rc " +
                 r.first + " display=`" + displayTextOf(lnBlk) + "`");
 
-    // The unknown-subcommand refusal survives the canonicaliser: not a prefix
-    // of anything documented -> still the BUG-105 arm-3 wording, rc 199.
+    // A word that is no prefix of anything documented passes the canonicaliser
+    // untouched and is Stata's r(198) "invalid syntax" (vs-stata bank
+    // 43b4a61857d277c8 `label zznotasub`, 08071978c27981ca `label delete lb`).
     r = rcOf(piet::dispatch("label nosuchsub f", session));
-    w2check(r.first == "199" && r.second.find("this subcommand is not") != std::string::npos,
-            "W2 labelglued/B: `label nosuchsub f` is still the unknown-subcommand refusal (BUG-105 "
-            "arm 3 pins its wording). Got rc " + r.first + " `" + r.second + "`");
+    w2check(r.first == "198" && r.second.find("invalid syntax") != std::string::npos,
+            "W2 labelglued/B: `label nosuchsub f` is r(198) invalid syntax. Got rc " + r.first +
+                " `" + r.second + "`");
   }
 
   // ── D. a prefix delivered through a macro (BUG-526) ─────────────────────

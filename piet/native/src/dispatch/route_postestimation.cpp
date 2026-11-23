@@ -13,7 +13,50 @@
 #include "piet/handlers/estimates_tables.h"
 #include "piet/handlers/postestimation.h"
 #include "piet/handlers/results.h"
+#include "piet/inrange_filter.h"  // parseInRangeBounds (predict ... in a/b)
+#include "core/distributions.h"  // betai / t_twosided_pvalue / t_critical (df())
 namespace piet::dispatch_detail {
+namespace {
+// test/testparm df(#): the Wald statistic as an F with # denominator degrees
+// of freedom (F = chi2 / q, or the F already formed after a least-squares
+// fit), p = Ftail(q, #, F) (bank 3b1dd274 `test mpg weight, df(30)` after
+// logit: F 8.890745485323746, df_r 30). False = the option is not a number.
+bool readDfOption(std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                  std::optional<double>& df, bool& bad) {
+  bad = false;
+  for (auto it = opts.begin(); it != opts.end(); ++it) {
+    if (it->first != "df") continue;
+    char* end = nullptr;
+    const std::string t = strutil::trim(it->second.strValue);
+    const double v = it->second.isBool ? -1.0 : std::strtod(t.c_str(), &end);
+    if (it->second.isBool || t.empty() || end == nullptr || *end != '\0' || !(v > 0)) {
+      bad = true;
+      return false;
+    }
+    df = v;
+    opts.erase(it);
+    return true;
+  }
+  return false;
+}
+void applyTestDf(ojson& blk, double D) {
+  if (!blk.is_object() || blk.value("type", std::string()) == "error") return;
+  auto num = [&blk](const char* k) {
+    return blk.contains(k) && blk[k].is_number() ? blk[k].get<double>()
+                                                 : std::numeric_limits<double>::quiet_NaN();
+  };
+  const double q = num("df1");
+  double F = num("F");
+  if (std::isnan(F)) F = num("chi2") / q;
+  if (!(q > 0) || std::isnan(F)) return;
+  const double p = cecon::betai(D / 2.0, q / 2.0, D / (D + q * F));
+  blk["F"] = F;
+  blk["df2"] = D;
+  blk["p_F"] = p;
+  blk.erase("chi2");
+  blk.erase("p_chi2");
+}
+}  // namespace
 bool route_postestimation(std::string& cmd,
     std::string& cmdTyped,
     eval::ParsedCommand& parsed,
@@ -83,6 +126,50 @@ bool route_postestimation(std::string& cmd,
         return true;
       }
     }
+    std::optional<double> testDf;
+    {
+      bool badDf = false;
+      readDfOption(testOpts, testDf, badDf);
+      if (badDf) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "option df() incorrectly specified",
+                                                std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+      if (testDf.has_value() && (!mtMethod.empty() || bareMtest)) {
+        blocks.push_back(ojson(eval::engineError(
+            "Option `df()` with mtest is a valid Stata combination that this version of PIET does not "
+            "yet implement; nothing was computed.", "unsupported_option")));
+        return true;
+      }
+    }
+    // common / constant change only the `[eqn]` and `[eqn1=eqn2]` forms (which
+    // coefficients of the named equations are tested); on a coefficient list or
+    // an expression they change nothing, so there they are served (bank 6e81c7a2
+    // `test mpg, common`, b10e87cc `test mpg, cons` after sureg: chi2(2) 1.02, as
+    // plain `test mpg`). With an equation form they stay refused by name.
+    {
+      const long long comma = eval::findUnquotedComma(parsed.raw);
+      const std::string spec = comma >= 0 ? parsed.raw.substr(0, static_cast<size_t>(comma)) : parsed.raw;
+      const bool eqForm = spec.find('[') != std::string::npos;
+      for (auto it = testOpts.begin(); it != testOpts.end();) {
+        const std::string k = lower(it->first);
+        const bool common = k.size() >= 3 && std::string("common").compare(0, k.size(), k) == 0;
+        const bool constant = k.size() >= 4 && std::string("constant").compare(0, k.size(), k) == 0;
+        if ((common || constant) && it->second.isBool && it->second.boolValue && !eqForm) {
+          it = testOpts.erase(it);
+          continue;
+        }
+        if ((common || constant) && eqForm) {
+          blocks.push_back(ojson(eval::engineError(
+              "Option `" + std::string(common ? "common" : "constant") +
+                  "` with an equation form of test is a valid Stata option that this version of PIET does "
+                  "not yet implement; nothing was computed.",
+              "unsupported_option")));
+          return true;
+        }
+        ++it;
+      }
+    }
     if (auto err = eval::rejectUnknownOptions(testOpts, {"accumulate"},
                                               {"notest", "mtest", "coef"})) {
       blocks.push_back(ojson(*err));
@@ -116,6 +203,7 @@ bool route_postestimation(std::string& cmd,
       blocks.push_back(std::move(listed));
       return true;
     }
+    if (testDf.has_value()) applyTestDf(testBlock, *testDf);
     eval::captureRFromBlock(testBlock, session.eval);
     if (testBlock.value("type", std::string()) != "error") {
       // BUG-373: Stata publishes r(drop) — whether any constraint was DROPPED.
@@ -222,10 +310,24 @@ bool route_postestimation(std::string& cmd,
     // are refused by name rather than silently dropped — the same discipline the
     // `test` arm above adopted under BUG-333.
     bool tpEqual = false;
+    std::string tpEquation;  // equation(eqname | #k): served over a posted, striped e(b)
     std::vector<std::pair<std::string, eval::OptValue>> tpRest;
     for (const auto& kv : parsed.opts) {
       if (kv.first == "equal" && kv.second.isBool) tpEqual = true;
+      else if (kv.first.size() >= 2 && std::string("equation").compare(0, kv.first.size(), kv.first) == 0 &&
+               !kv.second.isBool && !kv.second.strValue.empty())  // EQuation(string)
+        tpEquation = kv.second.strValue;
       else tpRest.push_back(kv);
+    }
+    std::optional<double> tpDf;
+    {
+      bool badDf = false;
+      readDfOption(tpRest, tpDf, badDf);
+      if (badDf) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "option df() incorrectly specified",
+                                                std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
     }
     if (auto err = eval::rejectUnknownOptions(tpRest, {},
                                               {"equal", "equation", "nosvyadjust", "df"})) {
@@ -237,10 +339,11 @@ bool route_postestimation(std::string& cmd,
       return true;
     }
     ojson tpBlock = ojson(runPostestKeepingE(  // round 3: e() is left alone
-        session, [&] { return handlers::runTestparm(parsed.varlist, session, tpEqual); }));
+        session, [&] { return handlers::runTestparm(parsed.varlist, session, tpEqual, tpEquation); }));
     // r-class, exactly as `test` is (W:P5 captureRFromBlock Branch 3) — a
     // `testparm` followed by `display r(p)` has to see the same r() the test
     // arm fills, or the two spellings of one command would disagree.
+    if (tpDf.has_value()) applyTestDf(tpBlock, *tpDf);
     eval::captureRFromBlock(tpBlock, session.eval);
     if (tpBlock.value("type", std::string()) != "error") {
       // r(drop) exactly as the test arm posts it: "test and testparm store" the
@@ -272,11 +375,33 @@ bool route_postestimation(std::string& cmd,
     // landed this wave; eform is a display metric applied to the block). The
     // BS-097 note below described the pre-fix state, when they were silently
     // discarded and then honestly rejected.
+    // df(#): the combination's t with # degrees of freedom (bank fd7198f6
+    // `lincom mpg + weight, df(30)` after logit: r(t), r(df) 30, the t(30)
+    // interval).
+    std::vector<std::pair<std::string, eval::OptValue>> lincomRaw = parsed.opts;
+    std::optional<double> lcDf;
+    {
+      bool badDf = false;
+      readDfOption(lincomRaw, lcDf, badDf);
+      if (badDf) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "option df() incorrectly specified",
+                                                std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+    }
     if (auto err = eval::rejectUnknownOptions(
-            parsed.opts, {"level", "eform", "or", "hr", "irr", "rrr", "shr", "coef"}, {"post"})) {
+            lincomRaw, {"level", "eform", "or", "hr", "irr", "rrr", "shr", "coef"}, {"post"})) {
       blocks.push_back(ojson(*err));
       return true;
     }
+    if (lcDf.has_value())
+      for (const auto& [ok, ov] : lincomRaw)
+        if (ok == "eform" || ok == "or" || ok == "hr" || ok == "irr" || ok == "rrr" || ok == "shr") {
+          blocks.push_back(ojson(eval::engineError(
+              "lincom, df() with " + ok + " is not implemented in this version of PIET; nothing was "
+              "computed.", "unsupported_option")));
+          return true;
+        }
     // FIX-RESTIMATE: lincom is r-class — populate r(estimate)/r(se)/r(t)/r(p)/
     // r(lb)/r(ub)/r(df) from its coeftable (captureRFromBlock Branch 2). This
     // was wired only for summarize before, so `lincom` after any estimation
@@ -288,7 +413,7 @@ bool route_postestimation(std::string& cmd,
     }
     // Without level(), lincom's interval is at `set level` (w2o_rnames.log:111
     // N03: set level 90 -> r(level) 90 with the 90% r(lb)/r(ub)).
-    auto lincomOpts = parsed.opts;
+    auto lincomOpts = lincomRaw;
     {
       bool hasLevel = false;
       for (const auto& [ok, ov] : lincomOpts)
@@ -303,6 +428,30 @@ bool route_postestimation(std::string& cmd,
     ojson lincomBlock = ojson(runPostestKeepingE(session, [&] {  // round 3: e() is left alone
       return handlers::runLincom(joinVarlist(parsed.varlist), session, lincomOpts);
     }));
+    if (lcDf.has_value() && lincomBlock.is_object() &&
+        lincomBlock.value("type", std::string()) != "error") {
+      double lv = static_cast<double>(session.level);
+      for (const auto& [ok, ov] : lincomOpts)
+        if (ok == "level" && !ov.isBool) lv = std::strtod(ov.strValue.c_str(), nullptr);
+      const double crit = cecon::t_critical(lv == 95.0 ? 0.05 : 1.0 - lv / 100.0, *lcDf);
+      for (const char* key : {"coeftable", "coefs"}) {
+        if (!lincomBlock.contains(key) || !lincomBlock[key].is_array()) continue;
+        for (auto& row : lincomBlock[key]) {
+          if (!row.is_object() || !row.contains("b") || !row["b"].is_number() || !row.contains("se") ||
+              !row["se"].is_number())
+            continue;
+          const double b = row["b"].get<double>(), se = row["se"].get<double>();
+          if (!(se > 0)) continue;
+          const double t = b / se;
+          row["t"] = t;
+          row["p"] = cecon::t_twosided_pvalue(t, *lcDf);
+          row["ci_lo"] = b - crit * se;
+          row["ci_hi"] = b + crit * se;
+          if (std::string(key) == "coefs") row["df"] = *lcDf;
+        }
+      }
+      lincomBlock["df"] = *lcDf;
+    }
     eval::captureRFromBlock(lincomBlock, session.eval);
     if (lincomBlock.value("type", std::string()) != "error") {
       // r(level) (lincom's help; pinned 95 at w2h_postest_refit.log:191;
@@ -590,18 +739,39 @@ bool route_postestimation(std::string& cmd,
   if (cmd == "predict") {
     // Only cached lasso predictions implement in-range filtering. Preserve
     // the tokenizer's previous explicit refusal for every generic path.
-    if (parsed.inRange.has_value() &&
-        !(session.lastModel().has_value() && session.lastModel()->stataCmd == "lasso")) {
-      blocks.push_back(ojson(eval::unsupportedOption("in " + *parsed.inRange,
-          "`" + cmdTyped + "` does not support the `in` row-range qualifier in this engine. "
-          "Use `if` to subset rows by a condition (maps to --keepif).")));
-      return true;
-    }
     // BUG-517: the `if` qualifier reaches the handler (it was parsed and then
     // dropped here, so `predict p if x` filled every row). c() refs resolve the
     // way gen's `if` does; est refs were already resolved at the parse point.
     std::optional<std::string> predictIf = parsed.ifExpr;
     if (predictIf.has_value()) predictIf = substituteCRefs(*predictIf, session);
+    // `in a/b`: the rows a..b of the data in memory, ANDed with any `if` -- folded
+    // into the row condition every `if`-capable predict path applies (bank
+    // 5e438d90 `predict double yh in 1/10`, ebc65ba5 `predict double yh if
+    // e(sample) in 1/50` after regress). The bounds resolve as Stata's (f, l, -k);
+    // an illegal range is Stata's own refusal. Cached lasso predictions filter `in`
+    // themselves.
+    if (parsed.inRange.has_value() &&
+        !(session.lastModel().has_value() && session.lastModel()->stataCmd == "lasso")) {
+      int64_t nRows = 0;
+      try {
+        if (session.hasData())
+          if (Datastore* live = session.datastore()) nRows = live->nRows();
+      } catch (...) {
+        nRows = 0;
+      }
+      const handlers::InRangeBounds bd = handlers::parseInRangeBounds(*parsed.inRange, nRows);
+      if (!bd.ok) {
+        blocks.push_back(ojson(eval::errorBlock(
+            "syntax_error", bd.refusal.empty() ? std::string("invalid syntax") : bd.refusal,
+            std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+      const std::string rowCond =
+          "(_n>=" + std::to_string(bd.a) + " & _n<=" + std::to_string(bd.b) + ")";
+      predictIf = predictIf.has_value() && !strutil::trim(*predictIf).empty()
+                      ? "(" + *predictIf + ") & " + rowCond
+                      : rowCond;
+    }
     ojson predictBlk;
     if (session.lastModel().has_value() && session.lastModel()->stataCmd == "lasso") {
       auto lassoParsed = parsed;
@@ -690,6 +860,13 @@ bool route_postestimation(std::string& cmd,
                  est == "ologit" || est == "mlogit") {
         if ((abbrevOf("scores", 2) || abbrevOf("score", 2)) && oneNew)
           leftover = std::make_pair(std::string("scorevars"), newVars[0]);
+        // regress's one equation: a stub `sc*` names its score `sc1` (bank
+        // 532334a3af72d0f8, r(scorevars) sc1).
+        else if (est == "regress" && (abbrevOf("scores", 2) || abbrevOf("score", 2)) &&
+                 newVars.size() == 1 && newVars[0].size() > 1 && newVars[0].back() == '*' &&
+                 newVars[0].find_first_of("*-") == newVars[0].size() - 1)
+          leftover = std::make_pair(std::string("scorevars"),
+                                    newVars[0].substr(0, newVars[0].size() - 1) + "1");
       }
       if (leftover.has_value()) {
         eval::replaceRClass(session.eval);

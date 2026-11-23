@@ -735,7 +735,12 @@ ojson runGeonear(const eval::ParsedCommand& parsed, SessionState& session) {
         head.push_back(w);
       }
     }
-    if (!sawUsing || usingTyped.empty() || head.size() != 3) {
+    // geonear's syntax line requires `using`: without it, r(100) "using
+    // required" (vs-stata bank 2cb4bf37dc9a530b).
+    if (!sawUsing)
+      return ojson(eval::errorBlock("syntax_error", "using required", std::nullopt, std::nullopt,
+                                    std::nullopt, "r(100)"));
+    if (usingTyped.empty() || head.size() != 3) {
       return gxSyntax(kCmd +
                       ": syntax is `geonear id lat lon using \"FILE\", neighbors(nid nlat nlon) "
                       "[nearcount(#) miles genstub(stub)]`");

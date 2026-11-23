@@ -30,6 +30,7 @@
 #include "piet/eval/errors.h"
 #include "piet/eval/macros.h"
 #include "piet/eval/pyvalue.h"
+#include "piet/datastore.h"
 #include "piet/session_state.h"
 #include "piet/strutil.h"
 
@@ -307,7 +308,7 @@ std::optional<std::vector<Token>> lex(const std::string& s, std::string* bad) {
 
 struct Node {
   enum class K { Num, Missing, Name, Neg, Bin, RowJoin, ColJoin, J, StMatrix, Exp, Select, Rows,
-                 Cols, InvSym, Sub };
+                 Cols, InvSym, Sub, Range, RUniform, StData };
   K k;
   double num = 0.0;
   std::string text;  // Name / StMatrix name / Bin operator / Select name
@@ -361,12 +362,29 @@ struct Parser {
     return l;
   }
 
-  NodeP coljoin() {
+  // [M-2] op_range: `a::b` is the column vector a, a+1, ..., b (a-1 steps
+  // when a > b); it binds looser than arithmetic and tighter than the joins.
+  NodeP range() {
     NodeP l = addop();
+    if (!l) return nullptr;
+    if (peek().kind == Tk::Op && peek().text == "::") {
+      ++p;
+      NodeP r = addop();
+      if (!r) return nullptr;
+      auto n = std::make_unique<Node>(Node::K::Range);
+      n->kids.push_back(std::move(l));
+      n->kids.push_back(std::move(r));
+      return n;
+    }
+    return l;
+  }
+
+  NodeP coljoin() {
+    NodeP l = range();
     if (!l) return nullptr;
     while (peek().kind == Tk::Comma) {
       ++p;
-      NodeP r = addop();
+      NodeP r = range();
       if (!r) return nullptr;
       auto n = std::make_unique<Node>(Node::K::ColJoin);
       n->kids.push_back(std::move(l));
@@ -379,11 +397,11 @@ struct Parser {
   // Inside a function's argument list a top-level comma separates arguments
   // ([M-2] op_join: "comma as a separator"); `\` still joins.
   NodeP argument() {
-    NodeP l = addop();
+    NodeP l = range();
     if (!l) return nullptr;
     while (peek().kind == Tk::Backslash) {
       ++p;
-      NodeP r = addop();
+      NodeP r = range();
       if (!r) return nullptr;
       auto n = std::make_unique<Node>(Node::K::RowJoin);
       n->kids.push_back(std::move(l));
@@ -409,7 +427,7 @@ struct Parser {
           fail("the operator `" + tok.text + "`");
           return nullptr;
         }
-        if (tok.kind == Tk::Op) {
+        if (tok.kind == Tk::Op && tok.text != "::") {
           fail("the operator `" + tok.text + "`");
           return nullptr;
         }
@@ -546,9 +564,25 @@ struct Parser {
       n->text = a.text;
       return n;
     }
+    // st_data(., "VARNAME"): every observation of one numeric variable.
+    if (fn == "st_data") {
+      ++p;  // (
+      if (peek().kind != Tk::Dot || peek(1).kind != Tk::Comma || peek(2).kind != Tk::Str ||
+          peek(3).kind != Tk::RParen) {
+        fail("st_data() other than st_data(., \"varname\")");
+        return nullptr;
+      }
+      auto n = std::make_unique<Node>(Node::K::StData);
+      n->text = strutil::trim(peek(2).text);
+      p += 4;
+      return n;
+    }
     Node::K k;
     size_t arity;
-    if (fn == "J") {
+    if (fn == "runiform") {
+      k = Node::K::RUniform;
+      arity = 2;
+    } else if (fn == "J") {
       k = Node::K::J;
       arity = 3;
     } else if (fn == "exp") {
@@ -756,6 +790,59 @@ class Evaluator {
       case Node::K::RowJoin:
       case Node::K::ColJoin: return join(n);
       case Node::K::J: return jfun(n);
+      case Node::K::Range: {
+        auto a = eval(*n.kids[0]);
+        if (!a) return std::nullopt;
+        auto b = eval(*n.kids[1]);
+        if (!b) return std::nullopt;
+        if (a->r * a->c != 1 || b->r * b->c != 1) return runtime(3200, "conformability error");
+        const double lo = a->v[0], hi = b->v[0];
+        if (std::isnan(lo) || std::isnan(hi)) return runtime(3351, "argument has missing values");
+        MMat out;
+        out.c = 1;
+        if (lo <= hi) {
+          for (double x = lo; x <= hi; x += 1.0) out.v.push_back(x);
+        } else {
+          for (double x = lo; x >= hi; x -= 1.0) out.v.push_back(x);
+        }
+        out.r = out.v.size();
+        return out;
+      }
+      case Node::K::RUniform: {
+        // [M-5] runiform(r, c): r x c draws from the session's Stata stream
+        // (`set seed`), the stream runiform() in generate draws from.
+        auto a = eval(*n.kids[0]);
+        if (!a) return std::nullopt;
+        auto b = eval(*n.kids[1]);
+        if (!b) return std::nullopt;
+        if (a->r * a->c != 1 || b->r * b->c != 1) return runtime(3200, "conformability error");
+        const double rr = std::floor(a->v[0]), cc = std::floor(b->v[0]);
+        if (std::isnan(rr) || std::isnan(cc) || rr < 0 || cc < 0)
+          return runtime(3300, "argument out of range");
+        MMat out;
+        out.r = static_cast<size_t>(rr);
+        out.c = static_cast<size_t>(cc);
+        out.v.resize(out.r * out.c);
+        cecon::Mt64& g = session_.seed.stream();
+        for (double& d : out.v) d = g.runiform();
+        return out;
+      }
+      case Node::K::StData: {
+        if (!session_.hasData()) return MMat{0, 1, {}};
+        Datastore* ds = session_.datastore();
+        if (ds == nullptr || !ds->has(n.text)) return runtime(3500, "invalid Stata variable name");
+        if (ds->dtype(n.text) == "factor") return refused("st_data() of a string variable");
+        const cecon::Column& col = ds->col(n.text);
+        MMat out;
+        out.c = 1;
+        out.r = static_cast<size_t>(ds->nRows());
+        out.v.reserve(out.r);
+        for (size_t i = 0; i < out.r; ++i) {
+          const double d = col.f64()[i];
+          out.v.push_back(std::isnan(d) ? kNaN : d);
+        }
+        return out;
+      }
       case Node::K::Exp: {
         auto x = eval(*n.kids[0]);
         if (!x) return std::nullopt;

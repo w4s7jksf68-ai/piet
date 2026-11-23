@@ -10,13 +10,15 @@
 //   stmt    := NAME '=' expr
 //   expr    := rowjoin                        (joins bind loosest; `,` tighter than `\`)
 //   rowjoin := coljoin ('\' coljoin)*
-//   coljoin := addop (',' addop)*
+//   coljoin := range (',' range)*
+//   range   := addop ['::' addop]             column vector a..b (vs-stata stage 4)
 //   addop   := mulop ((':+' | ':-') mulop)*   elementwise, c-conformable broadcast
 //   mulop   := unary ((':*' | ':/') unary)*
 //   unary   := '-' unary | postfix
 //   postfix := primary ['[' sel ',' sel ']']  sel := '.' | positive integer
 //   primary := NUMBER | '.' | NAME | '(' expr ')'
 //            | J(r, c, v) | st_matrix("NAME") | exp(x) | rows(x) | cols(x) | invsym(x)
+//            | runiform(r, c) | st_data(., "VARNAME")   (vs-stata stage 4)
 //            | select(A, rowmissing(A):==0)   the one idiom, same NAME twice
 //
 // Every other construct -- another function (rowsum, luinv, ...),

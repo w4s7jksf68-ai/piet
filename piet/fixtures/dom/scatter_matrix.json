@@ -1,0 +1,437 @@
+{
+  "full": {
+    "type": "graph",
+    "kind": "scatter_matrix",
+    "variables": [
+      "z",
+      "x",
+      "y"
+    ],
+    "grid": {
+      "rows": 3,
+      "cols": 3
+    },
+    "title": "",
+    "note": "",
+    "panels": [
+      {
+        "kind": "matrix_label",
+        "text": "z"
+      },
+      {
+        "kind": "twoway",
+        "x_label": "x",
+        "y_label": "z",
+        "x_min": 2.0,
+        "x_max": 4.0,
+        "y_min": 4.0,
+        "y_max": 16.0,
+        "layers": [
+          {
+            "kind": "scatter",
+            "x_var": "x",
+            "y_var": "z",
+            "n": 3,
+            "points": [
+              [
+                2.0,
+                4.0
+              ],
+              [
+                3.0,
+                9.0
+              ],
+              [
+                4.0,
+                16.0
+              ]
+            ],
+            "style": {
+              "color": "#1850a8",
+              "opacity": 1.0,
+              "lwidth": 1.2,
+              "lpattern": null,
+              "msymbol": "circle",
+              "msize": 2.2,
+              "hollow": false,
+              "mcolor": "#1850a8"
+            }
+          }
+        ]
+      },
+      {
+        "kind": "twoway",
+        "x_label": "y",
+        "y_label": "z",
+        "x_min": 6.0,
+        "x_max": 8.0,
+        "y_min": 4.0,
+        "y_max": 16.0,
+        "layers": [
+          {
+            "kind": "scatter",
+            "x_var": "y",
+            "y_var": "z",
+            "n": 2,
+            "points": [
+              [
+                6.0,
+                9.0
+              ],
+              [
+                8.0,
+                16.0
+              ]
+            ],
+            "style": {
+              "color": "#1850a8",
+              "opacity": 1.0,
+              "lwidth": 1.2,
+              "lpattern": null,
+              "msymbol": "circle",
+              "msize": 2.2,
+              "hollow": false,
+              "mcolor": "#1850a8"
+            }
+          }
+        ]
+      },
+      {
+        "kind": "twoway",
+        "x_label": "z",
+        "y_label": "x",
+        "x_min": 4.0,
+        "x_max": 16.0,
+        "y_min": 2.0,
+        "y_max": 4.0,
+        "layers": [
+          {
+            "kind": "scatter",
+            "x_var": "z",
+            "y_var": "x",
+            "n": 3,
+            "points": [
+              [
+                4.0,
+                2.0
+              ],
+              [
+                9.0,
+                3.0
+              ],
+              [
+                16.0,
+                4.0
+              ]
+            ],
+            "style": {
+              "color": "#1850a8",
+              "opacity": 1.0,
+              "lwidth": 1.2,
+              "lpattern": null,
+              "msymbol": "circle",
+              "msize": 2.2,
+              "hollow": false,
+              "mcolor": "#1850a8"
+            }
+          }
+        ]
+      },
+      {
+        "kind": "matrix_label",
+        "text": "Row & year"
+      },
+      {
+        "kind": "twoway",
+        "x_label": "y",
+        "y_label": "x",
+        "x_min": 6.0,
+        "x_max": 8.0,
+        "y_min": 2.0,
+        "y_max": 4.0,
+        "layers": [
+          {
+            "kind": "scatter",
+            "x_var": "y",
+            "y_var": "x",
+            "n": 2,
+            "points": [
+              [
+                6.0,
+                3.0
+              ],
+              [
+                8.0,
+                4.0
+              ]
+            ],
+            "style": {
+              "color": "#1850a8",
+              "opacity": 1.0,
+              "lwidth": 1.2,
+              "lpattern": null,
+              "msymbol": "circle",
+              "msize": 2.2,
+              "hollow": false,
+              "mcolor": "#1850a8"
+            }
+          }
+        ]
+      },
+      {
+        "kind": "twoway",
+        "x_label": "z",
+        "y_label": "y",
+        "x_min": 4.0,
+        "x_max": 16.0,
+        "y_min": 6.0,
+        "y_max": 8.0,
+        "layers": [
+          {
+            "kind": "scatter",
+            "x_var": "z",
+            "y_var": "y",
+            "n": 2,
+            "points": [
+              [
+                9.0,
+                6.0
+              ],
+              [
+                16.0,
+                8.0
+              ]
+            ],
+            "style": {
+              "color": "#1850a8",
+              "opacity": 1.0,
+              "lwidth": 1.2,
+              "lpattern": null,
+              "msymbol": "circle",
+              "msize": 2.2,
+              "hollow": false,
+              "mcolor": "#1850a8"
+            }
+          }
+        ]
+      },
+      {
+        "kind": "twoway",
+        "x_label": "x",
+        "y_label": "y",
+        "x_min": 2.0,
+        "x_max": 4.0,
+        "y_min": 6.0,
+        "y_max": 8.0,
+        "layers": [
+          {
+            "kind": "scatter",
+            "x_var": "x",
+            "y_var": "y",
+            "n": 2,
+            "points": [
+              [
+                3.0,
+                6.0
+              ],
+              [
+                4.0,
+                8.0
+              ]
+            ],
+            "style": {
+              "color": "#1850a8",
+              "opacity": 1.0,
+              "lwidth": 1.2,
+              "lpattern": null,
+              "msymbol": "circle",
+              "msize": 2.2,
+              "hollow": false,
+              "mcolor": "#1850a8"
+            }
+          }
+        ]
+      },
+      {
+        "kind": "matrix_label",
+        "text": "y"
+      }
+    ],
+    "name": "full"
+  },
+  "half": {
+    "type": "graph",
+    "kind": "scatter_matrix",
+    "variables": [
+      "z",
+      "x",
+      "y"
+    ],
+    "grid": {
+      "rows": 3,
+      "cols": 3
+    },
+    "title": "",
+    "note": "",
+    "panels": [
+      {
+        "kind": "matrix_label",
+        "text": "z",
+        "color": "#d42a1c"
+      },
+      null,
+      null,
+      {
+        "kind": "twoway",
+        "x_label": "z",
+        "y_label": "x",
+        "x_min": 1.0,
+        "x_max": 25.0,
+        "y_min": 1.0,
+        "y_max": 5.0,
+        "layers": [
+          {
+            "kind": "scatter",
+            "x_var": "z",
+            "y_var": "x",
+            "n": 5,
+            "points": [
+              [
+                1.0,
+                1.0
+              ],
+              [
+                4.0,
+                2.0
+              ],
+              [
+                9.0,
+                3.0
+              ],
+              [
+                16.0,
+                4.0
+              ],
+              [
+                25.0,
+                5.0
+              ]
+            ],
+            "style": {
+              "color": "#1850a8",
+              "opacity": 1.0,
+              "lwidth": 1.2,
+              "lpattern": null,
+              "msymbol": "circle",
+              "msize": 1.0,
+              "hollow": false,
+              "mcolor": "#1850a8"
+            }
+          }
+        ]
+      },
+      {
+        "kind": "matrix_label",
+        "text": "Custom label",
+        "color": "#d42a1c"
+      },
+      null,
+      {
+        "kind": "twoway",
+        "x_label": "z",
+        "y_label": "y",
+        "x_min": 1.0,
+        "x_max": 25.0,
+        "y_min": 2.0,
+        "y_max": 10.0,
+        "layers": [
+          {
+            "kind": "scatter",
+            "x_var": "z",
+            "y_var": "y",
+            "n": 4,
+            "points": [
+              [
+                1.0,
+                2.0
+              ],
+              [
+                9.0,
+                6.0
+              ],
+              [
+                16.0,
+                8.0
+              ],
+              [
+                25.0,
+                10.0
+              ]
+            ],
+            "style": {
+              "color": "#1850a8",
+              "opacity": 1.0,
+              "lwidth": 1.2,
+              "lpattern": null,
+              "msymbol": "circle",
+              "msize": 1.0,
+              "hollow": false,
+              "mcolor": "#1850a8"
+            }
+          }
+        ]
+      },
+      {
+        "kind": "twoway",
+        "x_label": "x",
+        "y_label": "y",
+        "x_min": 1.0,
+        "x_max": 5.0,
+        "y_min": 2.0,
+        "y_max": 10.0,
+        "layers": [
+          {
+            "kind": "scatter",
+            "x_var": "x",
+            "y_var": "y",
+            "n": 4,
+            "points": [
+              [
+                1.0,
+                2.0
+              ],
+              [
+                3.0,
+                6.0
+              ],
+              [
+                4.0,
+                8.0
+              ],
+              [
+                5.0,
+                10.0
+              ]
+            ],
+            "style": {
+              "color": "#1850a8",
+              "opacity": 1.0,
+              "lwidth": 1.2,
+              "lpattern": null,
+              "msymbol": "circle",
+              "msize": 1.0,
+              "hollow": false,
+              "mcolor": "#1850a8"
+            }
+          }
+        ]
+      },
+      {
+        "kind": "matrix_label",
+        "text": "y",
+        "color": "#d42a1c"
+      }
+    ],
+    "name": "lower"
+  }
+}

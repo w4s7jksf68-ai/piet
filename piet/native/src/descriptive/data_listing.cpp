@@ -17,6 +17,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <set>
 #include <memory>
 #include <regex>
 #include <sstream>
@@ -24,6 +25,9 @@
 #include <vector>
 
 #include "piet/cobra_runner.h"
+#include "piet/cclass.h"  // settingCValue: list's default linesize
+#include "language/display_internal.h"  // applyStataFmtLocal: list cells as display shows them
+#include "piet/loops.h"   // expandVarlist: list's sepby()/mean()/constant() varlists
 #include "piet/eval/errors.h"
 #include "piet/eval/exprfns.h"  // BUG-540: stataMissingWithKind — `.a`-`.z` identity in matrix literals
 #include "piet/eval/macros.h"
@@ -665,6 +669,527 @@ ojson runList(const std::optional<std::vector<std::string>>& varlist,
     block["windowed"] = true;
     block["n_rows_total"] = static_cast<int64_t>(block.value("rows", ojson::array()).size());
   }
+  return block;
+}
+
+// ---------------------------------------------------------------------------
+// list's layout ([D] list): the data the frontend's listing renderer draws.
+
+InRangeFilterResult applyIfAndInFilterKeepingIndex(SessionState& session,
+                                                   const std::string& basePath,
+                                                   const std::optional<std::string>& ifExpr,
+                                                   const std::optional<std::string>& inRange,
+                                                   std::string* indexVar);
+
+namespace {
+
+ojson listRefusal(const std::string& msg, int rc) {
+  return ojson(eval::errorBlock(rc == 111 ? "engine_error" : "syntax_error", msg, std::nullopt,
+                                std::nullopt, std::nullopt, "r(" + std::to_string(rc) + ")"));
+}
+
+std::vector<std::string> listWords(const std::string& s) {
+  std::vector<std::string> out;
+  std::istringstream in(s);
+  for (std::string w; in >> w;) out.push_back(w);
+  return out;
+}
+
+// A strict non-negative integer option argument.
+bool listCount(const eval::OptValue& v, long long* out) {
+  if (v.isBool) return false;
+  const std::string t = strutil::trim(v.strValue);
+  if (t.empty()) return false;
+  for (char c : t)
+    if (c < '0' || c > '9') return false;
+  try {
+    *out = std::stoll(t);
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
+// The width a display format asks for (`%-18s` 18, `%8.0gc` 8, `%td` 0 = none).
+long long listFormatWidth(const std::string& fmt) {
+  static const std::regex re(R"(^%-?0?(\d+))");
+  std::smatch m;
+  if (std::regex_search(fmt, m, re)) return std::stoll(m.str(1));
+  return 0;
+}
+
+// A number as `display %fmt` shows it (the same renderer: date/time details,
+// grouping, -0), without the field's padding.
+std::string listCellNumber(double v, const std::string& fmt) {
+  if (std::isnan(v)) return cecon::missing_text(cecon::missing_kind(v));
+  std::string err;
+  const std::string shown = display_detail::applyStataFmtLocal(
+      fmt.empty() ? std::string("%9.0g") : fmt, eval::pythonFloatRepr(v), &err);
+  if (!err.empty()) return strutil::trim(eval::applyStataFmt(v, fmt));
+  return strutil::trim(shown);
+}
+
+}  // namespace
+
+std::string listDisplayNumber(double v, const std::string& fmt) { return listCellNumber(v, fmt); }
+
+std::optional<ojson> parseListLayout(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                     const std::string& raw, ListLayout* out) {
+  ListLayout& lo = *out;
+  auto varArg = [](const eval::OptValue& v) {
+    return v.isBool ? std::vector<std::string>{} : listWords(v.strValue);
+  };
+  // A flag given an argument list is "option <typed>() incorrectly specified"
+  // (bank 202f82eb18f228f0 `c(foreign)`: c is compress).
+  static const std::set<std::string> kFlags = {
+      "noobs", "clean", "divider", "compress", "nocompress", "fast", "table", "display",
+      "noheader", "footer", "nolabel", "notrim", "nodotz", "subvarname", "absolute",
+      "relative", "ds", "fvall"};
+  for (const auto& [k, v] : opts) {
+    if (v.isBool || kFlags.count(k) == 0) continue;
+    std::string typed = k;
+    static const std::regex reOpt(R"(([A-Za-z_]\w*)\s*\()");
+    const long long comma = eval::findUnquotedComma(raw);
+    if (comma >= 0) {
+      const std::string tail = raw.substr(static_cast<size_t>(comma));
+      for (std::sregex_iterator it(tail.begin(), tail.end(), reOpt), end; it != end; ++it) {
+        const std::string w = strutil::lower((*it)[1].str());
+        if (k.compare(0, w.size(), w) == 0) {
+          typed = (*it)[1].str();
+          break;
+        }
+      }
+    }
+    return listRefusal("option " + typed + "() incorrectly specified", 198);
+  }
+  bool separatorGiven = false;
+  for (const auto& [k, v] : opts) {
+    if (k == "separator") separatorGiven = true;
+    if (k == "noobs") lo.noobs = true;
+    else if (k == "clean") lo.clean = true;
+    else if (k == "divider") lo.divider = true;
+    else if (k == "compress") lo.compress = true;
+    else if (k == "nocompress" || k == "fast") lo.nocompress = true;
+    else if (k == "table") lo.table = true;
+    else if (k == "display") lo.display = true;
+    else if (k == "noheader") lo.noheader = true;
+    else if (k == "footer") lo.footer = true;
+    else if (k == "nolabel") lo.nolabel = true;
+    else if (k == "notrim") lo.notrim = true;
+    else if (k == "nodotz") lo.nodotz = true;
+    else if (k == "subvarname") lo.subvarname = true;
+    else if (k == "absolute") lo.absolute = true;
+    else if (k == "relative") lo.relative = true;
+    else if (k == "ds") lo.doubleSpace = true;
+    else if (k == "fvall") continue;  // factor-variable levels: a varlist here has none
+    else if (k == "header") {
+      if (v.isBool) {
+        lo.header = true;
+      } else if (!listCount(v, &lo.headerEvery) || lo.headerEvery < 1) {
+        return listRefusal("option header() incorrectly specified", 198);
+      }
+    } else if (k == "separator") {
+      if (!listCount(v, &lo.separator))
+        return listRefusal("option separator() incorrectly specified", 198);
+    } else if (k == "abbreviate") {
+      if (!listCount(v, &lo.abbreviate))
+        return listRefusal("option abbreviate() incorrectly specified", 198);
+    } else if (k == "string") {
+      if (!listCount(v, &lo.stringWidth) || lo.stringWidth < 1)
+        return listRefusal("option string() incorrectly specified", 198);
+    } else if (k == "linesize") {
+      if (!listCount(v, &lo.linesize) || lo.linesize < 1)
+        return listRefusal("option linesize() incorrectly specified", 198);
+    } else if (k == "sepby") {
+      if (v.isBool) return listRefusal("option sepby() incorrectly specified", 198);
+      lo.sepby = listWords(v.strValue);
+    } else if (k == "mean") {
+      lo.mean = varArg(v);
+    } else if (k == "sum") {
+      lo.sum = varArg(v);
+    } else if (k == "n") {
+      // N is case-sensitive in Stata: `, n` is "option n not allowed".
+      static const std::regex reN(R"((^|[\s,])N(\(|\s|$))");
+      const long long comma = eval::findUnquotedComma(raw);
+      const std::string tail = comma >= 0 ? raw.substr(static_cast<size_t>(comma)) : std::string();
+      if (!std::regex_search(tail, reN)) return listRefusal("option n not allowed", 198);
+      lo.count = varArg(v);
+    } else if (k == "labvar") {
+      if (v.isBool) return listRefusal("option labvar() incorrectly specified", 198);
+      lo.labvar = strutil::trim(v.strValue);
+    } else if (k == "constant") {
+      lo.constant = varArg(v);
+    } else if (k == "sepbyexp") {
+      return ojson(eval::unsupportedOption(
+          "sepbyexp", "list's sepbyexp() (a separator wherever an expression changes) is not "
+                      "implemented in this build; sepby() with a generated variable draws the "
+                      "same lines."));
+    }
+  }
+  // bank 36f8b30adbeb62e2 `sepby(foreign) sep(2)`, 62ea8e5c032e6036 `separator(0)`.
+  if (separatorGiven && !lo.sepby.empty())
+    return listRefusal("options separator() and sepby() may not be combined", 198);
+  return std::nullopt;
+}
+
+ojson buildListing(SessionState& session, const Datastore& ds, const std::vector<int64_t>& rows,
+                   const std::vector<int64_t>& obs, const std::vector<std::string>& vars,
+                   const ListLayout& lo, ojson* err, const std::vector<ListLeadCol>& lead) {
+  // Expands a variable-list option against the dataset (wildcards and ranges as
+  // the varlist itself is expanded).
+  auto expand = [&](const std::vector<std::string>& words, std::vector<std::string>* names) -> bool {
+    if (words.empty()) return true;
+    std::string spec;
+    for (const auto& w : words) spec += (spec.empty() ? "" : " ") + w;
+    auto r = piet::loops::expandVarlist(spec, session);
+    if (r.isError) {
+      *err = r.error;
+      return false;
+    }
+    for (const auto& t : r.tokens) {
+      if (!ds.has(t)) {
+        *err = ojson(eval::engineError("variable " + t + " not found"));
+        return false;
+      }
+      names->push_back(t);
+    }
+    return true;
+  };
+
+  const auto fmtPairs = session.displayFormatMap(ds.formatCard(std::nullopt));
+  std::map<std::string, std::string> fmtOf(fmtPairs.begin(), fmtPairs.end());
+  std::map<std::string, const std::vector<std::pair<int, std::string>>*> labelsOf;
+  const auto vlMap = session.valueLabelMapForBrowse();
+  if (!lo.nolabel)
+    for (const auto& [name, codes] : vlMap) labelsOf[name] = &codes;
+  auto charOf = [&](const std::string& var, const std::string& charname) -> std::optional<std::string> {
+    for (const auto& c : session.characteristics)
+      if (c.varname == var && c.charname == charname) return c.value;
+    return std::nullopt;
+  };
+
+  auto cellOf = [&](const std::string& var, int64_t row) -> std::string {
+    const cecon::Column& c = ds.col(var);
+    if (c.dtype == cecon::DType::Factor) {
+      const int32_t code = c.codes()[row];
+      return code >= 0 && static_cast<size_t>(code) < c.levels.size()
+                 ? std::string(c.levels[static_cast<size_t>(code)])
+                 : std::string();
+    }
+    const double v = c.f64()[row];
+    // A labelled extended missing value lists as its label (`label define l .a
+    // "refused"`): the label set keys its codes as text.
+    if (!lo.nolabel && std::isnan(v) && cecon::missing_kind(v) > 0) {
+      auto ln = session.varLblname.find(var);
+      if (ln != session.varLblname.end()) {
+        auto defs = session.labelDefs.find(ln->second);
+        if (defs != session.labelDefs.end()) {
+          auto hit = defs->second.find(cecon::missing_text(cecon::missing_kind(v)));
+          if (hit != defs->second.end()) return hit->second;
+        }
+      }
+    }
+    if (!std::isnan(v)) {
+      auto it = labelsOf.find(var);
+      if (it != labelsOf.end() && v == std::floor(v) && std::fabs(v) < 2147483648.0) {
+        for (const auto& [code, text] : *it->second)
+          if (code == static_cast<int>(v)) return text;
+      }
+    }
+    // nodotz: a .z is listed as a field of blanks.
+    if (lo.nodotz && std::isnan(v) && cecon::missing_kind(v) == cecon::kMissZ) return std::string();
+    return listCellNumber(v, fmtOf[var]);
+  };
+  auto colOf = [&](const std::string& var) {
+    ojson col;
+    const bool isStr = ds.col(var).dtype == cecon::DType::Factor;
+    const std::string& fmt = fmtOf[var];
+    std::string head = var;
+    bool charHead = false;
+    if (lo.subvarname)
+      if (auto ch = charOf(var, "varname")) {
+        head = *ch;
+        charHead = true;
+      }
+    col["name"] = var;
+    col["head"] = head;
+    if (charHead) col["charhead"] = true;
+    col["str"] = isStr;
+    col["left"] = fmt.size() > 1 && fmt[1] == '-';
+    col["fmtw"] = listFormatWidth(fmt);
+    return col;
+  };
+
+  ojson listing;
+  // constant(): the listed (or named) variables that take one value over the
+  // listed rows are shown once, in a box of their own, and left out of the table.
+  std::vector<std::string> tableVars = vars;
+  ojson constCols = ojson::array();
+  if (lo.constant.has_value()) {
+    std::vector<std::string> cand;
+    if (lo.constant->empty()) cand = vars;
+    else if (!expand(*lo.constant, &cand)) return ojson();
+    for (const auto& var : cand) {
+      if (rows.empty()) break;
+      const std::string first = cellOf(var, rows.front());
+      bool same = true;
+      for (int64_t r : rows)
+        if (cellOf(var, r) != first) {
+          same = false;
+          break;
+        }
+      if (!same) continue;
+      ojson cc = colOf(var);
+      cc["cell"] = first;
+      constCols.push_back(cc);
+      tableVars.erase(std::remove(tableVars.begin(), tableVars.end(), var), tableVars.end());
+    }
+  }
+
+  int labvarIdx = -1;
+  if (lo.labvar.has_value()) {
+    for (size_t i = 0; i < tableVars.size(); ++i)
+      if (tableVars[i] == *lo.labvar) labvarIdx = static_cast<int>(lead.size() + i);
+    if (labvarIdx < 0) {
+      *err = listRefusal("labvar() not found in varlist", 111);
+      return ojson();
+    }
+  }
+
+  // The computed columns, in listing order: the leading ones, the variables, the
+  // trailing ones (`ord` holds -1-k for computed column k, else the variable index).
+  std::vector<int> ord;
+  for (size_t k = 0; k < lead.size(); ++k)
+    if (!lead[k].trailing) ord.push_back(-1 - static_cast<int>(k));
+  for (size_t v = 0; v < tableVars.size(); ++v) ord.push_back(static_cast<int>(v));
+  for (size_t k = 0; k < lead.size(); ++k)
+    if (lead[k].trailing) ord.push_back(-1 - static_cast<int>(k));
+  if (labvarIdx >= 0) {
+    const int v = labvarIdx - static_cast<int>(lead.size());
+    labvarIdx = static_cast<int>(std::find(ord.begin(), ord.end(), v) - ord.begin());
+  }
+  auto leadCell = [&](const ListLeadCol& lc, size_t i) -> std::string {
+    if (!lc.texts.empty()) return i < lc.texts.size() ? lc.texts[i] : std::string();
+    return listCellNumber(i < lc.values.size() ? lc.values[i] : NAN, lc.format);
+  };
+  ojson cols = ojson::array();
+  for (int o : ord) {
+    if (o >= 0) {
+      cols.push_back(colOf(tableVars[static_cast<size_t>(o)]));
+      continue;
+    }
+    const ListLeadCol& lc = lead[static_cast<size_t>(-1 - o)];
+    ojson col;
+    col["name"] = lc.head;
+    col["head"] = lc.head;
+    col["str"] = !lc.texts.empty();
+    col["left"] = false;
+    col["fmtw"] = lc.fmtw;
+    col["charhead"] = true;  // a header from a characteristic (subvarname)
+    cols.push_back(col);
+  }
+  ojson cells = ojson::array();
+  for (size_t i = 0; i < rows.size(); ++i) {
+    ojson row = ojson::array();
+    for (int o : ord)
+      row.push_back(o >= 0 ? cellOf(tableVars[static_cast<size_t>(o)], rows[i])
+                           : leadCell(lead[static_cast<size_t>(-1 - o)], i));
+    cells.push_back(std::move(row));
+  }
+
+  // sepby(): a separator before every listed row whose sepby values differ from
+  // the row listed before it (the variables need not be listed).
+  ojson breaks = ojson::array();
+  if (!lo.sepby.empty()) {
+    std::vector<std::string> by;
+    if (!expand(lo.sepby, &by)) return ojson();
+    for (size_t i = 1; i < rows.size(); ++i) {
+      bool differs = false;
+      for (const auto& var : by) {
+        const cecon::Column& c = ds.col(var);
+        if (c.dtype == cecon::DType::Factor) {
+          differs = c.codes()[rows[i]] != c.codes()[rows[i - 1]];
+        } else {
+          const double a = c.f64()[rows[i]], b = c.f64()[rows[i - 1]];
+          differs = !(a == b || (std::isnan(a) && std::isnan(b)));
+        }
+        if (differs) break;
+      }
+      if (differs) breaks.push_back(static_cast<int64_t>(i));
+    }
+  }
+
+  // mean / sum / N lines, in that order, over the listed rows.
+  ojson stats = ojson::array();
+  auto statLine = [&](const std::optional<std::vector<std::string>>& which, const std::string& label,
+                      int kind) -> bool {
+    if (!which.has_value()) return true;
+    std::vector<std::string> named;
+    if (!which->empty() && !expand(*which, &named)) return false;
+    ojson line;
+    line["label"] = label;
+    ojson vals = ojson::array();
+    for (int o : ord) {
+      if (o >= 0) {
+        const std::string& var = tableVars[static_cast<size_t>(o)];
+        const bool asked = which->empty() ||
+                           std::find(named.begin(), named.end(), var) != named.end();
+        const cecon::Column& c = ds.col(var);
+        if (!asked || c.dtype == cecon::DType::Factor) {
+          vals.push_back(nullptr);
+          continue;
+        }
+        double sum = 0.0;
+        long long n = 0;
+        for (int64_t r : rows) {
+          const double v = c.f64()[r];
+          if (std::isnan(v)) continue;
+          sum += v;
+          ++n;
+        }
+        const double out = kind == 0 ? (n > 0 ? sum / static_cast<double>(n) : NAN)
+                           : kind == 1 ? sum
+                                       : static_cast<double>(n);
+        vals.push_back(listCellNumber(out, fmtOf[var]));
+        continue;
+      }
+      const ListLeadCol& lc = lead[static_cast<size_t>(-1 - o)];
+      if (!which->empty() || !lc.texts.empty()) {
+        vals.push_back(nullptr);
+        continue;
+      }
+      double sum = 0.0;
+      long long n = 0;
+      for (double v : lc.values)
+        if (!std::isnan(v)) {
+          sum += v;
+          ++n;
+        }
+      const double out = kind == 0 ? (n > 0 ? sum / static_cast<double>(n) : NAN)
+                         : kind == 1 ? sum
+                                     : static_cast<double>(n);
+      vals.push_back(listCellNumber(out, lc.format));
+    }
+    line["cells"] = vals;
+    stats.push_back(line);
+    return true;
+  };
+  if (!statLine(lo.mean, "Mean", 0) || !statLine(lo.sum, "Sum", 1) ||
+      !statLine(lo.count, "N", 2))
+    return ojson();
+
+  ojson obsArr = ojson::array();
+  for (size_t i = 0; i < obs.size(); ++i)
+    obsArr.push_back(lo.relative ? static_cast<int64_t>(i + 1) : obs[i]);
+
+  long long linesize = lo.linesize;
+  if (linesize < 1) {
+    linesize = 80;
+    if (const auto cv = settingCValue("linesize", session)) {
+      if (!cv->isString) {
+        try {
+          linesize = std::stoll(cv->text);
+        } catch (...) {
+        }
+      }
+    }
+  }
+
+  listing["cols"] = cols;
+  listing["rows"] = cells;
+  listing["obs"] = obsArr;
+  listing["breaks"] = breaks;
+  listing["stats"] = stats;
+  listing["labvar"] = labvarIdx;
+  listing["constant"] = constCols;
+  ojson o;
+  o["noobs"] = lo.noobs;
+  o["clean"] = lo.clean;
+  o["divider"] = lo.divider;
+  o["compress"] = lo.compress;
+  o["nocompress"] = lo.nocompress;
+  o["table"] = lo.table;
+  o["display"] = lo.display;
+  o["header"] = lo.header;
+  o["noheader"] = lo.noheader;
+  o["footer"] = lo.footer;
+  o["header_every"] = lo.headerEvery;
+  o["notrim"] = lo.notrim;
+  o["ds"] = lo.doubleSpace;
+  o["separator"] = lo.separator;
+  o["sepby"] = !lo.sepby.empty();
+  o["abbreviate"] = lo.abbreviate;
+  o["string"] = lo.stringWidth;
+  o["linesize"] = linesize;
+  listing["opts"] = o;
+  return listing;
+}
+
+// How many observations one listing carries; past it the renderer says how many
+// it left out (a listing is text in the Results pane, not the data browser).
+constexpr int64_t kListingRowCap = 20000;
+
+ojson runListStata(const std::vector<std::string>& vars, const eval::ParsedCommand& parsed,
+                   SessionState& session, const ListLayout& lo) {
+  std::optional<std::vector<std::string>> vl;
+  if (!vars.empty()) vl = vars;
+  ojson block = runList(vl, parsed.ifExpr, parsed.inRange, session, lo.nolabel);
+  if (block.value("type", std::string()) != "browse") return block;
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return eval::noDataLoaded();
+  std::vector<std::string> names = vars;
+  if (names.empty()) names = ds->names();
+
+  const bool haveIf = parsed.ifExpr.has_value() && !parsed.ifExpr->empty();
+  const bool haveIn = parsed.inRange.has_value() && !parsed.inRange->empty();
+  std::vector<int64_t> rows, obs;
+  std::unique_ptr<Datastore> filtered;
+  std::string filteredPath;
+  const Datastore* src = ds;
+  if (haveIf) {
+    std::string idxVar;
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilterKeepingIndex(session, ds->path(), parsed.ifExpr, parsed.inRange,
+                                          &idxVar);
+    } catch (const CobraError& ce) {
+      return engineErrorBlock(cobraErrorStr(ce), ce.code);
+    }
+    if (!fr.ok) return inRangeRejectError(fr, *parsed.inRange, "list");
+    filtered = std::make_unique<Datastore>(fr.dataPath);
+    if (fr.dataPath != ds->path()) filteredPath = fr.dataPath;
+    src = filtered.get();
+    const int64_t n = src->nRows();
+    const double* idx = idxVar.empty() ? nullptr : src->col(idxVar).f64();
+    for (int64_t r = 0; r < n; ++r) {
+      rows.push_back(r);
+      obs.push_back(idx != nullptr ? static_cast<int64_t>(idx[r]) : r + 1);
+    }
+  } else if (haveIn) {
+    InRangeBounds rr = parseInRangeBounds(*parsed.inRange, ds->nRows());
+    for (long long r = rr.a; rr.ok && r <= rr.b; ++r) {
+      rows.push_back(r - 1);
+      obs.push_back(r);
+    }
+  } else {
+    for (int64_t r = 0; r < ds->nRows(); ++r) {
+      rows.push_back(r);
+      obs.push_back(r + 1);
+    }
+  }
+  int64_t omitted = 0;
+  if (static_cast<int64_t>(rows.size()) > kListingRowCap) {
+    omitted = static_cast<int64_t>(rows.size()) - kListingRowCap;
+    rows.resize(static_cast<size_t>(kListingRowCap));
+    obs.resize(static_cast<size_t>(kListingRowCap));
+  }
+  ojson err;
+  ojson listing = buildListing(session, *src, rows, obs, names, lo, &err);
+  filtered.reset();
+  if (!filteredPath.empty()) cecon::native_unlink(filteredPath);
+  if (listing.is_null()) return err;
+  listing["omitted"] = omitted;
+  block["listing"] = std::move(listing);
   return block;
 }
 

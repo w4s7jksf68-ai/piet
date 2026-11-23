@@ -98,6 +98,8 @@ nlohmann::ordered_json runCoefplot(const std::vector<std::string>& names,
 
 nlohmann::ordered_json runScatter(Datastore& ds, const std::vector<std::string>& varlist,
                                    const std::vector<std::pair<std::string, eval::OptValue>>& opts);
+nlohmann::ordered_json runScatterMatrix(Datastore& ds, const std::vector<std::string>& vars,
+                                        const eval::ParsedCommand& parsed, SessionState& session);
 
 // gfx-histogram-kdensity-family (oracle aer_w2 w2aq_histogram_family): ONE
 // binning rule ([R] histogram) and ONE density rule ([R] kdensity, Methods and
@@ -203,6 +205,17 @@ struct BarGraphResult {
 };
 BarGraphResult runGraphBarBox(SessionState& session, Datastore& ds, const std::string& kind,
                               const std::vector<std::string>& args, const eval::ParsedCommand& parsed);
+
+// graph pie (graph_bar.cpp): one wedge per variable (its sum) or, with over(), per category
+// (the sum of the variable, or the count). `warning` is Stata's "sum of pie wedges is not
+// positive" note, printed while the graph is still drawn.
+struct PieGraphResult {
+  nlohmann::ordered_json block;
+  std::string warning;
+  bool ok = false;
+};
+PieGraphResult runGraphPie(SessionState& session, Datastore& ds, const std::vector<std::string>& args,
+                           const eval::ParsedCommand& parsed, bool ifOrInGiven);
 
 // graph-family AI-4/AI-6/AI-7 (named_graphs.cpp): `graph describe [name |
 // "file.gph"]` (argText = the text after the subcommand, before the comma),

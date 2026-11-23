@@ -138,4 +138,62 @@ struct GmmResult {
 GmmResult gmm_fit(const NlResidFn& resid, const double* Z, int64_t n, int n_moments,
                   const std::vector<double>& b0, const std::vector<std::string>& names);
 
+
+// ---------------------------------------------------------------------------
+// gmm (full) — Stata `gmm`'s interactive estimator: one or more residual
+// equations, each with its own instrument list; the one-step, two-step (the
+// default) and iterated estimators; the initial weight matrix (unadjusted,
+// optionally block-diagonal across equations, or the identity); the weight
+// matrix and the VCE of type robust, unadjusted or cluster; aweights/pweights
+// (normalised to sum N, meat weighted by w^2) and fweights/iweights (N = sum w,
+// meat weighted by w).
+//
+// Moments g(b) = (1/N) sum_i w_i h_i(b), h_i the stacked z_mi e_mi. Each step
+// minimises Q(b) = g'Wg by Gauss-Newton from the previous step's estimates; the
+// two-step W is S(b1)^-1, S the wmatrix() estimate on the step-1 residuals; the
+// iterated estimator repeats until W (or b) moves by less than 1e-6 (mreldif).
+// V = (G'WG)^-1 G'W S W G (G'WG)^-1 / N with S the vce() estimate on the final
+// residuals; V_modelbased = (G'WG)^-1 / N. All verified against StataBE 19.5
+// (vs-stata bank 6858022a default, 9aa98f1b cluster, 64d051fb igmm, d062f1f6 aw,
+// 6b90790d fw) to the T3 tier.
+// ---------------------------------------------------------------------------
+
+using GmmEqResidFn = std::function<double(int eq, const std::vector<double>& b, int64_t i)>;
+
+struct GmmExSpec {
+    int M = 1;                          // equations
+    std::vector<int> L;                 // instruments per equation (constant included)
+    std::vector<const double*> Z;       // per equation, col-major n x L[m]
+    GmmEqResidFn resid;
+    int64_t n = 0;
+    std::vector<double> b0;
+    const double* w = nullptr;          // moment weights (aw/pw normalised to mean 1)
+    const double* omega = nullptr;      // meat weights (w^2 for aw/pw, w for fw/iw)
+    double Nw = 0;                      // N: n, or sum w for fw/iw
+    int winit = 0;                      // 0 unadjusted, 1 identity
+    bool winit_independent = false;     // block-diagonal across equations
+    int estimator = 1;                  // 0 onestep, 1 twostep, 2 igmm
+    int wmatrix = 0;                    // 0 robust, 1 unadjusted, 2 cluster
+    const int64_t* wclus = nullptr;     // cluster codes 0..G-1 for wmatrix(cluster)
+    int vce = 0;                        // 0 robust, 1 unadjusted, 2 cluster
+    const int64_t* vclus = nullptr;
+    double igmm_eps = 1e-6, igmm_weps = 1e-6;
+    int igmm_iterate = 16000;
+};
+
+struct GmmExResult {
+    std::vector<double> beta;
+    std::vector<double> V, Vmb;         // k x k
+    std::vector<double> S, W;           // L x L (S: the vce() estimate at the optimum)
+    std::vector<double> G;              // L x k, col-major
+    double Q = 0, Qcrit = 0, J = 0;
+    int k = 0, Ltot = 0, ic = 0;
+    int64_t n_clust = 0;
+    bool converged = false, ok = false;
+    std::string err, err_code;
+    std::vector<NlIter> iters;
+};
+
+GmmExResult gmm_fit_ex(const GmmExSpec& spec);
+
 }  // namespace cecon

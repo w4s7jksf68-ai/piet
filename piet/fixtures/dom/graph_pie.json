@@ -1,0 +1,64 @@
+{
+ "over_sorted": {
+  "type": "graph",
+  "kind": "pie",
+  "title": null,
+  "clockwise": true,
+  "angle0": 90.0,
+  "slices": [
+   {
+    "label": "3",
+    "value": 30.0,
+    "angle": 156.52173913043478,
+    "plabel": "43.48%"
+   },
+   {
+    "label": "4",
+    "value": 18.0,
+    "angle": 93.91304347826087,
+    "plabel": "26.09%"
+   },
+   {
+    "label": "5",
+    "value": 11.0,
+    "angle": 57.391304347826086,
+    "plabel": "15.94%"
+   },
+   {
+    "label": "2",
+    "value": 8.0,
+    "angle": 41.73913043478261,
+    "plabel": "11.59%"
+   },
+   {
+    "label": "1",
+    "value": 2.0,
+    "angle": 10.434782608695652,
+    "plabel": "2.899%"
+   }
+  ],
+  "suppressed": false
+ },
+ "vars_explode": {
+  "type": "graph",
+  "kind": "pie",
+  "title": null,
+  "clockwise": true,
+  "angle0": 90.0,
+  "slices": [
+   {
+    "label": "price",
+    "value": 456229.0,
+    "angle": 241.6506269963762,
+    "explode": true
+   },
+   {
+    "label": "weight",
+    "value": 223440.0,
+    "angle": 118.34937300362382,
+    "plabel": "weight"
+   }
+  ],
+  "suppressed": false
+ }
+}

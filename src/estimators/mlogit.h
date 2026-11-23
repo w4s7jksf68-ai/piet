@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "core/linalg.h"
+#include "estimators/ml_constraints.h"
 
 namespace cecon {
 
@@ -184,7 +185,8 @@ inline void hessian(const double* X, int64_t n, int k, const int* cat, int K,
 // iterations (iterate(#), 300 by default), when `converged` is false. V = inv(−H)
 // at the final θ.
 inline MlogitResult mlogit_fit(const double* X, int64_t n, int k, const int* cat, int K, int base,
-                               int cons_col = -1, int max_iter = 300, const double* wt = nullptr) {
+                               int cons_col = -1, int max_iter = 300, const double* wt = nullptr,
+                               const MlCns* cns = nullptr) {
     MlogitResult r;
     r.n = n;
     r.n_cats = K;
@@ -226,6 +228,8 @@ inline MlogitResult mlogit_fit(const double* X, int64_t n, int k, const int* cat
         }
     }
 
+    // constraints(): the start projected onto R·θ = r (ml_constraints.h)
+    if (cns != nullptr) ml_cns_project(*cns, theta);
     auto llat = [&](const std::vector<double>& th) {
         return mlg::ll_grad(X, n, k, cat, K, eq_of_cat, th, nullptr, nullptr, wt);
     };
@@ -237,7 +241,8 @@ inline MlogitResult mlogit_fit(const double* X, int64_t n, int k, const int* cat
         mlg::hessian(X, n, k, cat, K, eq_of_cat, th, H, wt);
         Vinv.assign(H.size(), 0.0);
         for (size_t i = 0; i < H.size(); ++i) Vinv[i] = -H[i];
-        if (la::spd_inverse(Vinv.data(), np) != 0) Vinv.clear();
+        if ((cns != nullptr ? ml_cns_inverse(*cns, Vinv.data()) : la::spd_inverse(Vinv.data(), np)) != 0)
+            Vinv.clear();
         return LL;
     };
     std::vector<double> grad, V, step(static_cast<size_t>(np));
@@ -292,6 +297,7 @@ inline MlogitResult mlogit_fit(const double* X, int64_t n, int k, const int* cat
     r.ll = LL;
     r.vcov = V;
     r.gradient = grad;
+    if (cns != nullptr) ml_cns_project_gradient(*cns, r.gradient);
     r.beta = theta;
     r.se.resize(static_cast<size_t>(np));
     for (int c = 0; c < np; ++c)

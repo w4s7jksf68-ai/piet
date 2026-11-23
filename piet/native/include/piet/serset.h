@@ -182,6 +182,7 @@ nlohmann::ordered_json makeGraphMeta(const std::string& family, const std::strin
                                      const std::string& scheme);
 // The `graphsize y` and `graphsize x` of a scheme, following its #include
 // chain as the base schemes ship it (/Applications/StataNow/ado/base/s/).
+bool hasGraphScheme(const std::string& name);
 std::pair<std::string, std::string> schemeGraphSize(const std::string& scheme);
 
 // The graph name name() selects, and whether it said `replace`.

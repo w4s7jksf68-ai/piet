@@ -12,6 +12,7 @@
 #include <exception>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -61,12 +62,9 @@ namespace {
 // `names()` is svmat's only option.
 const eval::OptVocab& kSvmatVocab = eval::registerOptVocab({"svmat"}, {{"names"}, {}});
 
-// getmata.ado's `syntax ... [, DOUBLE FORCE ID(string) REPLACE UPdate]`. All
-// five are declared: update and id() are UNIMPLEMENTED (neither is in the
-// corpus) and must be refused by name, not reported as unknown options and not
-// accepted and ignored.
-const eval::OptVocab& kGetmataVocab =
-    eval::registerOptVocab({"getmata"}, {{"double", "force", "replace"}, {"update", "id"}});
+// getmata.ado's `syntax ... [, DOUBLE FORCE ID(string) REPLACE UPdate]`.
+const eval::OptVocab& kGetmataVocab = eval::registerOptVocab(
+    {"getmata"}, {{"double", "force", "replace", "update", "id"}, {}});
 
 bool isErrorBlock(const ojson& b) {
   return b.is_object() && b.value("type", std::string()) == "error";
@@ -249,11 +247,12 @@ ojson runSvmat(const eval::ParsedCommand& parsed, SessionState& session) {
     namesArg = strutil::trim(kv.second.strValue);
   }
 
-  // eqcol is folded onto col rather than rejected: PIET's EvalMatrix carries no
-  // equation names at all (eval/session.h has rownames/colnames and nothing
-  // else), so "the column name with its equation stripped" IS the column name
-  // here. Refusing it would stop a do-file over a distinction this build cannot
-  // express; inventing an equation prefix would be a fabricated name.
+  // A column name carries its equation as `eq:name`. names(col) and
+  // names(matcol) read the name without the equation; names(eqcol) prefixes
+  // the equation (vs-stata bank 315634d3: coleq e1 e2 over a b gives e1a e2b),
+  // and a column with no equation has the equation `_` (StataBE's coleq of a
+  // matrix without equations is `_ _ _`, c6c13382), so eqcol makes it `_a`. The
+  // prefixed name is cut to 32 characters.
   const std::string namesKey = strutil::lower(namesArg);
   const bool useColNames = (namesKey == "col" || namesKey == "eqcol" || namesKey == "matcol");
   const bool prefixWithMatName = (namesKey == "matcol");
@@ -269,7 +268,12 @@ ojson runSvmat(const eval::ParsedCommand& parsed, SessionState& session) {
         return aerError("svmat: matrix " + matName + " has no column name for column " +
                         std::to_string(j + 1) + "; names(" + namesArg + ") cannot name it");
       }
-      name = prefixWithMatName ? matName + matrix.colnames[j] : matrix.colnames[j];
+      const std::string& full = matrix.colnames[j];
+      const size_t colon = full.find(':');
+      const std::string sub = colon == std::string::npos ? full : full.substr(colon + 1);
+      const std::string eqPart = colon == std::string::npos ? std::string("_") : full.substr(0, colon);
+      name = prefixWithMatName ? matName + sub : namesKey == "eqcol" ? eqPart + sub : sub;
+      if (prefixWithMatName || namesKey == "eqcol") name = name.substr(0, 32);
     } else {
       name = stub + std::to_string(j + 1);
     }
@@ -454,12 +458,15 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
                                             kGetmataVocab.unimplemented)) {
     return ojson(*err);
   }
-  bool force = false, replace = false;
+  bool force = false, replace = false, update = false;
+  std::string idText;
   bool useDouble = session.defaultStorageType == "double";
   for (const auto& kv : parsed.opts) {
     if (kv.first == "force") force = true;
     if (kv.first == "replace") replace = true;
     if (kv.first == "double") useDouble = true;
+    if (kv.first == "update") update = true;
+    if (kv.first == "id") idText = strutil::trim(kv.second.strValue);
   }
 
   std::string getlist;
@@ -474,6 +481,39 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
   const int64_t curRows = ds ? ds->nRows() : 0;
   const size_t curVars = ds ? ds->names().size() : 0;
   if (curRows == 0 && curVars == 0) force = true;  // getmata: nothing in memory implies force
+
+  // getmata.ado setup_problem: update and replace exclude each other (r(198));
+  // update implies replace. Then id([varname=]vecname) is read, before the
+  // getlist: the variable and the vector must both exist.
+  if (update && replace) {
+    return aerErrorRc("options update and replace may not both be specified", 198);
+  }
+  if (update) replace = true;
+  bool idOn = false;
+  std::string idVar, idMat;
+  eval::EvalMatrix idVec;
+  if (!idText.empty()) {
+    const size_t eq = idText.find('=');
+    idVar = strutil::trim(eq == std::string::npos ? idText : idText.substr(0, eq));
+    idMat = strutil::trim(eq == std::string::npos ? idText : idText.substr(eq + 1));
+    if (idVar.empty() || idMat.empty() || idVar.find(' ') != std::string::npos ||
+        idMat.find(' ') != std::string::npos) {
+      return aerErrorRc("id(" + idText + ") invalid", 198);
+    }
+    if (ds == nullptr || !ds->has(idVar)) return aerErrorRc("variable " + idVar + " not found", 111);
+    if (!isMataName(idMat)) return aerErrorRc(idMat + " invalid vector or matrix name", 198);
+    const eval::EvalMatrix* m = mata::findMataMatrix(session.eval, idMat);
+    if (m == nullptr) return aerErrorRc("vector or matrix " + idMat + " not found", 111);
+    idVec = *m;
+    if (mata::colsOf(idVec) != 1) return aerErrorRc("id() vector " + idMat + " must be a column vector", 459);
+    if (ds->dtype(idVar) == "factor") {
+      return ojson(eval::unsupportedOption(
+          "id(" + idText + ")",
+          "getmata's id() with a string id variable is not implemented in this version of "
+          "PIET; a numeric id variable is."));
+    }
+    idOn = true;
+  }
 
   // ---- parse and validate every element before touching anything ----------
   std::vector<GetmataElement> els;
@@ -582,7 +622,60 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
     minRows = std::min(minRows, el.value.data.size());
     maxRows = std::max(maxRows, el.value.data.size());
   }
-  if (!force && (minRows != static_cast<size_t>(curRows) ||
+  // With id(), the rows must match the id() vector instead of _N.
+  const size_t conformN = idOn ? idVec.data.size() : static_cast<size_t>(curRows);
+  if (idOn && !force && (minRows != conformN || maxRows != conformN)) {
+    return aerErrorRc(std::string(els.size() == 1 ? "rows of matrix" : "rows of matrices") +
+                          " != rows of id() vector; the id() vector " + idMat + " has " +
+                          std::to_string(conformN) +
+                          (conformN == 1 ? " observation" : " observations"),
+                      459);
+  }
+  // getmata.ado setup_id: the id() variable's values and the id() vector
+  // must each be unique; the data observation whose id equals a vector row's
+  // receives that row (Mata's `.` equals `.`).
+  std::vector<size_t> idLhs, idRhs;  // observation index <- vector row, by vector row
+  if (idOn) {
+    const cecon::Column& dcol = ds->col(idVar);
+    auto keyOf = [](double v) { return std::isnan(v) ? std::numeric_limits<double>::infinity() : v; };
+    std::map<double, size_t> dataPos, vecPos;
+    bool dataUniq = true, vecUniq = true;
+    for (int64_t i = 0; i < curRows; ++i)
+      dataUniq = dataPos.emplace(keyOf(dcol.f64()[static_cast<size_t>(i)]), static_cast<size_t>(i)).second && dataUniq;
+    for (size_t r = 0; r < idVec.data.size(); ++r)
+      vecUniq = vecPos.emplace(keyOf(idVec.data[r].empty() ? std::nan("") : idVec.data[r][0]), r).second && vecUniq;
+    if (!dataUniq || !vecUniq) {
+      std::string why = !dataUniq && !vecUniq
+                            ? "Neither the id() variable " + idVar + " nor the id() vector " +
+                                  idMat + " contain unique identifiers."
+                        : !dataUniq ? "The id() variable " + idVar +
+                                          " does not contain unique identifiers, although the "
+                                          "id() vector " + idMat + " does."
+                                    : "The id() vector " + idMat +
+                                          " does not contain unique identifiers, although the "
+                                          "id() variable " + idVar + " does.";
+      return aerErrorRc("id() variable/matrix not proper id\n" + why +
+                            " id() values must be unique.",
+                        459);
+    }
+    for (const auto& [key, r] : vecPos) {
+      auto it = dataPos.find(key);
+      if (it == dataPos.end()) continue;
+      idLhs.push_back(it->second);
+      idRhs.push_back(r);
+    }
+    std::vector<size_t> order(idRhs.size());
+    for (size_t k = 0; k < order.size(); ++k) order[k] = k;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return idRhs[a] < idRhs[b]; });
+    std::vector<size_t> l2, r2;
+    for (size_t k : order) {
+      l2.push_back(idLhs[k]);
+      r2.push_back(idRhs[k]);
+    }
+    idLhs.swap(l2);
+    idRhs.swap(r2);
+  }
+  if (!idOn && !force && (minRows != static_cast<size_t>(curRows) ||
                  maxRows != static_cast<size_t>(curRows))) {
     // getmata_rows_ne (log :1099-1107): r(459), and _N is left alone.
     const bool one = els.size() == 1;
@@ -628,12 +721,41 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
   for (const auto& el : els) {
     const size_t rows = el.value.data.size();
     for (size_t j = 0; j < el.vars.size(); ++j) {
-      std::vector<double> vals;
-      vals.reserve(static_cast<size_t>(nOut));
-      for (int64_t i = 0; i < nOut; ++i) {
-        vals.push_back(static_cast<size_t>(i) < rows
-                           ? el.value.data[static_cast<size_t>(i)][j]
-                           : std::numeric_limits<double>::quiet_NaN());
+      // getmata.ado post_variables_i_j: an existing variable is cleared to
+      // missing first unless `update`, which keeps the observations the
+      // vector does not reach; the vector's rows then land on the first rows
+      // (or, with id(), on the matching observations).
+      std::vector<double> vals(static_cast<size_t>(nOut),
+                               std::numeric_limits<double>::quiet_NaN());
+      std::vector<double> before;
+      if (el.exists[j] && update) {
+        if (Datastore* cur = session.datastore()) {
+          const cecon::Column& oc = cur->col(el.vars[j]);
+          for (int64_t i = 0; i < std::min<int64_t>(curRows, nOut); ++i)
+            before.push_back(oc.f64()[static_cast<size_t>(i)]);
+          for (size_t i = 0; i < before.size(); ++i) vals[i] = before[i];
+        }
+      }
+      const size_t nUp = idOn ? idLhs.size() : rows;
+      if (idOn) {
+        for (size_t k = 0; k < idLhs.size(); ++k) vals[idLhs[k]] = el.value.data[idRhs[k]][j];
+      } else {
+        for (size_t i = 0; i < rows && i < vals.size(); ++i) vals[i] = el.value.data[i][j];
+      }
+      // update with nothing to change leaves the variable (and its type) alone.
+      if (el.exists[j] && update && !before.empty()) {
+        bool same = nUp == 0;
+        if (!same) {
+          same = true;
+          for (size_t i = 0; i < before.size() && same; ++i) {
+            const double a = before[i], b = vals[i];
+            same = (std::isnan(a) && std::isnan(b)) || a == b;
+          }
+        }
+        if (same) {
+          kExisting += 1;
+          continue;
+        }
       }
       const std::string original = el.exists[j]
                                        ? storage::resolveReplaceType(session, el.vars[j])

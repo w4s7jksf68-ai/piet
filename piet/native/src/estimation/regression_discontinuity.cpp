@@ -225,8 +225,11 @@ ojson runRdrobust(const eval::ParsedCommand& parsed, SessionState& session) {
   say(twoColRow(G, "BW est. (h)", f3(num(r, "h_left")), f3(num(r, "h_right"))));
   say(twoColRow(G, "BW bias (b)", f3(num(r, "b_left")), f3(num(r, "b_right"))));
   say(twoColRow(G, "rho (h/b)", f3(num(r, "rho")), f3(num(r, "rho"))));
-  say(twoColRow(G, "Unique obs", std::to_string(inum(r, "n_unique_left")),
-                std::to_string(inum(r, "n_unique_right"))));
+  // rdrobust.ado prints this row only under masspoints(check) or when mass
+  // points were found; only masspoints(adjust) is implemented here.
+  if (mass)
+    say(twoColRow(G, "Unique obs", std::to_string(inum(r, "n_unique_left")),
+                  std::to_string(inum(r, "n_unique_right"))));
   say("");
   say("Outcome: " + str(r, "y") + ". Running variable: " + str(r, "x") + ".");
 
@@ -240,9 +243,18 @@ ojson runRdrobust(const eval::ParsedCommand& parsed, SessionState& session) {
   say(padLeft("", 18) + " |" + padRight(" Estimate", 15) + "|" + padLeft("z-stat", 7) +
       padLeft("P>|z|", 13) + padLeft("[" + lvl + "% Conf. Interval]", 24));
   say(sep);
-  say(padLeft("RD Effect", 18) + " |" + padRight(padLeft(g9(num(r, "effect")), 8), 15) + "|" +
-      padLeft(f4(num(r, "z")), 7) + padLeft(f3(num(r, "pvalue")), 13) +
-      padLeft(g9(num(r, "ci_lo")), 12) + padLeft(g9(num(r, "ci_hi")), 12));
+  // rdrobust.ado: estimate %7.0g at column 22, " | " at 35, z %5.4f, p %5.3f
+  // at 52, the interval %8.0g at 61 and 73.
+  const auto gw = [](double v, int w) {
+    std::string t = fmt::general(v, w, 0);
+    return padLeft(t, static_cast<size_t>(w));
+  };
+  std::string fx = padLeft("RD Effect", 18) + " | " + gw(num(r, "effect"), 7);
+  fx = padRight(fx, 34) + " | " + f4(num(r, "z"));
+  fx = padRight(fx, 51) + padLeft(f3(num(r, "pvalue")), 5);
+  fx = padRight(fx, 60) + gw(num(r, "ci_lo"), 8);
+  fx = padRight(fx, 72) + gw(num(r, "ci_hi"), 8);
+  say(fx);
   say(rule80);
   if (mass) say("Estimates adjusted for mass points in the running variable.");
 
@@ -456,16 +468,19 @@ ojson runRddensity(const eval::ParsedCommand& parsed, SessionState& session) {
   say("P-values of binomial tests. (H0: prob = .5)");
   const std::string rule53(53, '-');
   say(rule53);
-  say(padLeft("Window Length / 2", 18) + " |" + padLeft("<c", 9) + padLeft(">=c", 12) + " |" +
-      padLeft("P>|T|", 10));
+  const auto& windows = r.at("binomial");
+  const bool asymmetric = std::any_of(windows.begin(), windows.end(), [](const auto& row) {
+    return num(row, "window") != num(row, "window_right");
+  });
+  say(padLeft(asymmetric ? "Window Length" : "Window Length / 2", 18) + " |" +
+      padLeft("<c", 9) + padLeft(">=c", 12) + " |" + padLeft("P>|T|", 10));
   say(std::string(19, '-') + "+" + std::string(22, '-') + "+" + std::string(10, '-'));
-  if (r.contains("binomial") && r.at("binomial").is_array()) {
-    for (const auto& row : r.at("binomial")) {
-      say(padLeft(f3(num(row, "window")), 18) + " |" +
-          padLeft(std::to_string(inum(row, "n_left")), 9) +
-          padLeft(std::to_string(inum(row, "n_right")), 12) + " |" +
-          padLeft(f4(num(row, "p")), 10));
-    }
+  for (const auto& row : windows) {
+    std::string lengths = asymmetric
+        ? padLeft(f3(num(row, "window")), 8) + " + " + padLeft(f3(num(row, "window_right")), 7)
+        : padLeft(f3(num(row, "window")), 18);
+    say(lengths + " |" + padLeft(std::to_string(inum(row, "n_left")), 9) +
+        padLeft(std::to_string(inum(row, "n_right")), 12) + " |" + padLeft(f4(num(row, "p")), 10));
   }
   say(rule53);
 
@@ -485,8 +500,40 @@ ojson runRddensity(const eval::ParsedCommand& parsed, SessionState& session) {
   e["c"] = num(r, "cutoff");
   e["h_l"] = num(r, "h_left");
   e["h_r"] = num(r, "h_right");
+  e["p"] = inum(r, "p");
+  e["q"] = inum(r, "q");
+  e["N_h_l"] = inum(r, "n_eff_left");
+  e["N_h_r"] = inum(r, "n_eff_right");
+  const auto& robust = r.at("robust");
+  e["f_ql"] = num(robust, "f_left");
+  e["f_qr"] = num(robust, "f_right");
+  e["se_ql"] = num(robust, "se_left");
+  e["se_qr"] = num(robust, "se_right");
+  e["se_q"] = num(robust, "se");
+  e["pv_q"] = num(robust, "p");
+  e["T_q"] = num(robust, "T");
   postEClass(session, "rddensity", "", *session.currentHbin(), e, /*ePosted=*/false);
   session.eval.setEString("cmd", "");
+  session.eval.setEString("runningvar", str(r, "x"));
+  session.eval.setEString("kernel", str(r, "kernel"));
+  session.eval.setEString("bwmethod", str(r, "bw_method"));
+  session.eval.setEString("vce", str(r, "vce"));
+  session.eval.setEString("precision", "double");
+
+  session.eval.setEScalar("p", inum(r, "p"));
+  if (!windows.empty()) {
+    // Stata leaves the last window's bitesti results in r().
+    const auto& last = windows.back();
+    const auto left = inum(last, "n_left"), right = inum(last, "n_right");
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", left + right);
+    session.eval.rValues.set("P_p", 0.5);
+    session.eval.rValues.set("k", left);
+    session.eval.rValues.set("k_opp", right);
+    session.eval.rValues.set("p", num(last, "p"));
+    session.eval.rValues.set("p_l", num(last, "p_l"));
+    session.eval.rValues.set("p_u", num(last, "p_u"));
+  }
 
   ojson out = r;
   out["type"] = "qe_result";

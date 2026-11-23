@@ -11,6 +11,7 @@ extern const eval::OptVocab& kVocabReg3;
 extern const eval::OptVocab& kVocabBoottest;
 extern const eval::OptVocab& kVocabTobit;
 extern const eval::OptVocab& kVocabHeckman;
+extern const eval::OptVocab& kVocabZip;
 extern const eval::OptVocab& kVocabQreg;
 extern const eval::OptVocab& kVocabMediate;
 extern const eval::OptVocab& kVocabMediateTreat;

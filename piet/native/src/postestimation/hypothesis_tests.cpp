@@ -5,6 +5,7 @@
 #include "piet/eval/macros.h"  // resolveEstScalarRefs (posted e(df_r), e(N))
 #include "piet/handlers/variables.h"  // resolveByKeyNames (testparm's varlist)
 #include "eval/macro_results_internal.h"  // resolveEScalar
+#include "estimation/estimator_command_support.h"  // postBV (nlcom ..., post)
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -91,11 +92,24 @@ bool isInterceptNameM4(const std::string& n) {
 
 }  // namespace
 
-ojson runTestparm(const std::vector<std::string>& varlist, SessionState& session, bool equal) {
+namespace postest_detail {
+bool postedWaldServesM4(const SessionState& session);
+bool genericPostedWaldM4(const SessionState& session, const std::string& verb);
+std::optional<ojson> testparmPostedCoefsM4(SessionState& session, const std::string& equation,
+                                           std::vector<std::string>& coefs, std::string& eqPrefix,
+                                           bool& striped);
+}  // namespace postest_detail
+
+ojson runTestparm(const std::vector<std::string>& varlist, SessionState& session, bool equal,
+                  const std::string& equation) {
   const auto& lmOpt = session.lastModel();
   if (!lmOpt.has_value()) return noPreviousEstimation();
   const LastModel& lm = *lmOpt;
-  {  // BUG-203 — the same estimator gate `test` carries; testparm IS `test`.
+  // A fit whose e(b)/e(V) `test` reads as posted (mlogit, ologit, heckman, ...):
+  // testparm is test.ado's varlist form over those columns, so it is served there
+  // too (bank c724ce49 `testparm mpg weight, equation(4)` after mlogit).
+  const bool postedFit = postedWaldServesM4(session) || genericPostedWaldM4(session, "test");
+  if (!postedFit) {  // BUG-203 — the same estimator gate `test` carries; testparm IS `test`.
     ojson reject;
     if (!postestEstimatorOkM4("testparm", lm, reject)) return reject;
   }
@@ -105,7 +119,18 @@ ojson runTestparm(const std::vector<std::string>& varlist, SessionState& session
   // Coefficient names come from the stored fit, in coeftable order, so the
   // constraint list reads in the order the user saw the model printed.
   std::vector<std::string> coefs;
-  if (lm.result.has_value() && lm.result->contains("coeftable") &&
+  // An equation-striped posted e(b): the varlist is matched against ONE
+  // equation's columns; only equation() also qualifies the test (see below).
+  std::string eqPrefix;
+  bool striped = false;
+  if (postedFit)
+    if (auto refused = testparmPostedCoefsM4(session, equation, coefs, eqPrefix, striped)) return *refused;
+  if (!equation.empty() && !striped)
+    return engineErrorBlockM4(
+        "testparm: option equation() after a fit without equation names is not implemented in this "
+        "version of PIET; nothing was computed.",
+        "unsupported_option");
+  if (coefs.empty() && lm.result.has_value() && lm.result->contains("coeftable") &&
       (*lm.result)["coeftable"].is_array()) {
     for (const auto& row : (*lm.result)["coeftable"]) {
       std::string nm = row.value("name", std::string());
@@ -380,6 +405,9 @@ ojson runTestparm(const std::vector<std::string>& varlist, SessionState& session
     for (size_t i = 0; i < ranked.size(); ++i) picked[i] = ranked[i].second;
   }
 
+  if (!eqPrefix.empty())
+    for (std::string& c : picked) c = eqPrefix + c;
+
   // equal: every coefficient equal to the first, (b2 = b1) (b3 = b1) ...;
   // fewer than two is r(102) "too few variables" (testparm's own rule).
   if (equal) {
@@ -643,6 +671,7 @@ bool postedWaldServesM4(const SessionState& session) {
   // `lincom price - 300*mpg`, 879f124b / 6e55a1ca after `proportion rep78`).
   if (mlPostedCmdsM4().count(lm->cobraCmd)) return true;
   return lm->cobraCmd == "csdid" || lm->cobraCmd == "acreg" || lm->cobraCmd == "suest" ||
+         lm->cobraCmd == "nlcom" ||
          lm->cobraCmd == "var" || lm->cobraCmd == "leebounds" ||
          lm->cobraCmd == "qreg2" || lm->cobraCmd == "qreg2_margins" || lm->cobraCmd == "bootstrap" ||
          postedMeanProportionM4(*lm);
@@ -732,6 +761,11 @@ std::string eqCoefM4(const EqStripeM4& st, const std::string& eq, const std::str
   }
   static const std::regex rePlain(R"(^[A-Za-z_]\w*$)");
   if (!std::regex_match(tok, rePlain)) return "";
+  // A variable omitted in this equation (mlogit's base outcome posts `3:o.mpg`):
+  // `[3]mpg` names that omitted coefficient, whose value is 0 (bank e236fe1a
+  // `lincom [3]mpg - [4]mpg, rrr` .9085889 = exp(-[4]mpg); d5df9ae5
+  // `test [3]mpg = [4]mpg`).
+  if (std::find(inEq.begin(), inEq.end(), "o." + tok) != inEq.end()) return "o." + tok;
   std::string hit;
   for (const auto& n : inEq) {
     if (n.size() <= tok.size() || n.compare(0, tok.size(), tok) != 0 || !std::regex_match(n, rePlain)) continue;
@@ -780,9 +814,19 @@ std::string rewriteEqExprM4(const std::string& s, const EqStripeM4& st) {
         out += s.substr(i);
         break;
       }
-      out += "[" + eqQualifierM4(st, s.substr(i + 1, close - i - 1)) + "]";
+      const std::string qeq = eqQualifierM4(st, s.substr(i + 1, close - i - 1));
+      out += "[" + qeq + "]";
       i = close + 1;
-      copyQualified(i, out);
+      {
+        // The name after `[eq]` resolved in that equation (an omitted base
+        // coefficient `o.name`, a level without its base mark); else as typed.
+        std::string tail;
+        size_t j = i;
+        copyQualified(j, tail);
+        const std::string hit = tail.compare(0, 3, "_b[") == 0 ? std::string() : eqCoefM4(st, qeq, tail);
+        out += hit.empty() ? tail : hit;
+        i = j;
+      }
       continue;
     }
     if (boundary && s.compare(i, 3, "_b[") == 0) {
@@ -866,6 +910,66 @@ std::string rewriteEqJointM4(const std::string& csv, const EqStripeM4& st) {
   return joined;
 }
 
+// testparm over a posted, equation-striped e(b) (mlogit, ologit, heckman ...):
+// the varlist is matched against the coefficients of one equation -- the one
+// equation(eqname | #k) names, tested as `[eq]name`; without equation() the
+// first (the second after mlogit with base outcome 1), tested unqualified, i.e.
+// in every equation that has them. An omitted column (`o.mpg`, mlogit's
+// base outcome; a zero variance) is no testable coefficient: naming only such an
+// equation is r(111) (bank 532001dac `testparm mpg weight, equation(3)` after
+// `mlogit rep78 mpg weight`, base outcome 3). An unstriped e(b) leaves `striped`
+// false and `coefs` empty (the coefficient table is read instead).
+std::optional<ojson> testparmPostedCoefsM4(SessionState& session, const std::string& equation,
+                                           std::vector<std::string>& coefs, std::string& eqPrefix,
+                                           bool& striped) {
+  using Reader = eval::EvalSession::EReader;
+  const eval::EvalSession::EMatrixAnswer eb = session.eval.resolveEMatrixFor("b", Reader::kNames);
+  const eval::EvalSession::EMatrixAnswer eV = session.eval.resolveEMatrixFor("V", Reader::kNames);
+  if (!eb.matrix.has_value()) return std::nullopt;
+  const std::optional<EqStripeM4> st = eqStripeM4(eb.matrix->colnames);
+  if (!st.has_value()) return std::nullopt;
+  striped = true;
+  // The varlist is matched against ONE equation's columns: the one equation()
+  // names, else the first -- the second after an mlogit whose base outcome is the
+  // first (e(ibaseout) 1: the first equation is all omitted columns). Only an
+  // equation() qualifies the test itself; without it the matched names are
+  // tested unqualified, i.e. in every equation where they appear (`test mpg`
+  // after sureg tests [price]mpg and [trunk]mpg; bank 6e81c7a2df2d5004).
+  std::string eq = st->eqs.front();
+  const bool named = !trimM4(equation).empty();
+  if (named) {
+    eq = eqQualifierM4(*st, equation);
+    if (std::find(st->eqs.begin(), st->eqs.end(), eq) == st->eqs.end())
+      return ojson(eval::errorBlock("engine_error", "equation " + trimM4(equation) + " not found",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(303)"));
+  } else if (st->eqs.size() > 1) {
+    const std::string* cmd = session.eval.eStrings.find("cmd");
+    const std::string ib = trimM4(eval::macro_detail::resolveEScalar("ibaseout", session.eval));
+    char* end = nullptr;
+    const double ibv = std::strtod(ib.c_str(), &end);
+    if (cmd != nullptr && *cmd == "mlogit" && !ib.empty() && end != nullptr && *end == '\0' && ibv == 1.0)
+      eq = st->eqs[1];
+  }
+  if (named) eqPrefix = "[" + eq + "]";
+  static const std::regex reOmitted(R"((^|#)(\d*b?o|co)\.)");
+  for (size_t i = 0; i < st->cols.size(); ++i) {
+    if (st->cols[i].first != eq) continue;
+    const std::string& nm = st->cols[i].second;
+    const bool zeroVar = eV.matrix.has_value() && i < eV.matrix->data.size() &&
+                         i < eV.matrix->data[i].size() && eV.matrix->data[i][i] == 0.0;
+    if (!std::regex_search(nm, reOmitted) && !zeroVar) coefs.push_back(nm);
+  }
+  if (coefs.empty())
+    return ojson(eval::errorBlock("engine_error",
+                                  named ? "no such variables;\nthe specified varlist does not identify any "
+                                          "testable coefficients from\nequation(" +
+                                              trimM4(equation) + ")"
+                                        : std::string("no such variables;\nthe specified varlist does not "
+                                                      "identify any testable coefficients"),
+                                  std::nullopt, std::nullopt, std::nullopt, "r(111)"));
+  return std::nullopt;
+}
+
 // The engine's `--posted FILE` mode (apps/cmds/cmds_postest.cpp load_posted_model):
 // writes {names, b, V, df_r, n} from the live e() and runs `cobra VERB --posted FILE
 // <combo>`. e(df_r) present -> the F / t reference, absent -> chi2 / normal.
@@ -910,6 +1014,40 @@ ojson runPostedPostestM4(const std::string& verb, const std::vector<std::string>
         }
         ++i;
       }
+    }
+  } else if (const std::optional<EqStripeM4> st = eqStripeM4(b->colnames)) {
+    // A posted fit read directly: only the references `[eq]name` / `[eq]_b[name]`
+    // to a coefficient omitted in that equation are respelled `[eq]o.name`
+    // (mlogit's base outcome posts `3:o.mpg`; bank e236fe1a `lincom [3]mpg -
+    // [4]mpg, rrr`, d5df9ae5 `test [3]mpg = [4]mpg`, 4724a9ce `nlcom
+    // [3]_b[mpg] / [4]_b[mpg]`). Everything else is left as typed.
+    static const std::regex reQual(R"(\[([^\]\[]+)\]\s*(_b\[\s*)?([A-Za-z_]\w*))");
+    auto fixOmitted = [&st](const std::string& in) {
+      std::string out;
+      auto it = std::sregex_iterator(in.begin(), in.end(), reQual);
+      size_t last = 0;
+      for (; it != std::sregex_iterator(); ++it) {
+        const std::smatch& m = *it;
+        const std::string eq = eqQualifierM4(*st, m.str(1));
+        const std::string tok = m.str(3);
+        bool plain = false, omitted = false;
+        for (const auto& [e, n] : st->cols) {
+          if (e != eq) continue;
+          if (n == tok) plain = true;
+          if (n == "o." + tok) omitted = true;
+        }
+        if (plain || !omitted) continue;
+        const size_t at = static_cast<size_t>(m.position(3));
+        out += in.substr(last, at - last) + "o." + tok;
+        last = at + tok.size();
+      }
+      return out + in.substr(last);
+    };
+    for (size_t i = 0; i + 1 < comboRw.size(); ++i) {
+      const std::string& flag = comboRw[i];
+      if (flag != "--joint" && flag != "--constraint" && flag != "--exp" && flag != "--expr") continue;
+      comboRw[i + 1] = fixOmitted(comboRw[i + 1]);
+      ++i;
     }
   }
   ojson bv = ojson::array();
@@ -1502,7 +1640,46 @@ ojson runNlcom(const std::string& exprIn, SessionState& session,
   // block regardless of postOpt — Stata's nlcom is BOTH r-class (always)
   // and, under `post`, ALSO e-class. This only adds the e() publish.
   if (postOpt) {
+    // the fit's e(sample), read before the post replaces the live model (`lm`
+    // refers to it)
+    const LastModel::EsampleState fitEs = lm.esample;
+    const unsigned long long fitEsSerial = lm.esampleSerial;
+    const std::string fitEsPath = lm.esampleInstallPath, fitDataPath = lm.dataPath;
     postEstimationBlockM4(session, blk, "nlcom", lm.depvar, lm.dataPath);
+    // `post` makes the combinations e(b) and their delta-method covariance e(V)
+    // (Stata's nlcom ..., post), which test / lincom then read (bank 0e03ebcf
+    // `nlcom (r1: ...) (r2: ...), post` then `test r1 = 0`).
+    if (rawJson.is_object() && rawJson.contains("V") && rawJson["V"].is_array() && blk.contains("coeftable") &&
+        blk["coeftable"].is_array()) {
+      std::vector<std::string> nms;
+      std::vector<double> bv;
+      for (const auto& row : blk["coeftable"]) {
+        nms.push_back(row.value("name", std::string()));
+        bv.push_back(row.contains("b") && row["b"].is_number() ? row["b"].get<double>()
+                                                              : std::numeric_limits<double>::quiet_NaN());
+      }
+      std::vector<std::vector<double>> Vm;
+      bool ok = rawJson["V"].size() == nms.size();
+      for (const auto& r : rawJson["V"]) {
+        std::vector<double> row;
+        if (!r.is_array() || r.size() != nms.size()) { ok = false; break; }
+        for (const auto& x : r) row.push_back(x.is_number() ? x.get<double>() : std::numeric_limits<double>::quiet_NaN());
+        Vm.push_back(std::move(row));
+      }
+      if (ok && !nms.empty()) {
+        e3::postBV(session, nms, bv, Vm);
+        // e(rank): the rank of e(V); e(predict) nlcom_p; e(properties) "b V"; the
+        // fit's e(sample) carries over (bank 0e03ebcf: rank 2, e(sample) 74 rows).
+        size_t rank = 0;
+        const std::vector<std::vector<double>> inv = e3::invsym(Vm);
+        for (size_t i = 0; i < inv.size(); ++i) rank += inv[i][i] != 0.0 ? 1 : 0;
+        e3::setEScalarOnFit(session, "rank", static_cast<double>(rank));
+        e3::setEStringOnFit(session, "predict", "nlcom_p");
+        e3::setEStringOnFit(session, "properties", "b V");
+        if (fitEs == LastModel::EsampleState::kColumn)
+          session.setLastModelEsample(fitEs, fitEsSerial, fitEsPath, fitDataPath);
+      }
+    }
   }
   // FU-410: the engine's G V G' (cmd_nlcom `V`, in the order of its coefs) rides
   // to the dispatcher's nlcom arm, which posts it as r(V) and removes the key

@@ -28,6 +28,7 @@
 #include "piet/eval/pyeval.h"
 #include "piet/eval/pyvalue.h"
 #include "piet/strutil.h"
+#include "piet/regex_scans.h"
 #include "core/ident.h"  // Unicode names: the shared identifier byte tests
 #include "core/expr_blanks.h"  // FU-875: the blanks Stata drops inside ( ) and [ ]
 #include "data/stata_dates.h"  // the literal pseudo-function scan (liftDateLiterals)
@@ -820,7 +821,9 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
         lower.find("rowsof") != std::string::npos || lower.find("colnumb") != std::string::npos ||
         lower.find("rownumb") != std::string::npos ||
         lower.find("el(") != std::string::npos || lower.find("mreldif") != std::string::npos ||
-        lower.find("det(") != std::string::npos || lower.find("trace(") != std::string::npos) {
+        lower.find("det(") != std::string::npos || lower.find("trace(") != std::string::npos ||
+        lower.find("issymmetric(") != std::string::npos || lower.find("diag0cnt(") != std::string::npos ||
+        lower.find("matmissing(") != std::string::npos) {
       cleaned = substituteMatrixRefs(cleaned, *session);
       // FU-118: a matrix operand the pass could not answer is a named error
       // here, on the r(NNN) channel every caller already maps (display,
@@ -1213,7 +1216,9 @@ std::optional<std::string> evalMacroExpr(const std::string& expr, EvalSession& s
     if (cleaned.find('[') != std::string::npos || lower.find("colsof") != std::string::npos ||
         lower.find("rowsof") != std::string::npos || lower.find("el(") != std::string::npos ||
         lower.find("mreldif") != std::string::npos || lower.find("det(") != std::string::npos ||
-        lower.find("trace(") != std::string::npos) {
+        lower.find("trace(") != std::string::npos ||
+        lower.find("issymmetric(") != std::string::npos || lower.find("diag0cnt(") != std::string::npos ||
+        lower.find("matmissing(") != std::string::npos) {
       cleaned = substituteMatrixRefs(cleaned, session);
     }
   }
@@ -1653,31 +1658,31 @@ std::string substituteVarSubscripts(const std::string& in, EvalSession& session,
                                     std::optional<std::string>* whole, bool* stringLeft,
                                     std::vector<std::string>* outerSpans) {
   if (!session.varObs || in.find('[') == std::string::npos) return in;
-  static const std::regex reSub(R"((^|[^\w.$`\x80-\xff])([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\[([^\[\],]+)\])");
-  static const std::regex reInt(R"(^\s*(-?\d+)\s*$)");
+  // The subscripts are the matches of
+  //   R"((^|[^\w.$`\x80-\xff])([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\[([^\[\],]+)\])"
+  // and an index is read by R"(^\s*(-?\d+)\s*$)", both matched by hand
+  // (rx::nextVarSubscript, rx::matchSignedInt; piet/regex_scans.h).
   std::vector<std::string> spans;
   const std::string s = outerSpans != nullptr ? in : protectStringLiterals(in, &spans);
   std::string out;
   size_t last = 0;
   bool changed = false;
-  for (auto it = std::sregex_iterator(s.begin(), s.end(), reSub); it != std::sregex_iterator();
-       ++it) {
-    const std::smatch& m = *it;
-    const std::string name = m.str(2);
-    const size_t refPos = static_cast<size_t>(m.position(2));
-    const size_t refEnd = static_cast<size_t>(m.position(0) + m.length(0));
+  rx::VarSubscriptMatch sm;
+  for (size_t from = 0; rx::nextVarSubscript(s, from, &sm); from = sm.end) {
+    const std::string name = s.substr(sm.namePos, sm.nameLen);
+    const size_t refPos = sm.namePos;
+    const size_t refEnd = sm.end;
     if (session.findMatrix(name) != nullptr) continue;
-    std::string idxText = m.str(3);
-    std::smatch im;
-    if (!std::regex_match(idxText, im, reInt)) {
+    std::string idxText = s.substr(sm.idxPos, sm.idxLen);
+    std::string idxDigits;
+    if (!rx::matchSignedInt(idxText, &idxDigits)) {
       std::optional<std::string> v = evalMacroExpr(idxText, session);
-      if (!v || !std::regex_match(*v, im, reInt)) continue;
+      if (!v || !rx::matchSignedInt(*v, &idxDigits)) continue;
       idxText = *v;
-      std::regex_match(idxText, im, reInt);
     }
     long long idx = 0;
     try {
-      idx = std::stoll(im.str(1));
+      idx = std::stoll(idxDigits);
     } catch (...) {
       continue;
     }

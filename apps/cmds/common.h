@@ -62,7 +62,7 @@ using namespace cecon;
 // pen-holder — bumps when CONTRACT-engine.md changes, independently of the engine release
 // version (COBRA_VERSION). Source of truth mirrored in internal note CONTRACT-engine.md header.
 #ifndef CONTRACT_VERSION
-#define CONTRACT_VERSION "1.27.0"
+#define CONTRACT_VERSION "1.28.0"
 #endif
 
 namespace cecon {
@@ -220,6 +220,23 @@ inline bool out_missing(const std::string& s) { return s.empty() && !serve_resid
 bool commit_frame(Frame&& fr, const std::string& out);
 
 std::vector<std::string> split_csv(const std::string& s);
+
+// --cns SPEC: linear constraints on an ml fit's coefficients (Stata's
+// constraints() option, resolved by PIET to equation positions). SPEC is rows
+// separated by ';', each "TERM,TERM,...=RHS"; a TERM is "COEF|EQ|NAME" with EQ
+// empty (the first equation), "#n" (the n-th equation, 1-based) or "=v" (mlogit:
+// the outcome whose value is v), and NAME the coefficient's engine name (`_cons`
+// for the constant, `/cut1` for a cutpoint).
+struct CnsTermSpec {
+    double coef = 0.0;
+    std::string eq;
+    std::string name;
+};
+struct CnsRowSpec {
+    std::vector<CnsTermSpec> terms;
+    double rhs = 0.0;
+};
+std::vector<CnsRowSpec> parse_cns_spec(const std::string& s);
 
 // ---- E6: unknown-flag rejection net --------------------------------------------
 // opt()/has()/opt_all() are the sanctioned way a cmd_XXX() reads its flags out of
@@ -529,7 +546,8 @@ json run_feols(const std::string& data, const std::string& y,
                EsampleRows* esample = nullptr,
                bool keep_nested_fe_dof = false, bool emit_v = false,
                bool multiway_subset_factors = false, bool fe_nested_in_clusters = false,
-               bool regress_exact_fit = false, bool collinear_forward = false);
+               bool regress_exact_fit = false, bool collinear_forward = false,
+               bool xtreg_fe = false, bool absorb_test = false, bool aw_negative_drops = false);
 
 // P7 — `svy: regress`. Same WLS point estimates as the pweighted feols path; what
 // differs is the variance and the reference distribution: a stratified linearized

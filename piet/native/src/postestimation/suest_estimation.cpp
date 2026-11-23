@@ -79,6 +79,7 @@ struct Request {
   std::string clusterVar;
   bool mlVariance = false;
   bool svy = false;
+  std::optional<std::string> eform;  // eform(string): the exponentiated table's label
 };
 
 // Reads vce(...) into `word` ("robust"/"cluster", empty when vce() is empty) and
@@ -145,10 +146,13 @@ std::optional<ojson> readOptionLine(const eval::ParsedCommand& parsed, Request& 
       case kSvy:
         req.svy = true;  // judged after the fits are screened (Stata's order)
         break;
+      case kEform:
+        req.eform = strutil::trim(value.strValue);
+        break;
       case kMinus:
         if (notBuilt.empty()) notBuilt = "minus()";
         break;
-      default:  // robust, dir, eform: accepted, no effect on the posting
+      default:  // robust, dir: accepted, no effect on the posting
         break;
     }
   }
@@ -173,6 +177,10 @@ struct DesignTerm {
 };
 
 struct FitEquations {
+  // regress: a mean equation and ln(sigma^2); logit / probit: the one index
+  // equation, named after the depvar, scored by the model's own likelihood.
+  enum class Model { kRegress, kLogit, kProbit } model = Model::kRegress;
+  std::string depvar;
   std::string name;
   std::vector<std::string> columns;  // the stored e(b) stripe
   std::vector<DesignTerm> terms;     // index-aligned with columns
@@ -187,7 +195,7 @@ struct FitEquations {
     const double m = sampleCells[row];
     return !std::isnan(m) && m != 0.0;
   }
-  size_t slotCount() const { return columns.size() + 1; }
+  size_t slotCount() const { return columns.size() + (model == Model::kRegress ? 1 : 0); }
   size_t lnvarSlot() const { return firstSlot + columns.size(); }
 };
 
@@ -266,10 +274,11 @@ std::optional<ojson> screenFit(const std::string& name, const StoredModel& store
   if ((vce != "" && vce != "oim" && vce != "ols" && vce != "standard") || (vcetype != "" && vcetype != "OIM"))
     return e3::rcError(name + " was estimated with a nonstandard vce (" + (vce.empty() ? vcetype : vce) + ")",
                        322);
-  if (word("cmd") != "regress")
+  const bool binary = word("cmd") == "logit" || word("cmd") == "probit";
+  if (word("cmd") != "regress" && !binary)
     return outOfScope("suest of a stored `" + word("cmd") +
-                      "` fit is not implemented in this version of PIET (only regress is); "
-                      "nothing was estimated");
+                      "` fit is not implemented in this version of PIET (only regress, logit and "
+                      "probit are); nothing was estimated");
   if (first != nullptr) {
     if (word("wtype") != first->eStrings.get("wtype"))
       return e3::rcError("inconsistent weighting types", 322);
@@ -277,9 +286,9 @@ std::optional<ojson> screenFit(const std::string& name, const StoredModel& store
       return e3::rcError("weighting expression differs between models", 322);
   }
   const std::string wtype = word("wtype");
-  if (!wtype.empty() && wtype != "aweight")
-    return outOfScope("suest of a " + wtype +
-                      "ed regress is not implemented in this version of PIET; nothing was estimated");
+  if (!wtype.empty() && (wtype != "aweight" || binary))
+    return outOfScope("suest of a " + wtype + "ed " + word("cmd") +
+                      " is not implemented in this version of PIET; nothing was estimated");
   return std::nullopt;
 }
 
@@ -299,7 +308,7 @@ std::optional<ojson> loadFit(const std::string& name, const StoredModel& stored,
     return frame.col(var).f64();
   };
   const auto termRefusal = [](const std::string& term) {
-    return outOfScope("suest of a regress with the term `" + term +
+    return outOfScope("suest of a fit with the term `" + term +
                       "` is not implemented in this version of PIET; nothing was estimated");
   };
 
@@ -325,6 +334,13 @@ std::optional<ojson> loadFit(const std::string& name, const StoredModel& stored,
                       " do not line up in this version of PIET");
 
   fit.columns = bMat.colnames;
+  // A logit / probit e(b) column carries the depvar as its equation.
+  const std::string fitCmd = stored.eStrings.get("cmd");
+  if (fitCmd == "logit" || fitCmd == "probit")
+    for (std::string& c : fit.columns) {
+      const size_t colon = c.find(':');
+      if (colon != std::string::npos) c = c.substr(colon + 1);
+    }
   fit.terms.resize(columnCount);
   for (size_t j = 0; j < columnCount; ++j) {
     DesignTerm& term = fit.terms[j];
@@ -339,8 +355,23 @@ std::optional<ojson> loadFit(const std::string& name, const StoredModel& stored,
   const std::string depvar = stored.eStrings.get("depvar");
   fit.depvarCells = numericCells(depvar);
   if (fit.depvarCells == nullptr) return termRefusal(depvar);
+  fit.depvar = depvar;
 
   fit.observations = fitScalar(fitView, "N");
+  const std::string cmd = stored.eStrings.get("cmd");
+  if (cmd == "logit" || cmd == "probit") {
+    // The bread is the fit's own e(V) (the inverse of minus the Hessian).
+    fit.model = cmd == "logit" ? FitEquations::Model::kLogit : FitEquations::Model::kProbit;
+    if (!(fit.observations > 0.0))
+      return outOfScope("suest: the stored fit " + name + " reports no e(N); not implemented in this "
+                        "version of PIET");
+    fit.meanBread = vMat.data;
+    for (size_t j = 0; j < columnCount; ++j) {
+      if (fit.terms[j].reads != DesignTerm::Reads::kNothing) continue;
+      for (size_t i = 0; i < columnCount; ++i) fit.meanBread[j][i] = fit.meanBread[i][j] = 0.0;
+    }
+    return std::nullopt;
+  }
   const double rmse = fitScalar(fitView, "rmse");
   const double conventional = rmse * rmse;
   fit.sigma2 = mlVariance ? fitScalar(fitView, "rss") / fit.observations : conventional;
@@ -388,6 +419,25 @@ bool addScores(const FitEquations& fit, int64_t row, double rowWeight, long doub
     }
     fitted += term.coef * x[j];
   }
+  if (fit.model != FitEquations::Model::kRegress) {
+    // The equation-level score d lnL_i / d xb_i: logit y - invlogit(xb);
+    // probit normalden(xb)/normal(xb) when y != 0, -normalden(xb)/normal(-xb)
+    // when y == 0 (the scores logit's and probit's predict write).
+    const double yv = fit.depvarCells[row];
+    if (std::isnan(yv) || std::isnan(fitted)) return false;
+    const bool success = yv != 0.0;
+    double score;
+    if (fit.model == FitEquations::Model::kLogit) {
+      score = success ? 1.0 / (1.0 + std::exp(fitted)) : -1.0 / (1.0 + std::exp(-fitted));
+    } else {
+      const double den = std::exp(-0.5 * fitted * fitted) / std::sqrt(2.0 * 3.14159265358979323846);
+      score = success ? den / (0.5 * std::erfc(-fitted / std::sqrt(2.0)))
+                      : -den / (0.5 * std::erfc(fitted / std::sqrt(2.0)));
+    }
+    for (size_t j = 0; j < fit.terms.size(); ++j)
+      sum[fit.firstSlot + j] += static_cast<long double>(rowWeight) * (score * x[j]);
+    return true;
+  }
   const double residual = fit.depvarCells[row] - fitted;
   if (std::isnan(residual)) return false;
   const double scaled = residual / fit.sigma2;
@@ -433,7 +483,8 @@ std::vector<std::vector<double>> sandwich(const std::vector<FitEquations>& fits,
     const size_t k = fit.columns.size();
     for (size_t i = 0; i < k; ++i)
       for (size_t j = 0; j < k; ++j) bread[fit.firstSlot + i][fit.firstSlot + j] = fit.meanBread[i][j];
-    bread[fit.lnvarSlot()][fit.lnvarSlot()] = 2.0L / static_cast<long double>(fit.observations);
+    if (fit.model == FitEquations::Model::kRegress)
+      bread[fit.lnvarSlot()][fit.lnvarSlot()] = 2.0L / static_cast<long double>(fit.observations);
   }
   Grid breadMeat(dim, std::vector<long double>(dim, 0.0L));
   for (size_t i = 0; i < dim; ++i)
@@ -606,11 +657,15 @@ nlohmann::ordered_json runSuest(const eval::ParsedCommand& parsed, SessionState&
   double rank = 0.0;
   for (const FitEquations& fit : fits) {
     const std::string lead = severalFits ? fit.name + "_" : std::string();
+    // A binary fit's one equation is named after its depvar (bank 8f32ea74:
+    // `suest A C` over regress A and logit C posts C_foreign:mpg).
+    const std::string eq = fit.model == FitEquations::Model::kRegress ? "mean" : fit.depvar;
     for (size_t j = 0; j < fit.columns.size(); ++j) {
-      stackedNames.push_back(lead + "mean:" + fit.columns[j]);
+      stackedNames.push_back(lead + eq + ":" + fit.columns[j]);
       stackedB.push_back(fit.terms[j].coef);
       if (fit.terms[j].reads != DesignTerm::Reads::kNothing) rank += 1.0;
     }
+    if (fit.model != FitEquations::Model::kRegress) continue;
     stackedNames.push_back(lead + "lnvar:_cons");
     stackedB.push_back(std::log(fit.sigma2));
     rank += 1.0;
@@ -623,6 +678,22 @@ nlohmann::ordered_json runSuest(const eval::ParsedCommand& parsed, SessionState&
   block["n_obs"] = static_cast<long long>(unionRows.size());
   block["coeftable"] = e3::coeftableFromPosting(stackedNames, stackedB, stackedV,
                                                 std::numeric_limits<double>::quiet_NaN());
+  // eform(string): every equation is shown exponentiated, exp(b), exp(b) se and
+  // the exponentiated interval, with the test unchanged (bank 8f32ea74 `suest A
+  // C, ef(OR)`: r(table) b exp(-238.89) for A_mean:mpg, eform 1 throughout).
+  if (req.eform.has_value()) {
+    for (auto& row : block["coeftable"]) {
+      if (!row.is_object() || !row.contains("b") || !row["b"].is_number()) continue;
+      const double b = row["b"].get<double>();
+      const double eb = std::exp(b);
+      row["b"] = eb;
+      if (row.contains("se") && row["se"].is_number()) row["se"] = eb * row["se"].get<double>();
+      for (const char* k : {"ci_lo", "ci_hi"})
+        if (row.contains(k) && row[k].is_number()) row[k] = std::exp(row[k].get<double>());
+      row["eform"] = true;
+    }
+    block["eform_label"] = req.eform->empty() ? std::string("exp(b)") : *req.eform;
+  }
 
   LastModel posted;
   posted.cobraCmd = "suest";
@@ -668,7 +739,8 @@ nlohmann::ordered_json runSuest(const eval::ParsedCommand& parsed, SessionState&
   for (const std::string& n : names) joined += (joined.empty() ? "" : " ") + n;
   e3::setEStringOnFit(session, "names", joined);
   for (size_t m = 0; m < names.size(); ++m)
-    e3::setEStringOnFit(session, "eqnames" + std::to_string(m + 1), "mean lnvar");
+    e3::setEStringOnFit(session, "eqnames" + std::to_string(m + 1),
+                        fits[m].model == FitEquations::Model::kRegress ? "mean lnvar" : fits[m].depvar);
   if (!wtype.empty()) {
     e3::setEStringOnFit(session, "wtype", wtype);
     e3::setEStringOnFit(session, "wexp", wexp);

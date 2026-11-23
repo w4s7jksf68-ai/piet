@@ -15,7 +15,10 @@
 namespace piet {
 
 nlohmann::ordered_json VarInfo::toJson() const {
-  nlohmann::ordered_json j;
+  // Room for its six keys up front: an ordered_json object is a vector, and
+  // growing it key by key reallocated three times per variable on every card.
+  nlohmann::ordered_json j = nlohmann::ordered_json::object();
+  j.get_ref<nlohmann::ordered_json::object_t&>().reserve(6);
   j["name"] = name;
   j["dtype"] = dtype;
   j["format"] = format;

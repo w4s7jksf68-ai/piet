@@ -10,6 +10,7 @@
 #include <numeric>
 
 #include "core/linalg.h"
+#include "estimators/logit.h"  // MlObjective / ml_newton_path: Stata's ml path
 
 namespace cecon {
 
@@ -985,6 +986,459 @@ WeibullResult weibull_fit(const double* X, int64_t n, int k, const double* t0, c
     r.se_inv_p = r.se_ln_p / r.p;      // delta method on exp(-ln p)
     r.ok = true;
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// streg: the parametric families on Stata's ml path (survival.h)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+double log1pexp(double z) { return z > 0 ? z + std::log1p(std::exp(-z)) : std::log1p(std::exp(z)); }
+double logistic_cdf(double z) {
+    if (z >= 0) return 1.0 / (1.0 + std::exp(-z));
+    const double e = std::exp(z);
+    return e / (1.0 + e);
+}
+
+// ln Phi(-z) and the inverse Mills ratio r(z) = phi(z) / Phi(-z).
+void normal_upper_tail(double z, double* lnS, double* r) {
+    constexpr double kLnSqrt2Pi = 0.91893853320467274178;
+    if (z < 30.0) {
+        const double P = 0.5 * std::erfc(z * 0.70710678118654752440);
+        *lnS = std::log(P);
+        *r = std::exp(-0.5 * z * z - kLnSqrt2Pi) / P;
+        return;
+    }
+    // Phi(-z) = phi(z)/z (1 - 1/z^2 + 3/z^4 - 15/z^6 + ...) far in the tail
+    const double z2 = z * z;
+    const double sr = 1.0 - 1.0 / z2 + 3.0 / (z2 * z2) - 15.0 / (z2 * z2 * z2);
+    *lnS = -0.5 * z2 - kLnSqrt2Pi - std::log(z) + std::log(sr);
+    *r = z / sr;
+}
+
+// Gompertz cumulative-hazard kernel G(g, t) = (exp(g t) - 1) / g and its first
+// two derivatives in g; the power series near g t = 0 (G(0, t) = t).
+void gompertz_kernel(double g, double t, double* G, double* G1, double* G2) {
+    const double x = g * t;
+    if (std::fabs(x) < 0.5) {
+        // G = t sum_{n>=1} x^(n-1)/n!, G1 = t^2 sum_{n>=2} (n-1) x^(n-2)/n!,
+        // G2 = t^3 sum_{n>=3} (n-1)(n-2) x^(n-3)/n!
+        double s0 = 0, s1 = 0, s2 = 0;
+        double fact = 1.0;  // n!
+        double pw[45];      // x^j
+        pw[0] = 1.0;
+        for (int j = 1; j < 45; ++j) pw[j] = pw[j - 1] * x;
+        for (int nn = 1; nn <= 42; ++nn) {
+            fact *= nn;
+            s0 += pw[nn - 1] / fact;
+            if (nn >= 2) s1 += (nn - 1) * pw[nn - 2] / fact;
+            if (nn >= 3) s2 += static_cast<double>(nn - 1) * (nn - 2) * pw[nn - 3] / fact;
+        }
+        *G = t * s0;
+        *G1 = t * t * s1;
+        *G2 = t * t * t * s2;
+        return;
+    }
+    const double e = std::exp(x), em1 = std::expm1(x);
+    *G = em1 / g;
+    *G1 = (x * e - em1) / (g * g);
+    *G2 = (x * x * e - 2.0 * x * e + 2.0 * em1) / (g * g * g);
+}
+
+struct StregObs {
+    double ll = 0, g1 = 0, g2 = 0, h11 = 0, h12 = 0, h22 = 0;
+};
+
+// One record's log likelihood and its derivatives in the two linear predictors.
+// `m` centres ln t (weibull only; 0 otherwise).
+StregObs streg_obs(StregDist dist, double e1, double e2, double t, double t0, double d, double m) {
+    StregObs o;
+    switch (dist) {
+        case StregDist::Exponential: {
+            const double e = std::exp(e1), dt = t - t0;
+            o.ll = d * (e1 + std::log(t)) - e * dt;
+            o.g1 = d - e * dt;
+            o.h11 = -e * dt;
+            break;
+        }
+        case StregDist::Weibull: {
+            const double p = std::exp(e2), e = std::exp(e1);
+            const double lt = std::log(t) - m, tp = std::exp(p * lt);
+            double lt0 = 0, t0p = 0;
+            if (t0 > 0) {
+                lt0 = std::log(t0) - m;
+                t0p = std::exp(p * lt0);
+            }
+            const double A = e * (tp - t0p), B = e * (tp * lt - t0p * lt0),
+                         C = e * (tp * lt * lt - t0p * lt0 * lt0);
+            o.ll = d * (e1 + e2 + p * lt) - A;
+            o.g1 = d - A;
+            o.g2 = d * (1.0 + p * lt) - p * B;
+            o.h11 = -A;
+            o.h12 = -p * B;
+            o.h22 = d * p * lt - p * B - p * p * C;
+            break;
+        }
+        case StregDist::Gompertz: {
+            const double e = std::exp(e1);
+            double G, G1, G2, H = 0, H1 = 0, H2 = 0;
+            gompertz_kernel(e2, t, &G, &G1, &G2);
+            if (t0 > 0) gompertz_kernel(e2, t0, &H, &H1, &H2);
+            o.ll = d * (e1 + e2 * t + std::log(t)) - e * (G - H);
+            o.g1 = d - e * (G - H);
+            o.g2 = d * t - e * (G1 - H1);
+            o.h11 = -e * (G - H);
+            o.h12 = -e * (G1 - H1);
+            o.h22 = -e * (G2 - H2);
+            break;
+        }
+        case StregDist::Loglogistic:
+        case StregDist::Lognormal: {
+            constexpr double kLnSqrt2Pi = 0.91893853320467274178;
+            const double q = std::exp(-e2);
+            const double z = (std::log(t) - e1) * q;
+            double F = 0, F1 = 0, F2 = 0, c = 0, c1 = 0, c2 = 0, z0 = 0;
+            if (dist == StregDist::Loglogistic) {
+                const double L = log1pexp(z), Lam = logistic_cdf(z);
+                F = d * z - (1.0 + d) * L;
+                F1 = d - (1.0 + d) * Lam;
+                F2 = -(1.0 + d) * Lam * (1.0 - Lam);
+                if (t0 > 0) {
+                    z0 = (std::log(t0) - e1) * q;
+                    const double L0 = log1pexp(z0), Lam0 = logistic_cdf(z0);
+                    c = L0;
+                    c1 = Lam0;
+                    c2 = Lam0 * (1.0 - Lam0);
+                }
+            } else {
+                double lnS, r;
+                normal_upper_tail(z, &lnS, &r);
+                F = d * (-0.5 * z * z - kLnSqrt2Pi) + (1.0 - d) * lnS;
+                F1 = -d * z - (1.0 - d) * r;
+                F2 = -d - (1.0 - d) * r * (r - z);
+                if (t0 > 0) {
+                    z0 = (std::log(t0) - e1) * q;
+                    double lnS0, r0;
+                    normal_upper_tail(z0, &lnS0, &r0);
+                    c = -lnS0;
+                    c1 = r0;
+                    c2 = r0 * (r0 - z0);
+                }
+            }
+            o.ll = F - d * e2 + c;
+            o.g1 = -q * (F1 + c1);
+            o.g2 = -z * F1 - z0 * c1 - d;
+            o.h11 = q * q * (F2 + c2);
+            o.h12 = q * (F1 + z * F2) + q * (c1 + z0 * c2);
+            o.h22 = z * F1 + z * z * F2 + z0 * c1 + z0 * z0 * c2;
+            break;
+        }
+    }
+    return o;
+}
+
+class StregObjective : public MlObjective {
+public:
+    StregObjective(StregDist dist, const double* X, int64_t n, int k, const double* Z, int kz,
+                   const double* t0, const double* t, const double* d, double m)
+        : dist_(dist), X_(X), n_(n), k_(k), Z_(Z), kz_(kz), t0_(t0), t_(t), d_(d), m_(m) {}
+
+    double loglik(const std::vector<double>& b) override { return run(b, nullptr, nullptr, nullptr); }
+    double evaluate(const std::vector<double>& b, std::vector<double>& g, std::vector<double>& A) override {
+        return run(b, &g, &A, nullptr);
+    }
+    // per-record scores (n*np col-major) at b
+    void scores(const std::vector<double>& b, std::vector<double>* S) { run(b, nullptr, nullptr, S); }
+
+private:
+    double run(const std::vector<double>& b, std::vector<double>* g, std::vector<double>* A,
+               std::vector<double>* S) {
+        const int np = k_ + kz_;
+        if (g) g->assign(static_cast<size_t>(np), 0.0);
+        if (A) A->assign(static_cast<size_t>(np) * static_cast<size_t>(np), 0.0);
+        if (S) S->assign(static_cast<size_t>(n_) * static_cast<size_t>(np), 0.0);
+        double ll = 0;
+        std::vector<double> row(static_cast<size_t>(np));
+        for (int64_t i = 0; i < n_; ++i) {
+            double e1 = 0, e2 = 0;
+            for (int c = 0; c < k_; ++c) e1 += X_[static_cast<int64_t>(c) * n_ + i] * b[static_cast<size_t>(c)];
+            for (int c = 0; c < kz_; ++c)
+                e2 += Z_[static_cast<int64_t>(c) * n_ + i] * b[static_cast<size_t>(k_ + c)];
+            const StregObs o = streg_obs(dist_, e1, e2, t_[i], t0_[i], d_[i], m_);
+            ll += o.ll;
+            if (!g && !A && !S) continue;
+            for (int c = 0; c < k_; ++c) row[static_cast<size_t>(c)] = X_[static_cast<int64_t>(c) * n_ + i];
+            for (int c = 0; c < kz_; ++c)
+                row[static_cast<size_t>(k_ + c)] = Z_[static_cast<int64_t>(c) * n_ + i];
+            for (int a = 0; a < np; ++a) {
+                const double ga = a < k_ ? o.g1 : o.g2;
+                if (g) (*g)[static_cast<size_t>(a)] += ga * row[static_cast<size_t>(a)];
+                if (S) (*S)[static_cast<int64_t>(a) * n_ + i] = ga * row[static_cast<size_t>(a)];
+                if (!A) continue;
+                for (int c = 0; c < np; ++c) {
+                    const double h = a < k_ ? (c < k_ ? o.h11 : o.h12) : (c < k_ ? o.h12 : o.h22);
+                    (*A)[static_cast<size_t>(a) * static_cast<size_t>(np) + static_cast<size_t>(c)] -=
+                        h * row[static_cast<size_t>(a)] * row[static_cast<size_t>(c)];
+                }
+            }
+        }
+        return ll;
+    }
+    StregDist dist_;
+    const double* X_;
+    int64_t n_;
+    int k_;
+    const double* Z_;
+    int kz_;
+    const double *t0_, *t_, *d_;
+    double m_;
+};
+
+// ml search's deterministic rescaling (ml_searc.ado Rescale, then RescEqs once
+// more if an equation rescaled), for the constant-only fits the ado starts with
+// `search(quietly)`: each equation here is one constant, the whole vector is
+// halved or doubled while that improves, then each equation alone. (`ml max`
+// runs search with repeat(0): no random draws.)
+void ml_search_rescale(StregObjective& obj, std::vector<double>& b) {
+    auto ll = [&obj](const std::vector<double>& v) {
+        const double f = obj.loglik(v);
+        return std::isfinite(f) ? f : -HUGE_VAL;
+    };
+    double f = ll(b);
+    {  // Rescale (more than one equation)
+        std::vector<double> b0 = b;
+        double f0 = f;
+        std::vector<double> c = b;
+        for (auto& v : c) v *= 0.5;
+        double fc = ll(c);
+        if (fc > f0) {
+            while (fc > f0) {
+                b0 = c;
+                f0 = fc;
+                for (auto& v : c) v *= 0.5;
+                fc = ll(c);
+            }
+        } else {
+            c = b0;
+            for (auto& v : c) v *= 2.0;
+            fc = ll(c);
+            while (fc > f0) {
+                b0 = c;
+                f0 = fc;
+                for (auto& v : c) v *= 2.0;
+                fc = ll(c);
+            }
+        }
+        b = b0;
+        f = f0;
+    }
+    auto resc_eq = [&](size_t i) {
+        bool rescaled = false;
+        std::vector<double> b0 = b;
+        double f0 = f;
+        double sb = 0.5 * b[i];
+        std::vector<double> c = b;
+        c[i] = sb;
+        double fc = ll(c);
+        const auto rel = [](double x, double y) { return std::fabs(x - y) / (std::fabs(y) + 1.0); };
+        if (fc > f0 && rel(fc, f0) > 1e-12) {
+            rescaled = true;
+            while (fc > f0 && rel(fc, f0) > 1e-12) {
+                b0 = c;
+                f0 = fc;
+                sb *= 0.5;
+                c[i] = sb;
+                fc = ll(c);
+            }
+            // (a near-zero constant's sign reversal is not reached by these designs)
+        } else {
+            sb *= 4.0;
+            c[i] = sb;
+            fc = ll(c);
+            while (fc > f0) {
+                rescaled = true;
+                b0 = c;
+                f0 = fc;
+                sb *= 2.0;
+                c[i] = sb;
+                fc = ll(c);
+            }
+        }
+        b = b0;
+        f = f0;
+        return rescaled;
+    };
+    bool r = false;
+    for (size_t i = 0; i < b.size(); ++i) r = resc_eq(i) || r;
+    if (r)
+        for (size_t i = 0; i < b.size(); ++i) resc_eq(i);
+}
+
+}  // namespace
+
+StregFit streg_fit(StregDist dist, bool time_metric, const double* X, int64_t n, int k, int cons_col,
+                   const double* Z, int kz, const double* t0, const double* t, const double* d) {
+    StregFit r;
+    if (n <= 0 || k <= 0 || cons_col < 0 || cons_col >= k) {
+        r.err = "streg: empty sample or no constant";
+        return r;
+    }
+    double D = 0, T = 0, sumlnt = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (!(t[i] > 0.0) || !(t0[i] >= 0.0) || !(t[i] > t0[i])) {
+            r.err = "streg: every analysis record must satisfy 0 <= _t0 < _t";
+            return r;
+        }
+        D += d[i];
+        T += t[i] - t0[i];
+        sumlnt += std::log(t[i]);
+    }
+    if (D <= 0) {
+        r.err = "streg: no failures in the estimation sample";
+        return r;
+    }
+    const bool anc = dist != StregDist::Exponential;
+    if (!anc) kz = 0;
+    if (anc && (kz < 1 || Z == nullptr)) {
+        r.err = "streg: the ancillary equation has no design";
+        return r;
+    }
+    // weibull without ancillary() is fitted with ln t centred on its mean.
+    const bool center = dist == StregDist::Weibull && kz == 1;
+    const double m = center ? sumlnt / static_cast<double>(n) : 0.0;
+    if (time_metric && !center) {
+        r.err = "streg: the time metric is implemented for weibull without ancillary()";
+        return r;
+    }
+    const int np = k + kz;
+    MlMaxOptions opt;
+    // ml's curvature test: invsym, then the concavity check -- a non-concave point
+    // (loglogistic's and lognormal's full model at iteration 0) takes the
+    // m-marquardt step instead of ending the fit.
+    opt.stata_invsym = true;
+    std::vector<double> ones(static_cast<size_t>(n), 1.0);
+
+    // ---- constant-only model(s) ----
+    double cons0 = 0, anc0 = 0;
+    std::vector<double> ancStart;  // the ancillary equation's start (kz)
+    if (dist == StregDist::Exponential) {
+        cons0 = std::log(D / T);
+        r.ll_0 = D * cons0 - D;
+        for (int64_t i = 0; i < n; ++i) r.ll_0 += d[i] * std::log(t[i]);
+        r.converged_cons = true;
+    } else {
+        std::vector<double> b0(2, 0.0);
+        if (dist == StregDist::Weibull) {
+            double Tc = 0;
+            for (int64_t i = 0; i < n; ++i)
+                Tc += std::exp(std::log(t[i]) - m) - (t0[i] > 0 ? std::exp(std::log(t0[i]) - m) : 0.0);
+            b0 = {std::log(D / Tc), 0.0};
+        } else if (dist == StregDist::Gompertz) {
+            b0 = {std::log(D / T), 0.0};
+        } else {
+            b0 = {1.0, 0.0};  // init(_cons=1), then ml search
+        }
+        StregObjective o0(dist, ones.data(), n, 1, ones.data(), 1, t0, t, d, m);
+        if (dist == StregDist::Loglogistic || dist == StregDist::Lognormal) ml_search_rescale(o0, b0);
+        MlPath p0 = ml_newton_path(o0, b0, opt);
+        if (p0.failed || p0.b.size() != 2) {
+            r.err = "streg: constant-only model failed";
+            return r;
+        }
+        cons0 = p0.b[0];
+        anc0 = p0.b[1];
+        r.ll_0 = p0.ll;
+        r.converged_cons = p0.converged;
+        ancStart.assign(static_cast<size_t>(kz), 0.0);
+        ancStart.back() = anc0;
+        if (kz > 1) {
+            // ancillary(): the constant-only model carries the ancillary equation
+            // whole, from the plain constant-only estimates (its ll is e(ll_0)).
+            std::vector<double> b1(static_cast<size_t>(1 + kz), 0.0);
+            b1[0] = cons0;
+            b1.back() = anc0;
+            StregObjective o1(dist, ones.data(), n, 1, Z, kz, t0, t, d, m);
+            MlPath p1 = ml_newton_path(o1, b1, opt);
+            if (p1.failed) {
+                r.err = "streg: constant-only model failed";
+                return r;
+            }
+            cons0 = p1.b[0];
+            for (int c = 0; c < kz; ++c) ancStart[static_cast<size_t>(c)] = p1.b[static_cast<size_t>(1 + c)];
+            r.ll_0 = p1.ll;
+            r.converged_cons = p1.converged;
+        }
+    }
+
+    // ---- the full model, from the constant-only estimates with the slopes at 0 ----
+    std::vector<double> start(static_cast<size_t>(np), 0.0);
+    start[static_cast<size_t>(cons_col)] = cons0;
+    for (int c = 0; c < kz; ++c) start[static_cast<size_t>(k + c)] = ancStart[static_cast<size_t>(c)];
+    StregObjective obj(dist, X, n, k, kz > 0 ? Z : ones.data(), kz, t0, t, d, m);
+    MlPath path = ml_newton_path(obj, start, opt);
+    if (path.failed || path.b.size() != static_cast<size_t>(np)) {
+        r.err = "streg: MLE failed";
+        return r;
+    }
+    r.ll = path.ll;
+    r.ic = path.ic;
+    r.converged = path.converged;
+    r.ilog = path.ilog;
+    r.gradient = path.gradient;
+    obj.scores(path.b, &r.scores);
+    std::vector<double> Vf(static_cast<size_t>(np) * static_cast<size_t>(np));
+    for (int a = 0; a < np; ++a)
+        for (int c = 0; c < np; ++c)
+            Vf[static_cast<size_t>(a) * np + c] =
+                0.5 * (path.inv_curvature[static_cast<size_t>(a) * np + c] +
+                       path.inv_curvature[static_cast<size_t>(c) * np + a]);
+    r.V_fit = Vf;
+    // ---- the reported metric: J maps the fitted parameters' covariance ----
+    r.J.assign(static_cast<size_t>(np) * static_cast<size_t>(np), 0.0);
+    for (int a = 0; a < np; ++a) r.J[static_cast<size_t>(a) * np + a] = 1.0;
+    r.theta = path.b;
+    if (center) {
+        const int ilnp = k;
+        const double p = std::exp(path.b[static_cast<size_t>(ilnp)]);
+        if (!time_metric) {
+            // AdjCons: _cons - p * mean(ln t)
+            r.theta[static_cast<size_t>(cons_col)] -= p * m;
+            r.J[static_cast<size_t>(cons_col) * np + ilnp] = -p * m;
+        } else {
+            // Remetric: the AFT coefficients -b/p, _cons + mean(ln t)
+            const double sc = -1.0 / p;
+            for (int a = 0; a < k; ++a) {
+                r.theta[static_cast<size_t>(a)] = sc * path.b[static_cast<size_t>(a)];
+                r.J[static_cast<size_t>(a) * np + a] = sc;
+                r.J[static_cast<size_t>(a) * np + ilnp] = -r.theta[static_cast<size_t>(a)];
+            }
+            r.theta[static_cast<size_t>(cons_col)] += m;
+        }
+    }
+    r.V = streg_remetric(r.J, Vf, np);
+    r.ok = true;
+    return r;
+}
+
+std::vector<double> streg_remetric(const std::vector<double>& J, const std::vector<double>& Vf, int np) {
+    const size_t P = static_cast<size_t>(np);
+    std::vector<double> tmp(P * P, 0.0), out(P * P, 0.0);
+    for (size_t a = 0; a < P; ++a)
+        for (size_t c = 0; c < P; ++c) {
+            double s = 0;
+            for (size_t q = 0; q < P; ++q) s += J[a * P + q] * Vf[q * P + c];
+            tmp[a * P + c] = s;
+        }
+    for (size_t a = 0; a < P; ++a)
+        for (size_t c = 0; c < P; ++c) {
+            double s = 0;
+            for (size_t q = 0; q < P; ++q) s += tmp[a * P + q] * J[c * P + q];
+            out[a * P + c] = s;
+        }
+    for (size_t a = 0; a < P; ++a)
+        for (size_t c = a + 1; c < P; ++c) out[a * P + c] = out[c * P + a] = 0.5 * (out[a * P + c] + out[c * P + a]);
+    return out;
 }
 
 // ---------------------------------------------------------------------------

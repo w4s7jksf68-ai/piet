@@ -572,4 +572,1115 @@ ojson runCentile(const eval::ParsedCommand& parsed, SessionState& session) {
   return displayBlock(out.str());
 }
 
+
+// ---------------------------------------------------------------------------
+// ci means | proportions | variances ([R] ci). Methods and formulas of [R] ci:
+//   means:       mean +- invttail(N-1, alpha/2) * sqrt(Var/N) (aw/fw as summarize
+//                weights them); with poisson (or exposure()) the exact Poisson
+//                interval for the count k = sum(x) over the exposure n:
+//                lb = invpoisson(k-1, 1-alpha/2)/n (0 when k = 0),
+//                ub = invpoisson(k, alpha/2)/n, se = sqrt(k)/n.
+//   proportions: k successes of n (0/1 variables only): exact (Clopper-Pearson,
+//                the default), wald, wilson, agresti (Agresti-Coull), jeffreys.
+//   variances:   (N-1)Var/invchi2tail(N-1, alpha/2) .. (N-1)Var/invchi2(N-1,
+//                alpha/2); bonett: Bonett (2006) with the trimmed-mean kurtosis;
+//                sd reports the square roots.
+// The inverse distribution functions are solved here by bracketing and
+// bisection on the regularized incomplete gamma and beta functions.
+namespace {
+
+// Regularized incomplete gamma: series for x < a+1, Lentz continued fraction
+// otherwise (each returns the half it converges for; the other is 1 - it).
+double ciGammaSeriesP(double a, double x) {
+  double ap = a, sum = 1.0 / a, del = sum;
+  for (int n = 0; n < 100000; ++n) {
+    ap += 1.0;
+    del *= x / ap;
+    sum += del;
+    if (std::fabs(del) < std::fabs(sum) * 1e-17) break;
+  }
+  return sum * std::exp(-x + a * std::log(x) - std::lgamma(a));
+}
+double ciGammaCfQ(double a, double x) {
+  const double tiny = 1e-300;
+  double b = x + 1.0 - a, c = 1.0 / tiny, d = 1.0 / b, h = d;
+  for (int i = 1; i < 100000; ++i) {
+    const double an = -static_cast<double>(i) * (static_cast<double>(i) - a);
+    b += 2.0;
+    d = an * d + b;
+    if (std::fabs(d) < tiny) d = tiny;
+    c = b + an / c;
+    if (std::fabs(c) < tiny) c = tiny;
+    d = 1.0 / d;
+    const double del = d * c;
+    h *= del;
+    if (std::fabs(del - 1.0) < 1e-17) break;
+  }
+  return std::exp(-x + a * std::log(x) - std::lgamma(a)) * h;
+}
+double ciGammaP(double a, double x) {
+  if (x <= 0) return 0.0;
+  return x < a + 1.0 ? ciGammaSeriesP(a, x) : 1.0 - ciGammaCfQ(a, x);
+}
+double ciGammaQ(double a, double x) {
+  if (x <= 0) return 1.0;
+  return x < a + 1.0 ? 1.0 - ciGammaSeriesP(a, x) : ciGammaCfQ(a, x);
+}
+
+// Solve f(x) = target for a monotone f on (lo, hi): increasing when `up`.
+template <class F>
+double ciSolve(F f, double target, bool up, double lo, double hi, bool geometric) {
+  for (int it = 0; it < 400; ++it) {
+    const double mid = geometric ? std::sqrt(lo * hi) : lo + (hi - lo) / 2;
+    if (!(mid > lo && mid < hi)) break;
+    const double v = f(mid);
+    if ((v < target) == up) lo = mid;
+    else hi = mid;
+    if (geometric && hi / lo - 1.0 < 1e-3) geometric = false;
+  }
+  return lo + (hi - lo) / 2;
+}
+// x with P(a, x) = p (lower) or Q(a, x) = p (upper).
+double ciInvGamma(double a, double p, bool upper) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  if (!(a > 0) || !(p > 0 && p < 1)) return nan;
+  double hi = std::max(1.0, a);
+  while ((upper ? ciGammaQ(a, hi) > p : ciGammaP(a, hi) < p) && hi < 1e300) hi *= 2;
+  if (upper) return ciSolve([&](double x) { return ciGammaQ(a, x); }, p, false, 1e-300, hi, true);
+  return ciSolve([&](double x) { return ciGammaP(a, x); }, p, true, 1e-300, hi, true);
+}
+// x with I_x(a, b) = p.
+double ciInvIbeta(double a, double b, double p) {
+  if (!(p > 0 && p < 1)) return std::numeric_limits<double>::quiet_NaN();
+  if (p <= 0.5)
+    return ciSolve([&](double x) { return cecon::betai(a, b, x); }, p, true, 0.0, 1.0, false);
+  return ciSolve([&](double x) { return cecon::betaitail(a, b, x); }, 1.0 - p, false, 0.0, 1.0,
+                 false);
+}
+
+// Stata's display of a number in format `fmt`, missing as `.` right-aligned.
+std::string ciFmt(double v, const std::string& fmt) {
+  if (std::isnan(v)) {
+    const size_t w = static_cast<size_t>(std::atoi(fmt.c_str() + 1));
+    return std::string(w > 1 ? w - 1 : 0, ' ') + ".";
+  }
+  std::string t = eval::applyStataFmt(v, fmt);
+  const bool left = fmt.size() > 1 && fmt[1] == '-';
+  const size_t w = static_cast<size_t>(std::atoi(fmt.c_str() + (left ? 2 : 1)));
+  if (t.size() < w) t = left ? t + std::string(w - t.size(), ' ') : std::string(w - t.size(), ' ') + t;
+  return t;
+}
+void ciCol(std::string* line, size_t col) {  // _col(col): pad to 1-based column
+  if (line->size() < col - 1) line->append(col - 1 - line->size(), ' ');
+}
+std::string ciOutFmt(const std::string& fmt) {
+  if (fmt.size() >= 2 && fmt.back() == 'f') return "%9." + fmt.substr(fmt.size() - 2);
+  if (fmt.size() >= 3 && fmt.compare(fmt.size() - 2, 2, "fc") == 0)
+    return "%9." + fmt.substr(fmt.size() - 3);
+  return "%9.0g";
+}
+
+}  // namespace
+
+ojson runCi(const eval::ParsedCommand& parsed, SessionState& session) {
+  auto syn = [](const std::string& m, int rc = 198) {
+    return ojson(eval::errorBlock("syntax_error", m, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(rc) + ")"));
+  };
+  std::vector<std::string> words = parsed.varlist;
+  const std::string param = words.empty() ? std::string() : strutil::lower(words.front());
+  auto isParam = [&](const char* full, size_t minLen) {
+    const std::string f(full);
+    return param.size() <= f.size() && param == f.substr(0, std::max(minLen, param.size()));
+  };
+  std::string kind;
+  if (!param.empty() && isParam("variances", 3)) kind = "variances";
+  else if (!param.empty() && isParam("proportions", 4)) kind = "proportions";
+  else if (!param.empty() && isParam("means", 4)) kind = "means";
+  if (kind.empty()) {
+    if (param.empty()) return syn("you must specify one of means, proportions, or variances");
+    return syn("you must specify one of means, proportions, or variances following ci");
+  }
+  words.erase(words.begin());
+  if (!words.empty()) {
+    char* end = nullptr;
+    std::strtod(words.front().c_str(), &end);
+    if (end != nullptr && *end == '\0' && !words.front().empty())
+      return syn("number found where a variable expected; perhaps you meant to use cii");
+  }
+  // Options.
+  static const std::unordered_set<std::string> kMeans = {"level", "poisson", "exposure",
+                                                         "separator", "normal", "total"};
+  static const std::unordered_set<std::string> kProps = {
+      "level", "exact", "wald", "wilson", "agresti", "jeffreys", "separator", "total",
+      "poisson", "exposure", "binomial", "by"};
+  static const std::unordered_set<std::string> kVars = {"level", "sd", "bonett", "separator",
+                                                        "normal", "total"};
+  const auto& known = kind == "means" ? kMeans : kind == "proportions" ? kProps : kVars;
+  if (auto e = eval::rejectUnknownOptions(parsed.opts, known, {})) return ojson(*e);
+  double level = session.level;
+  int separator = 5;
+  bool poisson = false, normalOpt = false, sdOpt = false, bonett = false, total = false;
+  std::string exposure, ptype;
+  for (const auto& [k, v] : parsed.opts) {
+    const std::string val = v.isBool ? std::string() : strutil::trim(v.strValue);
+    if (k == "level") {
+      double lv = std::numeric_limits<double>::quiet_NaN();
+      size_t pos = 0;
+      try {
+        lv = std::stod(val, &pos);
+      } catch (...) {
+        pos = 0;
+      }
+      if (val.empty() || pos != val.size()) return syn("option level() incorrectly specified");
+      if (!(lv >= 10.0 && lv <= 99.99))
+        return syn("level() must be between 10 and 99.99 inclusive");
+      if (std::fabs(lv * 100.0 - std::round(lv * 100.0)) > 1e-8)
+        return syn("level() can have at most two digits after the decimal point");
+      level = lv;
+    } else if (k == "separator") {
+      char* end = nullptr;
+      const long s = std::strtol(val.c_str(), &end, 10);
+      if (val.empty() || end == nullptr || *end != '\0') return syn("option separator() incorrectly specified");
+      if (s < 0) return syn("option separator() must be >= 0");
+      separator = static_cast<int>(s);
+    } else if (k == "poisson") {
+      poisson = true;
+    } else if (k == "normal") {
+      normalOpt = true;
+    } else if (k == "exposure") {
+      exposure = val;
+    } else if (k == "sd") {
+      sdOpt = true;
+    } else if (k == "bonett") {
+      bonett = true;
+    } else if (k == "total") {
+      total = true;
+    } else if (k == "exact" || k == "wald" || k == "wilson" || k == "agresti" || k == "jeffreys") {
+      if (!ptype.empty() && ptype != k)
+        return syn("only one of " + ptype + " or " + k + " is allowed");
+      ptype = k;
+    } else if (kind == "proportions" && (k == "poisson" || k == "binomial" || k == "exposure")) {
+      return syn("option " + k + " is not allowed with ci proportions");
+    } else if (k == "by") {
+      return syn("option by() is not allowed");
+    }
+  }
+  if (kind == "proportions") {
+    for (const auto& [k, v] : parsed.opts) {
+      (void)v;
+      if (k == "poisson" || k == "binomial" || k == "exposure")
+        return syn("option " + k + (k == "exposure" ? "()" : "") +
+                   " is not allowed with ci proportions");
+    }
+  }
+  if (total) return syn("option total may only be specified with prefix by");
+  if (kind == "means" && poisson && normalOpt) return syn("only one of normal or poisson is allowed");
+  if (kind == "variances" && bonett && normalOpt) return syn("only one of normal or bonett is allowed");
+  if (!exposure.empty()) poisson = true;
+  if (ptype.empty()) ptype = "exact";
+  // Weights: means aw/fw, proportions and variances fw.
+  std::string wvar;
+  bool fweight = false;
+  if (parsed.weightVar.has_value() && !parsed.weightVar->empty() && parsed.weightType.has_value()) {
+    const std::string t = strutil::lower(*parsed.weightType);
+    if (t == "fw" || t == "fweight") fweight = true;
+    else if (!((t == "aw" || t == "aweight") && kind == "means"))
+      return syn("weights not allowed", 101);
+    wvar = *parsed.weightVar;
+    if (!fweight && poisson) return syn("aweights not allowed", 101);
+  }
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
+  std::vector<std::string> vars;
+  {
+    std::string spec;
+    for (const auto& v : words) spec += (spec.empty() ? "" : " ") + v;
+    if (spec.empty()) {
+      for (const auto& nm : session.datastore()->names()) vars.push_back(nm);
+    } else {
+      loops::VarlistExpandResult ex = loops::expandVarlist(spec, session);
+      if (ex.isError) return ex.error;
+      vars = ex.tokens;
+      if (auto err = loops::checkKnownVarlist(vars, session)) return *err;
+    }
+  }
+  std::vector<std::string> cols = vars;
+  if (!wvar.empty()) cols.push_back(wvar);
+  if (!exposure.empty()) cols.push_back(exposure);
+  ColumnScope scope(session, parsed, cols, "ci");
+  if (scope.failed()) return scope.error();
+  Datastore& ds = *scope.get();
+  const size_t nrow = static_cast<size_t>(ds.nRows());
+  // The touse sample: rows with a usable weight and exposure (not the variables).
+  std::vector<double> w(nrow, 1.0), ex;
+  std::vector<char> use(nrow, 1);
+  std::string err;
+  if (!wvar.empty()) {
+    if (!numericColumn(ds, wvar, &w, &err)) return aerError("ci: " + err);
+    for (size_t i = 0; i < nrow; ++i) {
+      if (std::isnan(w[i])) continue;
+      if (w[i] < 0) return syn("negative weights encountered", 402);
+      if (fweight && w[i] != std::floor(w[i]))
+        return syn("may not use noninteger frequency weights", 401);
+    }
+    for (size_t i = 0; i < nrow; ++i)
+      if (std::isnan(w[i]) || w[i] == 0) use[i] = 0;
+  }
+  if (!exposure.empty()) {
+    if (!numericColumn(ds, exposure, &ex, &err)) return aerError("ci: " + err);
+    for (size_t i = 0; i < nrow; ++i)
+      if (std::isnan(ex[i])) use[i] = 0;
+    for (size_t i = 0; i < nrow; ++i)
+      if (use[i] && !(ex[i] > 0)) return syn("variable " + exposure + " <= 0", 402);
+  }
+  std::map<std::string, std::string> fmts;
+  for (const auto& [n, f] : session.displayFormatMap(ds.formatCard(vars))) fmts[n] = f;
+
+  struct Res {
+    double N = 0, mean = 0, se = 0, lb = 0, ub = 0, var = 0, sd = 0, kurt = 0, varSe = 0;
+    std::string mark;
+  };
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double alphHalf = (100.0 - level) / 200.0;
+  std::ostringstream out;
+  std::string levelStr;
+  {
+    levelStr = eval::applyStataFmt(level, "%9.0g");
+    levelStr = strutil::trim(levelStr);
+  }
+  const std::string spaces = levelStr.size() == 2 ? "   " : levelStr.size() == 4 ? " " : "";
+  std::string warnl, warnh;
+  int marked = 0;
+  std::vector<std::string> rows;
+  bool any = false;
+  Res last;
+  bool haveLast = false;
+
+  if (kind == "proportions") {
+    // Variables with at most two levels, all of them 0/1 (ci proportions).
+    std::vector<std::string> bin;
+    size_t no01 = 0;
+    for (const auto& v : vars) {
+      if (ds.dtype(v) == "factor") continue;
+      std::vector<double> x;
+      if (!numericColumn(ds, v, &x, &err)) return aerError("ci: " + err);
+      std::set<double> lv;
+      bool ok01 = true;
+      for (size_t i = 0; i < nrow; ++i) {
+        if (std::isnan(x[i])) continue;
+        lv.insert(x[i]);
+        if (x[i] != 0 && x[i] != 1) ok01 = false;
+      }
+      if (lv.size() > 2) continue;
+      bin.push_back(v);
+      if (!ok01) ++no01;
+    }
+    if (bin.empty() || no01 == bin.size()) {
+      eval::replaceRClass(session.eval);
+      return displayBlock("no binary (0/1) variables found; nothing to compute");
+    }
+  }
+
+  out << "\n";
+  if (kind == "variances") {
+    if (bonett) out << std::string(46, ' ') << "       Bonett       \n";
+    std::string h = "    Variable |";
+    ciCol(&h, 23);
+    h += "Obs";
+    ciCol(&h, 32);
+    h += sdOpt ? "Std. dev." : "Variance";
+    ciCol(&h, 44);
+    h += spaces + "[" + levelStr + "% conf. interval]";
+    out << h << "\n" << std::string(13, '-') << "+" << std::string(52, '-') << "\n";
+  } else {
+    if (kind == "proportions") {
+      static const std::map<std::string, std::string> kTitle = {
+          {"exact", "   Binomial exact   "}, {"wald", "   Binomial Wald    "},
+          {"wilson", "       Wilson       "}, {"agresti", "   Agresti\xe2\x80\x93" "Coull    "},
+          {"jeffreys", "      Jeffreys      "}};
+      out << std::string(57, ' ') << kTitle.at(ptype) << "\n";
+    } else if (poisson) {
+      out << std::string(57, ' ') << "   Poisson exact    \n";
+    }
+    const std::string tl1 = (kind == "means" && poisson) ? "Exposure" : "     Obs";
+    const std::string spc = kind == "proportions" ? "  " : "    ";
+    const std::string ttl = kind == "proportions" ? "Proportion" : "    Mean";
+    out << "    Variable |   " << tl1 << spc << ttl << "    Std. err.    " << spaces << "["
+        << levelStr << "% conf. interval]\n"
+        << std::string(13, '-') << "+" << std::string(63, '-') << "\n";
+  }
+  size_t nlines = 0;
+  const double kap = cecon::stata_invnormal(1.0 - alphHalf);
+  for (const auto& v : vars) {
+    if (ds.dtype(v) == "factor") continue;
+    std::vector<double> x;
+    if (!numericColumn(ds, v, &x, &err)) return aerError("ci: " + err);
+    // The rows of this variable: touse and nonmissing.
+    double sw = 0, swx = 0;
+    size_t nobs = 0;
+    bool ok = true;
+    for (size_t i = 0; i < nrow; ++i) {
+      if (!use[i] || std::isnan(x[i])) continue;
+      if (kind == "proportions" && x[i] != 0 && x[i] != 1) ok = false;
+      if (kind == "means" && poisson && x[i] < 0) ok = false;
+      ++nobs;
+      sw += w[i];
+      swx += w[i] * x[i];
+    }
+    if (!ok) continue;
+    Res r;
+    const double meanW = nobs ? swx / sw : nan;
+    // summarize's N: the sum of the frequency weights, else the row count. The
+    // variance exists once N > 1, so one row of fweight 5 has Var 0 (summarize
+    // mpg in 1 [fw=w], w = 5: r(N) 5, r(Var) 0) and ci's se, lb and ub follow.
+    const double Nsum = fweight ? sw : static_cast<double>(nobs);
+    double varW = nan;
+    if (Nsum > 1) {
+      double ss = 0;
+      for (size_t i = 0; i < nrow; ++i)
+        if (use[i] && !std::isnan(x[i])) ss += w[i] * (x[i] - meanW) * (x[i] - meanW);
+      // fw: divide by sum(w)-1; aw: weights normalised to the row count.
+      varW = fweight ? ss / (sw - 1) : ss * static_cast<double>(nobs) / sw /
+                                           (static_cast<double>(nobs) - 1);
+    }
+    if (kind == "means" && !poisson) {
+      r.N = Nsum;
+      r.mean = meanW;
+      r.se = std::sqrt(varW / Nsum);
+      const double t = Nsum > 1 ? cecon::stata_invttail(Nsum - 1, alphHalf) : nan;
+      r.lb = r.mean - t * r.se;
+      r.ub = r.mean + t * r.se;
+      if (nobs == 0) r.mean = r.se = r.lb = r.ub = nan;
+    } else if (kind == "means") {
+      const double n0 = Nsum;
+      const double k = std::floor(meanW * n0 + 0.5);
+      double n = n0;
+      if (!exposure.empty()) {
+        double se = 0;
+        for (size_t i = 0; i < nrow; ++i)
+          if (use[i] && !std::isnan(x[i])) se += w[i] * ex[i];
+        n = se;
+      }
+      if (nobs == 0) {
+        r.N = 0;
+        r.mean = r.se = r.lb = r.ub = nan;
+      } else {
+        r.lb = k == 0 ? 0.0 : ciInvGamma(k, 1.0 - alphHalf, true) / n;
+        r.ub = ciInvGamma(k + 1, alphHalf, true) / n;
+        r.N = n;
+        r.mean = k / n;
+        r.se = std::sqrt(k) / n;
+        if (k == 0) {
+          r.mark = "*";
+          marked = 1;
+        }
+      }
+    } else if (kind == "proportions") {
+      const double n = Nsum;
+      const double k = std::floor(meanW * n + 0.5);
+      r.N = n;
+      r.mean = k / n;
+      r.se = std::sqrt(r.mean * (1 - r.mean) / n);
+      if (ptype == "exact") {
+        r.lb = k == 0 ? 0.0 : ciInvIbeta(k, n - k + 1, alphHalf);
+        r.ub = k == n ? 1.0 : ciInvIbeta(k + 1, n - k, 1.0 - alphHalf);
+        if (k == 0 || k == n) {
+          r.mark = "*";
+          marked = 1;
+        }
+      } else {
+        auto clip = [&](const std::string& name) {
+          if (r.lb <= 0 && ptype != "jeffreys") {
+            r.lb = 0;
+            warnl = "(*) The " + name + " interval was clipped at the lower endpoint";
+            r.mark = "*";
+            marked = 2;
+          }
+          if (r.ub >= 1 && !std::isnan(r.ub) && ptype != "jeffreys") {
+            r.ub = 1;
+            warnh = "(**) The " + name + " interval was clipped at the upper endpoint";
+            r.mark = r.mark.empty() ? "**" : "* **";
+            marked = 2;
+          }
+        };
+        if (ptype == "wald") {
+          r.lb = std::max(0.0, r.mean - kap * r.se);
+          r.ub = std::min(1.0, r.mean + kap * r.se);
+          if (r.lb == 0) {
+            warnl = "(*) The Wald interval was clipped at the lower endpoint";
+            r.mark = "*";
+            marked = 2;
+          }
+          if (r.ub == 1) {
+            warnh = "(**) The Wald interval was clipped at the upper endpoint";
+            r.mark = r.mark.empty() ? "**" : "* **";
+            marked = 2;
+          }
+        } else if (ptype == "wilson") {
+          const double c = (k + kap * kap / 2) / (n + kap * kap);
+          const double h = (kap * std::sqrt(n) / (n + kap * kap)) *
+                           std::sqrt(r.mean * (1 - r.mean) + kap * kap / (4 * n));
+          r.lb = c - h;
+          r.ub = c + h;
+          if (r.lb < 0) {
+            r.lb = 0;
+            warnl = "(*) The Wilson interval was clipped at the lower endpoint";
+            r.mark = "*";
+            marked = 2;
+          }
+          if (r.ub > 1) {
+            r.ub = 1;
+            warnh = "(**) The Wilson interval was clipped at the upper endpoint";
+            r.mark = r.mark.empty() ? "**" : "* **";
+            marked = 2;
+          }
+        } else if (ptype == "agresti") {
+          const double xt = k + kap * kap / 2, nt = n + kap * kap, pt = xt / nt, qt = 1 - pt;
+          r.lb = pt - kap * std::sqrt(pt * qt) / std::sqrt(nt);
+          r.ub = pt + kap * std::sqrt(pt * qt) / std::sqrt(nt);
+          if (r.lb < 0) {
+            r.lb = 0;
+            warnl = "(*) The Agresti\xe2\x80\x93" "Coull interval was clipped at the lower endpoint";
+            r.mark = "*";
+            marked = 2;
+          }
+          if (r.ub > 1) {
+            r.ub = 1;
+            warnh = "(**) The Agresti\xe2\x80\x93" "Coull interval was clipped at the upper endpoint";
+            r.mark = r.mark.empty() ? "**" : "* **";
+            marked = 2;
+          }
+        } else {  // jeffreys
+          r.lb = k > 0 ? ciInvIbeta(k + 0.5, n - k + 0.5, alphHalf) : 0.0;
+          r.ub = k < n ? ciInvIbeta(k + 0.5, n - k + 0.5, 1.0 - alphHalf) : 1.0;
+        }
+        (void)clip;
+      }
+    } else {  // variances
+      const double N = Nsum;
+      r.N = N;
+      r.var = varW;
+      r.varSe = nan;
+      const double alpha = (100.0 - level) / 100.0;
+      if (bonett) {
+        // Bonett (2006): the kurtosis about the trimmed mean (trim 1/(2 sqrt(n-4))
+        // from each end), fw expanded to one row per unit.
+        std::vector<double> xs;
+        for (size_t i = 0; i < nrow; ++i)
+          if (use[i] && !std::isnan(x[i]))
+            for (double c = 0; c < (fweight ? w[i] : 1.0); c += 1.0) xs.push_back(x[i]);
+        const double n = static_cast<double>(xs.size());
+        // The trim 1/(2 sqrt(n-4)) is missing for n <= 4, and so is the range
+        // lo..hi of the trimmed mean's subscript: Stata's kurtosis step stops
+        // there with Mata's 3301 "subscript invalid".
+        if (!(n > 4))
+          return ojson(eval::errorBlock("engine_error", "kurt():  3301  subscript invalid",
+                                        std::nullopt, std::nullopt, std::nullopt, "r(3301)"));
+        double xbar = 0;
+        for (double d : xs) xbar += d;
+        xbar /= n;
+        const double trim = 1.0 / (2.0 * std::sqrt(n - 4));
+        const size_t lo = static_cast<size_t>(std::floor(n * trim)) + 1;
+        const size_t hi = static_cast<size_t>(n) + 1 - lo;
+        std::sort(xs.begin(), xs.end());
+        double m = 0;
+        for (size_t i = lo; i <= hi; ++i) m += xs[i - 1];
+        m /= static_cast<double>(hi - lo + 1);
+        double num = 0, den = 0;
+        for (double d : xs) {
+          num += std::pow(d - m, 4);
+          den += (d - xbar) * (d - xbar);
+        }
+        const double g4 = n * num / (den * den);
+        const double z = cecon::stata_invnormal(1 - alpha / 2);
+        const double c = n / (n - z);
+        const double se = c * std::sqrt((g4 - (n - 3) / n) / (n - 1));
+        r.N = n;
+        r.lb = std::exp(std::log(c * varW) - z * se);
+        r.ub = std::exp(std::log(c * varW) + z * se);
+        r.kurt = g4;
+        r.varSe = se;
+      } else {
+        r.lb = (N - 1) * varW / (2 * ciInvGamma((N - 1) / 2, alpha / 2, true));
+        r.ub = (N - 1) * varW / (2 * ciInvGamma((N - 1) / 2, alpha / 2, false));
+      }
+      if (sdOpt) {
+        r.sd = std::sqrt(varW);
+        r.lb = std::sqrt(r.lb);
+        r.ub = std::sqrt(r.ub);
+      }
+    }
+    // The row.
+    if (separator > 0 && nlines % static_cast<size_t>(separator) == 0 && nlines != 0) {
+      out << std::string(13, '-') << "+" << std::string(kind == "variances" ? 52 : 63, '-')
+          << "\n";
+    }
+    ++nlines;
+    const std::string ofmt = ciOutFmt(fmts.count(v) ? fmts[v] : std::string("%9.0g"));
+    std::string line = fitLeft(abbrevCp(v, 12), 12) + " |";
+    if (kind == "variances") {
+      ciCol(&line, 16);
+      line += ciFmt(r.N, "%10.0fc");
+      ciCol(&line, 31);
+      line += ciFmt(sdOpt ? r.sd : r.var, ofmt);
+      ciCol(&line, 46);
+      line += ciFmt(r.lb, ofmt);
+      ciCol(&line, 58);
+      line += ciFmt(r.ub, ofmt);
+    } else {
+      const bool pois = kind == "means" && poisson;
+      ciCol(&line, pois ? 17 : 16);
+      line += ciFmt(r.N, pois ? "%9.0g" : "%10.0fc");
+      ciCol(&line, 29);
+      line += ciFmt(r.mean, ofmt);
+      ciCol(&line, 41);
+      line += ciFmt(r.se, ofmt);
+      ciCol(&line, 57);
+      line += ciFmt(r.lb, ofmt);
+      ciCol(&line, 69);
+      line += ciFmt(r.ub, ofmt) + r.mark;
+    }
+    out << line << "\n";
+    last = r;
+    haveLast = true;
+    any = true;
+  }
+  if (marked == 1) {
+    out << "\n(*) one-sided, " << strutil::trim(eval::applyStataFmt(100 - (100 - level) / 2, "%9.0g"))
+        << "% confidence interval\n";
+  }
+  if (marked == 2 && (!warnl.empty() || !warnh.empty())) {
+    out << "\n";
+    if (!warnl.empty()) out << warnl << "\n";
+    if (!warnh.empty()) out << warnh << "\n";
+  }
+  (void)any;
+  // r(): the last variable's results, in ci's posting order.
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted;
+  auto setS = [&](const std::string& k, double v) {
+    session.eval.rValues.set(k, v);
+    posted.push_back(k);
+  };
+  if (haveLast) {
+    setS("level", level);
+    setS("ub", last.ub);
+    setS("lb", last.lb);
+    if (kind == "variances") {
+      if (bonett) setS("kurtosis", last.kurt);
+      if (sdOpt) setS("sd", last.sd);
+      setS("Var", last.var);
+      setS("N", last.N);
+      setS("Var_se", last.varSe);
+      session.eval.markRHidden("Var_se");
+      session.eval.rStrings.set("citype", bonett ? "bonett" : "normal");
+    } else {
+      setS("se", last.se);
+      if (kind == "proportions") {
+        setS("proportion", last.mean);
+        setS("N", last.N);
+        setS("mean", last.mean);
+        session.eval.markRHidden("mean");
+        session.eval.rStrings.set("citype", ptype);
+      } else {
+        setS("mean", last.mean);
+        setS("N", last.N);
+        if (!exposure.empty()) {
+          session.eval.rStrings.set("exposure", exposure);
+          posted.push_back("exposure");
+        }
+        session.eval.rStrings.set("citype", poisson ? "poisson" : "normal");
+      }
+    }
+    posted.push_back("citype");
+  }
+  eval::declareRPosted(session.eval, "ci", std::move(posted));
+  std::string text = out.str();
+  while (!text.empty() && text.back() == '\n') text.pop_back();
+  return displayBlock(text);
+}
+
+}  // namespace piet::handlers
+
+namespace piet::handlers {
+
+namespace {
+
+// _ttest center2: three texts centred about columns 11, 40 and 70 (the third
+// about 79 - len/2 when it is longer than 20), each at least one blank after
+// the one before.
+std::string prCenter2(const std::string& a, const std::string& b, const std::string& c) {
+  std::string out;
+  size_t last = 0;
+  auto put = [&](const std::string& s, int center) {
+    const int len = static_cast<int>(s.size());
+    const int skip = std::max(last != 0 ? 1 : 0, center - len / 2 - 1 - static_cast<int>(last));
+    out += std::string(static_cast<size_t>(std::max(0, skip)), ' ') + s;
+    last += static_cast<size_t>(std::max(0, skip)) + s.size();
+  };
+  put(a, 11);
+  put(b, 40);
+  put(c, c.size() > 20 ? 79 - static_cast<int>(c.size()) / 2 : 70);
+  return out;
+}
+
+// %8.6f with the trailing zeros dropped (prtest's H0 value), %8.0g below 1e-6.
+std::string prH0Text(double p0) {
+  if (p0 < 1e-6) return strutil::trim(eval::applyStataFmt(p0, "%8.0g"));
+  if (p0 > 1 - 1e-6) return "0.999999";
+  std::string m = strutil::trim(eval::applyStataFmt(p0, "%8.6f"));
+  while (m.size() > 1 && m.back() == '0' && m.find('.') != std::string::npos) m.pop_back();
+  return m;
+}
+
+struct PrSample {
+  double n = 0, p = 0;
+};
+
+// The printed tables and r() of prtest / prtesti (prtesti.ado's two forms).
+ojson prReport(SessionState& session, bool two, const PrSample& a, const PrSample& b, double p0,
+               double level, const std::string& xname, const std::string& yname,
+               const std::string& col1, bool oneSampleVarForm) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double q = cecon::stata_invnormal((100 + level) / 200);
+  std::ostringstream out;
+  auto line78 = [](char mid) {
+    return std::string(13, '-') + mid + std::string(64, '-');
+  };
+  auto row = [&](const std::string& name, double mean, double se) {
+    std::string l = fitLeft(abbrevCp(name, 12), 12) + " |";
+    ciCol(&l, 17);
+    l += ciFmt(mean, "%9.0g");
+    ciCol(&l, 28);
+    l += ciFmt(se, "%9.0g");
+    ciCol(&l, 58);
+    l += ciFmt(mean - q * se, "%9.0g");
+    ciCol(&l, 70);
+    l += ciFmt(mean + q * se, "%9.0g");
+    return l;
+  };
+  const std::string levelStr = strutil::trim(eval::applyStataFmt(level, "%9.0g"));
+  auto header = [&](bool showZ) {
+    std::string h = "    " + col1;
+    ciCol(&h, 14);
+    h += "|";
+    ciCol(&h, 22);
+    h += "Mean";
+    ciCol(&h, 29);
+    h += "Std. err.";
+    if (showZ) {
+      ciCol(&h, 44);
+      h += "z";
+      ciCol(&h, 49);
+      h += "P>|z|";
+    }
+    ciCol(&h, static_cast<size_t>(61 - static_cast<int>(levelStr.size())));
+    h += "[" + levelStr + "% conf. interval]";
+    return line78('-') + "\n" + h + "\n" + line78('+') + "\n";
+  };
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted;
+  auto setS = [&](const std::string& k, double v) {
+    session.eval.rValues.set(k, v);
+    posted.push_back(k);
+  };
+  auto pvals = [](double z, double* pl, double* p, double* pr) {
+    *p = 2 * cecon::stata_normal(-std::fabs(z));
+    if (z < 0) {
+      *pl = *p / 2;
+      *pr = 1 - *pl;
+    } else {
+      *pr = *p / 2;
+      *pl = 1 - *pr;
+    }
+  };
+  auto f64 = [](double v) { return strutil::trim(eval::applyStataFmt(v, "%6.4f")); };
+  if (!two) {
+    const double s = std::sqrt(a.p * (1 - a.p) / a.n);
+    const double se = (a.n == 1) ? nan : s;
+    const double z = (a.p - p0) / std::sqrt(p0 * (1 - p0) / a.n);
+    double pl, p, pr;
+    pvals(z, &pl, &p, &pr);
+    out << "\n";
+    if (oneSampleVarForm) {
+      std::string t = "One-sample test of proportion";
+      ciCol(&t, 49);
+      t += "Number of obs      = " + ciFmt(a.n, "%9.0g");
+      out << t << "\n\n";
+    } else {
+      std::string t = "One-sample test of proportion";
+      ciCol(&t, static_cast<size_t>(53 - static_cast<int>(xname.size())));
+      t += xname;
+      ciCol(&t, 53);
+      t += ": Number of obs = " + ciFmt(a.n, "%8.0g");
+      out << t << "\n";
+    }
+    out << header(false) << row(xname, a.p, se) << "\n" << line78('-') << "\n";
+    std::string zl = "    p = proportion(" + abbrevCp(xname, 12) + ")";
+    ciCol(&zl, 67);
+    zl += "z = " + ciFmt(z, "%8.4f");
+    const std::string m0 = prH0Text(p0);
+    out << zl << "\nH0: p = " << m0 << "\n\n";
+    out << prCenter2("Ha: p < " + m0, "Ha: p != " + m0, "Ha: p > " + m0) << "\n";
+    out << prCenter2("Pr(Z < z) = " + f64(pl), "Pr(|Z| > |z|) = " + f64(p),
+                     "Pr(Z > z) = " + f64(pr));
+    setS("level", level);
+    setS("p_u", pr);
+    setS("p", p);
+    setS("p_l", pl);
+    setS("z", z);
+    setS("lb", a.p - q * s);
+    setS("ub", a.p + q * s);
+    setS("se", s);
+    setS("P", a.p);
+    setS("N", a.n);
+    setS("N_1", a.n);
+    setS("P_1", a.p);
+    session.eval.markRHidden("N_1");
+    session.eval.markRHidden("P_1");
+  } else {
+    const double n = a.n + b.n;
+    const double pp = (a.n * a.p + b.n * b.p) / n;
+    const double s1 = std::sqrt(a.p * (1 - a.p) / a.n), s2 = std::sqrt(b.p * (1 - b.p) / b.n);
+    const double sp = std::sqrt(a.p * (1 - a.p) / a.n + b.p * (1 - b.p) / b.n);
+    const double spp = std::sqrt(pp * (1 - pp) / a.n + pp * (1 - pp) / b.n);
+    const double dp = a.p - b.p;
+    const double z = dp / spp;
+    double pl, p, pr;
+    pvals(z, &pl, &p, &pr);
+    out << "\n";
+    {
+      std::string t = "Two-sample test of proportions";
+      ciCol(&t, static_cast<size_t>(53 - static_cast<int>(xname.size())));
+      t += xname;
+      ciCol(&t, 53);
+      t += ": Number of obs = " + ciFmt(a.n, "%8.0g");
+      std::string t2;
+      ciCol(&t2, static_cast<size_t>(53 - static_cast<int>(yname.size())));
+      t2 += yname;
+      ciCol(&t2, 53);
+      t2 += ": Number of obs = " + ciFmt(b.n, "%8.0g");
+      out << t << "\n" << t2 << "\n";
+    }
+    out << header(true) << row(xname, a.p, a.n == 1 ? nan : s1) << "\n"
+        << row(yname, b.p, b.n == 1 ? nan : s2) << "\n" << line78('+') << "\n";
+    {
+      const double tval = dp / spp;
+      const double pval = 2 * (1 - cecon::stata_normal(std::fabs(tval)));
+      std::string l = fitLeft("diff", 12) + " |";
+      ciCol(&l, 17);
+      l += ciFmt(dp, "%9.0g");
+      ciCol(&l, 28);
+      l += ciFmt(sp, "%9.0g");
+      ciCol(&l, 58);
+      l += ciFmt(dp - q * sp, "%9.0g");
+      ciCol(&l, 70);
+      l += ciFmt(dp + q * sp, "%9.0g");
+      std::string l2;
+      ciCol(&l2, 14);
+      l2 += "|";
+      ciCol(&l2, 17);
+      l2 += "under H0:";
+      ciCol(&l2, 28);
+      l2 += ciFmt(spp, "%9.0g");
+      ciCol(&l2, 38);
+      l2 += ciFmt(tval, "%8.2f");
+      ciCol(&l2, 49);
+      l2 += ciFmt(pval, "%5.3f");
+      out << l << "\n" << l2 << "\n" << line78('-') << "\n";
+    }
+    std::string zl = "        diff = prop(" + xname + ") - prop(" + yname + ")";
+    ciCol(&zl, 67);
+    zl += "z = " + ciFmt(z, "%8.4f");
+    out << zl << "\n    H0: diff = 0\n\n";
+    out << prCenter2("Ha: diff < 0", "Ha: diff != 0", "Ha: diff > 0") << "\n";
+    out << prCenter2("Pr(Z < z) = " + f64(pl), "Pr(|Z| > |z|) = " + f64(p),
+                     "Pr(Z > z) = " + f64(pr));
+    setS("level", level);
+    setS("p_u", pr);
+    setS("p", p);
+    setS("p_l", pl);
+    setS("z", z);
+    setS("ub_diff", dp + q * sp);
+    setS("lb_diff", dp - q * sp);
+    setS("ub2", b.p + q * s2);
+    setS("lb2", b.p - q * s2);
+    setS("ub1", a.p + q * s1);
+    setS("lb1", a.p - q * s1);
+    setS("se_diff", sp);
+    setS("se_diff0", spp);
+    setS("se2", s2);
+    setS("se1", s1);
+    setS("P_diff", dp);
+    setS("P2", b.p);
+    setS("P1", a.p);
+    setS("N2", b.n);
+    setS("N1", a.n);
+    setS("P_2", b.p);
+    setS("P_1", a.p);
+    setS("N_2", b.n);
+    setS("N_1", a.n);
+    for (const char* h : {"P_2", "P_1", "N_2", "N_1"}) session.eval.markRHidden(h);
+  }
+  eval::declareRPosted(session.eval, "prtest", std::move(posted));
+  return displayBlock(out.str());
+}
+
+bool prLevel(const eval::ParsedCommand& parsed, SessionState& session, double* level, ojson* err) {
+  *level = session.level;
+  for (const auto& [k, v] : parsed.opts) {
+    if (k != "level") continue;
+    const std::string val = v.isBool ? std::string() : strutil::trim(v.strValue);
+    char* end = nullptr;
+    const double lv = std::strtod(val.c_str(), &end);
+    if (val.empty() || end == nullptr || *end != '\0' || !(lv >= 10.0 && lv <= 99.99)) {
+      *err = ojson(eval::errorBlock("syntax_error", "level() must be between 10 and 99.99 inclusive",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+      return false;
+    }
+    *level = lv;
+  }
+  return true;
+}
+
+}  // namespace
+
+// `prtesti #obs #p #p0` / `prtesti #obs1 #p1 #obs2 #p2 [, level() count]`
+// ([R] prtest): the z tests of a proportion and of two proportions from
+// summary numbers (count: the second number of each pair is a count of
+// successes). Printed and posted as prtesti does (vs-stata bank
+// 887b544d197bb526).
+ojson runPrtesti(const eval::ParsedCommand& parsed, SessionState& session) {
+  auto syn = [](const std::string& m, int rc) {
+    return ojson(eval::errorBlock("syntax_error", m, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(rc) + ")"));
+  };
+  if (auto e = eval::rejectUnknownOptions(parsed.opts, {"level", "count", "xname", "yname"}, {}))
+    return ojson(*e);
+  double level = 95;
+  ojson err;
+  if (!prLevel(parsed, session, &level, &err)) return err;
+  bool count = false;
+  // xname()/yname(): the two samples' names in the two-sample report, trimmed
+  // and cut to their first 12 characters ("x" and "y" when not given). The
+  // one-sample report always names its sample x, so there they change nothing.
+  auto sampleName = [](const eval::OptValue& v, const std::string& dflt) {
+    std::string t = v.isBool ? std::string() : strutil::trim(v.strValue);
+    if (t.empty()) return dflt;
+    size_t cut = 0;
+    for (int chars = 0; cut < t.size() && chars < 12; ++chars) {
+      ++cut;
+      while (cut < t.size() && (static_cast<unsigned char>(t[cut]) & 0xC0) == 0x80) ++cut;
+    }
+    return strutil::trim(t.substr(0, cut));
+  };
+  std::string xname = "x", yname = "y";
+  for (const auto& [k, v] : parsed.opts) {
+    if (k == "count") count = true;
+    else if (k == "xname") xname = sampleName(v, "x");
+    else if (k == "yname") yname = sampleName(v, "y");
+  }
+  std::vector<double> x;
+  for (const auto& w : parsed.varlist) {
+    char* end = nullptr;
+    const double d = std::strtod(w.c_str(), &end);
+    if (w.empty() || end == nullptr || *end != '\0') return syn("'" + w + "' found where number expected", 7);
+    x.push_back(d);
+  }
+  if (x.size() != 3 && x.size() != 4)
+    return syn("either three arguments for a one-sample test or four arguments for a two-sample "
+               "test must be specified",
+               198);
+  auto isInt = [](double d) { return d == std::floor(d); };
+  if (!isInt(x[0])) return syn("'" + parsed.varlist[0] + "' found where integer expected", 7);
+  if (x.size() == 4 && !isInt(x[2]))
+    return syn("'" + parsed.varlist[2] + "' found where integer expected", 7);
+  auto prop = [&](double n, double v, const std::string& typed, double* out) -> std::optional<ojson> {
+    if (count) {
+      if (!isInt(v)) return syn("'" + typed + "' found where integer expected", 7);
+      if (v <= n) v = v / n;
+      if (v > 1 || v < 0) return syn(typed + " not less than " + strutil::trim(eval::applyStataFmt(n, "%12.0g")), 198);
+    } else if (v > 1 || v < 0) {
+      return syn(typed + " not in [0,1]", 198);
+    }
+    *out = v;
+    return std::nullopt;
+  };
+  PrSample a, b;
+  a.n = x[0];
+  if (x.size() == 4) {
+    b.n = x[2];
+    if (auto e = prop(a.n, x[1], parsed.varlist[1], &a.p)) return *e;
+    if (auto e = prop(b.n, x[3], parsed.varlist[3], &b.p)) return *e;
+    if (a.n <= 1)
+      return ojson(eval::errorBlock("engine_error", "insufficient observations", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(2001)"));
+    return prReport(session, true, a, b, 0, level, xname, yname, "", false);
+  }
+  if (x[2] > 1 || x[2] < 0) return syn(parsed.varlist[2] + " not in [0,1]", 198);
+  if (auto e = prop(a.n, x[1], parsed.varlist[1], &a.p)) return *e;
+  if (a.n <= 1)
+    return ojson(eval::errorBlock("engine_error", "insufficient observations", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(2001)"));
+  return prReport(session, false, a, b, x[2], level, "x", "", "", false);
+}
+
+// `prtest varname == #p [if] [in]`, `prtest varname == varname2`, `prtest
+// varname [if] [in], by(groupvar) [level()]` ([R] prtest) over 0/1 variables
+// (vs-stata bank 23685d043856ff5e, ccc958fd8867f31d). cluster() and the rho
+// options are refused by name.
+ojson runPrtest(const eval::ParsedCommand& parsed, SessionState& session) {
+  auto syn = [](const std::string& m, int rc) {
+    return ojson(eval::errorBlock("syntax_error", m, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(rc) + ")"));
+  };
+  if (auto e = eval::rejectUnknownOptions(parsed.opts, {"by", "level"},
+                                          {"cluster", "rho", "rho1", "rho2"}))
+    return ojson(*e);
+  double level = 95;
+  ojson err;
+  if (!prLevel(parsed, session, &level, &err)) return err;
+  std::string byv;
+  for (const auto& [k, v] : parsed.opts)
+    if (k == "by" && !v.isBool) byv = strutil::trim(v.strValue);
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
+  // varname [== exp]
+  std::string lhs, rhs;
+  {
+    std::string all;
+    for (const auto& t : parsed.varlist) all += (all.empty() ? "" : " ") + t;
+    size_t eq = all.find("==");
+    size_t len = 2;
+    if (eq == std::string::npos) {
+      eq = all.find('=');
+      len = 1;
+    }
+    if (eq != std::string::npos) {
+      lhs = strutil::trim(all.substr(0, eq));
+      rhs = strutil::trim(all.substr(eq + len));
+    } else {
+      lhs = strutil::trim(all);
+    }
+  }
+  if (lhs.empty()) return syn("varlist required", 100);
+  std::vector<std::string> names = {lhs};
+  if (auto e = loops::checkKnownVarlist(names, session)) return *e;
+  lhs = names[0];
+  std::vector<std::string> cols = {lhs};
+  double p0 = std::numeric_limits<double>::quiet_NaN();
+  bool rhsVar = false;
+  if (!rhs.empty()) {
+    if (!byv.empty()) return syn("may not combine == and option by()", 198);
+    char* end = nullptr;
+    p0 = std::strtod(rhs.c_str(), &end);
+    if (end == nullptr || *end != '\0') {
+      std::vector<std::string> r2 = {rhs};
+      if (auto e = loops::checkKnownVarlist(r2, session)) return *e;
+      rhs = r2[0];
+      rhsVar = true;
+      cols.push_back(rhs);
+    }
+  } else {
+    if (byv.empty()) return syn("option by() required", 100);
+    std::vector<std::string> b2 = {byv};
+    if (auto e = loops::checkKnownVarlist(b2, session)) return *e;
+    byv = b2[0];
+    cols.push_back(byv);
+  }
+  ColumnScope scope(session, parsed, cols, "prtest");
+  if (scope.failed()) return scope.error();
+  Datastore& ds = *scope.get();
+  std::vector<double> x, y;
+  std::string e2;
+  if (ds.dtype(lhs) == "factor") return syn("type mismatch", 109);
+  if (!numericColumn(ds, lhs, &x, &e2)) return aerError("prtest: " + e2);
+  auto zeroOne = [](const std::vector<double>& v, const std::vector<char>* use) {
+    for (size_t i = 0; i < v.size(); ++i) {
+      if (use && !(*use)[i]) continue;
+      if (std::isnan(v[i])) continue;
+      if (v[i] != 0 && v[i] != 1) return false;
+    }
+    return true;
+  };
+  auto mean = [](const std::vector<double>& v, const std::vector<char>* use, PrSample* s) {
+    double sum = 0, n = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+      if (use && !(*use)[i]) continue;
+      if (std::isnan(v[i])) continue;
+      sum += v[i];
+      n += 1;
+    }
+    s->n = n;
+    s->p = n > 0 ? sum / n : std::numeric_limits<double>::quiet_NaN();
+  };
+  if (!rhs.empty() && !rhsVar) {
+    if (!zeroOne(x, nullptr)) return syn(lhs + " is not a 0/1 variable", 450);
+    if (!(p0 < 1 && p0 > 0)) return syn(rhs + " is not in (0,1)", 450);
+    PrSample a;
+    mean(x, nullptr, &a);
+    if (a.n == 0)
+      return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
+                                    std::nullopt, "r(2000)"));
+    return prReport(session, false, a, a, p0, level, lhs, "", "Variable", true);
+  }
+  if (rhsVar) {
+    if (ds.dtype(rhs) == "factor") return syn("type mismatch", 109);
+    if (!numericColumn(ds, rhs, &y, &e2)) return aerError("prtest: " + e2);
+    if (!zeroOne(x, nullptr)) return syn(lhs + " is not a 0/1 variable", 450);
+    if (!zeroOne(y, nullptr)) return syn(rhs + " is not a 0/1 variable", 450);
+    PrSample a, b;
+    mean(x, nullptr, &a);
+    mean(y, nullptr, &b);
+    if (a.n <= 1)
+      return ojson(eval::errorBlock("engine_error", "insufficient observations", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(2001)"));
+    return prReport(session, true, a, b, 0, level, abbrevCp(lhs, 12), abbrevCp(rhs, 12),
+                    "Variable", false);
+  }
+  // by(): the sample is varname and groupvar present.
+  const bool strBy = ds.dtype(byv) == "factor";
+  if (strBy)
+    return ojson(eval::unsupportedCommand("prtest", std::nullopt, std::nullopt, "piet_gap",
+                                          eval::UnsupportedCommandKind::kNotImplemented));
+  if (!numericColumn(ds, byv, &y, &e2)) return aerError("prtest: " + e2);
+  std::vector<char> use(x.size(), 0);
+  std::set<double> xv, gv;
+  for (size_t i = 0; i < x.size(); ++i) {
+    if (std::isnan(x[i]) || std::isnan(y[i])) continue;
+    use[i] = 1;
+    xv.insert(x[i]);
+    gv.insert(y[i]);
+  }
+  if (xv.size() != 2) return syn(lhs + " takes on " + std::to_string(xv.size()) + " values, not 2", 450);
+  if (gv.size() != 2) return syn(byv + " takes on " + std::to_string(gv.size()) + " values, not 2", 450);
+  if (!zeroOne(x, &use)) return syn(lhs + " is not a 0/1 variable", 450);
+  const double g1 = *gv.begin(), g2 = *gv.rbegin();
+  std::vector<char> u1(x.size(), 0), u2(x.size(), 0);
+  for (size_t i = 0; i < x.size(); ++i) {
+    if (!use[i]) continue;
+    (y[i] == g1 ? u1 : u2)[i] = 1;
+  }
+  PrSample a, b;
+  mean(x, &u1, &a);
+  mean(x, &u2, &b);
+  auto lab = [&](double code) {
+    auto it = session.varLblname.find(byv);
+    if (it != session.varLblname.end()) {
+      auto d = session.labelDefs.find(it->second);
+      if (d != session.labelDefs.end()) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%.0f", code);
+        auto t = d->second.find(buf);
+        if (t != d->second.end() && !t->second.empty()) return t->second;
+      }
+    }
+    return strutil::trim(eval::applyStataFmt(code, "%9.0g"));
+  };
+  if (a.n <= 1)
+    return ojson(eval::errorBlock("engine_error", "insufficient observations", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(2001)"));
+  const std::string xn = lab(g1).substr(0, 12), yn = lab(g2).substr(0, 12);
+  return prReport(session, true, a, b, 0, level, xn, yn, "   Group", false);
+}
+
 }  // namespace piet::handlers

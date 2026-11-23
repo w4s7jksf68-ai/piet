@@ -690,9 +690,16 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
             // w2s_multiway_class fixture). Same (slopes, _cons) layout as Vn below.
             // BUG-1043: also after areg's and xtreg,fe's one-way vce(robust)/vce(cluster
             // id) (StataBE: equal to the plain fit's e(V)/s2, x1 cell
-            // +1.58e1772b1cf3fX-00b); unweighted only, as measured.
-            if (md.weights.empty() && (subset_multiway || vt == Vcov::HC1 || vt == Vcov::Cluster))
+            // +1.58e1772b1cf3fX-00b). Weighted one-way fits post the bread on the RAW
+            // weights, as without FE above: the normalised bread times n/sum(w) (vs-stata
+            // bank areg 477d369d [pw], 31d0e6a2 [aw] vce(cluster), a38f5aa2 [fw]
+            // vce(cluster), where n/sum(w) is 1). The weighted multiway path stays
+            // unmeasured.
+            if ((md.weights.empty() && subset_multiway) || vt == Vcov::HC1 || vt == Vcov::Cluster) {
                 r.vcov_modelbased = ext;
+                if (!md.weights.empty() && r.sum_w > 0.0 && r.n_eff > 0.0 && r.n_eff != r.sum_w)
+                    for (auto& v : r.vcov_modelbased) v *= r.n_eff / r.sum_w;
+            }
 
             //   The same keep_nested_fe_dof as the slope call: areg's _cons SE
             //   carries areg's factor (w2b_estim.log areg_vce_cluster

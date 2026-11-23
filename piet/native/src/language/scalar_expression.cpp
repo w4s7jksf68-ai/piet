@@ -4,6 +4,7 @@
 // (M3a; the frozen Python file is the spec — see the header for design
 // notes on why this module's helpers are NOT shared with
 // piet/eval/macros.cpp's similarly-named anonymous-namespace helpers).
+#include "piet/column_fetch.h"  // fetchColumns: one column of a resident head
 #include "piet/display_hardening.h"
 
 #include "piet/bcal.h"  // AER scope-2 B2-3: %tbNAME rendering
@@ -419,20 +420,48 @@ std::optional<VarObs> readVarObs(const std::string& nameIn, long long idx, Sessi
     if (str) return VarObs{k < cc->strs.size() ? cc->strs[k] : std::string(), true, true, true};
     return VarObs{k < cc->f64.size() ? numText(cc->f64[k]) : std::string("."), false};
   }
+  const auto cellOf = [&](Datastore& d) -> VarObs {
+    const bool str = d.dtype(name) == "factor";
+    if (idx < 1 || idx > d.nRows()) return VarObs{str ? "" : ".", str, false, str};
+    const size_t k = static_cast<size_t>(idx - 1);
+    const cecon::Column& col = d.col(name);
+    if (str) {
+      const int32_t code = col.codes()[k];
+      const auto& levels = col.levels;
+      if (code >= 0 && static_cast<size_t>(code) < levels.size())
+        return VarObs{levels[static_cast<size_t>(code)], true, true, true};
+      return VarObs{std::string(), true, true, true};
+    }
+    return VarObs{numText(col.f64()[k]), false};
+  };
+  // A resident head that is not on disk yet: fetch this ONE column from the engine (contract_A
+  // §38 getcols; every row, so the index means what it means on the head) instead of writing
+  // the whole frame out to read a cell of it. `local q = total[1]` inside a loop that also
+  // mutates the data paid a full frame snapshot per pass before this. Any refusal (no resident
+  // frame, an engine without getcols, a name the frame does not hold) falls through to the
+  // head, which is the previous behavior. referencedColumns is the other half of the safety
+  // pair (column_fetch.h): it answers only off a card that is current for THIS head, which is
+  // what rules out a worker that a post-estimation command resynced to a different file.
+  if (session.residentHeadDirty()) {
+    const std::optional<std::vector<std::string>> want = referencedColumns(session, {&name}, "");
+    if (want.has_value() && want->size() == 1 && want->front() == name) {
+      // The one cell, inline: the projection below writes the whole column to a file
+      // for this. Answers exactly what cellOf would read off that projection.
+      if (const std::optional<FetchedCell> fc = fetchCell(session, name, idx)) {
+        if (!fc->inRange) return VarObs{fc->isString ? "" : ".", fc->isString, false, fc->isString};
+        if (fc->isString) return VarObs{fc->text, true, true, true};
+        return VarObs{numText(fc->value), false};
+      }
+      std::string projPath;
+      if (std::unique_ptr<Datastore> proj =
+              fetchColumns(session, *want, session.workdir(), &projPath)) {
+        if (proj->has(name)) return cellOf(*proj);
+      }
+    }
+  }
   Datastore* ds = session.datastore();  // materializes a virtual head if needed
   if (ds == nullptr || !ds->has(name)) return VarObs{".", false};
-  const bool str = ds->dtype(name) == "factor";
-  if (idx < 1 || idx > ds->nRows()) return VarObs{str ? "" : ".", str, false, str};
-  const size_t k = static_cast<size_t>(idx - 1);
-  const cecon::Column& col = ds->col(name);
-  if (str) {
-    const int32_t code = col.codes()[k];
-    const auto& levels = col.levels;
-    if (code >= 0 && static_cast<size_t>(code) < levels.size())
-      return VarObs{levels[static_cast<size_t>(code)], true, true, true};
-    return VarObs{std::string(), true, true, true};
-  }
-  return VarObs{numText(col.f64()[k]), false};
+  return cellOf(*ds);
 }
 
 // A `,` outside quotes and brackets: `NAME[i,j]` is a matrix element, not a

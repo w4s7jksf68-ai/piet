@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 //   markout   a dispatched `quietly replace`, the shape runMarksample uses.
+//   mark      a dispatched `quietly generate byte` then `quietly replace`.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -32,12 +33,11 @@
 
 namespace {
 
-// markout: STRok SYSMISsok. `sysmissok` keeps a system-missing `.` and marks
-// out only the extended .a-.z -- a distinction this build's frame does not
-// carry (extended missings are stored as `.`; see runMvencode's note), so it
-// is refused rather than answered as if every missing were `.`.
+// markout: Strok SYSMISsok. `sysmissok` keeps a system-missing `.` and marks
+// out only the extended .a-.z (the frame keeps each missing code); `s` is strok
+// (vs-stata bank 3d0b21c40158327e).
 const piet::eval::OptVocab& kVocabMarkout =
-    piet::eval::registerOptVocab({"markout"}, {{"strok"}, {"sysmissok"}});
+    piet::eval::registerOptVocab({"markout"}, {{"strok", "sysmissok"}, {}, {{"s", "strok"}}});
 
 }  // namespace
 
@@ -106,12 +106,14 @@ nlohmann::ordered_json runMarkout(const eval::ParsedCommand& parsed, SessionStat
   }
   if (auto err = resolveByKeyNames(session, rest)) return *err;  // K5 `*v`, K12 `xvar-lv`
   const bool strok = hasOpt(parsed.opts, "strok");
+  const bool sysmissok = hasOpt(parsed.opts, "sysmissok");
   bool zeroAll = false;
   std::vector<std::string> terms;
   for (const auto& v : rest) {
     if (!ds->has(v)) return envError("variable " + v + " not found", 111);
     if (ds->dtype(v) == "f64") {
-      terms.push_back("missing(" + v + ")");
+      // sysmissok: only an extended missing (.a-.z, all above `.`) marks out.
+      terms.push_back(sysmissok ? "(" + v + " > .)" : "missing(" + v + ")");
     } else if (strok) {
       terms.push_back(v + " == \"\"");
     } else {
@@ -125,6 +127,43 @@ nlohmann::ordered_json runMarkout(const eval::ParsedCommand& parsed, SessionStat
   }
   ojson blocks = dispatch(cmd, session);
   if (const ojson* e = firstError(blocks)) return *e;
+  return ojson::array();
+}
+
+
+// ===========================================================================
+// mark
+// ===========================================================================
+//
+// `mark newvar [if] [in]` ([P] mark): a new byte variable that is 1 in the
+// observations the if/in qualifiers select and 0 in every other one (vs-stata
+// bank daf028b0 `mark t2 if price>5000`, 0196c214 `: type t` is byte). An
+// existing name is r(110). A weight (zeroweight marks out zero weights) is
+// not implemented here and keeps the tokenizer's named refusal.
+nlohmann::ordered_json runMark(const eval::ParsedCommand& parsed, SessionState& session) {
+  if (auto err = eval::rejectUnknownOptions(parsed.opts, {}, {"zeroweight"})) return ojson(*err);
+  if (parsed.varlist.empty()) return envError("varlist required", 100);
+  if (parsed.varlist.size() > 1) return envError("too many variables specified", 103);
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
+  const std::string name = parsed.varlist[0];
+  if (!strutil::isValidStataIdentifier(name)) return envError(name + " invalid name", 198);
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return ojson(eval::noDataLoaded());
+  if (ds->has(name)) return envError("variable " + name + " already defined", 110);
+  std::string sel;
+  if (parsed.ifExpr.has_value()) sel += " if " + *parsed.ifExpr;
+  if (parsed.inRange.has_value()) sel += " in " + *parsed.inRange;
+  ojson blocks = dispatch("quietly generate byte " + name + " = " + (sel.empty() ? "1" : "0"),
+                          session);
+  if (const ojson* e = firstError(blocks)) return *e;
+  if (!sel.empty()) {
+    blocks = dispatch("quietly replace " + name + " = 1" + sel, session);
+    if (const ojson* e = firstError(blocks)) {
+      ojson err = *e;
+      (void)dispatch("capture drop " + name, session);
+      return err;
+    }
+  }
   return ojson::array();
 }
 

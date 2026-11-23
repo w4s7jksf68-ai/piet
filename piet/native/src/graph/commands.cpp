@@ -14,6 +14,7 @@
 
 #include "piet/handlers/graph.h"
 #include "piet/eval/errors.h"
+#include "piet/eval/gettoken.h"
 #include "piet/strutil.h"
 #include "piet/twoway_opts.h"
 #include "graph_support.h"
@@ -143,6 +144,88 @@ ojson runScatter(Datastore& ds, const std::vector<std::string>& varlist,
   out["y_max"] = yMax;
   out["name"] = nullptr;  // filled by the dispatcher's name() capture (BS-010)
   return out;
+}
+
+ojson runScatterMatrix(Datastore& ds, const std::vector<std::string>& vars,
+                       const eval::ParsedCommand& parsed, SessionState& session) {
+  if (vars.size() < 2) {
+    return eval::errorBlock("syntax_error", "too few variables specified", std::nullopt,
+                            std::nullopt, std::nullopt, "r(102)");
+  }
+  std::vector<const double*> columns;
+  std::vector<std::pair<double, double>> ranges;
+  std::vector<std::string> labels;
+  for (const auto& name : vars) {
+    if (!ds.has(name)) {
+      return eval::errorBlock("engine_error", "variable " + name + " not found", std::nullopt,
+                              std::nullopt, std::nullopt, "r(111)");
+    }
+    const double* col = ds.col(name).f64();
+    columns.push_back(col);
+    double lo = std::numeric_limits<double>::infinity(), hi = -lo;
+    for (int64_t obs = 0; obs < ds.nRows(); ++obs) {
+      if (!std::isfinite(col[obs])) continue;
+      lo = std::min(lo, col[obs]);
+      hi = std::max(hi, col[obs]);
+    }
+    ranges.emplace_back(lo <= hi ? lo : 0.0, lo <= hi ? hi : 1.0);
+    const auto meta = session.varMeta.find(name);
+    const std::string label = meta == session.varMeta.end() ? "" : meta->second.label.value_or("");
+    labels.push_back(label.empty() ? name : label);
+  }
+  std::string labelColor;
+  if (auto diagonal = optStr(parsed.opts, "diagonal")) {
+    const auto comma = eval::findUnquotedComma(*diagonal);
+    const std::string names = diagonal->substr(0, comma < 0 ? std::string::npos
+                                                           : static_cast<size_t>(comma));
+    std::vector<std::string> overrides;
+    if (auto err = eval::tokenizeText(names, "", overrides)) return ojson(*err);
+    for (size_t i = 0; i < std::min(overrides.size(), labels.size()); ++i)
+      if (overrides[i] != ".") labels[i] = overrides[i];
+    if (comma >= 0) {
+      auto style = eval::parseOpts(diagonal->substr(static_cast<size_t>(comma) + 1));
+      for (auto& [name, value] : style) {
+        if (name != "color" || value.isBool) {
+          return eval::unsupportedOption(name, "graph matrix: unsupported diagonal() style");
+        }
+      }
+      if (!style.empty()) labelColor = twoway::layerStyle(style, 0, "scatter").value("color", "");
+    }
+  }
+
+  const bool half = optBool(parsed.opts, "half").value_or(false);
+  ojson style = twoway::layerStyle(parsed.opts, 0, "scatter");
+  style["color"] = style["mcolor"];
+  ojson panels = ojson::array();
+  for (size_t row = 0; row < vars.size(); ++row) {
+    for (size_t col = 0; col < vars.size(); ++col) {
+      if (half && col > row) {
+        panels.push_back(nullptr);
+      } else if (row == col) {
+        ojson label = {{"kind", "matrix_label"}, {"text", labels[row]}};
+        if (!labelColor.empty()) label["color"] = labelColor;
+        panels.push_back(std::move(label));
+      } else {
+        ojson points = ojson::array();
+        for (int64_t obs = 0; obs < ds.nRows(); ++obs) {
+          const double x = columns[col][obs], y = columns[row][obs];
+          if (std::isfinite(x) && std::isfinite(y)) points.push_back(ojson::array({x, y}));
+        }
+        ojson layer = {{"kind", "scatter"}, {"x_var", vars[col]}, {"y_var", vars[row]},
+                       {"n", points.size()}, {"points", std::move(points)}, {"style", style}};
+        panels.push_back({
+            {"kind", "twoway"}, {"x_label", vars[col]}, {"y_label", vars[row]},
+            {"x_min", ranges[col].first}, {"x_max", ranges[col].second},
+            {"y_min", ranges[row].first}, {"y_max", ranges[row].second},
+            {"layers", ojson::array({std::move(layer)})}});
+      }
+    }
+  }
+  return {{"type", "graph"}, {"kind", "scatter_matrix"}, {"variables", vars},
+          {"grid", {{"rows", vars.size()}, {"cols", vars.size()}}},
+          {"title", optTitleStr(parsed.opts, "title").value_or("")},
+          {"note", optTitleStr(parsed.opts, "note").value_or("")},
+          {"panels", std::move(panels)}};
 }
 
 

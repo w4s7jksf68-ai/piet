@@ -21,6 +21,7 @@ struct MxValue {
   eval::EvalMatrix m;  // every row/column has a name slot; "" is named by position
 };
 void applyDefaultStripe(eval::EvalMatrix& mat);
+eval::EvalMatrix transposeMatrix(const eval::EvalMatrix& in);
 bool splitTopLevel(const std::string& e, std::vector<std::string>& parts,
                    std::vector<char>& ops);
 bool evalMatrixScalarExpr(const std::string& exprIn, SessionState& session, double& outVal,
@@ -49,7 +50,11 @@ std::string renderMatrixList(const std::string& name, const eval::EvalMatrix& m,
                              const std::function<std::string(double)>& cellText = nullptr,
                              const MatrixListOptions& opts = MatrixListOptions{});
 ojson runMatrixStripe(bool isRow, const std::string& name, const std::string& namesRhs,
-                       SessionState& session);
+                       SessionState& session, bool equations = false);
+// matrix_subcommands.cpp: `matrix dir|rename|roweq|coleq|symeigen|eigenvalues|svd`;
+// nullopt when FULL is none of them.
+std::optional<ojson> runMatrixSubcommand(const std::string& full, const std::string& args,
+                                         SessionState& session);
 ojson runMatrixAccum(const std::string& name, const std::string& rhs, SessionState& session);
 }  // namespace command_detail
 }  // namespace piet::handlers

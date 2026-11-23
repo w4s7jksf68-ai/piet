@@ -24,7 +24,7 @@ material (see *Relationship to Stata* below).
 
 PIET is free and will stay free. If it helps you and you would like to support
 its development, donations are very welcome:
-**https://buymeacoffee.com/pietwithcobra**. Bank-transfer details are in
+**[bunq.me/Munkyung](https://bunq.me/Munkyung)**. Bank-transfer details are in
 [DEVELOPER_NOTE.md](DEVELOPER_NOTE.md).
 
 ## Download for macOS
@@ -82,7 +82,7 @@ fourth significant digit.
 
 ## Linux
 
-The Linux port builds PIET A.1.1 / CoBrA 1.1.0 for x86-64 PCs (SSE4.2,
+The Linux port builds PIET A.2.0 / CoBrA 1.2.0 for x86-64 PCs (SSE4.2,
 roughly 2009 onward), using GTK 3 and WebKitGTK 4.1. The release build uses
 Ubuntu 24.04; Ubuntu 24.04 or newer is supported. The application runs offline
 and includes its engine, frontend, sample data, examples and licence notices.
@@ -90,10 +90,10 @@ and includes its engine, frontend, sample data, examples and licence notices.
 `scripts/package-linux.sh` produces two files under `dist/linux-amd64/`,
 with a SHA-256 beside each:
 
-- `PIET-A.1.1-linux-x64.deb`: install with
-  `sudo apt install ./PIET-A.1.1-linux-x64.deb`, then open **PIET** from the
+- `PIET-A.2.0-linux-x64.deb`: install with
+  `sudo apt install ./PIET-A.2.0-linux-x64.deb`, then open **PIET** from the
   application menu or run `piet`.
-- `PIET-A.1.1-linux-x64.tar.xz`: extract the entire folder and run `./PIET`
+- `PIET-A.2.0-linux-x64.tar.xz`: extract the entire folder and run `./PIET`
   inside it. Install its system libraries first:
   `sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libopenblas0 liblapacke`.
 
@@ -230,6 +230,12 @@ fixed-effects packages ourselves. If you measure PIET against something,
 please share the do-file and the machine in an issue.
 
 ## Demo data and demo do-files
+
+PIET will never bundle Stata's example datasets, including `auto`, `lifeexp`,
+`census` and `citytemp`. Requests for those samples via `sysuse` return r(601).
+`sysuse dir` lists PIET's own sample data. `require` returns r(601) for
+unavailable packages and does not download or install packages. See the
+[compatibility policy](docs/piet/COMPATIBILITY-POLICY.md).
 
 Everything needed to try PIET ships in the tree, and it is also what the
 project's own release gate runs ("the demo law": every block of every demo

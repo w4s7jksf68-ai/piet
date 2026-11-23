@@ -1,0 +1,52 @@
+{
+ "logit_testparm_df30": {
+  "type": "estimation",
+  "estimator": "test",
+  "depvar": "",
+  "n_obs": 74,
+  "J": 2,
+  "df1": 2,
+  "restrictions": [
+   "mpg = 0",
+   "weight = 0"
+  ],
+  "vcov_type": "oim",
+  "F": 8.890745485323801,
+  "df2": 30.0,
+  "p_F": 0.0009288024684619536
+ },
+ "robust_test_df30": {
+  "type": "estimation",
+  "estimator": "test",
+  "depvar": "",
+  "n_obs": 74,
+  "F": 22.101917954289394,
+  "J": 2,
+  "df1": 2,
+  "df2": 30.0,
+  "p_F": 1.2601535733199113e-06,
+  "restrictions": [
+   "mpg = 0",
+   "weight = 0"
+  ],
+  "vcov_type": "HC1"
+ },
+ "robust_test_plain": {
+  "type": "estimation",
+  "estimator": "test",
+  "depvar": "",
+  "n_obs": 74,
+  "F": 22.101917954289394,
+  "J": 2,
+  "chi2": 44.20383590857879,
+  "df1": 2,
+  "df2": 70.0,
+  "p_F": 3.62749817956491e-08,
+  "p_chi2": 2.51917880063421e-10,
+  "restrictions": [
+   "mpg = 0",
+   "weight = 0"
+  ],
+  "vcov_type": "HC1"
+ }
+}

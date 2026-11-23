@@ -31,6 +31,8 @@
 #include "piet/inrange_filter.h"
 #include "piet/mutation_result.h"
 #include "piet/program.h"  // BUG-922: program::restorePreservesDeeperThan is defined here
+#include "estimation/statistics_command_support.h"  // numericColumn / abbrevCp (tsreport)
+#include "piet/dispatcher.h"  // tsreport: the if/in sample marked by generate/replace
 #include "piet/serset.h"  // BUG-1461: serset::storageType, signed into `datasignature`
 #include "piet/strmutate.h"  // BUG-532: needsStringCount, the string-condition test under by:
 #include "piet/stata_format.h"  // eb-order T-P1: `matrix list ..., format()`
@@ -662,5 +664,283 @@ ojson runXtset(const std::string& ivar, const std::optional<std::string>& tvar, 
 // ---------------------------------------------------------------------------
 // drop / keep (varlist form)
 
+
+
+// `tsreport [if] [in] [, detail panel nopanel]` ([TS] tsreport): the sample's
+// first and last periods, its observation count and the gaps in it -- an
+// observation whose next period (t + delta, in its panel) is not in the
+// sample. Without `panel` a panel's end counts as a gap ("includes panel
+// changes") except at the very end; with it, only gaps within a panel count.
+// detail lists them (observation numbers before and after, the panel, the
+// first and last missing period, the missing count) and posts r(table)
+// (vs-stata bank d05ab7915bd5c213, a8e77c4da53be74b, 5a2ccb8dc685388d,
+// e751e767c32ef34a, b572ef742d19de1b, ff4a3ed7d95fcc22). The varlist forms
+// (Gap summary report, casewise) are refused by name.
+ojson runTsreport(const eval::ParsedCommand& parsed, SessionState& session) {
+  auto rc = [](const std::string& m, int r) {
+    return ojson(eval::errorBlock("syntax_error", m, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(r) + ")"));
+  };
+  if (auto e = eval::rejectUnknownOptions(parsed.opts, {"detail", "casewise", "nopanel", "panel"},
+                                          {}))
+    return ojson(*e);
+  bool detail = false, casewise = false, nopanel = false, panelOpt = false;
+  for (const auto& [k, v] : parsed.opts) {
+    (void)v;
+    if (k == "detail") detail = true;
+    if (k == "casewise") casewise = true;
+    if (k == "nopanel") nopanel = true;
+    if (k == "panel") panelOpt = true;
+  }
+  if (panelOpt && nopanel) return rc("cannot specify both panel and nopanel", 198);
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
+  if (!session.timevar.has_value() || session.timevar->empty())
+    return rc("time variable not set, use tsset varname ...", 111);
+  const bool hasPanel = session.panelvar.has_value() && !session.panelvar->empty();
+  if ((panelOpt || nopanel) && !hasPanel) return rc("must specify panelvar; use tsset or xtset", 321);
+  if (!parsed.varlist.empty()) {
+    if (casewise && parsed.varlist.size() < 2)
+      return rc("casewise can only be specified with two or more variables", 198);
+    return ojson(eval::unsupportedCommand("tsreport", std::nullopt, std::nullopt, "piet_gap",
+                                          eval::UnsupportedCommandKind::kNotImplemented));
+  }
+  if (casewise) return rc("casewise can only be specified with two or more variables", 198);
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return ojson(eval::noDataLoaded());
+  const std::string tvar = *session.timevar;
+  const std::string pvar = hasPanel ? *session.panelvar : std::string();
+  const double delta = session.delta.value_or(1.0);
+  std::string tsfmt = tsCurrentFormat(session, ds, tvar);
+  if (tsfmt.empty()) tsfmt = "%9.0g";
+  // The if/in sample (row mask over the data in memory).
+  const int64_t nr = ds->nRows();
+  std::vector<char> inq(static_cast<size_t>(nr), 1);
+  if ((parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
+      (parsed.inRange.has_value() && !parsed.inRange->empty())) {
+    // Mark the rows through a scratch variable so `if`/`in` follow Stata's rules.
+    const std::string mk = "__tsreport_m";
+    std::string q;
+    if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) q += " if " + *parsed.ifExpr;
+    if (parsed.inRange.has_value() && !parsed.inRange->empty()) q += " in " + *parsed.inRange;
+    for (const std::string& line :
+         {"quietly generate byte " + mk + " = 0", "quietly replace " + mk + " = 1" + q}) {
+      ojson r = dispatch(line, session);
+      for (const auto& b : r)
+        if (b.is_object() && b.value("type", std::string()) == "error") {
+          (void)dispatch("capture drop " + mk, session);
+          return b;
+        }
+    }
+    ds = session.datastore();
+    std::vector<double> mv;
+    std::string err;
+    if (ds == nullptr || !statcmd_detail::numericColumn(*ds, mk, &mv, &err)) {
+      (void)dispatch("capture drop " + mk, session);
+      return engineErrorBlockRc("tsreport: could not read the sample", 198);
+    }
+    for (size_t i = 0; i < inq.size() && i < mv.size(); ++i) inq[i] = mv[i] == 1 ? 1 : 0;
+    (void)dispatch("quietly drop " + mk, session);
+    ds = session.datastore();
+  }
+  std::vector<double> t, pv;
+  std::string cerr;
+  if (!statcmd_detail::numericColumn(*ds, tvar, &t, &cerr))
+    return engineErrorBlockRc("tsreport: time variable", 198);
+  if (hasPanel && !statcmd_detail::numericColumn(*ds, pvar, &pv, &cerr))
+    return engineErrorBlockRc("tsreport: panel variable", 198);
+  const size_t n = t.size();
+  std::vector<char> use(n, 0);
+  for (size_t i = 0; i < n; ++i)
+    use[i] = inq[i] && !std::isnan(t[i]) && (!hasPanel || !std::isnan(pv[i]));
+  // Order by panel and time (the tsset order), original row number kept.
+  std::vector<size_t> ord(n);
+  for (size_t i = 0; i < n; ++i) ord[i] = i;
+  auto keyLess = [&](size_t a, size_t b) {
+    if (hasPanel) {
+      const double pa = pv[a], pb = pv[b];
+      if (std::isnan(pa) != std::isnan(pb)) return !std::isnan(pa);
+      if (pa != pb && !(std::isnan(pa) && std::isnan(pb))) return pa < pb;
+    }
+    const double ta = t[a], tb = t[b];
+    if (std::isnan(ta) != std::isnan(tb)) return !std::isnan(ta);
+    if (ta != tb && !(std::isnan(ta) && std::isnan(tb))) return ta < tb;
+    return a < b;
+  };
+  std::stable_sort(ord.begin(), ord.end(), keyLess);
+  double tmin = std::numeric_limits<double>::quiet_NaN(), tmax = tmin, ptop = tmin;
+  double tobs = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (!use[i]) continue;
+    tobs += 1;
+    if (std::isnan(tmin) || t[i] < tmin) tmin = t[i];
+    if (std::isnan(tmax) || t[i] > tmax) tmax = t[i];
+    if (hasPanel && (std::isnan(ptop) || pv[i] > ptop)) ptop = pv[i];
+  }
+  // F.touse: the sample flag of the same panel's observation at t + delta.
+  std::map<std::pair<double, double>, char> at;
+  for (size_t i = 0; i < n; ++i)
+    if (!std::isnan(t[i]) && (!hasPanel || !std::isnan(pv[i])))
+      at[{hasPanel ? pv[i] : 0.0, t[i]}] = use[i];
+  std::vector<char> gap(n, 0);
+  for (size_t k = 0; k < n; ++k) {
+    const size_t i = ord[k];
+    if (!use[i]) continue;
+    auto it = at.find({hasPanel ? pv[i] : 0.0, t[i] + delta});
+    const bool fUse = it != at.end() && it->second == 1;
+    if (fUse) continue;
+    if (!panelOpt && hasPanel) {
+      gap[i] = !(t[i] == tmax && pv[i] == ptop);
+    } else {
+      if (k + 1 >= n) continue;
+      const size_t j = ord[k + 1];
+      const bool pcheck = !hasPanel || pv[j] == pv[i];
+      gap[i] = pcheck && !std::isnan(t[j]) && t[i] < tmax;
+    }
+  }
+  double ngaps = 0;
+  for (char g : gap) ngaps += g;
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted;
+  session.eval.rValues.set("end", tmax);
+  session.eval.rValues.set("start", tmin);
+  session.eval.rValues.set("N_obs", tobs);
+  session.eval.rValues.set("N_gaps", ngaps);
+  session.eval.rStrings.set("tsfmt", tsfmt);
+  session.eval.rStrings.set("timevar", tvar);
+  posted = {"end", "start", "N_obs", "N_gaps", "tsfmt", "timevar"};
+  if (hasPanel) {
+    session.eval.rStrings.set("panelvar", pvar);
+    posted.push_back("panelvar");
+  }
+  // The display.
+  auto fmtT = [&](double v) { return strutil::trim(eval::applyStataFmt(v, tsfmt)); };
+  auto fmtWidth = [&](const std::string& f) -> size_t {
+    static const std::map<std::string, size_t> kDef = {
+        {"%td", 9}, {"%tc", 18}, {"%tC", 18}, {"%tw", 7}, {"%tm", 7},
+        {"%tq", 6}, {"%th", 6},  {"%ty", 4},  {"%tb", 9}};
+    auto it = kDef.find(f);
+    if (it != kDef.end()) return it->second;
+    size_t i = 1;
+    if (i < f.size() && f[i] == '-') ++i;
+    const size_t w = static_cast<size_t>(std::atoi(f.c_str() + i));
+    if (w > 0) return w;
+    return std::max(fmtT(tmin).size(), fmtT(tmax).size());
+  };
+  const size_t fw = fmtWidth(tsfmt);
+  const bool left = tsfmt.size() > 1 && tsfmt[1] == '-';
+  size_t digits = std::max<size_t>(4, strutil::trim(eval::applyStataFmt(tobs, "%12.0f")).size() + 2);
+  auto num = [&](double v) {
+    if (fw > digits)
+      return strutil::trim(eval::applyStataFmt(v, "%" + std::string(left ? "-" : "") +
+                                                      std::to_string(fw) + ".0fc"));
+    return strutil::trim(eval::applyStataFmt(v, "%12.0f"));
+  };
+  std::vector<std::string> vals = {fmtT(tmin), fmtT(tmax), num(tobs), num(ngaps)};
+  size_t len = 0;
+  for (const auto& v : vals) len = std::max(len, cecon::ident::codePointCount(v));
+  auto padL = [](const std::string& s, size_t w) {
+    const size_t c = cecon::ident::codePointCount(s);
+    return c >= w ? s : std::string(w - c, ' ') + s;
+  };
+  std::ostringstream out;
+  out << "\n";
+  if (hasPanel) out << "Panel variable: " << pvar << "\nTime variable:  " << tvar << "\n";
+  else out << "Time variable: " << tvar << "\n";
+  out << std::string(18 + len, '-') << "\n";
+  out << "Starting period = " << padL(vals[0], len) << "\n";
+  out << "Ending period   = " << padL(vals[1], len) << "\n";
+  out << "Number of obs   = " << padL(vals[2], len) << "\n";
+  out << "Number of gaps  = " << padL(vals[3], len);
+  if (!panelOpt && hasPanel) out << " (includes panel changes)";
+  if (detail && ngaps > 0) {
+    // The gap rows in (sample, panel, time, original order).
+    std::vector<size_t> o2(n);
+    for (size_t i = 0; i < n; ++i) o2[i] = i;
+    std::stable_sort(o2.begin(), o2.end(), [&](size_t a, size_t b) {
+      if (use[a] != use[b]) return use[a] < use[b];
+      return keyLess(a, b);
+    });
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    struct GapRow {
+      double before, after, panel, s, e, obs;
+    };
+    std::vector<GapRow> rowsG;
+    for (size_t k = 0; k < n; ++k) {
+      const size_t i = o2[k];
+      if (!gap[i]) continue;
+      GapRow g{static_cast<double>(i + 1), nan, hasPanel ? pv[i] : nan, t[i] + delta, nan, nan};
+      if (k + 1 < n) {
+        const size_t j = o2[k + 1];
+        const bool pcheck = !hasPanel || pv[j] == pv[i];
+        if (pcheck && !std::isnan(t[j])) {
+          g.e = t[j] - delta;
+          g.after = static_cast<double>(j + 1);
+        }
+      }
+      g.obs = std::isnan(g.e) ? nan : (g.e - g.s + delta) / delta;
+      rowsG.push_back(g);
+    }
+    auto i0 = [](double v) { return strutil::trim(eval::applyStataFmt(v, "%30.0f")); };
+    size_t gds = 13;
+    for (const auto& g : rowsG)
+      gds = std::max(gds, i0(g.before).size() + 2 + (std::isnan(g.after) ? 1 : i0(g.after).size()) + 1);
+    const size_t ffw = std::max<size_t>(fw + 2, 12);
+    auto cell = [&](const std::string& v, size_t w, bool lastCol) {
+      return lastCol ? padL(v, w) : padL(v, w - 1) + " ";
+    };
+    std::string pfmt = "%9.0g";
+    if (hasPanel) {
+      auto it = session.varMeta.find(pvar);
+      if (it != session.varMeta.end() && it->second.format.has_value()) pfmt = *it->second.format;
+    }
+    const size_t pw = std::max<size_t>(fmtWidth(pfmt) + 2, 12);
+    size_t total = gds + 1 + (hasPanel ? pw : 0) + ffw * 2 + 12;
+    out << "\n\nGap report\n" << std::string(total, '-') << "\n";
+    std::string hdr = (gds < 12 ? std::string(gds > 4 ? gds - 4 : 0, ' ') + "Obs"
+                                : std::string(gds - 13, ' ') + "Observations");
+    hdr += std::string(gds > cecon::ident::codePointCount(hdr) ? gds - cecon::ident::codePointCount(hdr) : 0, ' ');
+    hdr += "|";
+    if (hasPanel) hdr += cell(statcmd_detail::abbrevCp(pvar, 9), pw, false);
+    hdr += cell("Start", ffw, false) + cell("End", ffw, false) + cell("N. obs", 12, true);
+    out << hdr << "\n" << std::string(gds, '-') << "+" << std::string(total - gds - 1, '-') << "\n";
+    std::vector<std::string> rowNames;
+    for (const auto& g : rowsG) {
+      std::string lab, rname;
+      if (std::isnan(g.after) || g.after == g.before) {
+        lab = i0(g.before);
+        rname = lab;
+      } else {
+        lab = i0(g.before) + "\xe2\x80\x93" + i0(g.after);
+        rname = i0(g.before) + "--" + i0(g.after);
+      }
+      rowNames.push_back(rname);
+      std::string line = padL(lab + " ", gds) + "|";
+      if (hasPanel) line += cell(strutil::trim(eval::applyStataFmt(g.panel, pfmt)), pw, false);
+      line += cell(fmtT(g.s), ffw, false);
+      line += cell(std::isnan(g.e) ? "." : fmtT(g.e), ffw, false);
+      line += cell(std::isnan(g.obs) ? "." : strutil::trim(eval::applyStataFmt(g.obs, "%9.0fc")), 12,
+                   true);
+      out << line << "\n";
+    }
+    out << std::string(total, '-');
+    eval::EvalMatrix M;
+    M.rownames = rowNames;
+    M.colnames = hasPanel ? std::vector<std::string>{"ObsBefore", "ObsAfter", pvar, "StartTime",
+                                                     "EndTime", "Obs"}
+                          : std::vector<std::string>{"ObsBefore", "ObsAfter", "StartTime",
+                                                     "EndTime", "Obs"};
+    for (const auto& g : rowsG) {
+      if (hasPanel) M.data.push_back({g.before, g.after, g.panel, g.s, g.e, g.obs});
+      else M.data.push_back({g.before, g.after, g.s, g.e, g.obs});
+    }
+    session.eval.rMatrices.emplace_back("table", M);
+    posted.push_back("table");
+  }
+  eval::declareRPosted(session.eval, "tsreport", std::move(posted));
+  ojson b;
+  b["type"] = "display";
+  b["text"] = out.str();
+  return b;
+}
 
 }  // namespace piet::handlers

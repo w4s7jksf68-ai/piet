@@ -241,6 +241,8 @@ std::optional<ojson> parseFvTerm(const std::string& term, SessionState& session,
       fvHere = "ib" + std::to_string(*lv);
     } else if (std::regex_match(g, reIbn)) {
       fvHere = "ibn";
+    } else if (g == "o" || g == "O") {
+      fvHere = "o";  // omitted: kept as written (vs-stata bank efa1f513 `o.mpg weight`)
     } else if (std::regex_match(g, m, reIn)) {
       auto lv = opInt(m.str(1));
       if (!lv) return rcError(invalidOp, 198);
@@ -314,9 +316,8 @@ std::optional<ojson> parseFvTerm(const std::string& term, SessionState& session,
     }
     for (auto& a : atoms) tsAtoms.push_back(std::move(a));
   }
-  if (!fv.empty() && !tsAtoms.empty())
-    return notImplemented("fvunab: a factor-variable operator combined with a time-series "
-                          "operator is not implemented in this version of PIET (" + term + ")");
+  // A factor-variable operator beside time-series ones is written factor
+  // first, `iL.c` for `L.i.c` (vs-stata bank f37c5426); runFvunab joins them.
   int multi = 0;
   for (const auto& a : tsAtoms)
     if (a.second.size() > 1) ++multi;
@@ -411,6 +412,104 @@ std::vector<std::string> fvTerms(const std::string& textIn) {
 
 }  // namespace
 
+namespace {
+
+// One factor of an interaction, as fvunab writes it: in the interaction a
+// categorical factor keeps its operator (`i.` when it has none) and a
+// continuous one is `c.` with its time-series operator after the c
+// (`cL.x`); as a main effect of `##` a continuous factor is its variable
+// alone (`mpg`). StataBE 19.5, vs-stata bank: `i.foreign##c.mpg` is
+// `i.foreign mpg i.foreign#c.mpg` (641697f8), `rep78#foreign` is
+// `i.rep78#i.foreign` (37e467b3), `c.mpg##c.mpg` is `mpg c.mpg#c.mpg`
+// (1c05a7f8), abbreviations resolved (15df67ab).
+struct FvFactor {
+  std::string inInteraction;
+  std::string mainEffect;
+};
+
+std::optional<ojson> parseFactor(const std::string& partIn, const std::string& term,
+                                 SessionState& session, FvFactor* out) {
+  std::string part = partIn;
+  bool continuous = false;
+  if (!part.empty() && (part[0] == 'c' || part[0] == 'C')) {
+    const size_t dot = part.find('.');
+    if (dot != std::string::npos) {
+      const std::string op = part.substr(1, dot - 1);
+      bool tsOnly = true;
+      for (char ch : op) {
+        const char u = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        if (!(u == 'L' || u == 'F' || u == 'D' || u == 'S' ||
+              std::isdigit(static_cast<unsigned char>(ch))))
+          tsOnly = false;
+      }
+      if (tsOnly) {
+        continuous = true;
+        part = op.empty() ? part.substr(dot + 1) : op + part.substr(dot);
+      }
+    }
+  }
+  FvTerm ft;
+  if (auto e = parseFvTerm(part, session, &ft)) return e;
+  if (ft.vars.size() != 1 || ft.tsPrefixes.size() != 1)
+    return notImplemented("fvunab: an interaction of a varlist or an operator numlist is not "
+                          "implemented in this version of PIET (" + term + ")");
+  const std::string& v = ft.vars[0];
+  const std::string& ts = ft.tsPrefixes[0];
+  if (continuous || ft.fvPrefix == "o") {
+    if (ft.fvPrefix == "o")
+      return notImplemented("fvunab: o. inside an interaction is not implemented in this "
+                            "version of PIET (" + term + ")");
+    out->inInteraction = "c" + ts + "." + v;
+    out->mainEffect = ts.empty() ? v : ts + "." + v;
+  } else {
+    Datastore* ds = session.datastore();
+    if (ds != nullptr && ds->has(v) && ds->dtype(v) == "factor")
+      return rcError(v + ":  string variables may not be used as factor variables", 109);
+    const std::string fv = ft.fvPrefix.empty() ? "i" : ft.fvPrefix;
+    out->inInteraction = fv + ts + "." + v;
+    out->mainEffect = out->inInteraction;
+  }
+  return std::nullopt;
+}
+
+std::optional<ojson> expandInteraction(const std::string& term, SessionState& session,
+                                       std::vector<std::string>& result) {
+  const auto add = [&result](const std::string& t) {
+    if (std::find(result.begin(), result.end(), t) == result.end()) result.push_back(t);
+  };
+  const bool full = term.find("##") != std::string::npos;
+  std::vector<std::string> parts;
+  {
+    const std::string sep = full ? "##" : "#";
+    size_t from = 0;
+    for (;;) {
+      const size_t at = term.find(sep, from);
+      parts.push_back(term.substr(from, at == std::string::npos ? std::string::npos : at - from));
+      if (at == std::string::npos) break;
+      from = at + sep.size();
+    }
+  }
+  for (const auto& p : parts)
+    if (p.empty()) return rcError(term + " invalid name", 198);
+  if (full && (parts.size() != 2 || parts[0].find('#') != std::string::npos ||
+               parts[1].find('#') != std::string::npos))
+    return notImplemented("fvunab: a factorial `##` of more than two factors is not "
+                          "implemented in this version of PIET (" + term + ")");
+  std::vector<FvFactor> f(parts.size());
+  for (size_t k = 0; k < parts.size(); ++k)
+    if (auto e = parseFactor(parts[k], term, session, &f[k])) return e;
+  std::string inter;
+  for (size_t k = 0; k < f.size(); ++k) inter += (k ? "#" : "") + f[k].inInteraction;
+  if (full) {
+    add(f[0].mainEffect);
+    add(f[1].mainEffect);
+  }
+  add(inter);
+  return std::nullopt;
+}
+
+}  // namespace
+
 ojson runFvunab(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabFvunab.known,
                                             kVocabFvunab.unimplemented))
@@ -447,12 +546,18 @@ ojson runFvunab(const eval::ParsedCommand& parsed, SessionState& session) {
   std::vector<std::string> result;
   std::set<std::string> fvSeen;  // variables already carrying a factor term
   for (const auto& term : fvTerms(text.substr(colon + 1))) {
+    if (term.find('#') != std::string::npos) {
+      if (auto e = expandInteraction(term, session, result)) return *e;
+      continue;
+    }
     FvTerm ft;
     if (auto e = parseFvTerm(term, session, &ft)) return *e;
     for (const auto& v : ft.vars) {
       if (!ft.fvPrefix.empty()) {
-        if (!fvSeen.insert(v).second) continue;
-        result.push_back(ft.fvPrefix + "." + v);
+        for (const auto& p : ft.tsPrefixes) {
+          if (!fvSeen.insert(p + "|" + v).second) continue;
+          result.push_back(ft.fvPrefix + p + "." + v);
+        }
         continue;
       }
       for (const auto& p : ft.tsPrefixes) result.push_back(p.empty() ? v : p + "." + v);

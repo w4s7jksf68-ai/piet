@@ -74,6 +74,72 @@ ojson runReshape(const std::vector<std::string>& stubsIn,
   std::string direction = lower(stubsIn[0]);
   std::vector<std::string> stubs(stubsIn.begin() + 1, stubsIn.end());
 
+  // The reshape a dataset remembers: Stata keeps the last reshape's i, j, xij and string
+  // flag in the _dta characteristics ReS_i / ReS_j / ReS_Xij / ReS_str, so a bare
+  // `reshape long` or `reshape wide` goes back the other way, and `reshape clear` forgets
+  // them (vs-stata bank 06a2670418c4a425 `reshape wide bp, i(patient) j(when)` then
+  // `reshape long`; 0bb3376e1d8c125a a bare `reshape long` with nothing remembered is
+  // r(111) "data have not been reshaped yet"; c5c125951362ac58 `reshape clear`).
+  auto getChar = [&](const std::string& name) -> std::optional<std::string> {
+    for (const auto& c : session.characteristics)
+      if (c.varname == "_dta" && c.charname == name) return c.value;
+    return std::nullopt;
+  };
+  auto clearState = [&]() {
+    auto& cs = session.characteristics;
+    cs.erase(std::remove_if(cs.begin(), cs.end(),
+                            [](const DtaCharacteristic& c) {
+                              return c.varname == "_dta" && c.charname.rfind("ReS_", 0) == 0;
+                            }),
+             cs.end());
+  };
+  if (direction == "clear" && stubs.empty() && opts.empty()) {
+    clearState();
+    return ojson::array();
+  }
+  if ((direction == "long" || direction == "wide") && stubs.empty() && opts.empty()) {
+    const auto ri = getChar("ReS_i"), rj = getChar("ReS_j"), rx = getChar("ReS_Xij");
+    if (!ri.has_value() || !rj.has_value() || !rx.has_value())
+      return ojson(eval::errorBlock("engine_error", "data have not been reshaped yet",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(111)"));
+    // Already in the remembered direction: `wide` with no j variable left, `long` with
+    // the j variable already there, is a note and rc 0, not a second reshape.
+    if (Datastore* cur = session.datastore()) {
+      std::string jName;
+      {
+        std::istringstream in(*rj);
+        in >> jName;
+      }
+      const std::vector<std::string> now = cur->names();
+      const bool jThere = !jName.empty() && std::find(now.begin(), now.end(), jName) != now.end();
+      if ((direction == "wide" && !jThere) || (direction == "long" && jThere)) {
+        ojson note;
+        note["type"] = "display";
+        note["class"] = "note";
+        note["text"] = direction == "wide" ? "(data are already wide)" : "(data are already long)";
+        return ojson::array({note});
+      }
+    }
+    std::vector<std::string> again = {direction};
+    {
+      std::istringstream in(*rx);
+      for (std::string w; in >> w;) again.push_back(w);
+    }
+    std::vector<std::pair<std::string, eval::OptValue>> o2;
+    eval::OptValue iv, jv;
+    iv.strValue = *ri;
+    jv.strValue = *rj;
+    o2.push_back({"i", iv});
+    o2.push_back({"j", jv});
+    if (getChar("ReS_str").value_or("0") == "1") {
+      eval::OptValue sv;
+      sv.isBool = true;
+      sv.boolValue = true;
+      o2.push_back({"string", sv});
+    }
+    return runReshape(again, o2, session);
+  }
+
   // BUG-105 (옵션망): reshape accepts only i()/j() — any other residual
   // option token is a named reject, not a silent no-op.
   // BUG-233: the one copy of this vocabulary now lives in the file-scope
@@ -443,6 +509,35 @@ ojson runReshape(const std::vector<std::string>& stubsIn,
       session.labelSeq.erase(it->first);
       it = session.labelDefs.erase(it);
     }
+    // wide: the sets that survive come back through that saved file, which is read in the
+    // order `label dir` listed them, so the newest set before is the oldest after
+    // (vs-stata bank 95f953face897afd: bplong's when, sex, agegrp list as agegrp, sex
+    // after `reshape wide bp, i(patient) j(when)`).
+    if (direction == "wide") {
+      const std::vector<std::string> before = session.labelSetOrder();
+      for (const auto& name : before) session.stampLabelSet(name);
+    }
+  }
+  // remember this reshape for a bare `reshape long|wide` later (see the top of this function)
+  {
+    auto& cs = session.characteristics;
+    cs.erase(std::remove_if(cs.begin(), cs.end(),
+                            [](const DtaCharacteristic& c) {
+                              return c.varname == "_dta" && c.charname.rfind("ReS_", 0) == 0;
+                            }),
+             cs.end());
+    std::string iJoined;
+    for (const auto& v : iVars) iJoined += (iJoined.empty() ? "" : " ") + v;
+    std::string xJoined;
+    for (const auto& st : stubs) xJoined += (xJoined.empty() ? "" : " ") + st;
+    std::string jvJoined;
+    for (const auto& v : jValues) jvJoined += (jvJoined.empty() ? "" : " ") + v;
+    cs.push_back({"_dta", "ReS_ver", "v.2"});
+    cs.push_back({"_dta", "ReS_i", iJoined});
+    cs.push_back({"_dta", "ReS_j", *jVar});
+    cs.push_back({"_dta", "ReS_jv", jvJoined});
+    cs.push_back({"_dta", "ReS_Xij", xJoined});
+    cs.push_back({"_dta", "ReS_str", jString ? "1" : "0"});
   }
   postDescribeResults(session, "reshape");
   ojson result = mutationResult(session, "reshape");

@@ -39,6 +39,8 @@ struct XtpoisFeResult {
     double loglik = 0;
     int iters = 0;
     bool converged = false;
+    std::vector<double> ilog;      // ml's log: ll at iteration 0..iters (e(ilog))
+    std::vector<double> gradient;  // d ll / d b at the last iterate (e(gradient))
 };
 
 // Estimate xtpoisson, fe by Newton-Raphson on the conditional log-likelihood.

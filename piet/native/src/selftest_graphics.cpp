@@ -2665,7 +2665,9 @@ void testAerW2OptVocabTwoWay() {
       // --- promoted BUG-336 nets: the sets did not change, only their home ---
       {&kFatal, "codebook fatal, compact", "codebook fatal, zzzfake", true, "codebook"},
       {&kFatal, "describe", "describe, zzzfake", true, "describe"},
-      {&kFatal, "rename fatal fatal2", "rename fatal fatal2, zzzfake", true, "rename"},
+      // rename reads its option words itself and passes over one it does not know: Stata
+      // renames (vs-stata bank b052888e087a900b `rename price p, zznotanoption` rc 0).
+      {&kFatal, "rename fatal fatal2", "rename fatal fatal2, zzzfake", false, "rename"},
       {&kFatal, "generate w2g = 1", "generate w2g = 1, zzzfake", true, "generate"},
       {&kFatal, "sort year", "sort year, zzzfake", true, "sort"},
       {&kFatal, "gsort -year", "gsort -year, zzzfake", true, "gsort"},
@@ -2799,15 +2801,18 @@ void testAerW2OptVocabTwoWay() {
   // separate bucket from "not a member": a real Stata option this build does
   // not have must say so, not read as a typo.
   {
-    const auto beta = runOf(kFatal, "regress fatal beertax, beta");
+    // (`beta` is implemented now -- vs-stata bank 23a1222407b860c9 -- so the
+    // real-but-unwired example is vce(hc2), still refused by name.)
+    const auto beta = runOf(kFatal, "regress fatal beertax, vce(hc2)");
     check(beta.first.find("valid Stata option") != std::string::npos,
-          "W2 regress: `beta` is refused as a real-but-unwired Stata option, not as a typo -- "
+          "W2 regress: `vce(hc2)` is refused as a real-but-unwired Stata option, not as a typo -- "
           "got " + beta.first);
-    // joinby's unmatched() is served now; its `update` is the real-but-unwired
-    // option this leg probes (joinby's documented `update`).
-    const auto unm = runOf(kFatal, "joinby state using \"nowhere.dta\", update");
+    // joinby's update is served now (vs-stata bank 2226af525d223e5c); geonear's
+    // `long` is the real-but-unwired option this leg probes.
+    const auto unm =
+        runOf(kFatal, "geonear state fatal beertax using \"nowhere.dta\", neighbors(a b c) long");
     check(unm.first.find("valid Stata option") != std::string::npos,
-          "W2 joinby: `update` is refused as a real-but-unwired Stata option -- got " +
+          "W2 geonear: `long` is refused as a real-but-unwired Stata option -- got " +
               unm.first);
     // `be` fits since BUG-1515; `pa` is the xtreg estimator the arm still refuses.
     const auto paq = runOf(kPanel, "xtreg fatal beertax, pa");

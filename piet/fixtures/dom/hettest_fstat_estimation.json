@@ -1,0 +1,13 @@
+{
+  "type": "estimation",
+  "estimator": "hettest",
+  "depvar": "",
+  "n_obs": 74,
+  "F": 2.3837844645982007,
+  "p_F": 0.07659376694132457,
+  "df": 3,
+  "p": 0.07659376694132457,
+  "df_r": 70.0,
+  "assumption": "i.i.d. error terms",
+  "df_m": 3.0
+}

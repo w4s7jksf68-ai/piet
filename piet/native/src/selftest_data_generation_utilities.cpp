@@ -132,8 +132,10 @@ void mvdecodeArms(const std::string& workdir) {
   genCheck(rcOf(s, "mvdecode f, mv(abc)") == "121", "mvdecode mv(abc) r(121) (probe p2 mvbad)");
   genCheck(rcOf(s, "mvdecode f, mv(1=2)") == "198",
            "mvdecode mv(1=2) r(198) `2 is not a missing value code' (probe p2 mvbadcode)");
-  genCheck(rcOf(s, "mvdecode f, mv(1=.a)") == "198" && shown(s, "f[1]") == "1",
-           "mvdecode mv(1=.a) refused by name, data untouched (probe p2 mvext: no .a in PIET)");
+  // An extended code is stored (vs-stata bank a492838d4b819796 `mvdecode rep78, mv(1=.a \\ 5=.b)`
+  // rc 0, 13 missing values generated).
+  genCheck(rcOf(s, "mvdecode f, mv(1=.a)") == "0" && shown(s, "f[1]") == ".a",
+           "mvdecode mv(1=.a) stores .a (bank a492838d4b819796)");
 
   // Float compare (probe p2 mvfloat): a float variable meets float(#).
   piet::SessionState s2(workdir);
@@ -289,8 +291,9 @@ void sencodeArms(const std::string& workdir) {
   genCheck(rcOf(s2, "sencode A if n > 1, g(e6)") == "0" && shown(s2, "e6[1]") == "." &&
                shown(s2, "e6[2]") == "1" && shown(s2, "e6[5]") == "3",
            "sencode if: codes over the sample only (probe p3 sif)");
-  genCheck(rcOf(s2, "sencode A, g(e8) manyto1") == "198" && rcOf(s2, "confirm variable e8") == "111",
-           "sencode manyto1 refused by name, nothing written (probe p3 smany)");
+  // manyto1 is served (vs-stata bank 042cbfd13f7bf8ca): the variable is written.
+  genCheck(rcOf(s2, "sencode A, g(e8) manyto1") == "0" && rcOf(s2, "confirm variable e8") == "0",
+           "sencode manyto1 writes its variable (bank 042cbfd13f7bf8ca)");
 }
 
 // ---------------------------------------------------------------------------

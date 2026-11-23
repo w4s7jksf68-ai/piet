@@ -45,13 +45,11 @@ using namespace resampling_detail;
 
 namespace {
 
-// A one-column CSV of int64 values, for `cobra convert` to turn into an hbin.
-bool writeIndexCsv(const std::string& path, const std::string& colName,
-                   const std::vector<int64_t>& vals) {
+// `cobra take`'s rows file: 1-based row numbers, one per line, in output order.
+bool writeRowsFile(const std::string& path, const std::vector<int64_t>& rows) {
   std::ofstream f(cecon::to_native_path(path));
   if (!f) return false;
-  f << colName << "\n";
-  for (int64_t v : vals) f << v << "\n";
+  for (int64_t v : rows) f << v << "\n";
   return static_cast<bool>(f);
 }
 
@@ -610,16 +608,7 @@ ojson runBootstrap(const std::string& expListRaw, const std::string& optsRaw,
   }
   const std::string rngstate = session.seed.stream().state_string();
 
-  const std::string basePathIdx = nextPath(session.workdir(), "bs_baseidx");
-  {
-    CobraRunResult cr = runCobra({"eval", "--data", obsHbin, "--egen",
-                                  std::string(kRowIdx) + " = seq()", "--out", basePathIdx});
-    if (!cr.ok) {
-      CobraError ce = errorFromRaw(cr);
-      return rsError(cobraErrorStr(ce), ce.code);
-    }
-  }
-  SessionState::ScratchPin pin(session, {basePathIdx, startHbin, obsHbin});
+  SessionState::ScratchPin pin(session, {startHbin, obsHbin});
 
   std::vector<std::vector<double>> repVals;  // one row per replicate, NaN = missing
   repVals.reserve(static_cast<size_t>(reps));
@@ -628,31 +617,20 @@ ojson runBootstrap(const std::string& expListRaw, const std::string& optsRaw,
     const std::vector<int64_t> pos =
         clusterVar.empty() ? bsdraw::srswrFast(session.seed.stream(), nBase)
                            : bsdraw::clustSrswr(session.seed.stream(), clid, nClust);
+    // The replicate is the drawn base rows, repeats included, in draw order:
+    // one `cobra take` gathers them straight from the observed data. (It used
+    // to be convert + merge m:1 against a row-stamped copy of the base + a
+    // keepif pass -- three whole-width writes per replicate, ~19 of ~25 ms per
+    // replicate on a 606 x 273 dataset whose estimator took 0.2 ms.)
     std::vector<int64_t> idx;
     idx.reserve(pos.size());
     for (int64_t p : pos) idx.push_back(baseRows[static_cast<size_t>(p)] + 1);
-    const std::string csv = session.workdir() + "/bs_idx.csv";
-    registerScratchMint(csv);  // BUG-389
-    if (!writeIndexCsv(csv, kRowIdx, idx)) { failure = "could not write the resample index"; break; }
-    const std::string idxHbin = nextPath(session.workdir(), "bs_idx");
-    CobraRunResult c1 = runCobra({"convert", "--data", csv, "--out", idxHbin, "--delim", ","});
-    if (!c1.ok) { failure = cobraErrorStr(errorFromRaw(c1)); break; }
-    const std::string merged = nextPath(session.workdir(), "bs_merged");
-    // master = the drawn rows (with repeats, in the resample's row order),
-    // using = the base keyed by the same index; the using-only (undrawn) rows
-    // are not part of the sample.
-    CobraRunResult c2 = runCobra({"merge", "--data", idxHbin, "--using", basePathIdx, "--type",
-                                  "m:1", "--key", kRowIdx, "--out", merged});
-    if (!c2.ok) { failure = cobraErrorStr(errorFromRaw(c2)); break; }
+    const std::string rowsFile = session.workdir() + "/bs_rows.txt";
+    registerScratchMint(rowsFile);  // BUG-389
+    if (!writeRowsFile(rowsFile, idx)) { failure = "could not write the resample index"; break; }
     const std::string repPath = nextPath(session.workdir(), "bs_rep");
-    CobraRunResult c3 = runCobra({"eval", "--data", merged, "--keepif", "_merge!=2", "--drop",
-                                  "_merge", "--out", repPath});
-    if (!c3.ok) { failure = cobraErrorStr(errorFromRaw(c3)); break; }
-    // The two intermediates are never loaded; drop them now rather than at exit.
-    for (const std::string& p : {idxHbin, merged}) {
-      cecon::native_unlink(p);
-      forgetScratchMint(p);
-    }
+    CobraRunResult ct = runCobra({"take", "--data", obsHbin, "--rows-file", rowsFile, "--out", repPath});
+    if (!ct.ok) { failure = cobraErrorStr(errorFromRaw(ct)); break; }
 
     session.load(repPath);
     const ojson inner = dispatch(repCmd, session);

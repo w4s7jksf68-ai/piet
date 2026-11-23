@@ -295,6 +295,30 @@ std::string glevelsofNumText(double v) {
   return buf;
 }
 
+// glevelsof numfmt(): gtools hands the format to C's printf, so it is a C
+// format, not a Stata display format. The first %W.Dc or %.Dc (c = f or g)
+// in the text is the conversion; any text around it is printed as it stands
+// (numfmt(%9.2fc) prints "     0.25c"). Anything else is refused, r(198).
+struct GtoolsNumfmt {
+  std::string prefix, spec, suffix;
+};
+
+std::optional<GtoolsNumfmt> parseGtoolsNumfmt(const std::string& fmt) {
+  static const std::regex reWide(R"(%([0-9]+)\.([0-9]+)([gf]))");
+  static const std::regex reBare(R"(%\.([0-9]+)([gf]))");
+  std::smatch m;
+  if (!std::regex_search(fmt, m, reWide) && !std::regex_search(fmt, m, reBare))
+    return std::nullopt;
+  return GtoolsNumfmt{m.prefix().str(), m.str(0), m.suffix().str()};
+}
+
+std::string gtoolsNumfmtText(const GtoolsNumfmt& f, double v) {
+  if (std::isnan(v)) return levelMissingText(v);
+  char buf[512];
+  std::snprintf(buf, sizeof(buf), f.spec.c_str(), v == 0.0 ? 0.0 : v);
+  return f.prefix + buf + f.suffix;
+}
+
 std::string compoundQuote(const std::string& s) { return "`\"" + s + "\"'"; }
 
 std::string replaceAllOf(std::string s, const std::string& from, const std::string& to) {
@@ -312,6 +336,13 @@ ojson runLevelsofCommand(const LevelsofRequest& req, SessionState& session) {
   const std::string cmdName = req.gtools ? "glevelsof" : "levelsof";
   if (req.vars.empty()) return levelsRcError("varlist required", 100);
   if (!req.gtools && req.vars.size() > 1) return levelsRcError("too many variables specified", 103);
+  std::optional<GtoolsNumfmt> numfmt;
+  if (req.gtools && req.numfmt.has_value()) {
+    numfmt = parseGtoolsNumfmt(*req.numfmt);
+    if (!numfmt.has_value())
+      return levelsRcError(
+          "Number format must be %(width).(digits)(f|g); e.g. %.16g (default), %20.5f", 198);
+  }
 
   // The projection first (one fetch of the columns read), the head as fallback:
   // the same shape the single-variable form has used since ONESHOT-GETCOLS2.
@@ -498,21 +529,44 @@ ojson runLevelsofCommand(const LevelsofRequest& req, SessionState& session) {
     b["text"] = "(no observations)";
     return b;
   }
+  // `-var` sorts that variable's levels descending (glevelsof's [+|-]varname).
+  std::vector<std::pair<std::vector<LevelCell>, int64_t>> ordered(groups.begin(), groups.end());
+  {
+    bool anyDesc = false;
+    for (bool d : req.desc) anyDesc = anyDesc || d;
+    if (anyDesc) {
+      LevelKeyLess less;
+      std::stable_sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) {
+        for (size_t j = 0; j < a.first.size(); ++j) {
+          const std::vector<LevelCell> ca{a.first[j]}, cb{b.first[j]};
+          const bool lt = less(ca, cb), gt = less(cb, ca);
+          if (!lt && !gt) continue;
+          const bool d = j < req.desc.size() && req.desc[j];
+          return d ? gt : lt;
+        }
+        return false;
+      });
+    }
+  }
   std::vector<std::string> rows;
   int64_t minJ = std::numeric_limits<int64_t>::max(), maxJ = 0;
-  for (const auto& kv : groups) {
+  for (const auto& kv : ordered) {
     minJ = std::min(minJ, kv.second);
     maxJ = std::max(maxJ, kv.second);
     std::string row;
     for (size_t j = 0; j < kv.first.size(); ++j) {
       const LevelCell& c = kv.first[j];
-      std::string cell = c.isStr ? (req.clean ? c.s : compoundQuote(c.s)) : glevelsofNumText(c.d);
+      std::string cell = c.isStr ? (req.clean ? c.s : compoundQuote(c.s))
+                         : numfmt.has_value() ? gtoolsNumfmtText(*numfmt, c.d)
+                                              : glevelsofNumText(c.d);
       row += (j ? colsep : std::string()) + cell;
     }
     rows.push_back(req.vars.size() > 1 ? compoundQuote(row) : row);
   }
   std::string joined;
   for (size_t i = 0; i < rows.size(); ++i) joined += (i ? sep : "") + rows[i];
+  // One numeric variable: " 0." -> " ." and "-0." -> "-.", whatever numfmt()
+  // spelled the levels with.
   if (req.vars.size() == 1 && !isStr[0]) {
     joined = replaceAllOf(joined, " 0.", " .");
     joined = replaceAllOf(joined, "-0.", "-.");
@@ -521,19 +575,27 @@ ojson runLevelsofCommand(const LevelsofRequest& req, SessionState& session) {
   // string level unquoted (its compound quotes belong to the r(levels) / local
   // text above). A multi-variable row has no plainer form than the quoted row.
   size_t gi = 0;
-  for (const auto& kv : groups) {
+  for (const auto& kv : ordered) {
     const bool bareStr = req.vars.size() == 1 && kv.first[0].isStr;
     levelsArr.push_back(bareStr ? kv.first[0].s : rows[gi]);
     ++gi;
   }
   eval::replaceRClass(session.eval);
-  session.eval.rStrings.set("levels", joined);
-  session.eval.rStrings.set("sep", sep);
-  session.eval.rStrings.set("colsep", colsep);
   session.eval.rValues.set("N", static_cast<double>(kept));
   session.eval.rValues.set("J", static_cast<double>(groups.size()));
   session.eval.rValues.set("minJ", static_cast<double>(minJ));
   session.eval.rValues.set("maxJ", static_cast<double>(maxJ));
+  if (req.noLocalvar) {
+    // nolocalvar: no levels anywhere (vs-stata bank 80adf6d521207ad9).
+    eval::declareRPosted(session.eval, "glevelsof", {"N", "J", "minJ", "maxJ"});
+    ojson note;
+    note["type"] = "display";
+    note["text"] = "(note: glevelsof will not store the levels of varlist)";
+    return note;
+  }
+  session.eval.rStrings.set("levels", joined);
+  session.eval.rStrings.set("sep", sep);
+  session.eval.rStrings.set("colsep", colsep);
   eval::declareRPosted(session.eval, "glevelsof",
                        {"N", "J", "minJ", "maxJ", "levels", "sep", "colsep"});
   if (req.localName.has_value() && !req.localName->empty())

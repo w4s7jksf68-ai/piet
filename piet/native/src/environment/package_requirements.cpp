@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
-//   require   an accept-note, the `ssc install`/`which` precedent.
+// Offline package requirements.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -28,6 +28,7 @@
 #include "piet/stata_format.h"       // renderValue/padToField: the one %w.pf renderer
 #include "piet/strutil.h"
 #include "language/command_reply_support.h"
+#include "dispatch/registry.h"
 
 // ---------------------------------------------------------------------------
 // OPTION VOCABULARIES -- namespace scope, before any dispatch (defect class 3).
@@ -65,11 +66,9 @@ using namespace command_reply_detail;
 // is r(9) `assert failed: inlist("distinct", ">=", "==", "")`, and envp2
 // req_gt `estout>3` is r(9) the same way. A syntax rule, so it is mirrored.
 //
-// Everything past the grammar is an installed-files fact PIET cannot see:
-// PIET runs no ado-files and keeps no package store, so it neither finds the
-// package (Stata: r(601) when absent) nor reads its version (r(2226)/r(2227)
-// when too old). It answers rc 0 with a note that says exactly that, the
-// `ssc install` / `which` accept-note precedent. `require stata>=V` IS a fact
+// Available packages are backed by native commands. Missing packages return
+// r(601). Native implementations do not have upstream package versions.
+// `require stata>=V` is a fact
 // PIET knows -- the Stata release it answers for is 19.5 (the oracles') -- so
 // V above that is Stata's r(9) (envp2 req_stata21), and V at or below it rc 0.
 nlohmann::ordered_json runRequire(const eval::ParsedCommand& parsed, SessionState& session) {
@@ -144,6 +143,12 @@ nlohmann::ordered_json runRequire(const eval::ParsedCommand& parsed, SessionStat
                       9);
     return ojson::array();
   }
+  const auto* command = registry::findByName(package);
+  // These distributions contain native commands whose names differ from the
+  // distribution name. The registry handles packages with an eponymous command.
+  const bool bundled = package == "gtools" || package == "ftools" ||
+                       (command != nullptr && command->canonical == package);
+  if (!bundled) return envError("package " + package + " is not available in PIET", 601);
   return displayBlock("(require " + req +
                       ": PIET bundles its own implementations; installation and version not checked)");
 }

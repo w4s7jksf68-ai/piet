@@ -846,13 +846,23 @@ static std::string buildSvgCombine(const ojson& block) {
 
   ojson panels = block.value("panels", ojson::array());
   for (size_t idx = 0; idx < panels.size(); ++idx) {
+    const auto& panel = panels[idx];
+    if (panel.is_null()) continue;
     int row = static_cast<int>(idx) / cols;
     int col = static_cast<int>(idx) % cols;
     if (row >= rows) break;
     double tx = col * kSvgW, ty = row * kSvgH;
+    if (panel.value("kind", std::string()) == "matrix_label") {
+      lines.push_back("  <text x=\"" + fmtNum(tx + kSvgW / 2) + "\" y=\"" +
+                       fmtNum(ty + kSvgH / 2) +
+                       "\" text-anchor=\"middle\" font-size=\"22\" fill=\"" +
+                       svgEscape(jstr(panel, "color", "#111")) + "\">" +
+                       svgEscape(jstr(panel, "text")) + "</text>");
+      continue;
+    }
     std::string subSvg;
     try {
-      subSvg = buildSvgDispatch(panels[idx]);
+      subSvg = buildSvgDispatch(panel);
     } catch (...) {
       subSvg = "<svg viewBox=\"0 0 520 360\" xmlns=\"http://www.w3.org/2000/svg\">"
                 "<text x=\"10\" y=\"20\" font-size=\"10\" fill=\"red\">render error</text></svg>";
@@ -888,7 +898,9 @@ static std::string buildSvgCombine(const ojson& block) {
 static std::string buildSvgBar(const ojson& block) {
   static const char* kBarColors[] = {"#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"};
   const bool horizontal = block.value("horizontal", false);
-  const bool stack = block.value("stack", false);
+  // `graph dot`: a dotted guide line per slot and one marker per series at its value.
+  const bool dot = block.value("chart", std::string()) == "dot";
+  const bool stack = block.value("stack", false) && !dot;
   std::vector<std::string> slotKeys, slotLabels, seriesNames;
   struct Cell { size_t slot, series; double v; };
   std::vector<Cell> cells;
@@ -929,8 +941,34 @@ static std::string buildSvgBar(const ojson& block) {
   svgTitle(lines, jstr(block, "title"));
   if (horizontal) svgFrameAndAxes(lines, vr, sr, jstr(block, "ytitle"), std::string(), false, true);
   else svgFrameAndAxes(lines, sr, vr, std::string(), jstr(block, "ytitle"), true, false);
+  if (dot) {
+    for (size_t i = 0; i < slotKeys.size(); ++i) {
+      const double mid = static_cast<double>(i) + 0.5;
+      double x1, y1, x2, y2;
+      if (horizontal) {
+        x1 = svgSx(vr.first, vr.first, vr.second);
+        x2 = svgSx(vr.second, vr.first, vr.second);
+        y1 = y2 = svgSy(mid, sr.first, sr.second);
+      } else {
+        x1 = x2 = svgSx(mid, sr.first, sr.second);
+        y1 = svgSy(vr.first, vr.first, vr.second);
+        y2 = svgSy(vr.second, vr.first, vr.second);
+      }
+      lines.push_back("  <line x1=\"" + fmtNum(x1, "%.2f") + "\" y1=\"" + fmtNum(y1, "%.2f") + "\" x2=\"" +
+                      fmtNum(x2, "%.2f") + "\" y2=\"" + fmtNum(y2, "%.2f") +
+                      "\" stroke=\"#888\" stroke-width=\"1\" stroke-dasharray=\"1 3\"/>");
+    }
+    for (const auto& c : cells) {
+      const double mid = static_cast<double>(c.slot) + 0.5;
+      const double cx = horizontal ? svgSx(c.v, vr.first, vr.second) : svgSx(mid, sr.first, sr.second);
+      const double cy = horizontal ? svgSy(mid, sr.first, sr.second) : svgSy(c.v, vr.first, vr.second);
+      lines.push_back("  <circle cx=\"" + fmtNum(cx, "%.2f") + "\" cy=\"" + fmtNum(cy, "%.2f") +
+                      "\" r=\"3.5\" fill=\"" + std::string(kBarColors[c.series % 6]) + "\"/>");
+    }
+  }
   std::vector<double> stackRun(nSlots, 0.0);
   for (const auto& c : cells) {
+    if (dot) break;
     const double slotW = 1.0 / static_cast<double>(stack ? 1 : nSer);
     const double a0 = static_cast<double>(c.slot) + 0.1 + (stack ? 0.0 : 0.8 * slotW * static_cast<double>(c.series));
     const double a1 = a0 + (stack ? 0.8 : 0.8 * slotW);
@@ -974,6 +1012,67 @@ static std::string buildSvgBar(const ojson& block) {
 }
 
 
+// `graph pie`: "slices" [{label, value, angle, plabel?, explode?}], the first wedge starting at
+// angle0 degrees (90 = 12 o'clock) and running clockwise unless "clockwise" is false.
+static std::string buildSvgPie(const ojson& block) {
+  static const char* kPieColors[] = {"#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"};
+  std::vector<std::string> lines;
+  lines.push_back("<svg viewBox=\"0 0 " + fmtNum(kSvgW, "%.0f") + " " + fmtNum(kSvgH, "%.0f") +
+                  "\" xmlns=\"http://www.w3.org/2000/svg\">");
+  svgTitle(lines, jstr(block, "title"));
+  const double cx = kSvgW / 2.0, cy = kSvgMT + kSvgPlotH / 2.0 - 6.0;
+  const double r = std::min(kSvgPlotW, kSvgPlotH) / 2.0 - 8.0;
+  const double dir = block.value("clockwise", true) ? -1.0 : 1.0;
+  double a = block.value("angle0", 90.0);
+  const double kRad = 3.14159265358979323846 / 180.0;
+  size_t i = 0;
+  for (const auto& sl : block.value("slices", ojson::array())) {
+    const size_t idx = i++;
+    const double ang = sl.value("angle", 0.0);
+    if (!(ang > 0.0) || !std::isfinite(ang)) continue;
+    const double a0 = a, a1 = a + dir * ang;
+    a = a1;
+    const double mid = (a0 + a1) / 2.0;
+    const double off = sl.value("explode", false) ? r * 0.08 : 0.0;
+    const double ox = off * std::cos(mid * kRad), oy = -off * std::sin(mid * kRad);
+    const std::string color = kPieColors[idx % 6];
+    if (ang >= 359.999) {
+      lines.push_back("  <circle cx=\"" + fmtNum(cx + ox, "%.2f") + "\" cy=\"" + fmtNum(cy + oy, "%.2f") +
+                      "\" r=\"" + fmtNum(r, "%.2f") + "\" fill=\"" + color + "\"/>");
+    } else {
+      const double x0 = cx + ox + r * std::cos(a0 * kRad), y0 = cy + oy - r * std::sin(a0 * kRad);
+      const double x1 = cx + ox + r * std::cos(a1 * kRad), y1 = cy + oy - r * std::sin(a1 * kRad);
+      lines.push_back("  <path d=\"M " + fmtNum(cx + ox, "%.2f") + " " + fmtNum(cy + oy, "%.2f") + " L " +
+                      fmtNum(x0, "%.2f") + " " + fmtNum(y0, "%.2f") + " A " + fmtNum(r, "%.2f") + " " +
+                      fmtNum(r, "%.2f") + " 0 " + (ang > 180.0 ? "1" : "0") + " " + (dir < 0 ? "1" : "0") +
+                      " " + fmtNum(x1, "%.2f") + " " + fmtNum(y1, "%.2f") + " Z\" fill=\"" + color +
+                      "\" stroke=\"#fff\"/>");
+    }
+    const std::string lab = jstr(sl, "plabel");
+    if (!lab.empty()) {
+      lines.push_back("  <text x=\"" + fmtNum(cx + ox + r * 2.0 / 3.0 * std::cos(mid * kRad), "%.2f") +
+                      "\" y=\"" + fmtNum(cy + oy - r * 2.0 / 3.0 * std::sin(mid * kRad) + 3.5, "%.2f") +
+                      "\" text-anchor=\"middle\" font-size=\"10\" fill=\"#fff\">" + svgEscape(lab) + "</text>");
+    }
+  }
+  double lx = kSvgML;
+  i = 0;
+  for (const auto& sl : block.value("slices", ojson::array())) {
+    const std::string label = jstr(sl, "label");
+    lines.push_back("  <rect x=\"" + fmtNum(lx, "%.0f") + "\" y=\"" + fmtNum(kSvgH - 14, "%.0f") +
+                    "\" width=\"8\" height=\"8\" fill=\"" + std::string(kPieColors[i++ % 6]) + "\"/>");
+    lines.push_back("  <text x=\"" + fmtNum(lx + 11, "%.0f") + "\" y=\"" + fmtNum(kSvgH - 6, "%.0f") +
+                    "\" font-size=\"10\" fill=\"#444\">" + svgEscape(label) + "</text>");
+    lx += 24.0 + 6.0 * static_cast<double>(label.size());
+  }
+  lines.push_back("</svg>");
+  std::string out;
+  for (auto& l : lines) { out += l; out += "\n"; }
+  if (!out.empty()) out.pop_back();
+  return out;
+}
+
+
 static std::string buildSvgDispatch(const ojson& block) {
   std::string kind = block.value("kind", std::string("scatter"));
   if (kind == "histogram") return buildSvgHistogram(block);
@@ -984,10 +1083,11 @@ static std::string buildSvgDispatch(const ojson& block) {
   // frame/axes/title rendered fine (kind-agnostic), zero data ever drawn.
   if (kind == "xtline" || kind == "tsline") return buildSvgSeriesPlot(block, /*asMarkers=*/false);
   if (kind == "twoway") return buildSvgTwoway(block);
-  if (kind == "graph_combine") return buildSvgCombine(block);
+  if (kind == "graph_combine" || kind == "scatter_matrix") return buildSvgCombine(block);
   if (kind == "marginsplot") return buildSvgMarginsplot(block);
   if (kind == "coefplot") return buildSvgCoefplot(block);
   if (kind == "bar" && block.contains("bars")) return buildSvgBar(block);
+  if (kind == "pie") return buildSvgPie(block);
   return buildSvgScatter(block);
 }
 

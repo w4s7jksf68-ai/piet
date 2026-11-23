@@ -2,6 +2,7 @@
 // Copyright (C) 2026 M.K. Kim
 #include "piet/handlers/observations.h"
 #include "piet/handlers/utility.h"
+#include "piet/dispatcher.h"  // carryforward.ado's steps run as commands
 
 #include <algorithm>
 #include <cctype>
@@ -57,6 +58,174 @@ using namespace utility_detail;
 // rows are not contiguous (an explicit `by()` on unsorted data) still fills
 // from the previous row OF THE SAME GROUP, which is the same answer sorting
 // would have given and a defensible one when it was not.
+namespace {
+
+// carryforward.ado's own steps, for the forms with a sample or a carry rule:
+// clone the variable (gen) or keep the original (replace with cfindic or
+// carryalong), then one `[by g:] replace x = x[_n-1] if _n>1 & <sample> &
+// <missing here, not missing before> [& sample before (strict)] [& rule]`,
+// which Stata evaluates row by row so a carried value carries again; then
+// the indicator (`x ~= original`), the note, and each carryalong variable
+// carried where the indicator is on. `@` in dynamic_condition() is the value
+// being carried, x[_n-1]; extmiss fills only `.` and may carry `.a`-`.z`.
+ojson carryforwardStata(const eval::ParsedCommand& parsed, SessionState& session,
+                        const std::vector<std::string>& newVars,
+                        const std::vector<std::string>& byVars) {
+  auto errOf = [](const ojson& blocks) -> std::optional<ojson> {
+    if (blocks.is_object() && blocks.value("type", std::string()) == "error") return blocks;
+    if (blocks.is_array())
+      for (const auto& b : blocks)
+        if (b.is_object() && b.value("type", std::string()) == "error") return b;
+    return std::nullopt;
+  };
+  ojson out = ojson::array();
+  auto keep = [&](const ojson& blocks) {
+    if (!blocks.is_array()) return;
+    for (const auto& b : blocks)
+      if (b.is_object() && b.value("type", std::string()) != "echo") out.push_back(b);
+  };
+  const bool back = hasFlag(parsed.opts, "back");
+  const bool strict = hasFlag(parsed.opts, "strict");
+  const bool extmiss = hasFlag(parsed.opts, "extmiss");
+  const bool nonotes = hasFlag(parsed.opts, "nonotes");
+  const std::string fwdback = back ? " (backward)" : "";
+  std::vector<std::string> cfindic, carryalong;
+  if (auto c = optStr(parsed.opts, "cfindic")) cfindic = splitWs(*c);
+  if (auto c = optStr(parsed.opts, "carryalong")) carryalong = splitWs(*c);
+  const std::string dyn = optStr(parsed.opts, "dynamic_condition").value_or("");
+  const std::vector<std::string>& vars = parsed.varlist;
+  if (!carryalong.empty() && vars.size() > 1)
+    return utilErrorRc("carryalong may not be specified if varlist has more than one variable", 198);
+  if (!cfindic.empty()) {
+    if (cfindic.size() != vars.size())
+      return utilErrorRc("there must be as many variables in cfindic as in varlist", 198);
+    for (const auto& c : cfindic) {
+      ojson guard = newVarGuard(session, "carryforward", c);
+      if (!guard.is_null()) return guard;
+      if (std::find(newVars.begin(), newVars.end(), c) != newVars.end())
+        return utilErrorRc("cfindic and gen may not have elements in common", 198);
+    }
+  }
+  const std::string byPrefix =
+      byVars.empty() ? std::string() : "by " + joinWith(byVars, " ") + ": ";
+
+  // The if/in sample (marksample, novarlist) as a 1/. column, and the
+  // temporaries this routine makes, all dropped on the way out.
+  std::vector<std::string> temps;
+  struct DropTemps {
+    SessionState& s;
+    std::vector<std::string>& names;
+    ~DropTemps() {
+      if (names.empty()) return;
+      try {
+        SessionState::TempDropScope quiet(s);
+        (void)dispatch("quietly drop " + joinWith(names, " "), s);
+      } catch (...) {
+      }
+    }
+  } dropTemps{session, temps};
+  int serial = 0;
+  auto tempName = [&]() {
+    Datastore* d = session.datastore();
+    std::string nm;
+    do {
+      nm = "__cf" + std::to_string(++serial);
+    } while (d != nullptr && d->has(nm));
+    return nm;
+  };
+  std::string touseCond = "1", strictCond;
+  const bool haveIf = parsed.ifExpr.has_value() && !parsed.ifExpr->empty();
+  const bool haveIn = parsed.inRange.has_value() && !parsed.inRange->empty();
+  if (haveIf || haveIn) {
+    const std::string tu = tempName();
+    std::string q;
+    if (haveIf) q += " if " + *parsed.ifExpr;
+    if (haveIn) q += " in " + *parsed.inRange;
+    ojson r = dispatch("quietly generate byte " + tu + " = 1" + q, session);
+    if (auto e = errOf(r)) return *e;
+    temps.push_back(tu);
+    touseCond = "!missing(" + tu + ")";
+    if (strict) strictCond = " & !missing(" + tu + "[_n-1])";
+  }
+  for (size_t k = 0; k < vars.size(); ++k) {
+    const std::string& v = vars[k];
+    Datastore* ds = session.datastore();
+    const bool numeric = ds != nullptr && ds->dtype(v) != "factor";
+    std::string ggg = v, orig;
+    if (!newVars.empty()) {
+      ggg = newVars[k];
+      ojson r = dispatch("quietly clonevar " + ggg + " = " + v, session);
+      if (auto e = errOf(r)) return *e;
+    } else if (!cfindic.empty() || !carryalong.empty()) {
+      orig = tempName();
+      ojson r = dispatch("quietly clonevar " + orig + " = " + v, session);
+      if (auto e = errOf(r)) return *e;
+      temps.push_back(orig);
+    }
+    out.push_back(ojson{{"type", "display"}, {"text", ggg + ": "}});
+    std::string dynCond;
+    if (!dyn.empty()) {
+      std::string d = dyn;
+      for (size_t at = d.find('@'); at != std::string::npos; at = d.find('@', at))
+        d.replace(at, 1, ggg + "[_n-1]");
+      dynCond = " & (" + d + ")";
+    }
+    const std::string misval = extmiss && numeric
+                                   ? "(" + ggg + "==.) & (" + ggg + "[_n-1]~=.)"
+                                   : "missing(" + ggg + ") & !missing(" + ggg + "[_n-1])";
+    ojson rr = dispatch(byPrefix + "replace " + ggg + " = " + ggg + "[_n-1] if _n>1 & " +
+                            touseCond + " & " + misval + strictCond + dynCond,
+                        session);
+    if (auto e = errOf(rr)) return *e;
+    keep(rr);
+    std::string ccc = k < cfindic.size() ? cfindic[k] : std::string();
+    if (ccc.empty() && !carryalong.empty()) {
+      ccc = tempName();
+      temps.push_back(ccc);
+    }
+    if (!ccc.empty()) {
+      ojson g = dispatch("quietly generate byte " + ccc + " = " + ggg + " ~= " +
+                             (newVars.empty() ? orig : v),
+                         session);
+      if (auto e = errOf(g)) return *e;
+      ojson l = dispatch("label variable " + ccc + " \"" + ggg + " has a carryforward" + fwdback +
+                             " value\"",
+                         session);
+      if (auto e = errOf(l)) return *e;
+    }
+    if (!nonotes) {
+      ojson nt = dispatch("notes " + ggg + ": subjected to a carryforward" + fwdback + " operation",
+                          session);
+      if (auto e = errOf(nt)) return *e;
+    }
+    for (const auto& var : carryalong) {
+      const std::string t2 = tempName();
+      ojson c1 = dispatch("quietly clonevar " + t2 + " = " + var, session);
+      if (auto e = errOf(c1)) return *e;
+      temps.push_back(t2);
+      ojson c2 = dispatch("quietly " + byPrefix + "replace " + var + " = " + var +
+                              "[_n-1] if _n>1 & " + ccc,
+                          session);
+      if (auto e = errOf(c2)) return *e;
+      ojson c3 = dispatch("quietly count if " + var + " ~= " + t2, session);
+      if (auto e = errOf(c3)) return *e;
+      const double* nch = session.eval.rValues.find("N");
+      out.push_back(ojson{{"type", "display"},
+                          {"text", "(" + var + ": " + intText(nch ? static_cast<int64_t>(*nch) : 0) +
+                                       " changes made)"}});
+      if (!nonotes) {
+        ojson nt = dispatch("notes " + var + ": subjected to a carryforward" + fwdback +
+                                " operation as a carryalong variable, along with " + v,
+                            session);
+        if (auto e = errOf(nt)) return *e;
+      }
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
 ojson runCarryforward(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabCarryforward.known,
                                             kVocabCarryforward.unimplemented))
@@ -83,9 +252,20 @@ ojson runCarryforward(const eval::ParsedCommand& parsed, SessionState& session) 
   std::vector<std::string> byVars;
   if (auto b = optStr(parsed.opts, "by")) byVars = splitWs(*b);
 
-  // A written column must be as long as the frame and aligned to it; a filtered
-  // read cannot be mapped back. Refused by name (registry allowIf is false for
-  // this row, so this is the belt to the tokenizer's suspenders).
+  // A sample, or any of carryforward.ado's carry rules, takes the ado's own
+  // steps (carryforwardStata above).
+  if ((parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
+      (parsed.inRange.has_value() && !parsed.inRange->empty()) || hasFlag(parsed.opts, "back") ||
+      hasFlag(parsed.opts, "strict") || hasFlag(parsed.opts, "extmiss") ||
+      hasFlag(parsed.opts, "nonotes") || optStr(parsed.opts, "cfindic").has_value() ||
+      optStr(parsed.opts, "carryalong").has_value() ||
+      optStr(parsed.opts, "dynamic_condition").has_value()) {
+    for (const auto& nm : newVars) {
+      ojson guard = newVarGuard(session, "carryforward", nm);
+      if (!guard.is_null()) return guard;
+    }
+    return carryforwardStata(parsed, session, newVars, byVars);
+  }
   {
     ojson q = refuseQualifiers(
         parsed, "`carryforward` writes a column as long as the dataset, and this build cannot map a "

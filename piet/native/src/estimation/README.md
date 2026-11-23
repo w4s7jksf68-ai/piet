@@ -56,7 +56,7 @@ commands (option parsing, `vce()`/cluster handling, reply conversion).
 | Engine reply to result block: coefficient table, factor labels, `vce()` argv, cluster spec refusals, if-filter, fit-filter capture | `estimation_support.cpp` |
 | `e()` name lists and macros posted after regress, `xtreg, fe` and ivregress | `estimation_results.cpp` |
 | Wald p/CI backfill of `coeftable` for `nbreg`, `xtpoisson`, `xtlogit` | `inference_statistics.cpp` |
-| Shared engine call for the maximum-likelihood families, ancillary `e(b)` columns | `likelihood_support.cpp` |
+| Shared engine call for the maximum-likelihood families, ancillary `e(b)` columns, `in` folded into the fit's `if`, the `constraint` command and the `constraints()` parser | `likelihood_support.cpp` |
 | Registered option vocabularies (the accept/ignore net for most commands here and for post-estimation commands) | `estimation_options.cpp`, `estimation_options.h` |
 | `e(sample)` mask: engine handshake, hidden column install | `estimation_sample_install.cpp` |
 | `e(sample)` carried through `expand`, `collapse`, `merge`, `joinby`, `bsample` | `estimation_sample_carry.cpp` |

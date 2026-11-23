@@ -79,7 +79,8 @@ struct VarResult {
 
     int K = 0;         // number of endogenous variables
     int lags = 0;      // p
-    int m = 0;         // regressors per equation = K*lags + 1
+    int m = 0;         // regressors per equation = K*lags + 1 (K*lags under noconstant)
+    bool constant = true;  // noconstant: no `_cons`, R-squared uncentred
     int64_t n_obs = 0; // T — usable rows after the lag sample is formed
     std::vector<int64_t> sample_rows;  // the T rows of the lag sample (e(sample)), time order
     double t_first = 0, t_last = 0;  // Stata's "Sample: <first> thru <last>"
@@ -125,6 +126,6 @@ struct VarResult {
 // values at t = 49, 50 as the first rows' lags (bank 1e267597: N 198, not 196).
 VarResult var_fit(const double* Y, const double* time, int64_t n,
                   const std::vector<std::string>& names, int lags, int irf_steps, double delta,
-                  const char* in_sample = nullptr);
+                  const char* in_sample = nullptr, bool constant = true);
 
 }  // namespace cecon

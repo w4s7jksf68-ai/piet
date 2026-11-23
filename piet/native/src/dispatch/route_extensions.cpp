@@ -168,6 +168,8 @@ bool route_extensions(std::string& cmd,
         {"zipuse", &handlers::runZipuse},         {"zipsave", &handlers::runZipsave},
         {"require", &handlers::runRequire},       {"_dots", &handlers::runDots},
         {"postutil", &handlers::runPostutil},     {"markout", &handlers::runMarkout},
+        {"mark", &handlers::runMark},
+        {"matname", &handlers::runMatname},
         {"lrtest", &handlers::runLrtest},         {"findname", &handlers::runFindname},
         {"xtdescribe", &handlers::runXtdescribe}, {"cf", &handlers::runCf},
         {"fvunab", &handlers::runFvunab},         {"numlabel", &handlers::runNumlabel},
@@ -236,6 +238,18 @@ bool route_extensions(std::string& cmd,
   }
 
   if (cmd == "recast") {
+    // recast takes its type off the front of the line (`gettoken`) and then
+    // `syntax varlist`: with nothing before the comma the comma is the "type"
+    // and the option word is read as the varlist, so `recast , zzabbrprobe` is
+    // r(111) "variable zzabbrprobe not found" (vs-stata bank 9c8b7471f284571a).
+    if (parsed.varlist.empty() && !parsed.opts.empty() && session.hasData() &&
+        session.datastore() != nullptr && !session.datastore()->has(parsed.opts.front().first)) {
+      blocks.push_back(ojson(eval::errorBlock("engine_error",
+                                              "variable " + parsed.opts.front().first +
+                                                  " not found",
+                                              std::nullopt, std::nullopt, std::nullopt, "r(111)")));
+      return true;
+    }
     // format-display-default-lifecycle: recast moves the storage type, never the
     // display format (`recast double y` of a float stays %9.0g,
     // internal capture exprfns_contract_oracle.log:735). Each named

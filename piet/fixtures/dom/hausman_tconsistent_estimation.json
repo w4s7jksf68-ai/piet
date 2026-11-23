@@ -1,0 +1,34 @@
+{
+  "type": "estimation",
+  "estimator": "hausman",
+  "depvar": "",
+  "n_obs": 0,
+  "chi2": 1.1538232667899404,
+  "p": 0.5616302108914757,
+  "dof": 2.0,
+  "rank": 2,
+  "coefs": [
+    {
+      "b_fe": -0.4134987171623954,
+      "b_re": 0.060326952104349754,
+      "diff": -0.47382566926674513,
+      "name": "beertax",
+      "se_diff": 0.14410267946598415
+    },
+    {
+      "b_fe": -0.029975732353774317,
+      "b_re": -0.031024080894144875,
+      "diff": 0.0010483485403705584,
+      "name": "unemp",
+      "se_diff": 0.0007884606050624856
+    }
+  ],
+  "b_title": "FixedFX",
+  "B_title": "re",
+  "b_cmd": "xtreg",
+  "B_cmd": "xtreg",
+  "not_pd": true,
+  "notes": [
+    "(V_b-V_B is not positive definite)"
+  ]
+}

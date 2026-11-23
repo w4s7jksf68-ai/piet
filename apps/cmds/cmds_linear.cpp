@@ -279,7 +279,10 @@ int cmd_feols(const std::vector<std::string>& a) {
                              "                  (reghdfe keeps the computed RSS).\n"
                              "  --collinear-forward  Stata reghdfe/areg/xtreg,fe collinearity rule: of a\n"
                              "                  collinear set the EARLIER term is kept and the later one\n"
-                             "                  omitted (default: the norm-pivoted basis of `regress`).\n");
+                             "                  omitted (default: the norm-pivoted basis of `regress`).\n"
+                             "  --aw-negative-drops  Stata builtin `regress` rule: a row whose aweight is\n"
+                             "                  negative leaves the sample like a zero one (default: a\n"
+                             "                  negative weight is r(402)). Needs --wtype aw, no --fe.\n");
         return 2;
     }
     std::string vcov_type = opt(a, "--vcov", "iid");
@@ -388,6 +391,14 @@ int cmd_feols(const std::vector<std::string>& a) {
     // Anywhere else (a pweight's robust VCE, any sandwich, svy) it would be silently
     // ignored, so it is refused instead.
     const bool regress_exact_fit = has(a, "--regress-exact-fit");
+    // Stata's builtin `regress` drops a negative aweight's row (vs-stata bank
+    // bf3a397b1ed2f096); the commands that mark their sample with the weight
+    // (areg, reghdfe, xtreg) refuse r(402), so the rule is asked for, never default.
+    const bool aw_negative_drops = has(a, "--aw-negative-drops");
+    if (aw_negative_drops && (wkind != cecon::WeightKind::Analytic || !fes.empty()))
+        throw EngineError("bad_input",
+            "feols: --aw-negative-drops requires --wtype aw without --fe (it selects Stata "
+            "regress's rule for a negative aweight)");
     if (regress_exact_fit &&
         (wkind == cecon::WeightKind::Probability || has(a, "--svy") ||
          !(vcov_type == "iid" || vcov_type.empty())))
@@ -480,7 +491,8 @@ int cmd_feols(const std::vector<std::string>& a) {
         out = run_feols(kp.data, y, xs, fes, vcov_type, clusters, drop_singleton, &tsm,
                         mask_p, no_intercept, level, level_set, weight_var, wkind, es_p,
                         keep_nested_fe_dof, emit_v, multiway_subset_factors,
-                        fe_nested_in_clusters, regress_exact_fit, collinear_forward);
+                        fe_nested_in_clusters, regress_exact_fit, collinear_forward, has(a, "--xtreg-fe"),
+                        has(a, "--absorb-test"), aw_negative_drops);
     }
     emit_esample(esreq, "feols", data, keepif, kp.active, esrows, out);
     emit(out, opt(a, "--out"));

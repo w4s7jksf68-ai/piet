@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "piet/handlers/data_combine.h"
+#include "piet/handlers/variables.h"  // isValidDisplayFormat: xpose, format(%fmt)
 #include "piet/dispatcher.h"  // dispatch(): cumul marks its if/in sample with generate
 
 #include <algorithm>
@@ -84,7 +85,11 @@ ojson echoBlock(const std::string& text) {
 //    and is not itself transposed; `varname` adds `_varname` (the source names)
 //    as the LAST variable.
 //  - r() is what xpose's last r-class step left: `file read` -> r(eof) = 1.
-// Not implemented: format / format() (refused by the vocabulary).
+//  - `format(%fmt)` formats every new variable %fmt (`format _all %fmt`, so a
+//    text that is not a format is read as variable names: `format(abc)` is
+//    r(111) "variable abc not found" and the data are left as they were);
+//    bare `format` uses the format of the widest numeric, non-date, non-string
+//    source variable (the first of equal width), and none when there is none.
 
 namespace {
 
@@ -118,6 +123,17 @@ ojson runXpose(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.hasData()) return rsErrorRc("no observations", 2000);
   const bool wantVarname = hasFlag(parsed.opts, "varname");
   const bool promote = hasFlag(parsed.opts, "promote");
+  // format / format(): xpose.ado's `syntax` reads both into one name pair; given
+  // twice (once bare, once with a value) they are r(198).
+  bool formatBare = false;
+  std::optional<std::string> formatText;
+  for (const auto& [k, v] : parsed.opts) {
+    if (k != "format") continue;
+    if (v.isBool) formatBare = true;
+    else formatText = strutil::trim(v.strValue);
+  }
+  if (formatBare && formatText.has_value() && !formatText->empty())
+    return rsErrorRc("format() and format are mutually exclusive", 198);
 
   Datastore* ds = nullptr;
   try {
@@ -190,6 +206,42 @@ ojson runXpose(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
 
+  // The format the new variables get (applied after the transpose, as the ado's
+  // `format _all fmt`).
+  std::string newFormat;
+  if (formatBare) {
+    long long widest = 0;
+    const auto fmts = session.displayFormatMap(ds->formatCard(invars));
+    for (const auto& [nm, f] : fmts) {
+      if (ds->dtype(nm) != "f64") continue;  // a string source is a str format
+      if (f.find_first_of("sdDmMyY") != std::string::npos) continue;
+      std::string w = f;
+      w.erase(std::remove(w.begin(), w.end(), '-'), w.end());
+      w = w.size() > 1 ? w.substr(1, 2) : std::string();
+      w.erase(std::remove(w.begin(), w.end(), '.'), w.end());
+      long long width = 0;
+      if (!parseStrictInt(w, &width)) continue;
+      if (widest < width) {
+        widest = width;
+        newFormat = f;
+      }
+    }
+  } else if (formatText.has_value() && !formatText->empty()) {
+    if ((*formatText)[0] == '%') {
+      if (!isValidDisplayFormat(*formatText))
+        return rsErrorRc("invalid %format", 120);
+      newFormat = *formatText;
+    } else {
+      // `format _all <text>`: the words are variable names of the transposed data.
+      std::istringstream words(*formatText);
+      for (std::string w; words >> w;) {
+        const bool known = std::find(outNames.begin(), outNames.end(), w) != outNames.end() ||
+                           (wantVarname && w == "_varname");
+        if (!known) return rsErrorRc("variable " + w + " not found", 111);
+      }
+    }
+  }
+
   // The transpose: one row per ORIGINAL variable, one column per original
   // observation; `varname` appends the source names as `_varname`.
   CsvTable t;
@@ -223,6 +275,7 @@ ojson runXpose(const eval::ParsedCommand& parsed, SessionState& session) {
   for (const auto& nm : outNames) {
     session.varMeta.erase(nm);
     storage::recordCreateType(session, nm, newType, newType);
+    if (!newFormat.empty()) session.varMeta[nm].format = newFormat;
   }
   if (wantVarname) {
     // `gen str8 _varname = ""`, then each name replaced in: str8, or the

@@ -57,6 +57,8 @@ const piet::eval::OptVocab& kVocabEsttab = piet::eval::registerOptVocab(
       "replace", "append", "booktabs", "label", "title", "mtitles", "nonumbers",
       "nomtitles", "stats", "scalars", "keep", "drop", "order", "r2", "ar2",
       "noobs", "nonotes", "addnotes", "fragment", "coeflabels", "csv",
+      // Stata accepts these exact bare spellings without changing the table.
+      "non", "nob", "obs",
       "compress", "nogaps", "plain",
       // B4-W5 (2026-09-09). Each of these is CONTENT -- it changes what a cell
       // comparator reads out of the written table -- and each is pinned to one
@@ -407,6 +409,51 @@ ojson runEsttab(const std::vector<std::string>& modelNamesIn,
     }
   }
 
+  // Match screen and clipboard CSV row selection with the estout writer.
+  // The writer resolves equations and renames before selecting, so its
+  // rendered table handles those layouts.
+  std::optional<std::string> keep, drop, order;
+  bool writerSelection = false;
+  for (const auto& [key, value] : opts) {
+    if (value.isBool) continue;
+    if (key == "keep") keep = value.strValue;
+    if (key == "drop") drop = value.strValue;
+    if (key == "order") order = value.strValue;
+    if (key == "rename" || key == "equations" || key == "indicate") writerSelection = true;
+  }
+  if (keep && !writerSelection && !unionNames.empty()) {
+    using namespace table_detail;
+    std::vector<EoKey> rows;
+    for (const auto& name : unionNames) {
+      const size_t colon = name.find(':');
+      rows.emplace_back(colon == std::string::npos ? "__" : name.substr(0, colon),
+                        colon == std::string::npos ? name : name.substr(colon + 1));
+    }
+    EoError error;
+    std::vector<EoSpecItem> selection;
+    if (order) {
+      std::vector<EoKey> appended;
+      if (eoExpandEqVarlist(*order, rows, true, &selection, &appended, &error))
+        eoOrder(*order, selection, &rows);
+      selection.clear();
+    }
+    // If a name only exists on the writer's expanded stripe, leave it to the
+    // writer to either render it or return its normal syntax error.
+    if (eoExpandEqVarlist(*keep, rows, false, &selection, nullptr, &error)) {
+      eoDropOrKeep(true, selection, &rows);
+      if (drop && !rows.empty()) {
+        selection.clear();
+        if (eoExpandEqVarlist(*drop, rows, false, &selection, nullptr, &error))
+          eoDropOrKeep(false, selection, &rows);
+      }
+      unionNames.clear();
+      for (const auto& [equation, name] : rows)
+        unionNames.push_back(equation == "__" ? name : equation + ":" + name);
+    } else {
+      writerSelection = true;
+    }
+  }
+
   // `transform()`: applied where the CELL is built, so esttab's screen block, its
   // csv and every file writer downstream see the same numbers. One semantics
   // with estout -- the function is shared (piet/handlers.h) rather than copied,
@@ -560,6 +607,7 @@ ojson runEsttab(const std::vector<std::string>& modelNamesIn,
   out["coef_rows"] = coefRows;
   out["footers"] = footers;
   out["csv"] = csv;
+  if (keep && writerSelection) out["writer_selection"] = true;
   ojson options;
   options["se"] = showSe;
   options["nostar"] = nostar;

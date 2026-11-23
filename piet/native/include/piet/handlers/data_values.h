@@ -306,11 +306,12 @@ nlohmann::ordered_json runTostring(const std::string& varname, bool doReplace,
 
 // -- M4a: output-completion surface (ROADMAP M4a) ----------------------------
 
-// `winsor2 VARLIST [, cuts(p_lo p_hi) trim by(G) suffix(SUF) replace]` — C++
+// `winsor2 VARLIST [if] [in] [, cuts(p_lo p_hi) trim by(G) suffix(SUF) replace]` — C++
 // port of winsor2.py's run_winsor2 (SSC winsorize via cobra eval --winsor).
 nlohmann::ordered_json runWinsor2(SessionState& session, const std::vector<std::string>& varlist,
                                    double cutLo, double cutHi, bool trim, const std::string& by,
-                                   const std::string& suffix, bool replace);
+                                   const std::string& suffix, bool replace,
+                                   const eval::ParsedCommand* command = nullptr);
 
 // `mkspline stub = varname [, cubic [nknots(#) | knots(v1,v2,...)]]` — BS-087
 // (part). ONLY the `cubic` (restricted cubic spline) form is supported —

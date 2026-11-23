@@ -480,9 +480,15 @@ void testW2dEreturn() {
         {"ereturn repost b = b", "152"},
         {"ereturn scalar", "199"},
         {"ereturn matrix m = b", "152"},
-        {"ereturn display", "199"},
+        // `ereturn display` is served (results/ereturn_commands.cpp runDisplay; vs-stata
+        // bank c7bdd997, 10698eae, 88509ffa); with no e(b) posted it is r(301) "last
+        // estimates not found", the rc estat and lrtest give with nothing posted (the
+        // bank has no ereturn-display cell without estimates: unmeasured).
+        {"ereturn display", "301"},
         {"ereturn hidden local x y", "199"},
-        {"ereturn nosuchsub", "199"},
+        // Not an ereturn subcommand: StataBE r(198) invalid syntax (vs-stata bank
+        // bde9c3705b3267f3 `ereturn zzz`).
+        {"ereturn nosuchsub", "198"},
         {"ereturn clear, nosuch", "198"},
         {"ereturn post b, nosuch(1)", "198"},
         {"ereturn post b, buildfvinfo", "198"},

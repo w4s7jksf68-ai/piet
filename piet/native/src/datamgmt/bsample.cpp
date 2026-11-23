@@ -41,6 +41,7 @@
 #include "piet/eval/pyvalue.h"  // pythonFloatRepr -- round-trippable CSV numerics
 #include "piet/eval/session.h"
 #include "piet/eval/tokenizer.h"
+#include "piet/loops.h"
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
@@ -98,12 +99,29 @@ std::optional<ojson> refuseWeights(const eval::ParsedCommand& parsed, const std:
 // bsample
 // ===========================================================================
 
+// bsample.ado's fast path is taken when the whole argument parses as
+// `[, weight(varname)]` with `weight` typed in full: no `#`, no if/in, no other
+// option. It leaves r() alone; every other form counts the sample first, so
+// r(N) is set (vs-stata bank: `bsample, weight(w)` posts no r(N), `bsample,
+// w(w)` and `wei(w)` post r(N) 74 -- the same draw otherwise).
 bool bsampleIsStataFastPath(const eval::ParsedCommand& parsed) {
   if (!parsed.varlist.empty()) return false;  // `bsample #` is the SRSWR path
-  for (const auto& [k, v] : parsed.opts)
-    if (k == "cluster" || k == "idcluster" || k == "strata" || k == "weight") return false;
+  if (parsed.ifExpr.has_value() || parsed.inRange.has_value()) return false;
+  for (const auto& [k, v] : parsed.opts) {
+    if (k != "weight") return false;
+    static const std::regex reFull(R"(,.*\bweight\s*\()", std::regex::icase);
+    if (!std::regex_search(parsed.raw, reFull)) return false;
+  }
   return true;
 }
+
+// One row's place in bsample.ado's sample layout: rows outside the if/in (or
+// with a missing stratum) sort after the sample, then the strata.
+struct BsGroupKey {
+  bool out = false;
+  std::vector<double> num;
+  std::vector<std::string> str;
+};
 
 ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
   // strata() names variables that must exist whether or not this build draws within strata
@@ -126,9 +144,23 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabBsample.known,
                                             kVocabBsample.unimplemented))
     return ojson(*err);
-  if (auto q = refuseQualifiers(parsed, "bsample")) return *q;
   if (auto w = refuseWeights(parsed, "bsample")) return *w;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
+  const bool haveIf = parsed.ifExpr.has_value() && !parsed.ifExpr->empty();
+  const bool haveIn = parsed.inRange.has_value() && !parsed.inRange->empty();
+
+  // The if/in sample, as generate marks it (computed before anything is read,
+  // since the scratch column passes through the dataset).
+  std::vector<double> inSample;
+  if (haveIf || haveIn) {
+    std::string qualifier;
+    if (haveIf) qualifier += " if " + *parsed.ifExpr;
+    if (haveIn) qualifier += " in " + *parsed.inRange;
+    ScratchColumns scratch(session);
+    std::string col;
+    if (auto failed = scratch.add("1", qualifier, &col)) return *failed;
+    inSample = scratch.values(col);
+  }
 
   Datastore* ds = nullptr;
   try {
@@ -188,7 +220,250 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
     nsamp = static_cast<long long>(std::llround(want));
   }
   const bool fast = bsampleIsStataFastPath(parsed);
-  if (!clusterOpt.has_value()) {
+  const std::optional<std::string> strataOpt = optStr(parsed.opts, "strata");
+  const std::optional<std::string> weightOpt = optStr(parsed.opts, "weight");
+  int64_t nSample = n;                     // r(N): the observations drawn from
+  std::string weightVar;                   // weight(): the variable that receives the counts
+  std::vector<double> weightCounts;        // ... one per result row
+  if (clusterOpt.has_value() && (strataOpt.has_value() || weightOpt.has_value() || haveIf ||
+                                 haveIn)) {
+    return ojson(eval::unsupportedOption(
+        "bsample, cluster() with strata(), weight(), if or in",
+        "the clustered draw within strata, with weights or on a subsample is not implemented "
+        "in this version of PIET; bsample, cluster() over the whole dataset is."));
+  }
+  if (!clusterOpt.has_value() &&
+      (strataOpt.has_value() || weightOpt.has_value() || haveIf || haveIn)) {
+    // bsample.ado's SRSWR / StrSRSWR. The rows are ordered (stably) with the
+    // sample first and then by the strata; every row draws a target in
+    // 1..m (m = the sample size, or its stratum's size) and then every row a
+    // key, in that order. Within each stratum the rows sorted by (target, key)
+    // form runs; the last row of a run stands for its target and is taken as
+    // many times as the run is long.
+    std::vector<std::string> strataVars;
+    if (strataOpt.has_value()) {
+      auto vr = loops::expandVarlist(*strataOpt, session);
+      if (vr.isError) return vr.error;
+      strataVars = vr.tokens;
+      if (auto bad = loops::checkKnownVarlist(strataVars, session)) return *bad;
+    }
+    if (weightOpt.has_value()) {
+      std::vector<std::string> w = {strutil::trim(*weightOpt)};
+      if (auto bad = loops::checkKnownVarlist(w, session)) return *bad;
+      weightVar = w[0];
+      if (ds->dtype(weightVar) == "factor") return rsErrorRc("type mismatch", 109);
+      if (nsamp >= 0)
+        return ojson(eval::unsupportedOption(
+            "bsample #, weight()",
+            "a resample smaller than the sample with weight() redistributes the counts with a "
+            "further draw that this version of PIET does not reproduce."));
+    }
+    std::vector<BsGroupKey> key(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+      BsGroupKey& k = key[static_cast<size_t>(i)];
+      k.out = !inSample.empty() && std::isnan(inSample[static_cast<size_t>(i)]);
+      for (const auto& sv : strataVars) {
+        const cecon::Column& c = ds->col(sv);
+        if (c.dtype == cecon::DType::Factor) {
+          const int32_t code = c.codes()[i];
+          std::string v = (code >= 0 && static_cast<size_t>(code) < c.levels.size())
+                              ? c.levels[static_cast<size_t>(code)]
+                              : std::string();
+          if (v.empty()) k.out = true;
+          k.str.push_back(v);
+          k.num.push_back(0.0);
+        } else {
+          const double v = c.f64()[i];
+          if (std::isnan(v)) k.out = true;
+          k.num.push_back(v);
+          k.str.emplace_back();
+        }
+      }
+    }
+    auto cmpKey = [&](const BsGroupKey& a, const BsGroupKey& b) -> int {
+      if (a.out != b.out) return a.out ? 1 : -1;
+      for (size_t j = 0; j < a.num.size(); ++j) {
+        if (!a.str[j].empty() || !b.str[j].empty()) {
+          if (a.str[j] != b.str[j]) return a.str[j] < b.str[j] ? -1 : 1;
+          continue;
+        }
+        const int c = cecon::stata_cmp(a.num[j], b.num[j]);
+        if (c != 0) return c;
+      }
+      return 0;
+    };
+    std::vector<int64_t> order(static_cast<size_t>(n));
+    std::iota(order.begin(), order.end(), int64_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+      return cmpKey(key[static_cast<size_t>(a)], key[static_cast<size_t>(b)]) < 0;
+    });
+    int64_t nmax = 0;
+    for (const auto& k : key) nmax += k.out ? 0 : 1;
+    nSample = nmax;
+    if (nmax == 0) return rsErrorRc("no observations", 2000);
+    // Groups: without strata, the sample is one group and the rows outside it
+    // are not drawn from; with strata, every (sample, stratum) run is a group.
+    std::vector<std::pair<size_t, size_t>> groups;  // [begin, end) over `order`
+    if (strataVars.empty()) {
+      groups.emplace_back(0, static_cast<size_t>(nmax));
+    } else {
+      size_t b = 0;
+      for (size_t q = 1; q <= order.size(); ++q) {
+        if (q == order.size() ||
+            cmpKey(key[static_cast<size_t>(order[q])], key[static_cast<size_t>(order[b])]) != 0) {
+          groups.emplace_back(b, q);
+          b = q;
+        }
+      }
+    }
+    if (nsamp >= 0) {
+      if (strataVars.empty() && nsamp > nmax)
+        return rsErrorRc("resample size must not be greater than number of observations", 498);
+      for (const auto& [b, e] : groups) {
+        if (key[static_cast<size_t>(order[b])].out) continue;
+        if (static_cast<int64_t>(e - b) < nsamp)
+          return rsErrorRc("resample sizes must not be greater than number of observations "
+                           "with strata",
+                           498);
+      }
+    }
+    // Draws: a target for every row in layout order, then a key for every row.
+    std::vector<size_t> groupOf(order.size(), std::numeric_limits<size_t>::max());
+    for (size_t gi = 0; gi < groups.size(); ++gi)
+      for (size_t q = groups[gi].first; q < groups[gi].second; ++q) groupOf[q] = gi;
+    cecon::Mt64& g = session.seed.stream();
+    std::vector<int64_t> target(order.size());
+    std::vector<double> keyDraw(order.size());
+    for (size_t q = 0; q < order.size(); ++q) {
+      const int64_t m = strataVars.empty() ? nmax
+                                           : static_cast<int64_t>(groups[groupOf[q]].second -
+                                                                  groups[groupOf[q]].first);
+      target[q] = bsdraw::detail::stataUnitTarget(g.runiform(), m);
+    }
+    for (size_t q = 0; q < order.size(); ++q) keyDraw[q] = g.runiform();
+    // Within each group: positions by (target, key); run counts.
+    std::vector<size_t> layout;          // positions (into order) of the sorted data
+    std::vector<int64_t> count;          // per layout row: run size on the run's last row, else 0
+    std::vector<size_t> layoutGroup;
+    size_t covered = 0;
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+      const auto [b, e] = groups[gi];
+      for (; covered < b; ++covered) {  // rows outside every group keep their place
+        layout.push_back(covered);
+        count.push_back(0);
+        layoutGroup.push_back(std::numeric_limits<size_t>::max());
+      }
+      std::vector<size_t> pos;
+      for (size_t q = b; q < e; ++q) pos.push_back(q);
+      std::stable_sort(pos.begin(), pos.end(), [&](size_t x, size_t y) {
+        if (target[x] != target[y]) return target[x] < target[y];
+        return keyDraw[x] < keyDraw[y];
+      });
+      for (size_t t = 0; t < pos.size(); ++t) {
+        int64_t run = 1;
+        size_t u = t;
+        while (u > 0 && target[pos[u - 1]] == target[pos[t]]) {
+          --u;
+          ++run;
+        }
+        const bool last = t + 1 == pos.size() || target[pos[t + 1]] != target[pos[t]];
+        layout.push_back(pos[t]);
+        count.push_back(last ? run : 0);
+        layoutGroup.push_back(gi);
+      }
+      covered = e;
+    }
+    for (; covered < order.size(); ++covered) {
+      layout.push_back(covered);
+      count.push_back(0);
+      layoutGroup.push_back(std::numeric_limits<size_t>::max());
+    }
+    if (!weightVar.empty()) {
+      // weight(): every row stays, in the sorted layout, carrying its count;
+      // a row outside the sample carries 0.
+      for (size_t r = 0; r < layout.size(); ++r) {
+        const size_t q = layout[r];
+        idx.push_back(order[q] + 1);
+        isCopy.push_back(0);
+        const bool outRow = key[static_cast<size_t>(order[q])].out;
+        weightCounts.push_back(outRow ? 0.0 : static_cast<double>(count[r]));
+      }
+    } else {
+      // Keep each run's last row, then append the extra copies (expand's
+      // order: after the whole kept data, row by row).
+      std::vector<size_t> keptQ;
+      std::vector<int64_t> keptCount;
+      std::vector<size_t> keptGroup;
+      for (size_t r = 0; r < layout.size(); ++r) {
+        if (count[r] <= 0) continue;
+        keptQ.push_back(layout[r]);
+        keptCount.push_back(count[r]);
+        keptGroup.push_back(layoutGroup[r]);
+      }
+      // Without strata the rows outside the sample are dropped; with strata a
+      // stratum of rows outside the sample is resampled like any other here
+      // (its draws are consumed) and dropped by the second draw below.
+      std::vector<size_t> rowsQ, rowsGroup;
+      std::vector<char> rowsCopy;
+      for (size_t k = 0; k < keptQ.size(); ++k) {
+        rowsQ.push_back(keptQ[k]);
+        rowsGroup.push_back(keptGroup[k]);
+        rowsCopy.push_back(0);
+      }
+      for (size_t k = 0; k < keptQ.size(); ++k)
+        for (int64_t c = 1; c < keptCount[k]; ++c) {
+          rowsQ.push_back(keptQ[k]);
+          rowsGroup.push_back(keptGroup[k]);
+          rowsCopy.push_back(1);
+        }
+      // The second draw. Without strata it is skipped when # is the sample
+      // size (the resample already has # rows). With strata the test that
+      // would skip it -- every in-sample stratum already holds # rows -- runs
+      // `by` over the expanded data, whose copies were appended at the end,
+      // so the data are no longer sorted, the test fails, and the draw is
+      // always taken; without # each stratum keeps all its rows, only
+      // reordered, and the strata outside the sample are dropped. Bank cells
+      // 27e934b43d3a605b and acde5de77838eaee (`bsample, strata()`): Stata's
+      // saved data are sorted by stratum in the second draw's order, not in
+      // the kept-rows-then-copies order of the first.
+      const bool secondDraw =
+          strataVars.empty() ? (nsamp >= 0 && nsamp != nmax) : true;
+      if (secondDraw) {
+        // One more uniform per row in this order, the rows sorted by
+        // (group, it), and the first # (without #: all) of each sample group
+        // kept.
+        std::vector<double> w(rowsQ.size());
+        for (auto& x : w) x = g.runiform();
+        std::vector<size_t> ord(rowsQ.size());
+        std::iota(ord.begin(), ord.end(), size_t{0});
+        std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
+          if (rowsGroup[a] != rowsGroup[b]) return rowsGroup[a] < rowsGroup[b];
+          return w[a] < w[b];
+        });
+        std::map<size_t, int64_t> taken;
+        std::vector<size_t> q2, g2;
+        std::vector<char> c2;
+        for (size_t k : ord) {
+          const size_t gi = rowsGroup[k];
+          if (key[static_cast<size_t>(order[rowsQ[k]])].out) continue;  // keep if touse
+          const int64_t limit =
+              nsamp >= 0 ? nsamp
+                         : static_cast<int64_t>(groups[gi].second - groups[gi].first);
+          if (taken[gi]++ >= limit) continue;
+          q2.push_back(rowsQ[k]);
+          g2.push_back(gi);
+          c2.push_back(rowsCopy[k]);
+        }
+        rowsQ.swap(q2);
+        rowsGroup.swap(g2);
+        rowsCopy.swap(c2);
+      }
+      for (size_t k = 0; k < rowsQ.size(); ++k) {
+        idx.push_back(order[rowsQ[k]] + 1);
+        isCopy.push_back(rowsCopy[k]);
+      }
+    }
+  } else if (!clusterOpt.has_value()) {
     if (nsamp > n)
       return rsErrorRc("resample size must not be greater than number of observations", 498);
     int64_t nKept = 0;
@@ -291,7 +566,7 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   if (!fast) {
     eval::replaceRClass(session.eval);
-    session.eval.rValues.set("N", static_cast<double>(n));
+    session.eval.rValues.set("N", static_cast<double>(nSample));
     eval::declareRPosted(session.eval, "bsample", {"N"});
   }
 
@@ -337,6 +612,15 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
       return *err;
     drawFrame = withId;
   }
+  const std::string kWeightCol = "__piet_bs_wt";
+  if (!weightVar.empty()) {
+    std::vector<std::string> cells;
+    cells.reserve(weightCounts.size());
+    for (double v : weightCounts) cells.push_back(std::to_string(static_cast<long long>(v)));
+    std::string withW;
+    if (auto err = appendColumn(session, drawFrame, kWeightCol, cells, "f64", &withW)) return *err;
+    drawFrame = withW;
+  }
 
   const std::string merged = nextPath(session.workdir(), "bsample_merged");
   if (auto err = runVerb({"merge", "--data", drawFrame, "--using", baseIdx, "--type", "m:1",
@@ -365,6 +649,17 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
                        "not be cleared on the expanded copies; e(sample) is not reliable until "
                        "the next estimation.");
     }
+  }
+  if (!weightVar.empty()) {
+    // weight(): `replace` the variable with the counts (its type is kept, or
+    // promoted as replace promotes).
+    ojson rw = dispatch("quietly replace " + weightVar + " = " + kWeightCol, session);
+    for (const auto& b : rw)
+      if (b.is_object() && b.value("type", std::string()) == "error") return b;
+    SessionState::TempDropScope quietDrop(session);
+    ojson dw = dispatch("quietly drop " + kWeightCol, session);
+    for (const auto& b : dw)
+      if (b.is_object() && b.value("type", std::string()) == "error") return b;
   }
   if (idclusterOpt.has_value()) {
     // NewClustID: `gen byte` 0/1, then the running sum -- byte while the ids fit.

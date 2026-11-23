@@ -5,6 +5,7 @@
 
 #include <limits>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 
 #include "core/collinear.h"
@@ -756,6 +757,29 @@ void drop_glm_intercept(GlmInputs& g, const char* cmd) {
     g.names.pop_back();
 }
 
+// The name of the term a screen rule names: its design column, or the factor
+// level `<level>.<var>` of a base-level rule (`stripe`: e(rules)'s `<level>b.<var>`).
+std::string binary_rule_name(const BinaryPerfectRule& r, const std::vector<std::string>& names, bool stripe) {
+    if (r.col >= 0) {
+        std::string name = names[static_cast<size_t>(r.col)];
+        if (!stripe || name.find('#') == std::string::npos) return name;
+        std::istringstream parts(name);
+        std::string part, out;
+        while (std::getline(parts, part, '#')) {
+            if (!out.empty()) out += '#';
+            if (part.find('.') == std::string::npos) out += "c.";
+            out += part;
+        }
+        return out;
+    }
+    char lv[32];
+    if (r.base_level == std::floor(r.base_level) && std::fabs(r.base_level) < 1e15)
+        std::snprintf(lv, sizeof(lv), "%lld", static_cast<long long>(r.base_level));
+    else
+        std::snprintf(lv, sizeof(lv), "%.17g", r.base_level);
+    return std::string(lv) + (stripe ? "b." : ".") + r.base_var;
+}
+
 namespace {
 
 struct MlModelTest {
@@ -965,18 +989,6 @@ bool screen_binary_design(GlmInputs& g, bool asis, bool has_constant, const char
     const std::vector<BinaryBaseLevel> bases = asis ? std::vector<BinaryBaseLevel>()
                                                     : binary_base_levels(ds, xs, g);
     return binary_screen_glm(g, asis, has_constant, cmd, yname, info.screen, info.fit_cols, true, &bases);
-}
-
-// The name of the term a screen rule names: its design column, or the factor
-// level `<level>.<var>` of a base-level rule (`stripe`: e(rules)'s `<level>b.<var>`).
-std::string binary_rule_name(const BinaryPerfectRule& r, const std::vector<std::string>& names, bool stripe) {
-    if (r.col >= 0) return names[static_cast<size_t>(r.col)];
-    char lv[32];
-    if (r.base_level == std::floor(r.base_level) && std::fabs(r.base_level) < 1e15)
-        std::snprintf(lv, sizeof(lv), "%lld", static_cast<long long>(r.base_level));
-    else
-        std::snprintf(lv, sizeof(lv), "%.17g", r.base_level);
-    return std::string(lv) + (stripe ? "b." : ".") + r.base_var;
 }
 
 // V = bread * meat * bread * factor for vce(robust) / vce(cluster), with
@@ -1230,6 +1242,43 @@ bool parse_ml_max_options(const std::vector<std::string>& a, const char* cmd, Ml
     return true;
 }
 
+// Screen factor base levels in their varlist positions without adding them to
+// the fitted design. Map the result back to the original design's column order.
+BinaryPerfectScreen binary_screen_with_bases(const double* X, int64_t n, int k, int ncheck,
+                                             const double* y, const std::vector<BinaryBaseLevel>& bases) {
+    if (bases.empty()) return binary_perfect_screen(X, n, k, ncheck, y);
+    std::vector<int> src;
+    for (int c = 0; c <= k; ++c) {
+        for (size_t b = 0; b < bases.size(); ++b)
+            if (bases[b].before == c) src.push_back(-1 - static_cast<int>(b));
+        if (c < k) src.push_back(c);
+    }
+    const int ka = static_cast<int>(src.size());
+    std::vector<double> augmented(static_cast<size_t>(ka) * static_cast<size_t>(n));
+    for (int j = 0; j < ka; ++j) {
+        const int c = src[static_cast<size_t>(j)];
+        const double* from = c >= 0 ? X + static_cast<std::ptrdiff_t>(c) * n
+                                   : bases[static_cast<size_t>(-1 - c)].col.data();
+        std::copy(from, from + n, augmented.begin() + static_cast<std::ptrdiff_t>(j) * n);
+    }
+    BinaryPerfectScreen screen = binary_perfect_screen(
+        augmented.data(), n, ka, ncheck + static_cast<int>(bases.size()), y);
+    std::vector<char> omitted(static_cast<size_t>(k), 0);
+    for (int j = 0; j < ka; ++j)
+        if (src[static_cast<size_t>(j)] >= 0 && screen.omit_col[static_cast<size_t>(j)])
+            omitted[static_cast<size_t>(src[static_cast<size_t>(j)])] = 1;
+    screen.omit_col = std::move(omitted);
+    for (BinaryPerfectRule& rule : screen.rules) {
+        const int c = src[static_cast<size_t>(rule.col)];
+        rule.col = c >= 0 ? c : -1;
+        if (c < 0) {
+            rule.base_var = bases[static_cast<size_t>(-1 - c)].var;
+            rule.base_level = bases[static_cast<size_t>(-1 - c)].level;
+        }
+    }
+    return screen;
+}
+
 // Stata's perfect-prediction screen (logit.h binary_perfect_screen) on the loaded
 // design: a rule's rows leave the sample and its regressor leaves the fit, to be
 // posted as omitted (_b 0). `asis` skips the rules but not
@@ -1251,45 +1300,8 @@ bool binary_screen_glm(GlmInputs& g, bool asis, bool has_constant, const char* c
         s.omit_col.assign(static_cast<size_t>(g.k), 0);
     } else {
         const int ncheck = has_constant ? g.k - 1 : g.k;
-        const size_t nb = bases ? bases->size() : 0;
-        if (nb == 0) {
-            s = binary_perfect_screen(g.X.data(), g.n, g.k, ncheck, g.y.data());
-        } else {
-            // The expanded varlist: each base level ahead of its factor's first
-            // higher level (the constant stays last). src[j] is the design column
-            // of screen column j, or -1 - (its base level's index).
-            std::vector<int> src;
-            for (int c = 0; c <= g.k; ++c) {
-                for (size_t b = 0; b < nb; ++b)
-                    if ((*bases)[b].before == c) src.push_back(-1 - static_cast<int>(b));
-                if (c < g.k) src.push_back(c);
-            }
-            const int ka = static_cast<int>(src.size());
-            std::vector<double> Xa(static_cast<size_t>(ka) * static_cast<size_t>(g.n));
-            for (int j = 0; j < ka; ++j) {
-                const double* from = src[static_cast<size_t>(j)] >= 0
-                    ? g.X.data() + static_cast<std::ptrdiff_t>(src[static_cast<size_t>(j)]) * g.n
-                    : (*bases)[static_cast<size_t>(-1 - src[static_cast<size_t>(j)])].col.data();
-                std::copy(from, from + g.n, Xa.begin() + static_cast<std::ptrdiff_t>(j) * g.n);
-            }
-            BinaryPerfectScreen sa =
-                binary_perfect_screen(Xa.data(), g.n, ka, ncheck + static_cast<int>(nb), g.y.data());
-            s.keep_row = std::move(sa.keep_row);
-            s.inestimable = sa.inestimable;
-            s.omit_col.assign(static_cast<size_t>(g.k), 0);
-            for (int j = 0; j < ka; ++j)
-                if (src[static_cast<size_t>(j)] >= 0 && sa.omit_col[static_cast<size_t>(j)])
-                    s.omit_col[static_cast<size_t>(src[static_cast<size_t>(j)])] = 1;
-            for (BinaryPerfectRule r : sa.rules) {
-                const int c = src[static_cast<size_t>(r.col)];
-                r.col = c >= 0 ? c : -1;
-                if (c < 0) {
-                    r.base_var = (*bases)[static_cast<size_t>(-1 - c)].var;
-                    r.base_level = (*bases)[static_cast<size_t>(-1 - c)].level;
-                }
-                s.rules.push_back(r);
-            }
-        }
+        s = bases ? binary_screen_with_bases(g.X.data(), g.n, g.k, ncheck, g.y.data(), *bases)
+                  : binary_perfect_screen(g.X.data(), g.n, g.k, ncheck, g.y.data());
         if (s.inestimable) {
             const BinaryPerfectRule& r = s.rules.back();
             std::fprintf(stderr, "%s: outcome = %s %s %.17g predicts data perfectly; r(2000)\n", cmd,
@@ -1374,21 +1386,37 @@ bool binary_screen_glm(GlmInputs& g, bool asis, bool has_constant, const char* c
     return true;
 }
 
-// For each plain factor main effect of the varlist (`i.g`, `ib#.g`, `ib(first).g`
-// ...; not `ibn.`, `i(numlist).` or an interaction) whose levels in the sample are
-// all `<level>.g` design columns but one: that one, the base level, as a column
-// over g's rows, placed before its factor's first higher level (logit.h).
+// A factor main effect contributes a base level even when the effect comes
+// from a full-factorial term. A stand-alone # has no implicit main effects.
 std::vector<BinaryBaseLevel> binary_base_levels(const Dataset& ds, const std::vector<std::string>& xs,
                                                 const GlmInputs& g) {
     std::vector<BinaryBaseLevel> out;
     if (g.keep.size() != static_cast<size_t>(g.n)) return out;
-    for (const std::string& t : xs) {
+
+    std::vector<std::string> main_effects;
+    for (const std::string& term : xs) {
+        if (term.find("##") == std::string::npos) {
+            if (term.find('#') == std::string::npos) main_effects.push_back(term);
+            continue;
+        }
+        for (size_t start = 0; start < term.size();) {
+            const size_t sep = term.find("##", start);
+            const std::string operand = term.substr(start, sep - start);
+            // Bare operands are factor terms in an interaction.
+            main_effects.push_back(operand.find_first_of(".(") == std::string::npos
+                                       ? "i." + operand : operand);
+            if (sep == std::string::npos) break;
+            start = sep + 2;
+        }
+    }
+    std::set<std::string> added;
+    for (const std::string& t : main_effects) {
         const size_t dot = t.find('.');
-        if (dot == std::string::npos || t.find('#') != std::string::npos) continue;
+        if (dot == std::string::npos) continue;
         const std::string op = t.substr(0, dot), var = t.substr(dot + 1);
         if (op != "i" && !(op.size() > 2 && op.compare(0, 2, "ib") == 0 && op != "ibn")) continue;
         if (var.empty() || var.find_first_of(".() ") != std::string::npos || !ds.has(var) ||
-            ds.col(var).dtype != DType::F64)
+            ds.col(var).dtype != DType::F64 || added.count(var))
             continue;
         std::vector<int> cols;
         std::vector<double> levels;
@@ -1428,6 +1456,7 @@ std::vector<BinaryBaseLevel> binary_base_levels(const Dataset& ds, const std::ve
                 b.before = cols[j];
                 break;
             }
+        added.insert(var);
         out.push_back(std::move(b));
     }
     return out;

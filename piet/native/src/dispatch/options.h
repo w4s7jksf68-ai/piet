@@ -30,6 +30,7 @@ extern const piet::eval::OptVocab& kVocabRename;
 extern const piet::eval::OptVocab& kVocabGenerate;
 extern const piet::eval::OptVocab& kVocabReplace;
 extern const piet::eval::OptVocab& kVocabNlGmm;
+extern const piet::eval::OptVocab& kVocabGmm;
 extern const piet::eval::OptVocab& kVocabMixed;
 extern const piet::eval::OptVocab& kVocabIvMl;
 extern const piet::eval::OptVocab& kVocabFracreg;

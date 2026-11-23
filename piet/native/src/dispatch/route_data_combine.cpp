@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
+#include <filesystem>
 #include "data_support.h"
 #include "prefix_support.h"
 #include "text_support.h"
@@ -7,6 +8,7 @@
 #include "options.h"
 #include "handler_declarations.h"
 #include "piet/handlers/data_combine.h"
+#include "piet/handlers/session_commands.h"
 #include "piet/handlers/observations.h"
 namespace piet::dispatch_detail {
 bool route_data_combine(std::string& cmd,
@@ -77,6 +79,10 @@ bool route_data_combine(std::string& cmd,
                         "reshaped data (") + e.what() + ")")));
         return true;
       }
+    }
+    if (reshaped.is_array()) {  // `reshape clear`: nothing to show
+      for (auto& b : reshaped) blocks.push_back(b);
+      return true;
     }
     blocks.push_back(reshaped);
     return true;
@@ -234,11 +240,28 @@ bool route_data_combine(std::string& cmd,
         }
       }
     }
-    static const std::regex reMergeHead(R"(^\s*merge\s+([^\s,]+)\s*(.*)$)", std::regex::icase);
+    // The first word is the command as typed (`merge`, or its `mer`/`merg` abbreviation).
+    static const std::regex reMergeHead(R"(^\s*[A-Za-z_]\w*\s+([^\s,]+)\s*(.*)$)", std::regex::icase);
     std::smatch m;
     if (!std::regex_match(parsed.raw, m, reMergeHead)) {
-      blocks.push_back(ojson(eval::engineError(
-          "merge: syntax error. Usage: merge 1:1|m:1|1:m|m:m KEYLIST using FILE [, opts]")));
+      // Nothing after `merge` is no merge type at all (r(198), bank 1d35a48fb0744cdb). A
+      // leading comma is read as the old syntax, which unabbreviates every word before
+      // `using` as a varlist, so the comma hands the rest to that varlist's own option
+      // parser: `merge , zzabbrprobe` is r(198) "option zzabbrprobe not allowed"
+      // (3bfb10ffb422fa16).
+      static const std::regex reMergeComma(R"(^\s*[A-Za-z_]\w*\s*,\s*([A-Za-z_]\w*)?(\()?.*$)",
+                                           std::regex::icase);
+      std::smatch cm;
+      if (std::regex_match(parsed.raw, cm, reMergeComma) && cm[1].matched) {
+        blocks.push_back(ojson(eval::errorBlock(
+            "syntax_error", "option " + cm.str(1) + (cm[2].matched ? "()" : "") + " not allowed",
+            std::nullopt, std::nullopt, std::nullopt, std::string("r(198)"))));
+        return true;
+      }
+      blocks.push_back(ojson(eval::errorBlock(
+          "syntax_error",
+          "merge :  invalid merge type\n    merge types are 1:1, 1:m, m:1, or m:m",
+          std::nullopt, std::nullopt, std::nullopt, std::string("r(198)"))));
       return true;
     }
     const std::string mtypeRaw = m.str(1);
@@ -251,7 +274,7 @@ bool route_data_combine(std::string& cmd,
       // duplicates pair as m:m unless a uniq option asks otherwise.
       const long long comma = eval::findUnquotedComma(parsed.raw);
       std::string head = comma >= 0 ? parsed.raw.substr(0, static_cast<size_t>(comma)) : parsed.raw;
-      static const std::regex reOldHead(R"(^\s*merge\s+(.*?)\busing\b\s*(.*?)\s*$)",
+      static const std::regex reOldHead(R"(^\s*[A-Za-z_]\w*\s+(.*?)\busing\b\s*(.*?)\s*$)",
                                         std::regex::icase);
       std::smatch om;
       if (!std::regex_match(head, om, reOldHead)) {
@@ -356,8 +379,17 @@ bool route_data_combine(std::string& cmd,
     static const std::regex reUsingSplit(R"(\busing\b)", std::regex::icase);
     std::smatch usingM;
     if (!std::regex_search(restNoOpts, usingM, reUsingSplit)) {
-      blocks.push_back(ojson(eval::engineError(
-          "merge: missing `using FILE` clause. Usage: merge 1:1 id using \"file.hbin\"")));
+      // merge's `syntax [varlist] using/`: a quoted file name where the keys are read is
+      // not a variable name, r(101) (bank beb75f8cf375f9a8 `merge 1:1 make "u.dta"`); no
+      // `using` at all is syntax's r(100) "using required".
+      if (restNoOpts.find('"') != std::string::npos) {
+        blocks.push_back(ojson(eval::errorBlock(
+            "syntax_error", "factor-variable and time-series operators not allowed",
+            std::nullopt, std::nullopt, std::nullopt, std::string("r(101)"))));
+        return true;
+      }
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "using required", std::nullopt,
+                                              std::nullopt, std::nullopt, std::string("r(100)"))));
       return true;
     }
     std::string keyPart = trimWs(restNoOpts.substr(0, static_cast<size_t>(usingM.position(0))));
@@ -592,7 +624,9 @@ bool route_data_combine(std::string& cmd,
     std::string sub;
     std::string subRest;
     {
-      size_t sp = rest.find_first_of(" \t");
+      // The subcommand ends at a blank or at the option comma (`frames dir,
+      // zz` is `dir` with an option).
+      size_t sp = rest.find_first_of(" \t,");
       if (sp == std::string::npos) {
         sub = lower(rest);
       } else {
@@ -602,87 +636,251 @@ bool route_data_combine(std::string& cmd,
     }
 
     // StataBE 19.5 (vs-stata bank 2026-11-10): `frames dir, zznotanoption` is
-    // r(101) "options not allowed"; `frame drop default` (the current frame) is
-    // r(119) "may not drop current frame"; `frame put price` and `frame
-    // putlabel foreign` without into() are r(198) "option into() required".
-    if (sub == "dir" && !parsed.opts.empty()) {
-      blocks.push_back(ojson(eval::errorBlock("syntax_error", "options not allowed", std::nullopt,
-                                              std::nullopt, std::nullopt, "r(101)")));
+    // r(101) "options not allowed"; `frame drop` of the current frame is
+    // r(119) "may not drop current frame" (runFrameDrop); `frame put price`
+    // and `frame putlabel foreign` without into() are r(198) "option into()
+    // required".
+    auto words = [](const std::string& t) {
+      std::vector<std::string> out;
+      std::istringstream iss(t);
+      std::string tok;
+      while (iss >> tok) out.push_back(tok);
+      return out;
+    };
+    auto optValue = [&](const char* name) -> std::optional<std::string> {
+      for (const auto& kv : parsed.opts)
+        if (lower(kv.first) == name) return kv.second.strValue;
+      return std::nullopt;
+    };
+    auto pushResult = [&](const ojson& r) {
+      if (r.is_array()) {
+        for (const auto& b : r) blocks.push_back(b);
+      } else {
+        blocks.push_back(r);
+      }
+    };
+    auto onlyOptions = [&](std::initializer_list<const char*> allowed) -> bool {
+      for (const auto& kv : parsed.opts) {
+        bool ok = false;
+        for (const char* a : allowed) ok = ok || lower(kv.first) == a;
+        if (!ok) {
+          blocks.push_back(ojson(eval::errorBlock(
+              "syntax_error", parsed.opts.size() == 1 && allowed.size() == 0
+                                  ? "options not allowed"
+                                  : "option " + kv.first + " not allowed",
+              std::nullopt, std::nullopt, std::nullopt,
+              allowed.size() == 0 ? "r(101)" : "r(198)")));
+          return false;
+        }
+      }
       return true;
-    }
-    if (sub == "drop" && trimWs(subRest) == "default") {
-      blocks.push_back(ojson(eval::errorBlock("engine_error", "may not drop current frame",
-                                              std::nullopt, std::nullopt, std::nullopt, "r(119)")));
-      return true;
-    }
+    };
+    const std::string head = trimWs(splitTopLevelComma(subRest).first);
+    const std::vector<std::string> args = words(head);
+
     if (sub == "put" || sub == "putlabel") {
-      bool hasInto = false;
-      for (const auto& kv : parsed.opts) hasInto = hasInto || lower(kv.first) == "into";
-      if (!hasInto) {
+      if (!optValue("into").has_value()) {
         blocks.push_back(ojson(eval::errorBlock("syntax_error", "option into() required",
                                                 std::nullopt, std::nullopt, std::nullopt,
                                                 "r(198)")));
         return true;
       }
     }
-    if (sub == "create" || sub == "change" || sub == "cwf" || sub == "pwf" || sub == "rename" ||
-        sub == "copy" || sub == "dir") {
+
+    if (sub == "dir") {
+      if (!onlyOptions({})) return true;
+      pushResult(handlers::runFrameDir(session));
+      return true;
+    }
+    if (sub == "pwf") {
+      if (!onlyOptions({})) return true;
+      pushResult(handlers::runFramePwf(session));
+      return true;
+    }
+    if (sub == "create") {
+      if (!onlyOptions({})) return true;
+      if (args.empty()) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "frame name required",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
+        return true;
+      }
+      std::vector<std::string> vars(args.begin() + 1, args.end());
+      pushResult(handlers::runFrameCreate(args[0], vars, session));
+      return true;
+    }
+    if (sub == "change" || sub == "cwf") {
+      if (!onlyOptions({})) return true;
+      if (args.size() != 1) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+      pushResult(handlers::runFrameChange(args[0], session));
+      return true;
+    }
+    if (sub == "rename") {
+      if (!onlyOptions({})) return true;
+      if (args.size() != 2) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+      pushResult(handlers::runFrameRename(args[0], args[1], session));
+      return true;
+    }
+    if (sub == "copy") {
+      if (!onlyOptions({"replace"})) return true;
+      if (args.size() != 2) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+      pushResult(handlers::runFrameCopy(args[0], args[1], optValue("replace").has_value(),
+                                        session));
+      return true;
+    }
+    if (sub == "reset") {
+      if (!onlyOptions({})) return true;
+      pushResult(handlers::runFramesReset(session));
+      return true;
+    }
+    if (sub == "describe") {
+      std::string optText;
+      for (const auto& kv : parsed.opts) {
+        optText += " " + kv.first;
+        if (!kv.second.isBool) optText += "(" + kv.second.strValue + ")";
+      }
+      pushResult(handlers::runFramesDescribe(head + (optText.empty() ? "" : "," + optText),
+                                             session));
+      return true;
+    }
+    if (sub == "post") {
+      if (!onlyOptions({})) return true;
+      if (args.empty()) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "frame name required",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
+        return true;
+      }
+      // (exp) groups after the frame name, parentheses balanced, quotes kept.
+      std::string after = trimWs(head.substr(head.find(args[0]) + args[0].size()));
+      std::vector<std::string> exprs;
+      int depth = 0;
+      bool inQ = false;
+      std::string cur;
+      for (char c : after) {
+        if (c == '"') inQ = !inQ;
+        if (!inQ && c == '(') {
+          if (depth++ == 0) {
+            cur.clear();
+            continue;
+          }
+        } else if (!inQ && c == ')') {
+          if (--depth == 0) {
+            exprs.push_back(trimWs(cur));
+            continue;
+          }
+        }
+        if (depth > 0) cur.push_back(c);
+      }
+      if (depth != 0) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "unmatched parentheses",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
+        return true;
+      }
+      pushResult(handlers::runFramePost(args[0], exprs, session));
+      return true;
+    }
+    if (sub == "putlabel") {
+      if (!onlyOptions({"into"})) return true;
+      pushResult(handlers::runFramePutlabel(args, *optValue("into"), session));
+      return true;
+    }
+    // `frames save FILE, frames(LIST) [replace]` and `frames use FILE`: the
+    // .dtas container is not implemented; its argument checks are Stata's
+    // (frames() is required, r(198); a missing file is r(601)).
+    if (sub == "save") {
+      if (!optValue("frames").has_value()) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "option frames() required",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
+        return true;
+      }
       blocks.push_back(ojson(eval::unsupportedCommand(
-          "frame " + sub, std::nullopt, std::nullopt, "piet_gap",
+          "frames save", std::nullopt, std::nullopt, "piet_gap",
+          eval::UnsupportedCommandKind::kNotImplemented)));
+      return true;
+    }
+    if (sub == "use") {
+      if (!args.empty()) {
+        std::string f = args[0];
+        if (f.size() >= 2 && f.front() == '"' && f.back() == '"') f = f.substr(1, f.size() - 2);
+        if (std::filesystem::path(f).extension().empty()) f += ".dtas";
+        std::error_code ec;
+        if (!std::filesystem::exists(f, ec)) {
+          blocks.push_back(ojson(eval::errorBlock("engine_error", "file " + f + " not found",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(601)")));
+          return true;
+        }
+      }
+      blocks.push_back(ojson(eval::unsupportedCommand(
+          "frames use", std::nullopt, std::nullopt, "piet_gap",
           eval::UnsupportedCommandKind::kNotImplemented)));
       return true;
     }
 
     if (sub == "drop") {
-      if (subRest.empty()) {
-        blocks.push_back(ojson(eval::engineError("frame drop: frame name required")));
+      if (!onlyOptions({})) return true;
+      if (args.empty()) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "frame name required",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
         return true;
       }
-      ojson r = handlers::runFrameDrop(subRest, session);
-      if (!(r.is_array() && r.empty())) blocks.push_back(r);
+      for (const auto& nm : args) {
+        ojson r = handlers::runFrameDrop(nm, session);
+        if (!(r.is_array() && r.empty())) {
+          blocks.push_back(r);
+          return true;
+        }
+      }
       return true;
     }
 
     if (sub == "put") {
-      // `frame put VARLIST [if COND], into(NAME)`
-      auto [head, optsPart] = splitTopLevelComma(subRest);
-      std::string varsPart = trimWs(head);
-      std::optional<std::string> ifExpr;
+      // `frame put VARLIST [if COND] [in RANGE], into(NAME)`
+      if (!onlyOptions({"into"})) return true;
+      std::string varsPart = head;
+      std::optional<std::string> ifExpr, inRange;
       {
-        static const std::regex reIf(R"(\s+if\s+(.+)$)", std::regex::icase);
+        static const std::regex reIn(R"(\s+in\s+(\S+)\s*$)", std::regex::icase);
         std::smatch im;
+        if (eval::searchUnquoted(varsPart, reIn, im)) {
+          inRange = trimWs(im.str(1));
+          varsPart = varsPart.substr(0, static_cast<size_t>(im.position(0)));
+        }
+        static const std::regex reIf(R"((^|\s+)if\s+(.+)$)", std::regex::icase);
         if (eval::searchUnquoted(varsPart, reIf, im)) {
-          ifExpr = trimWs(im.str(1));
-          varsPart = trimWs(varsPart.substr(0, static_cast<size_t>(im.position(0))));
+          ifExpr = trimWs(im.str(2));
+          varsPart = varsPart.substr(0, static_cast<size_t>(im.position(0)));
+        }
+        if (!inRange.has_value() && eval::searchUnquoted(varsPart, reIn, im)) {
+          inRange = trimWs(im.str(1));
+          varsPart = varsPart.substr(0, static_cast<size_t>(im.position(0)));
         }
       }
-      std::vector<std::string> varlist;
-      {
-        std::istringstream iss(varsPart);
-        std::string tok;
-        while (iss >> tok) varlist.push_back(tok);
-      }
-      std::string into;
-      for (const auto& [k, v] : parsed.opts) {
-        if (lower(k) == "into") into = v.strValue;
-      }
-      // BUG-233: the one copy of this vocabulary now lives in the file-scope
-      // registration block (see top of file); this binding keeps every existing
-      // use — including the reject net below — reading the same set.
-      const std::unordered_set<std::string>& kFramePutKnown = kVocabFramePut.known;
-      if (auto err = eval::rejectUnknownOptions(parsed.opts, kFramePutKnown)) {
-        blocks.push_back(ojson(*err));
-        return true;
-      }
-      (void)optsPart;
-      ojson r = handlers::runFramePut(varlist, ifExpr, into, session);
+      ojson r = handlers::runFramePut(words(varsPart), ifExpr, *optValue("into"), session,
+                                      inRange);
       if (!(r.is_array() && r.empty())) blocks.push_back(r);
       return true;
     }
 
     // A word that is no subcommand of frame at all is r(198) "subcommand X is
     // unrecognized" (vs-stata bank `frame zzz`, `frame , zzabbrprobe`, `frames
-    // zzz`); Stata's own subcommands this build lacks keep the refusal below.
+    // zzz`).
     {
       static const std::set<std::string> kFrameSubs = {
           "create", "change", "pwf", "put", "putlabel", "copy", "rename", "drop", "dir",
@@ -695,16 +893,36 @@ bool route_data_combine(std::string& cmd,
         return true;
       }
     }
-    blocks.push_back(ojson(eval::engineError(
-        "frame " + sub +
-        ": unrecognized subcommand. This build supports `frame put`, `frame drop` and the "
-        "`frame NAME: COMMAND` prefix.")));
+    blocks.push_back(ojson(eval::unsupportedCommand(
+        "frame " + sub, std::nullopt, std::nullopt, "piet_gap",
+        eval::UnsupportedCommandKind::kNotImplemented)));
     return true;
   }
 
 
   // `frlink m:1|1:1 KEY [KEY2 ...], frame(F) generate(G)`
   if (cmd == "frlink") {
+    // `frlink dir`, `frlink describe VAR`, `frlink rebuild VAR`.
+    {
+      static const std::regex reSub(R"(^\s*frlink\s+(dir|describe|rebuild)\b\s*([^,]*)(,.*)?$)",
+                                    std::regex::icase);
+      std::smatch sm;
+      if (std::regex_match(parsed.raw, sm, reSub)) {
+        if (!parsed.opts.empty()) {
+          blocks.push_back(ojson(eval::errorBlock("syntax_error", "options not allowed",
+                                                  std::nullopt, std::nullopt, std::nullopt,
+                                                  "r(101)")));
+          return true;
+        }
+        ojson r = handlers::runFrlinkSub(lower(sm.str(1)), trimWs(sm.str(2)), session);
+        if (r.is_array()) {
+          for (const auto& b : r) blocks.push_back(b);
+        } else {
+          blocks.push_back(r);
+        }
+        return true;
+      }
+    }
     static const std::regex reFrlink(R"(^\s*frlink\s+(1:1|m:1)\s+(.+)$)", std::regex::icase);
     std::smatch m;
     if (!std::regex_match(parsed.raw, m, reFrlink)) {
@@ -751,6 +969,7 @@ bool route_data_combine(std::string& cmd,
     // generate() the link variable takes the frame's name ("the default is
     // generate(framename)"; `frlink 1:1 make, frame(f2)` then `frget ...,
     // from(f2)` run in StataBE 19.5).
+    std::vector<std::string> keys2;
     {
       std::istringstream fw(frameName);
       std::string first;
@@ -761,9 +980,13 @@ bool route_data_combine(std::string& cmd,
                                                 "r(198)")));
         return true;
       }
-      if (genName.empty() && frameName == first) genName = first;
+      std::string w;
+      while (fw >> w) keys2.push_back(w);
+      frameName = first;
+      if (genName.empty()) genName = first;
     }
-    blocks.push_back(ojson(handlers::runFrlink(linkType, keylist, frameName, genName, session)));
+    blocks.push_back(ojson(handlers::runFrlink(linkType, keylist, frameName, genName, session,
+                                               keys2, trimWs(parsed.raw))));
     return true;
   }
 
@@ -779,18 +1002,23 @@ bool route_data_combine(std::string& cmd,
     }
     auto [head, optsPart] = splitTopLevelComma(trimWs(m.str(1)));
     (void)optsPart;
-    std::vector<std::pair<std::string, std::string>> renames;
+    // `frget NEWVAR = VAR` (blanks around `=` optional) or `frget VARLIST`.
+    std::vector<std::string> srcTokens;
+    std::string renameTo;
     {
-      std::istringstream iss(trimWs(head));
+      std::string h = trimWs(head);
+      size_t eq = h.find('=');
+      if (eq != std::string::npos) {
+        renameTo = trimWs(h.substr(0, eq));
+        h = trimWs(h.substr(eq + 1));
+      }
+      std::istringstream iss(h);
       std::string tok;
-      while (iss >> tok) {
-        size_t eq = tok.find('=');
-        if (eq == std::string::npos) {
-          // Bare `frget VAR` copies VAR under its own name.
-          renames.emplace_back(tok, tok);
-        } else {
-          renames.emplace_back(trimWs(tok.substr(0, eq)), trimWs(tok.substr(eq + 1)));
-        }
+      while (iss >> tok) srcTokens.push_back(tok);
+      if (!renameTo.empty() && (srcTokens.size() != 1 || renameTo.find(' ') != std::string::npos)) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt,
+                                                std::nullopt, std::nullopt, "r(198)")));
+        return true;
       }
     }
     std::string fromLink;
@@ -814,7 +1042,25 @@ bool route_data_combine(std::string& cmd,
                                               "r(198)")));
       return true;
     }
-    blocks.push_back(ojson(handlers::runFrget(renames, fromLink, session)));
+    std::string prefix, suffix;
+    std::vector<std::string> excludeTokens;
+    for (const auto& [k, v] : parsed.opts) {
+      const std::string kl = lower(k);
+      if (kl == "prefix") prefix = trimWs(v.strValue);
+      if (kl == "suffix") suffix = trimWs(v.strValue);
+      if (kl == "exclude") {
+        std::istringstream iss(v.strValue);
+        std::string tok;
+        while (iss >> tok) excludeTokens.push_back(tok);
+      }
+    }
+    ojson fr = handlers::runFrget(srcTokens, renameTo, fromLink, prefix, suffix, excludeTokens,
+                                  session);
+    if (fr.is_array()) {
+      for (const auto& b : fr) blocks.push_back(b);
+    } else {
+      blocks.push_back(fr);
+    }
     return true;
   }
 
@@ -917,11 +1163,21 @@ bool route_data_combine(std::string& cmd,
       }
     }
     if (preflight::gate("joinby", session, filePart, 0, blocks) == preflight::Verdict::Cancel) return true;
-    bool joinNolabel = false;
-    for (const auto& [k, v] : parsed.opts)
+    bool joinNolabel = false, joinUpdate = false, joinReplace = false;
+    for (const auto& [k, v] : parsed.opts) {
       if (k == "nolabel" && (v.isBool ? v.boolValue : true)) joinNolabel = true;
+      if (k == "update") joinUpdate = true;
+      if (k == "replace") joinReplace = true;
+    }
+    if (joinReplace && !joinUpdate) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", "option replace requires option update",
+                                              std::nullopt, std::nullopt, std::nullopt,
+                                              "r(198)")));
+      return true;
+    }
     blocks.push_back(ojson(handlers::runJoinby(keylist, filePart, session, joinUnmatched,
-                                               joinMergeVar, joinNolabel)));
+                                               joinMergeVar, joinNolabel, joinUpdate,
+                                               joinReplace)));
     return true;
   }
 
@@ -991,14 +1247,53 @@ bool route_data_combine(std::string& cmd,
     if (sub == "drop" && !subVarlist.has_value() && dupForce)
       { blocks = dupRefuse("options not allowed", 101); return true; }
     if (sub == "tag" && dupForce) { blocks = dupRefuse("option force not allowed", 198); return true; }
+    // list and examples draw their table through list's layout (handlers::ListLayout):
+    // the options are read here and refused only when something is listed, below.
+    handlers::ListLayout dupLayout;
+    std::optional<ojson> dupLayoutBad;
+    if (listOptions) {
+      // A spelling duplicates' own net left as typed is list's to resolve: `c` / `co`
+      // compress, `f` fast, `d` display ... (list's aliases; bank fbdef5d46065b81a,
+      // 85e5bcdc56acff4d, b11e02a31aca1c0a).
+      for (auto& kv : parsed.opts) {
+        if (kVocabList.known.count(kv.first) || kv.first == "gen" || kv.first == "generate" ||
+            kv.first == "force")
+          continue;
+        std::vector<std::pair<std::string, eval::OptValue>> one{kv};
+        eval::canonicalizeForCommand(one, "list");
+        if (kVocabList.known.count(one.front().first)) kv.first = one.front().first;
+      }
+      // list reads a typed `not` as no-table, the display layout (bank 70a57cd30b2b8f6f).
+      auto listOpts = parsed.opts;
+      try {
+        const auto asTyped = eval::tokenize(parsed.raw).opts;
+        if (asTyped.size() == listOpts.size())
+          for (size_t oi = 0; oi < listOpts.size(); ++oi)
+            if (asTyped[oi].first == "not" && listOpts[oi].second.isBool) listOpts[oi].first = "display";
+      } catch (const eval::TokenizerError&) {
+      }
+      if (auto bad = handlers::parseListLayout(listOpts, parsed.raw, &dupLayout)) {
+        dupLayoutBad = *bad;
+        dupLayout = handlers::ListLayout{};
+      }
+    }
     ojson dupRes = ojson(handlers::runDuplicates(sub, subVarlist, genvar, session, parsed.ifExpr,
-                                                 parsed.inRange));
+                                                 parsed.inRange,
+                                                 listOptions ? &dupLayout : nullptr));
+    // "Duplicates in terms of ..." is printed before list's table, as duplicates.ado does --
+    // and before list's refusal of an option, which list prints after it (BUG-1895).
+    auto pushDupTitle = [&]() {
+      if (dupRes.is_object() && dupRes.contains("listing") && dupRes["listing"].contains("title")) {
+        ojson title;
+        title["type"] = "display";
+        title["text"] = dupRes["listing"]["title"];
+        dupRes["listing"].erase("title");
+        blocks.push_back(std::move(title));
+      }
+    };
     if (listOptions && !parsed.opts.empty() && dupRes.is_object() &&
         dupRes.value("type", std::string()) != "error") {
-      const std::string dupText = dupRes.value("text", std::string());
-      const bool listed = sub == "list" ? dupRes.value("type", std::string()) == "browse"
-                                        : dupText.find("(0 observations are duplicates)") ==
-                                              std::string::npos;
+      const bool listed = dupRes.value("type", std::string()) == "browse";
       if (listed) {
         // The options go to `list` (duplicates.ado adds `subvarname noobs` itself). The spelling
         // in parsed.opts is already the bank-resolved one: a canonical list option, or the typed
@@ -1034,6 +1329,7 @@ bool route_data_combine(std::string& cmd,
           const eval::OptValue& v = parsed.opts[oi].second;
           const std::string& typed = typedNames[oi];
           auto bad = [&](const std::string& msg, int rc) {
+            pushDupTitle();
             blocks.push_back(ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt,
                                                     std::nullopt, "r(" + std::to_string(rc) + ")")));
             return true;
@@ -1068,11 +1364,11 @@ bool route_data_combine(std::string& cmd,
           if (k == "nolabel") noLabel = true;
           else if (k != "fast" && !notDrawn) notDrawn = k;
         }
-        if (notDrawn) {
-          blocks.push_back(ojson(eval::unsupportedOption(
-              *notDrawn,
-              "`duplicates " + sub + "` hands its options to `list`, but this build does not draw "
-              "the effect of `" + *notDrawn + "` in the duplicates table.")));
+        // Every list option is drawn now (the block's `listing`, list-format.js).
+        (void)notDrawn;
+        if (dupLayoutBad) {
+          pushDupTitle();
+          blocks.push_back(*dupLayoutBad);
           return true;
         }
         if (noLabel && dupRes.contains("columns") && dupRes["columns"].is_array())
@@ -1080,6 +1376,7 @@ bool route_data_combine(std::string& cmd,
             if (col.is_object()) col.erase("value_labels");
       }
     }
+    pushDupTitle();
     blocks.push_back(std::move(dupRes));
     return true;
   }

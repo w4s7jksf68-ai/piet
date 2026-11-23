@@ -127,6 +127,7 @@ int cmd_joinby(const std::vector<std::string>& a);
 // P1 wave data verbs — Stata expand / fillin / cross / contract.
 int cmd_expand(const std::vector<std::string>& a);
 int cmd_fillin(const std::vector<std::string>& a);
+int cmd_take(const std::vector<std::string>& a);
 int cmd_cross(const std::vector<std::string>& a);
 int cmd_contract(const std::vector<std::string>& a);
 int cmd_merge(const std::vector<std::string>& a);
@@ -180,6 +181,7 @@ int cmd_lpoly(const std::vector<std::string>& a);
 int cmd_lowess(const std::vector<std::string>& a);
 int cmd_oaxaca(const std::vector<std::string>& a);
 int cmd_nnmatch(const std::vector<std::string>& a);
+int cmd_teffects_ra(const std::vector<std::string>& a);
 int cmd_pca(const std::vector<std::string>& a);
 
 }  // namespace cli

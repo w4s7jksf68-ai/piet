@@ -183,6 +183,10 @@ ojson runImportExcel(const std::string& pathArg,
     try {
       info = xlsx::sheets(path);
     } catch (const std::exception& e) {
+      if (std::string(e.what()).find("no ZIP directory found") != std::string::npos)
+        return eval::errorBlock("engine_error",
+                                "file " + stripOneQuotePair(trim(pathArg)) + " could not be loaded",
+                                std::nullopt, std::nullopt, std::nullopt, "r(603)");
       return engineErrorBlock(std::string("import excel: ") + e.what(), "data_io");
     }
     session.eval.rValues.set("N_worksheet", static_cast<double>(info.size()));
@@ -229,6 +233,13 @@ ojson runImportExcel(const std::string& pathArg,
     // (:81-82, :91-92).
     return engineErrorBlock(e.what(), "unsupported_option");
   } catch (const std::exception& e) {
+    // A file that is no workbook at all (a .csv named to import excel) is
+    // Stata's r(603) "file NAME could not be loaded" (vs-stata bank
+    // 72614f07d3ccfbeb).
+    if (std::string(e.what()).find("no ZIP directory found") != std::string::npos)
+      return eval::errorBlock("engine_error",
+                              "file " + stripOneQuotePair(trim(pathArg)) + " could not be loaded",
+                              std::nullopt, std::nullopt, std::nullopt, "r(603)");
     return engineErrorBlock(std::string("import excel: ") + e.what(), "data_io");
   }
 

@@ -3,6 +3,7 @@
 // Categorical estimation.
 #include "piet/handlers/estimation.h"
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -125,6 +126,130 @@ void eformRowM4(ojson& row) {
     row["ci_hi"] = std::exp(row["ci_hi"].get<double>());
   row["eform"] = true;
 }
+// The constraints a fit drops (their notes, keyed by position in the
+// constraints() list) and the positions of those it keeps.
+struct CnsDropsM4 {
+  std::vector<std::pair<int, std::string>> notes;
+  std::vector<int> keptPos;
+};
+// constraints(numlist) of ologit/oprobit/mlogit: the defined constraints as the
+// engine's `--cns` spec (cmds/common.h). `eqOf` maps a typed equation ("" when
+// none) to the engine's EQ field, or nullopt when the model has no such
+// equation. A constraint that cannot be laid on the model is dropped, as makecns
+// drops a constraint that causes an error, and the fit goes on with the rest:
+// an unknown equation here (r(303)), an unknown coefficient by the engine
+// (dropCnsAfterFitM4). `dropped` gets each such constraint's note, keyed by its
+// position in the constraints() list, and the kept ones' positions. Returns an error block, or nullopt with
+// `spec` empty when the option is absent.
+std::optional<ojson> constraintsSpecM4(
+    const eval::ParsedCommand& parsed, SessionState& session,
+    const std::function<std::optional<std::string>(const std::string&, std::string&)>& eqOf,
+    std::string& spec, std::vector<est_detail::CnsDefM4>& defs, CnsDropsM4& dropped) {
+  spec.clear();
+  dropped = CnsDropsM4();
+  ojson err;
+  if (!est_detail::readConstraintsM4(parsed, session, defs, err)) return err;
+  std::vector<est_detail::CnsDefM4> kept;
+  for (size_t di = 0; di < defs.size(); ++di) {
+    est_detail::CnsDefM4& d = defs[di];
+    std::string row;
+    bool badEq = false;
+    for (auto& t : d.terms) {
+      std::string nm = t.name;
+      const std::optional<std::string> eq = eqOf(t.eq, nm);
+      if (!eq.has_value()) {
+        badEq = true;
+        break;
+      }
+      t.eq = *eq;
+      t.name = nm;
+      char c[40];
+      std::snprintf(c, sizeof(c), "%.17g", t.coef);
+      row += (row.empty() ? "" : ",") + std::string(c) + "|" + t.eq + "|" + t.name;
+    }
+    if (badEq) {
+      dropped.notes.emplace_back(static_cast<int>(di), "constraint number " + std::to_string(d.num) +
+                                                           " caused error r(303)");
+      continue;
+    }
+    kept.push_back(d);
+    dropped.keptPos.push_back(static_cast<int>(di));
+    if (row.empty()) continue;  // a constraint on numbers alone
+    char r[40];
+    std::snprintf(r, sizeof(r), "%.17g", d.rhs);
+    spec += (spec.empty() ? "" : ";") + row + "=" + r;
+  }
+  defs.swap(kept);
+  return std::nullopt;
+}
+
+// After the fit: the engine's `cns_dropped` rows (a coefficient the model does
+// not have, r(111)) leave `defs`, each with its note; the notes go above the
+// table in constraints() order (`note: constraint number 6 caused error r(111)`).
+void dropCnsAfterFitM4(const ojson& raw, std::vector<est_detail::CnsDefM4>& defs,
+                       CnsDropsM4& dropped, ojson& block) {
+  if (raw.is_object() && raw.contains("cns_dropped") && raw["cns_dropped"].is_array()) {
+    std::map<size_t, int> rcOfRow;  // engine spec row -> rc
+    for (const auto& d : raw["cns_dropped"])
+      if (d.is_object() && d.contains("row") && d["row"].is_number_integer())
+        rcOfRow[d["row"].get<size_t>()] = d.value("rc", 111);
+    std::vector<est_detail::CnsDefM4> kept;
+    std::vector<int> keptPos;
+    size_t row = 0;
+    for (size_t i = 0; i < defs.size(); ++i) {
+      const est_detail::CnsDefM4& d = defs[i];
+      const int pos = i < dropped.keptPos.size() ? dropped.keptPos[i] : static_cast<int>(i);
+      const auto it = d.terms.empty() ? rcOfRow.end() : rcOfRow.find(row++);
+      if (it == rcOfRow.end()) {
+        kept.push_back(d);
+        keptPos.push_back(pos);
+        continue;
+      }
+      dropped.notes.emplace_back(pos, "constraint number " + std::to_string(d.num) + " caused error r(" +
+                                          std::to_string(it->second) + ")");
+    }
+    defs.swap(kept);
+    dropped.keptPos.swap(keptPos);
+  }
+  if (dropped.notes.empty() || !block.is_object() || block.value("type", std::string()) == "error") return;
+  std::stable_sort(dropped.notes.begin(), dropped.notes.end(),
+                   [](const auto& a, const auto& b) { return a.first < b.first; });
+  ojson notes = ojson::array();
+  for (const auto& [pos, text] : dropped.notes) notes.push_back(text);
+  if (block.contains("warnings") && block["warnings"].is_array())
+    for (const auto& w : block["warnings"]) notes.push_back(w);
+  block["warnings"] = std::move(notes);
+}
+
+// `( 1)  [rep78]mpg = -.1`: the constraint lines Stata prints above the table.
+std::vector<std::string> constraintLinesM4(
+    const std::vector<est_detail::CnsDefM4>& defs,
+    const std::function<std::string(const est_detail::CnsTermM4&)>& shown) {
+  std::vector<std::string> out;
+  int i = 0;
+  for (const auto& d : defs) {
+    if (d.terms.empty()) continue;
+    std::vector<std::pair<double, std::string>> terms;
+    for (const auto& t : d.terms) terms.emplace_back(t.coef, shown(t));
+    char head[16];
+    std::snprintf(head, sizeof(head), "(%2d)  ", ++i);
+    out.push_back(head + est_detail::cnsDisplayLineM4(terms, d.rhs));
+  }
+  return out;
+}
+
+// A coefficient the constraints fix (variance exactly 0): Stata shows its value
+// and `(constrained)`, with no standard error, test or interval.
+void markConstrainedRowM4(ojson& row) {
+  if (!row.is_object() || !row.value("constrained", false)) return;
+  for (const char* k : {"se", "z", "t", "p", "ci_lo", "ci_hi"})
+    if (row.contains(k)) row[k] = nullptr;
+}
+// The same coefficient's r(table) column: its value, the statistics missing.
+void markConstrainedRtColM4(ojson& col) {
+  col["constrained"] = true;
+  for (const char* k : {"se", "z", "p", "ci_lo", "ci_hi"}) col[k] = nullptr;
+}
 }  // namespace
 
 // `ologit depvar indepvars [if] [, vce(robust|cluster V)]` and its probit twin.
@@ -133,6 +258,7 @@ ojson runOrdered(const std::string& cobraCmd, const eval::ParsedCommand& parsed,
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   P7MleArgv b = buildP7MleArgv(cobraCmd, parsed, {"iid", "robust", "cluster"});
   if (b.errored) return b.errorBlock;
+  if (auto err = pushInRangeKeepifM4(session, parsed, b.argv, cobraCmd)) return *err;
   if (auto err = pushMlWeightM4(parsed, cobraCmd, b.argv)) return *err;
   // offset(varname): a term in the linear predictor with coefficient 1 (vs-stata
   // bank 13941585 `ologit rep78 mpg weight, offset(off)`). An expression is not a
@@ -151,9 +277,38 @@ ojson runOrdered(const std::string& cobraCmd, const eval::ParsedCommand& parsed,
   // it was read by nobody.
   pushLevelIfGivenM4(parsed, b.argv);
   if (auto err = pushIterateM4(parsed, b.argv)) return *err;
+  // constraints(numlist): `mpg`, `[rep78]mpg`, `_b[mpg]`, `/cut1` or
+  // `[cut1]_cons` (bank eae58c67 `constraint 1 mpg = -0.1`, `ologit rep78 mpg
+  // weight, const(1)`).
+  const std::string& depvar = parsed.varlist[0];
+  std::vector<est_detail::CnsDefM4> cnsDefs;
+  CnsDropsM4 cnsDrops;
+  {
+    std::string spec;
+    const auto eqOf = [&depvar](const std::string& eq, std::string& name) -> std::optional<std::string> {
+      if (eq.empty() || eq == depvar || eq == "#1") return std::string();
+      static const std::regex reCut(R"(^/?cut([0-9]+)$)");
+      std::smatch m;
+      if (std::regex_match(eq, m, reCut) && name == "_cons") {
+        name = "/cut" + m[1].str();
+        return std::string();
+      }
+      if (eq == "/" && name.rfind("cut", 0) == 0) {
+        name = "/" + name;
+        return std::string();
+      }
+      return std::nullopt;
+    };
+    if (auto err = constraintsSpecM4(parsed, session, eqOf, spec, cnsDefs, cnsDrops)) return *err;
+    if (!spec.empty()) {
+      b.argv.push_back("--cns");
+      b.argv.push_back(spec);
+    }
+  }
   b.argv.push_back("--emit-v");  // BUG-1196: the fit's e(V), posted below
   ojson raw;
   ojson block = runP7Mle(cobraCmd, b.argv, session, &raw);
+  dropCnsAfterFitM4(raw, cnsDefs, cnsDrops, block);
   // BUG-1196: Stata's e(b) is the depvar's equation, then the cutpoints
   // (StataBE 19.5 `yo:x1 yo:x2 /cut1 /cut2`); e(V) is the fit's, in that order.
   if (raw.is_object() && raw.contains("e_V") && raw.contains("coefs") && raw.contains("cuts") &&
@@ -230,8 +385,25 @@ ojson runOrdered(const std::string& cobraCmd, const eval::ParsedCommand& parsed,
       row["p"] = nullptr;
       row["ci_lo"] = c.contains("ci_lo") ? c["ci_lo"] : ojson(nullptr);
       row["ci_hi"] = c.contains("ci_hi") ? c["ci_hi"] : ojson(nullptr);
+      if (c.value("constrained", false)) row["constrained"] = true;
       block["coeftable"].push_back(row);
     }
+  }
+  if (!cnsDefs.empty() && raw.contains("cns") && block.contains("coeftable") &&
+      block["coeftable"].is_array()) {
+    std::set<std::string> fixedSlopes;  // the engine's slopes the constraints fix
+    if (raw.contains("coefs") && raw["coefs"].is_array())
+      for (const auto& c : raw["coefs"])
+        if (c.is_object() && c.value("constrained", false)) fixedSlopes.insert(c.value("name", std::string()));
+    for (auto& row : block["coeftable"]) {
+      if (row.is_object() && fixedSlopes.count(row.value("name", std::string())) != 0)
+        row["constrained"] = true;
+      markConstrainedRowM4(row);
+    }
+    block["chi2type"] = "Wald";
+    block["constraint_lines"] = constraintLinesM4(cnsDefs, [&depvar](const est_detail::CnsTermM4& t) {
+      return t.name.rfind("/", 0) == 0 ? t.name : "[" + depvar + "]" + t.name;
+    });
   }
   return block;
 }
@@ -241,6 +413,7 @@ ojson runMlogit(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   P7MleArgv b = buildP7MleArgv("mlogit", parsed, {"iid", "robust", "cluster"});
   if (b.errored) return b.errorBlock;
+  if (auto err = pushInRangeKeepifM4(session, parsed, b.argv, "mlogit")) return *err;
   if (auto err = pushMlWeightM4(parsed, "mlogit", b.argv)) return *err;
   for (const auto& [k, v] : parsed.opts) {
     if ((k == "baseoutcome" || k == "base") && !v.isBool) {
@@ -252,9 +425,63 @@ ojson runMlogit(const eval::ParsedCommand& parsed, SessionState& session) {
   // iterate(#) (bank d678752f `mlogit race age grade wage, iterate(2)`: e(ll)
   // -1383.0289533345524, e(converged) 0)
   if (auto err = pushIterateM4(parsed, b.argv)) return *err;
+  // constraints(numlist): an equation is named by its outcome's value label, its
+  // value or `#n` (bank 908e6dce `constraint 1 [2]age = 0`, `mlogit race age grade
+  // wage, c(1)`: outcome 2, Black).
+  const std::string& yv = parsed.varlist[0];
+  std::map<int, std::string> cnsLabels;
+  {
+    const auto vl = session.valueLabels.find(yv);
+    if (vl != session.valueLabels.end()) cnsLabels = vl->second;
+    const auto lbl = session.varLblname.find(yv);
+    if (cnsLabels.empty() && lbl != session.varLblname.end() && !lbl->second.empty()) {
+      const auto defs = session.labelDefs.find(lbl->second);
+      if (defs != session.labelDefs.end())
+        for (const auto& [code, text] : defs->second) {
+          char* e = nullptr;
+          const long v = std::strtol(code.c_str(), &e, 10);
+          if (e != nullptr && *e == '\0' && !code.empty()) cnsLabels[static_cast<int>(v)] = text;
+        }
+    }
+  }
+  std::vector<est_detail::CnsDefM4> cnsDefs;
+  CnsDropsM4 cnsDrops;
+  {
+    std::string spec;
+    const auto eqOf = [&cnsLabels](const std::string& eq, std::string&) -> std::optional<std::string> {
+      if (eq.empty()) return std::string();
+      static const std::regex reNum(R"(^#?[0-9]+$)");
+      for (const auto& [v, text] : cnsLabels)
+        if (text == eq) return "=" + std::to_string(v);
+      if (std::regex_match(eq, reNum)) return eq[0] == '#' ? eq : "=" + eq;
+      return std::nullopt;
+    };
+    if (auto err = constraintsSpecM4(parsed, session, eqOf, spec, cnsDefs, cnsDrops)) return *err;
+    if (!spec.empty()) {
+      b.argv.push_back("--cns");
+      b.argv.push_back(spec);
+    }
+  }
   b.argv.push_back("--emit-v");  // BUG-1196: the fit's e(V), posted below
   ojson raw;
   ojson block = runP7Mle("mlogit", b.argv, session, &raw);
+  dropCnsAfterFitM4(raw, cnsDefs, cnsDrops, block);
+  // A coefficient the constraints hold at 0 is `o.`-marked, as ml's findomitted
+  // marks it (bank 908e6dce `Black:o.age`, r(label5) `(omitted)`): the engine
+  // outcome value -> the names of its coefficients so fixed.
+  std::map<std::string, std::set<std::string>> cnsZero;
+  if (!cnsDefs.empty() && raw.contains("cns") && raw.contains("equations") && raw["equations"].is_array())
+    for (const auto& e : raw["equations"]) {
+      if (!e.is_object() || e.value("base", false) || !e.contains("coefs") || !e.contains("outcome")) continue;
+      char eng[64];
+      std::snprintf(eng, sizeof(eng), "%.17g", e["outcome"].get<double>());
+      for (const auto& c : e["coefs"])
+        if (c.is_object() && c.value("constrained", false) && c.value("b", 1.0) == 0.0) {
+          std::string nm = c.value("name", std::string());
+          if (nm == "(intercept)") nm = "_cons";
+          cnsZero[eng].insert(nm);
+        }
+    }
   // baseoutcome(#) naming no outcome: Stata's r(111) "basecategory not found"
   // (vs-stata bank be442720 `mlogit race age grade wage, baseoutcome(9)`).
   if (block.is_object() && block.value("type", std::string()) == "error" &&
@@ -311,6 +538,9 @@ ojson runMlogit(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
   bool ebPosted = false;
+  // a factor-variable fit's per-equation layout (Stata name, engine name; "" = base)
+  std::optional<std::vector<std::pair<std::string, std::string>>> mlogitFvLayout;
+  std::vector<AncillaryEbColM4> mlogitEbCols;  // the posted columns of such a fit
   if (eqOk && raw.contains("e_V")) {
     std::vector<std::string> coefNames;  // a non-base equation's names, engine spelling
     for (const auto& e : raw["equations"])
@@ -335,21 +565,119 @@ ojson runMlogit(const eval::ParsedCommand& parsed, SessionState& session) {
         for (const auto& n : coefNames) coefs.push_back({{"name", n}, {"b", 0.0}});
       std::vector<AncillaryEbColM4> ec;  // `y:name`, re-keyed to the outcome's equation
       if (!depvarEqColsM4(y, coefs, "b", ec)) {
-        ok = false;
-        break;
+        // Factor-variable terms: each equation's columns as r(table) lays them out
+        // (a base level a structural 0; the base outcome's every column off its
+        // base level `o.`-marked: bank 6b328e96 `mlogit race age i.collgrad`
+        // White:o.age White:0b.collgrad White:1o.collgrad White:o._cons
+        // Black:age Black:0b.collgrad Black:1.collgrad Black:_cons ..., 2ef46669
+        // `i.collgrad##c.age` White:0b.collgrad#co.age Black:1.collgrad#c.age).
+        if (!mlogitFvLayout.has_value()) {
+          mlogitFvLayout.emplace();
+          ojson ct = ojson::array();
+          for (const auto& e2 : raw["equations"])
+            if (e2.is_object() && !e2.value("base", false) && e2.contains("coefs")) {
+              ct = e2["coefs"];
+              break;
+            }
+          std::vector<rtable_detail::RtCol> rc;
+          bool placedFv = false;
+          try {
+            placedFv = session.lastModel().has_value() && ct.is_array() && !ct.empty() &&
+                       rtable_detail::stataColumns(session, *session.lastModel(), ct, rc);
+          } catch (const std::exception&) {
+            placedFv = false;
+          }
+          if (placedFv)
+            for (const auto& c : rc) {
+              std::string en = c.row != nullptr ? c.row->value("name", std::string()) : std::string();
+              // (a coefficient the constraints hold at 0 is b 0, se 0 too, but it is
+              // the user's, not an omitted regressor: placed, and `o.`-marked below)
+              const bool zeroRow = c.row != nullptr && c.row->contains("b") && (*c.row)["b"].is_number() &&
+                                   (*c.row)["b"].get<double>() == 0.0 && c.row->contains("se") &&
+                                   (*c.row)["se"].is_number() && (*c.row)["se"].get<double>() == 0.0 &&
+                                   !c.row->value("constrained", false);
+              if (zeroRow) {  // an engine-omitted regressor: its Stata name is not known here
+                mlogitFvLayout->clear();
+                break;
+              }
+              mlogitFvLayout->push_back({c.name, en});
+            }
+        }
+        if (mlogitFvLayout->empty()) {
+          ok = false;
+          break;
+        }
+        std::map<std::string, const ojson*> byName;
+        if (!isBase)
+          for (const auto& c : e["coefs"]) byName[c.value("name", std::string())] = &c;
+        for (const auto& [stataName, engName] : *mlogitFvLayout) {
+          AncillaryEbColM4 c;
+          if (isBase || engName.empty()) {
+            c.stata = eq + ":" + (isBase ? rtable_detail::omittedColumnName(stataName) : stataName);
+            c.b = 0.0;
+          } else {
+            const auto it = byName.find(engName);
+            if (it == byName.end() || !(*it->second).contains("b") || !(*it->second)["b"].is_number()) {
+              ok = false;
+              break;
+            }
+            c.b = (*it->second)["b"].get<double>();
+            // held at 0 by the constraints: `o.`-marked as ml's findomitted marks it
+            // (bank 908e6dce `Black:o.age`)
+            const bool fixed0 = (*it->second).value("constrained", false) && c.b == 0.0;
+            c.stata = eq + ":" + (fixed0 ? rtable_detail::omittedColumnName(stataName) : stataName);
+            c.engine = std::string(eng) + ":" + engName;
+          }
+          cols.push_back(std::move(c));
+        }
+        if (!ok) break;
+        continue;
       }
       for (auto& c : ec) {
-        c.stata = eq + (isBase ? ":o." : ":") + c.stata.substr(y.size() + 1);
+        const std::string nm = c.stata.substr(y.size() + 1);
+        const auto z = cnsZero.find(eng);
+        const bool fixed0 = !isBase && z != cnsZero.end() && z->second.count(nm) != 0;
+        c.stata = eq + (isBase || fixed0 ? ":o." : ":") + nm;
         c.engine = isBase ? std::string() : std::string(eng) + ":" + c.engine;
         cols.push_back(std::move(c));
       }
     }
     if (ok) ebPosted = postAncillaryEbM4(session, raw, cols);
+    if (ok && mlogitFvLayout.has_value()) mlogitEbCols = cols;
   }
   // r(table) laid out as e(b) (the base equation's columns `o.`: b 0, the rest
   // missing; bank e9b3681e r(label1..4) `(omitted)`), in the coefficient metric,
   // each column marked eform under `rrr` (bank a127b83e: the base column's b 1).
-  if (ebPosted && block.is_object()) {
+  if (ebPosted && block.is_object() && !mlogitEbCols.empty()) {
+    // the factor-variable layout: r(table)'s columns are the posted e(b)'s
+    const bool rrr = flagOptM4(parsed, "rrr");
+    std::map<std::string, const ojson*> rowOf;  // engine `outcome:name` -> its coef row
+    for (const auto& e : raw["equations"]) {
+      if (e.value("base", false) || !e.contains("coefs")) continue;
+      char eng[64];
+      std::snprintf(eng, sizeof(eng), "%.17g", e["outcome"].get<double>());
+      for (const auto& c : e["coefs"]) rowOf[std::string(eng) + ":" + c.value("name", std::string())] = &c;
+    }
+    ojson rt = ojson::array();
+    for (const auto& c : mlogitEbCols) {
+      ojson col;
+      col["name"] = c.stata;
+      col["eform"] = rrr;
+      const auto it = c.engine.empty() ? rowOf.end() : rowOf.find(c.engine);
+      const bool cns = it != rowOf.end() && it->second->value("constrained", false);
+      if (it == rowOf.end() || (cns && it->second->value("b", 1.0) == 0.0)) {
+        col["omitted"] = true;
+      } else {
+        for (const char* key : {"b", "se", "z", "p", "ci_lo", "ci_hi"})
+          col[key] = it->second->contains(key) ? (*it->second)[key] : ojson(nullptr);
+        if (cns) markConstrainedRtColM4(col);
+      }
+      rt.push_back(std::move(col));
+    }
+    if (session.lastEstBlock.has_value() && session.lastEstBlock->is_object())
+      (*session.lastEstBlock)["rtable_cols"] = rt;
+    block["rtable_cols"] = std::move(rt);
+  } else if (ebPosted && block.is_object()) {
     const bool rrr = flagOptM4(parsed, "rrr");
     ojson rt = ojson::array();
     size_t ei = 0;
@@ -371,14 +699,19 @@ ojson runMlogit(const eval::ParsedCommand& parsed, SessionState& session) {
       for (size_t i : order) {
         const std::string nm = coefNames[i] == "(intercept)" ? std::string("_cons") : coefNames[i];
         ojson col;
-        col["name"] = eq + (isBase ? ":o." : ":") + nm;
+        char engv[64];
+        std::snprintf(engv, sizeof(engv), "%.17g", e["outcome"].get<double>());
+        const auto z = cnsZero.find(engv);
+        const bool fixed0 = !isBase && z != cnsZero.end() && z->second.count(nm) != 0;
+        col["name"] = eq + (isBase || fixed0 ? ":o." : ":") + nm;
         col["eform"] = rrr;
-        if (isBase) {
+        if (isBase || fixed0) {
           col["omitted"] = true;
         } else {
           const ojson& c = e["coefs"][i];
           for (const char* key : {"b", "se", "z", "p", "ci_lo", "ci_hi"})
             col[key] = c.contains(key) ? c[key] : ojson(nullptr);
+          if (c.value("constrained", false)) markConstrainedRtColM4(col);
         }
         rt.push_back(std::move(col));
       }
@@ -407,56 +740,401 @@ ojson runMlogit(const eval::ParsedCommand& parsed, SessionState& session) {
       if (o.is_object() && !o.value("base", false) && o.contains("coeftable") &&
           o["coeftable"].is_array())
         for (auto& row : o["coeftable"]) eformRowM4(row);
+  // constraints(): a coefficient held at 0 is drawn `(omitted)`, and the
+  // constraint lines (`( 1)  [Black]o.age = 0`) go above the table.
+  if (!cnsDefs.empty() && raw.contains("cns") && block.contains("outcomes") && block["outcomes"].is_array()) {
+    for (auto& o : block["outcomes"]) {
+      if (!o.is_object() || o.value("base", false) || !o.contains("outcome") || !o.contains("coeftable"))
+        continue;
+      char eng[64];
+      std::snprintf(eng, sizeof(eng), "%.17g", o["outcome"].get<double>());
+      // held at a nonzero value: its value and `(constrained)`, no statistics
+      // (Stata's coefficient table, as ologit's `mpg | -.1 (constrained)`)
+      std::set<std::string> fixedNonzero;
+      for (const auto& e : raw["equations"]) {
+        if (!e.is_object() || e.value("base", false) || !e.contains("coefs") || !e.contains("outcome")) continue;
+        char ev[64];
+        std::snprintf(ev, sizeof(ev), "%.17g", e["outcome"].get<double>());
+        if (std::string(ev) != eng) continue;
+        for (const auto& c : e["coefs"])
+          if (c.is_object() && c.value("constrained", false) && c.value("b", 0.0) != 0.0)
+            fixedNonzero.insert(c.value("name", std::string()));
+      }
+      const auto z = cnsZero.find(eng);
+      for (auto& row : o["coeftable"]) {
+        const std::string en = row.value("name", std::string());
+        if (fixedNonzero.count(en) != 0) {
+          row["constrained"] = true;
+          markConstrainedRowM4(row);
+          continue;
+        }
+        if (z == cnsZero.end()) continue;
+        std::string nm = en;
+        if (nm == "(intercept)") nm = "_cons";
+        if (z->second.count(nm) == 0) continue;
+        for (const char* k : {"b", "se", "t", "z", "p", "ci_lo", "ci_hi"})
+          if (row.contains(k)) row[k] = nullptr;
+      }
+    }
+    std::vector<std::string> engOf;  // outcome position -> engine spelling of its value
+    if (raw.contains("equations"))
+      for (const auto& e : raw["equations"]) {
+        char eng[64];
+        std::snprintf(eng, sizeof(eng), "%.17g", e.value("outcome", 0.0));
+        engOf.push_back(eng);
+      }
+    block["chi2type"] = "Wald";
+    block["constraint_lines"] = constraintLinesM4(cnsDefs, [&](const est_detail::CnsTermM4& t) {
+      size_t pos = 0;
+      if (!t.eq.empty() && t.eq[0] == '#') pos = static_cast<size_t>(std::max(1, std::atoi(t.eq.c_str() + 1)) - 1);
+      std::string engv = pos < engOf.size() ? engOf[pos] : std::string();
+      if (!t.eq.empty() && t.eq[0] == '=') {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.17g", std::strtod(t.eq.c_str() + 1, nullptr));
+        engv = buf;
+        for (size_t i = 0; i < engOf.size(); ++i)
+          if (engOf[i] == engv) pos = i;
+      }
+      const std::string eqName = pos < eqNames.size() ? eqNames[pos] : engv;
+      const auto z = cnsZero.find(engv);
+      const bool fixed0 = z != cnsZero.end() && z->second.count(t.name) != 0;
+      return "[" + eqName + "]" + (fixed0 ? "o." : "") + t.name;
+    });
+  }
   return block;
 }
 
-// `zip`/`zinb depvar indepvars [if], inflate(...) [vce(robust)]`.
-// inflate() is REQUIRED by Stata and only the constant-only form is implemented;
-// a covariate list there would be a different model, so it rejects rather than
-// quietly fitting the constant-only one.
+// `zip`/`zinb depvar indepvars [if] [fw pw], inflate(varlist | _cons) [probit
+// exposure() offset() iterate() irr level() vce()]`: the engine fits zip.ado's /
+// zinb.ado's constant-only then full model (cmds_zicount.cpp run_zi_ml), and the
+// e() contract is posted here from its reply (vs-stata bank ce0a6a9f `zip ten age
+// grade, inflate(married south)`, d496c5be the zinb twin): e(b)/e(V) on the
+// `depvar:` / `inflate:` (/lnalpha) stripe, e(gradient), e(ilog), e(ll_0), the
+// LR (default VCE) or Wald model test of the count slopes, and zip's macros.
+// Factor variables (base-level columns of their own on the stripe) and
+// iweights are refused by name.
 ojson runZeroInflated(const std::string& cobraCmd, const eval::ParsedCommand& parsed,
                       SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
+  const bool nb = cobraCmd == "zinb";
+  // The options this fit reads; zip.ado's others are real but not implemented. A
+  // word in neither is r(198) (bank 7d468089 `..., zznotanoption`; 2a764ccb `...,
+  // nolog`: zip's own parser answers "invalid 'nolog'", r(198)).
+  {
+    // kVocabZip (estimation_options.cpp) is registered for both tokens, so the
+    // dispatcher has already resolved every abbreviation to its full name here.
+    if (auto e = eval::rejectUnknownOptions(parsed.opts, kVocabZip.known, kVocabZip.unimplemented))
+      return ojson(*e);
+    // A second comma at the top level of the option list is not an option
+    // separator to zip.ado's parser: the word after it is "invalid" (bank 2a764ccb
+    // `..., inflate(married south), nolog`: r(198) invalid 'nolog').
+    int depth = 0, commas = 0;
+    bool inQ = false;
+    for (size_t i = 0; i < parsed.raw.size(); ++i) {
+      const char c = parsed.raw[i];
+      if (c == '"') inQ = !inQ;
+      if (inQ) continue;
+      if (c == '(') ++depth;
+      else if (c == ')') --depth;
+      else if (c == ',' && depth == 0 && ++commas == 2) {
+        std::istringstream rest(parsed.raw.substr(i + 1));
+        std::string w;
+        rest >> w;
+        const size_t paren = w.find('(');
+        if (paren != std::string::npos) w = w.substr(0, paren);
+        return extended_fit_detail::stataRefusalM4b("invalid '" + w + "'", 198);
+      }
+    }
+  }
   P7MleArgv b = buildP7MleArgv(cobraCmd, parsed, {"iid", "robust", "cluster"});
   if (b.errored) return b.errorBlock;
   std::optional<std::string> inflate;
-  for (const auto& [k, v] : parsed.opts)
+  bool irr = false, probit = false;
+  std::string exposure, offset;
+  for (const auto& [k, v] : parsed.opts) {
     if (k == "inflate" && !v.isBool) inflate = trimM4(v.strValue);
+    else if (k == "irr" && v.isBool && v.boolValue) irr = true;
+    else if (k == "probit" && v.isBool && v.boolValue) probit = true;
+    else if (k == "exposure" && !v.isBool) exposure = trimM4(v.strValue);
+    else if (k == "offset" && !v.isBool) offset = trimM4(v.strValue);
+  }
   if (!inflate.has_value()) {
     return engineErrorBlockM4("syntax_error: " + cobraCmd + " requires inflate()", "syntax_error");
   }
-  if (*inflate != "_cons") {
+  const auto isFactorish = [](const std::string& t) { return t.find_first_of(".#") != std::string::npos; };
+  std::vector<std::string> infl;
+  {
+    std::istringstream iss(*inflate);
+    for (std::string t; iss >> t;) infl.push_back(t);
+  }
+  bool factors = false;
+  for (size_t i = 1; i < parsed.varlist.size(); ++i) factors = factors || isFactorish(parsed.varlist[i]);
+  for (const auto& t : infl) factors = factors || isFactorish(t) || t.find(',') != std::string::npos;
+  if (infl.empty() || factors) {
     return engineErrorBlockM4(
-        "Option `inflate(" + *inflate + ")` is a valid Stata option that this version of PIET does "
-        "not implement for `" + cobraCmd + "` — only the constant-only inflation equation "
-        "`inflate(_cons)` is available.",
+        "Option `inflate(" + *inflate + ")` with factor variables or suboptions, or a factor-variable "
+        "count equation, is a valid Stata form that this version of PIET does not implement for `" +
+            cobraCmd + "`.",
         "unsupported_option");
   }
+  if (!exposure.empty() && !offset.empty())
+    return extended_fit_detail::stataRefusalM4b("cannot specify both exposure() and offset()", 198);
+  std::string inflCsv;
+  if (!(infl.size() == 1 && infl[0] == "_cons"))
+    for (const auto& t : infl)
+      if (t != "_cons") inflCsv += (inflCsv.empty() ? "" : ",") + t;
   b.argv.push_back("--inflate");
-  b.argv.push_back("_cons");
-  bool irr = false;
+  b.argv.push_back(inflCsv.empty() ? std::string("_cons") : inflCsv);
+  if (probit) b.argv.push_back("--probit");
+  // cluster(varname), unlike vce(cluster varname), is marked out of the whole
+  // sample by zip.ado / zinb.ado before the zero count and the constant-only fit
   for (const auto& [k, v] : parsed.opts)
-    if (k == "irr" && v.isBool && v.boolValue) irr = true;
-  ojson block = runP7Mle(cobraCmd, b.argv, session);
-  // `irr` reports incidence-rate ratios for the COUNT equation only (zip/zinb:
-  // "Estimates are transformed only in the first equation"): its rows show
-  // exp(b), exp(b)*se and the exponentiated interval, z and p unchanged, and
-  // r(table) carries them with eform 1 while inflate: stays in its own metric
-  // (eform 0). e(b) is untouched -- `irr` is a display metric. It was accepted
-  // and ignored, so r(table) posted the log-scale count coefficients.
-  if (irr && block.value("type", std::string()) == "estimation" && block.contains("coeftable") &&
-      block["coeftable"].is_array()) {
-    for (auto& row : block["coeftable"]) {
-      if (!row.is_object() || !row.contains("b") || !row["b"].is_number()) continue;
-      const double e = std::exp(row["b"].get<double>());
-      row["b"] = e;
-      if (row.contains("se") && row["se"].is_number()) row["se"] = e * row["se"].get<double>();
-      if (row.contains("ci_lo") && row["ci_lo"].is_number())
-        row["ci_lo"] = std::exp(row["ci_lo"].get<double>());
-      if (row.contains("ci_hi") && row["ci_hi"].is_number())
-        row["ci_hi"] = std::exp(row["ci_hi"].get<double>());
-      row["eform"] = true;
+    if (k == "cluster" && !v.isBool && !trimM4(v.strValue).empty()) {
+      b.argv.push_back("--cluster-markout");
+      break;
     }
+  if (!exposure.empty()) { b.argv.push_back("--exposure"); b.argv.push_back(exposure); }
+  if (!offset.empty()) { b.argv.push_back("--offset"); b.argv.push_back(offset); }
+  if (parsed.weightType.has_value()) {
+    const std::string wt = lowerM4(*parsed.weightType);
+    const std::string var = trimM4(parsed.weightVar.value_or(""));
+    // zinb: frequency and sampling weights stay refused -- StataBE does not converge
+    // on the bank's weighted fits (75da680e, b1fec1b0: r(430) after 300 nonconcave
+    // iterations) and the pweight sandwich's inflation block is not Stata's
+    // (7ba9aa16: V[inflate:married] 4.5751 vs 4.6559)
+    if (wt == "iw" || wt == "iweight" || nb)
+      return engineErrorBlockM4("Option `[" + *parsed.weightType + "=" + var + "]` is not supported in this version "
+                                "of PIET for `" + cobraCmd + "`" +
+                                    (nb ? std::string(" (no weights are)") : std::string(" (frequency and sampling weights are)")) + ".",
+                                "unsupported_option");
+    if (wt != "fw" && wt != "fweight" && wt != "pw" && wt != "pweight")
+      return ojson(eval::errorBlock("engine_error", wt + "s not allowed", std::nullopt, std::nullopt,
+                                    std::nullopt, std::string("r(101)")));
+    const bool pw = wt == "pw" || wt == "pweight";
+    b.argv.push_back("--weight");
+    b.argv.push_back(var);
+    b.argv.push_back("--wtype");
+    b.argv.push_back(pw ? "pweight" : "fweight");
+    bool sandwich = false;
+    for (size_t i = 0; i + 1 < b.argv.size(); ++i)
+      if (b.argv[i] == "--vce" && b.argv[i + 1] != "iid") sandwich = true;
+    if (pw && !sandwich) { b.argv.push_back("--vce"); b.argv.push_back("robust"); }
+  }
+  pushLevelIfGivenM4(parsed, b.argv);
+  if (auto err = pushIterateM4(parsed, b.argv)) return *err;
+  ojson raw;
+  ojson block = runP7Mle(cobraCmd, b.argv, session, &raw, /*recordSample=*/true);
+  if (!block.is_object() || block.value("type", std::string()) != "estimation" || !raw.is_object()) return block;
+  const std::string y = parsed.varlist[0];
+  // ---- e(b) / e(V) on Stata's stripe ----
+  std::vector<AncillaryEbColM4> cols;
+  std::vector<std::string> stripe;
+  const auto addEq = [&](const char* key, const std::string& eq, const char* eng) {
+    std::optional<AncillaryEbColM4> cons;
+    for (const auto& c : raw.value(key, ojson::array())) {
+      const std::string nm = c.value("name", std::string());
+      AncillaryEbColM4 col{eq + ":" + (nm == "(intercept)" ? std::string("_cons") : nm),
+                           std::string(eng) + ":" + nm, c.value("b", 0.0)};
+      if (nm == "(intercept)") cons = col;
+      else cols.push_back(col);
+    }
+    if (cons) cols.push_back(*cons);
+  };
+  addEq("coefs", y, "count");
+  addEq("inflate", "inflate", "inflate");
+  if (nb && raw.contains("lnalpha")) cols.push_back({"/lnalpha", "lnalpha", raw["lnalpha"].value("b", 0.0)});
+  if (!postAncillaryEbM4(session, raw, cols)) return block;
+  for (const auto& c : cols) stripe.push_back(c.stata);
+  const size_t K = cols.size();
+  const auto putE = [&session](const std::string& name, eval::EvalMatrix m) {
+    auto& store = session.eval.eMatrices;
+    store.erase(std::remove_if(store.begin(), store.end(), [&name](const auto& q) { return q.first == name; }),
+                store.end());
+    store.emplace_back(name, std::move(m));
+    session.noteEOnFit(name);
+  };
+  // engine order of the gradient: count (x..., intercept), inflate (z..., intercept), lnalpha
+  {
+    std::vector<std::string> engOrder;
+    for (const auto& c : raw.value("coefs", ojson::array())) engOrder.push_back("count:" + c.value("name", std::string()));
+    for (const auto& c : raw.value("inflate", ojson::array())) engOrder.push_back("inflate:" + c.value("name", std::string()));
+    if (nb) engOrder.push_back("lnalpha");
+    const ojson& gr = raw.value("gradient", ojson::array());
+    eval::EvalMatrix m;
+    m.rownames = {"r1"};
+    m.colnames = stripe;
+    m.data.assign(1, std::vector<double>(K, 0.0));
+    for (size_t j = 0; j < K; ++j)
+      for (size_t e = 0; e < engOrder.size() && e < gr.size(); ++e)
+        if (engOrder[e] == cols[j].engine && gr[e].is_number()) m.data[0][j] = gr[e].get<double>();
+    putE("gradient", std::move(m));
+  }
+  {
+    eval::EvalMatrix m;
+    m.rownames = {"r1"};
+    m.data.assign(1, std::vector<double>(20, 0.0));
+    for (int c = 1; c <= 20; ++c) m.colnames.push_back("c" + std::to_string(c));
+    size_t i = 0;
+    for (const auto& v : raw.value("ilog", ojson::array())) {
+      if (i >= 20) break;
+      if (v.is_number()) m.data[0][i] = v.get<double>();
+      ++i;
+    }
+    putE("ilog", std::move(m));
+  }
+  // ---- scalars and macros (zip.ado / zinb.ado, ml) ----
+  const auto setS = [&session](const char* n, double v) { e3::setEScalarOnFit(session, n, v); };
+  const auto setM = [&session](const char* n, const std::string& v) { e3::setEStringOnFit(session, n, v); };
+  const std::string vce = raw.value("vce", std::string("iid"));
+  const bool pseudo = vce != "iid";
+  const double kz = static_cast<double>(raw.value("inflate", ojson::array()).size());
+  setS("N", raw.value("n_obs", 0.0));
+  setS("N_zero", raw.value("n_zero", 0.0));
+  setS("ll", raw.value("ll", 0.0));
+  if (raw.contains("ll_0") && raw["ll_0"].is_number()) setS("ll_0", raw["ll_0"].get<double>());
+  if (raw.contains("chi2") && raw["chi2"].is_number()) {
+    setS("chi2", raw["chi2"].get<double>());
+    // The LR test is ml's against lf0(1 ll_0): its e(p) is taken on k - 1 degrees of
+    // freedom, the constant-only model counted as one parameter, while zip.ado then
+    // posts e(df_m) as the count slopes (bank ce0a6a9f: chi2 130.888, df_m 2, p
+    // 1.5421e-26 = chi2tail(5, chi2); d496c5be zinb: p = chi2tail(6, 36.643)).
+    if (raw.value("chi2type", std::string()) == "LR")
+      setS("p", chi2UpperTailM4(static_cast<double>(cols.size()) - 1.0, raw["chi2"].get<double>()));
+    else if (raw.contains("p_chi2") && raw["p_chi2"].is_number())
+      setS("p", raw["p_chi2"].get<double>());
+  }
+  setS("df_m", raw.value("df_chi2", 0.0));
+  setS("df_c", kz);
+  setS("ic", raw.value("ic", 0.0));
+  setS("converged", raw.value("converged", false) ? 1.0 : 0.0);
+  setS("rc", 0.0);
+  setS("k", static_cast<double>(K));
+  setS("rank", static_cast<double>(K));
+  setS("k_eq", nb ? 3.0 : 2.0);
+  setS("k_eq_model", 1.0);
+  setS("k_dv", 1.0);
+  setS("k_autoCns", 0.0);
+  setS("noconstant", 0.0);
+  setS("consonly", 0.0);
+  if (nb) setS("k_aux", 1.0);
+  if (raw.contains("n_clusters")) setS("N_clust", raw.value("n_clusters", 0.0));
+  setM("cmd", cobraCmd);
+  setM("depvar", y);
+  setM("title", nb ? "Zero-inflated negative binomial regression" : "Zero-inflated Poisson regression");
+  setM("inflate", probit ? "probit" : "logit");
+  setM("predict", "zip_p");
+  setM("user", std::string(nb ? "zinb" : "zip") + (probit ? "_plf" : "_llf"));
+  setM("chi2type", raw.value("chi2type", std::string("LR")));
+  setM("crittype", pseudo ? "log pseudolikelihood" : "log likelihood");
+  setM("ml_method", "e2");
+  setM("opt", "moptimize");
+  setM("technique", "nr");
+  setM("singularHmethod", "m-marquardt");
+  setM("which", "max");
+  setM("deriv_useminbound", "off");
+  setM("properties", "b V");
+  setM("vce", vce == "iid" ? "oim" : vce);
+  if (pseudo) setM("vcetype", "Robust");
+  if (vce == "cluster") setM("clustvar", raw.value("cluster_var", std::string()));
+  // the count equation's offset (bank 80e6a489 `zip ..., exposure(hours)`: e(offset1) ln(hours))
+  if (!exposure.empty()) setM("offset1", "ln(" + exposure + ")");
+  else if (!offset.empty()) setM("offset1", offset);
+  if (parsed.weightType.has_value()) {
+    const std::string wt = lowerM4(*parsed.weightType);
+    setM("wtype", wt == "fw" || wt == "fweight" ? "fweight" : "pweight");
+    setM("wexp", "= " + trimM4(parsed.weightVar.value_or("")));
+  }
+  // e(V_modelbased) under a sandwich: the inverse of -H (bank 227d2d83)
+  if (raw.contains("e_Vmb") && raw["e_Vmb"].is_object()) {
+    const ojson& vn = raw["e_Vmb"].value("names", ojson::array());
+    const ojson& vm = raw["e_Vmb"].value("matrix", ojson::array());
+    std::vector<long> at(K, -1);
+    bool ok = vn.is_array() && vm.is_array() && vm.size() == vn.size();
+    for (size_t a = 0; ok && a < K; ++a) {
+      for (size_t j = 0; j < vn.size(); ++j)
+        if (vn[j].is_string() && vn[j].get<std::string>() == cols[a].engine) at[a] = static_cast<long>(j);
+      ok = at[a] >= 0;
+    }
+    if (ok) {
+      eval::EvalMatrix m;
+      m.rownames = stripe;
+      m.colnames = stripe;
+      m.data.assign(K, std::vector<double>(K, 0.0));
+      for (size_t a = 0; a < K; ++a)
+        for (size_t c = 0; c < K; ++c) {
+          const ojson& r1 = vm[static_cast<size_t>(at[a])];
+          const ojson& r2 = vm[static_cast<size_t>(at[c])];
+          if (r1.is_array() && r2.is_array() && r1[static_cast<size_t>(at[c])].is_number() &&
+              r2[static_cast<size_t>(at[a])].is_number())
+            m.data[a][c] = 0.5 * (r1[static_cast<size_t>(at[c])].get<double>() + r2[static_cast<size_t>(at[a])].get<double>());
+        }
+      putE("V_modelbased", std::move(m));
+    }
+  }
+  if (nb) setM("diparm1", "lnalpha, exp label(\"alpha\")");
+  // ---- the reported table: each equation, then (zinb) /lnalpha and alpha ----
+  // `irr` reports incidence-rate ratios in the COUNT equation only ("Estimates are
+  // transformed only in the first equation"): r(table) carries them with eform 1
+  // while inflate: stays in its own metric; e(b) is untouched.
+  ojson rt = ojson::array();
+  ojson outcomes = ojson::array();
+  const auto rowsOf = [&](const char* key, const std::string& eq, bool eform) {
+    ojson ct = ojson::array();
+    std::optional<ojson> cons;
+    for (const auto& c : raw.value(key, ojson::array())) {
+      ojson r = c;
+      const std::string nm = c.value("name", std::string());
+      r["name"] = nm == "(intercept)" ? std::string("_cons") : nm;
+      if (eform && r.contains("b") && r["b"].is_number()) {
+        const double e = std::exp(r["b"].get<double>());
+        r["b"] = e;
+        if (r.contains("se") && r["se"].is_number()) r["se"] = e * r["se"].get<double>();
+        if (r.contains("ci_lo") && r["ci_lo"].is_number()) r["ci_lo"] = std::exp(r["ci_lo"].get<double>());
+        if (r.contains("ci_hi") && r["ci_hi"].is_number()) r["ci_hi"] = std::exp(r["ci_hi"].get<double>());
+      }
+      ojson col = c;
+      col["name"] = eq + ":" + r["name"].get<std::string>();
+      col["eform"] = eform;
+      if (nm == "(intercept)") {
+        cons = r;
+        (*cons)["__col"] = col;
+      } else {
+        ct.push_back(r);
+        rt.push_back(col);
+      }
+    }
+    if (cons) {
+      rt.push_back((*cons)["__col"]);
+      cons->erase("__col");
+      ct.push_back(*cons);
+    }
+    outcomes.push_back({{"depvar", eq}, {"coeftable", ct}});
+  };
+  rowsOf("coefs", y, irr);
+  rowsOf("inflate", "inflate", false);
+  if (nb && raw.contains("lnalpha")) {
+    ojson c = raw["lnalpha"];
+    c["name"] = "/lnalpha";
+    c["eform"] = false;
+    rt.push_back(c);
+    ojson a = raw.value("alpha", ojson::object());
+    ojson r1 = raw["lnalpha"];
+    r1["name"] = "/lnalpha";
+    ojson r2 = a;
+    r2["name"] = "alpha";
+    outcomes.push_back({{"depvar", "/"}, {"coeftable", ojson::array({r1})}});
+    block["rtable_diparm"] = ojson::array({ojson{{"name", "_diparm1:alpha"}, {"b", a.value("b", 0.0)},
+                                                 {"se", a.value("se", 0.0)}, {"ci_lo", a.value("ci_lo", 0.0)},
+                                                 {"ci_hi", a.value("ci_hi", 0.0)}}});
+  }
+  block["rtable_cols"] = rt;
+  block["outcomes"] = outcomes;
+  block["depvar"] = y;
+  block["n_obs"] = raw.value("n_obs", 0.0);
+  block.erase("coeftable");
+  if (session.lastEstBlock.has_value() && session.lastEstBlock->is_object()) {
+    (*session.lastEstBlock)["rtable_cols"] = block["rtable_cols"];
+    if (block.contains("rtable_diparm")) (*session.lastEstBlock)["rtable_diparm"] = block["rtable_diparm"];
   }
   return block;
 }

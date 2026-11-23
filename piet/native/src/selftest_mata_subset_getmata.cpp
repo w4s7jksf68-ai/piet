@@ -484,8 +484,13 @@ void testW2Getmata() {
     w2check(rcOf(s, "mata: bad = nosuch :+ 1") == "3499",
             "W2(getmata): an undefined Mata name is Mata's r(3499)");
     (void)piet::dispatch("mata: v = J(2,1,5)", s);
-    w2check(rcOf(s, "getmata v, update") == "198" && rcOf(s, "getmata v, id(k)") == "198",
-            "W2(getmata): getmata's update and id() options are refused by name at r(198)");
+    // vs-stata stage 4: update and id() are implemented (getmata.ado's rules;
+    // bank e5d2d893b5af6248 `getmata price = v, update` rc 0, d4f8c528d5a03c4f
+    // `getmata v, id(idn=ids)` rc 0). With nothing in memory update runs; an
+    // id() variable that does not exist is unabvarname's r(111).
+    w2check(rcOf(s, "getmata v, update") == "0" && rcOf(s, "getmata v, id(k)") == "111" &&
+                rcOf(s, "getmata v, update replace") == "198",
+            "W2(getmata): update runs, id(nosuchvar) is r(111), update with replace is r(198)");
     w2check(rcOf(s, "getmata") == "100", "W2(getmata): a bare `getmata` is r(100) (getlist "
                                          "required, getmata.ado)");
   }

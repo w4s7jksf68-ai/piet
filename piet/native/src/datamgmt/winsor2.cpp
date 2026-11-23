@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 // winsor2 — C++ port of piet/backend/piet/winsor2.py's run_winsor2 (row-wise
-// winsorization at the given percentiles). Each variable is winsorized via `cobra eval --winsor`;
-// trim mode instead keeps each value inside the cutoffs and sets the rest to
-// missing, in one `cobra eval --gen cond(...)` pass over the original values.
+// winsorization at the given percentiles). The unrestricted winsor path uses
+// `cobra eval --winsor`. Trim and qualified commands derive their cutoffs
+// before writing the selected rows with `cobra eval --gen`.
 #include "piet/handlers/data_values.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <ctime>
 #include <optional>
 
 #include "piet/cobra_runner.h"
 #include "piet/eval/errors.h"
+#include "piet/inrange_filter.h"
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/storage_type.h"
@@ -43,22 +43,17 @@ ojson engineErrorBlockW(const std::string& message, const std::string& code = "e
 // call sites didn't need touching. Pure dedup, no behavior change here.
 std::string cobraErrorStrW(const CobraError& ce) { return cobraErrorMessage(ce); }
 
-// _clamp_boundaries: compute lo_val/hi_val using the same floor(cut/100*N)
-// rank method cobra --winsor uses (winsor2.py's _clamp_boundaries).
 std::pair<double, double> clampBoundaries(Datastore& ds, const std::string& src, double plo,
-                                           double phi) {
-  const cecon::Column& c = ds.col(src);
-  int64_t n = ds.nRows();
-  const double* d = c.f64();
+                                         double phi, const std::string& maskVar,
+                                         int64_t first, int64_t last) {
+  const double* data = ds.col(src).f64();
+  const double* mask = maskVar.empty() ? nullptr : ds.col(maskVar).f64();
   std::vector<double> valid;
-  valid.reserve(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i) {
-    if (!std::isnan(d[i])) valid.push_back(d[i]);
+  valid.reserve(static_cast<size_t>(last - first));
+  for (int64_t i = first; i < last; ++i) {
+    if ((!mask || mask[i] != 0.0) && !std::isnan(data[i])) valid.push_back(data[i]);
   }
-  if (valid.empty()) return {std::nan(""), std::nan("")};
   std::sort(valid.begin(), valid.end());
-  // Stata's _pctile, the rule the engine's --winsor uses too (core/stata_pctile.h);
-  // the old x[floor(p*n)] index matched it only where the two happen to agree.
   return {cecon::stata_pctile_sorted(valid, plo), cecon::stata_pctile_sorted(valid, phi)};
 }
 
@@ -79,7 +74,7 @@ std::string fmtNum(double v) {
 
 ojson runWinsor2(SessionState& session, const std::vector<std::string>& varlist, double cutLo,
                   double cutHi, bool trim, const std::string& by, const std::string& suffix,
-                  bool replace) {
+                  bool replace, const eval::ParsedCommand* command) {
   if (varlist.empty()) return engineErrorBlockW("winsor2: no variables specified");
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
 
@@ -91,6 +86,18 @@ ojson runWinsor2(SessionState& session, const std::vector<std::string>& varlist,
     return engineErrorBlockW(
         "winsor2: by() option is not yet supported in PIET — "
         "please winsorize the full sample or split groups manually");
+  }
+  const bool hasIf = command && command->ifExpr && !command->ifExpr->empty();
+  const bool hasIn = command && command->inRange && !command->inRange->empty();
+  const bool qualified = hasIf || hasIn;
+  InRangeBounds range;
+  if (hasIn) {
+    range = parseInRangeBounds(*command->inRange, session.datastore()->nRows());
+    if (!range.ok) {
+      InRangeFilterResult refusal;
+      refusal.refusal = range.refusal;
+      return inRangeRejectError(refusal, *command->inRange, "winsor2");
+    }
   }
 
   // C4-L4B (FIX-C4L4B-RESIDUALS ①): winsor2 already passes the head token as
@@ -113,10 +120,12 @@ ojson runWinsor2(SessionState& session, const std::vector<std::string>& varlist,
   //     staged in worker RAM and never wrote.
   // Everything outside those two shapes keeps the pre-C4 stateless path
   // verbatim, as does the escape arm (PIET_NO_RESIDENT_READ).
-  const bool residentWinsor = !residentReadDisabled() && varlist.size() == 1 && !trim;
+  const bool residentWinsor = !residentReadDisabled() && varlist.size() == 1 && !trim && !qualified;
 
   std::vector<std::string> newVars;
   std::string currentHbin = *session.currentHbin();
+  std::optional<std::pair<double, double>> postedCuts;
+  if (qualified) session.ensureMaterializedHead();
 
   for (const auto& src : varlist) {
     std::string outName = replace ? src : (src + suffix);
@@ -130,7 +139,48 @@ ojson runWinsor2(SessionState& session, const std::vector<std::string>& varlist,
     // byte cutoff 2.5 stored as 2); PIET made every one a float.
     const std::string srcType = storage::resolveReplaceType(session, src);
     storage::appendStoreTypeArg(args, srcType);
-    if (!trim) {
+    if (qualified) {
+      // Work on scratch frames until all variables are ready to commit. The ADO
+      // re-evaluates if for each source, including after an earlier replace.
+      RowIndexCache sample;
+      sample.path = currentHbin;
+      if (hasIf) {
+        if (auto error = addIfMaskColumn(session, sample, *command->ifExpr, {})) return *error;
+      }
+      Datastore read(sample.path);
+      const auto [lo, hi] = clampBoundaries(read, src, cutLo, cutHi, sample.maskVar,
+                                           hasIn ? range.a - 1 : 0, hasIn ? range.b : read.nRows());
+      if (std::isnan(lo)) {
+        return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt,
+                                      std::nullopt, std::nullopt, "r(2000)"));
+      }
+      postedCuts = {lo, hi};
+      const std::string left = fmtNum(lo);
+      const std::string right = fmtNum(hi);
+      const std::string expression = trim
+          ? "cond(" + src + "<" + left + "|" + src + ">" + right + ",.," + src + ")"
+          : "max(min(" + src + "," + right + ")," + left + ")";
+      std::string mask = "!missing(" + src + ")";
+      if (hasIf) mask += "&" + sample.maskVar;
+      args = {"eval", "--data", sample.path, "--gen", outName + "=" + expression,
+              "--gen-mask", mask};
+      if (hasIn) {
+        args.insert(args.end(), {"--gen-in", std::to_string(range.a) + "/" + std::to_string(range.b)});
+      }
+      if (replace) args.push_back("--gen-replace");
+      if (hasIf) args.insert(args.end(), {"--drop", sample.maskVar});
+      storage::appendStoreTypeArg(args, srcType);
+      args.insert(args.end(), {"--out", outPath});
+      try {
+        runCobraJson(args);
+      } catch (const CobraError& ce) {
+        return engineErrorBlockW(cobraErrorStrW(ce), ce.code);
+      }
+    } else if (!trim) {
+      if (command && &src == &varlist.back()) {
+        Datastore* ds = session.datastore();
+        postedCuts = clampBoundaries(*ds, src, cutLo, cutHi, "", 0, ds->nRows());
+      }
       std::optional<SessionState::ResidentEligible> winsorResident;
       if (residentWinsor) winsorResident.emplace(session);
       try {
@@ -138,16 +188,15 @@ ojson runWinsor2(SessionState& session, const std::vector<std::string>& varlist,
       } catch (const CobraError& ce) {
         return engineErrorBlockW(cobraErrorStrW(ce), ce.code);
       }
-    }
-
-    if (trim) {
+    } else {
       // Only a value strictly outside the cutoffs goes missing: StataBE keeps
       // the values AT them (uni-oracle/tm.do on AER 007's expectcomm_ehai_amount,
       // `cuts(0 95) trim`: 10 trimmed, max 80 = p95, min 5 = p0), where the old
       // pass dropped every clamped value and so both cutoffs (22). Read from the
       // original values, so `replace` trims its own variable the same way.
       Datastore preDs(currentHbin);
-      auto [loVal, hiVal] = clampBoundaries(preDs, src, cutLo, cutHi);
+      auto [loVal, hiVal] = clampBoundaries(preDs, src, cutLo, cutHi, "", 0, preDs.nRows());
+      if (command) postedCuts = {loVal, hiVal};
       if (!std::isnan(loVal) && !std::isnan(hiVal)) {
         std::string trimExpr = outName + "=cond((" + src + ">=" + fmtNum(loVal) + "&" + src +
                                 "<=" + fmtNum(hiVal) + ")," + src + ",.)";
@@ -173,9 +222,16 @@ ojson runWinsor2(SessionState& session, const std::vector<std::string>& varlist,
 
     currentHbin = outPath;
     newVars.push_back(outName);
-    if (outName != src) storage::carryTypeClaim(session, src, outName, false);
   }
 
+  if (postedCuts && !std::isnan(postedCuts->first)) {
+    // Newest results are listed first, so publish r2 before r1.
+    session.eval.rValues.set("r2", postedCuts->second);
+    session.eval.rValues.set("r1", postedCuts->first);
+  }
+  if (!replace) {
+    for (const auto& src : varlist) storage::carryTypeClaim(session, src, src + suffix, false);
+  }
   session.load(currentHbin);
   // C4-L4B: on the resident shape, fold the frame delta into the shadow card
   // instead of invalidate+reopen. winsor2 KNOWS its output names up front

@@ -126,8 +126,25 @@ ojson runDrawnorm(const eval::ParsedCommand& parsed, SessionState& session) {
   if (parsed.varlist.empty())
     return rsSyntax("drawnorm: syntax is `drawnorm newvarlist, n(#) [means() sds() corr()|cov() "
                     "seed() clear]`");
-  const size_t k = parsed.varlist.size();
-  for (const auto& nm : parsed.varlist)
+  // The new-variable list expands `x1-x3` to x1 x2 x3 (a shared stem), as
+  // syntax's newvarlist does (vs-stata bank `drawnorm x1-x3, n(3) clear`).
+  std::vector<std::string> newNames;
+  {
+    static const std::regex reRange(R"(^([A-Za-z_]+)([0-9]+)-([A-Za-z_]+)([0-9]+)$)");
+    for (const auto& t : parsed.varlist) {
+      std::smatch rm;
+      if (std::regex_match(t, rm, reRange) && rm.str(1) == rm.str(3) &&
+          std::atoll(rm.str(2).c_str()) <= std::atoll(rm.str(4).c_str())) {
+        for (long long a = std::atoll(rm.str(2).c_str()); a <= std::atoll(rm.str(4).c_str()); ++a)
+          newNames.push_back(rm.str(1) + std::to_string(a));
+      } else {
+        newNames.push_back(t);
+      }
+    }
+  }
+  const std::vector<std::string>& names = newNames;
+  const size_t k = names.size();
+  for (const auto& nm : names)
     if (!strutil::isValidStataIdentifier(nm))
       return rsSyntax("drawnorm: invalid variable name `" + nm + "' — " +
                       strutil::stataIdentifierRuleText());
@@ -436,7 +453,18 @@ ojson runDrawnorm(const eval::ParsedCommand& parsed, SessionState& session) {
         m.gen = eval::nextStoreGeneration();
         session.eval.rMatrices.emplace_back(name, std::move(m));
       };
-      put("L", cp.vec, "e");
+      auto displayedVec = cp.vec;
+      if (k == 2) {
+        // The recorded two-variable symeigen columns are oriented from the
+        // first nonzero component. Sign choices leave the decomposition
+        // invariant. Keep the original factor used for seeded draws.
+        for (size_t j = 0; j < k; ++j) {
+          const double first = displayedVec[0][j] != 0.0 ? displayedVec[0][j] : displayedVec[1][j];
+          if (first < 0.0)
+            for (auto& row : displayedVec) row[j] = -row[j];
+        }
+      }
+      put("L", displayedVec, "e");
       put("Ev", {cp.ev}, "e");
       put("C", cp.c, "c");
       eval::declareRPosted(session.eval, "drawnorm",
@@ -466,7 +494,7 @@ ojson runDrawnorm(const eval::ParsedCommand& parsed, SessionState& session) {
                        " observation(s) already in memory; drop the data first (`clear`) or omit "
                        "n().");
     }
-    for (const auto& nm : parsed.varlist) {
+    for (const auto& nm : names) {
       ojson guard = newVarGuard(session, "drawnorm", nm);
       if (!guard.is_null()) return guard;
       // BUG-1120: `drawnorm _all' is "_all not allowed" r(101) (StataBE 19.5).
@@ -500,7 +528,7 @@ ojson runDrawnorm(const eval::ParsedCommand& parsed, SessionState& session) {
 
   if (ds == nullptr) {
     CsvTable t;
-    for (const auto& nm : parsed.varlist) {
+    for (const auto& nm : names) {
       t.names.push_back(nm);
       t.isFactor.push_back(0);
     }
@@ -515,7 +543,7 @@ ojson runDrawnorm(const eval::ParsedCommand& parsed, SessionState& session) {
     if (auto err = writeAndConvert(session, t, "drawnorm", &outPath)) return *err;
     session.load(outPath);
     if (auto bad = assertRowCount(session, "drawnorm", n)) return *bad;
-    ojson made0 = mutationResult(session, "drawnorm", parsed.varlist);
+    ojson made0 = mutationResult(session, "drawnorm", names);
     restoreResidue();
     return made0;
   }
@@ -526,11 +554,11 @@ ojson runDrawnorm(const eval::ParsedCommand& parsed, SessionState& session) {
     cells.reserve(static_cast<size_t>(n));
     for (int64_t r = 0; r < n; ++r) cells.push_back(numCell(draws[static_cast<size_t>(r)][i]));
     std::string out;
-    if (auto err = appendColumn(session, cur, parsed.varlist[i], cells, "f64", &out)) return *err;
+    if (auto err = appendColumn(session, cur, names[i], cells, "f64", &out)) return *err;
     cur = out;
   }
   session.load(cur);
-  ojson made = mutationResult(session, "drawnorm", parsed.varlist);
+  ojson made = mutationResult(session, "drawnorm", names);
   restoreResidue();
   return made;
 }

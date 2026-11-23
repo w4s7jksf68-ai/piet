@@ -4,6 +4,7 @@
 #include "commands.h"
 
 #include "estimators/oglm.h"
+#include "estimators/ml_constraints.h"
 
 // P7 wave — ologit, oprobit (Stata `ologit` / `oprobit`).
 //
@@ -125,7 +126,55 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
         }
         max_iter = static_cast<int>(v);
     }
-    OglmResult r = oglm_fit(g.X.data(), g.n, g.k, cat.data(), J, link, max_iter, wt, off);
+    // --cns: constraints() (ml_constraints.h). Parameters are the slopes in
+    // design order, then /cut1 ... /cut(J-1); every term names the first equation.
+    // A row naming a coefficient the model does not have is dropped (r(111)), as
+    // makecns drops a constraint that causes an error; cns_dropped reports it.
+    MlCns cns;
+    std::vector<std::vector<double>> cns_rows;  // the kept rows, [R | r] in θ order
+    json cns_dropped = json::array();
+    if (has(a, "--cns")) {
+        const std::vector<CnsRowSpec> spec = parse_cns_spec(opt(a, "--cns"));
+        std::vector<double> R, rr;
+        for (size_t ri = 0; ri < spec.size(); ++ri) {
+            const CnsRowSpec& row = spec[ri];
+            std::vector<double> line(static_cast<size_t>(np), 0.0);
+            bool bad = false;
+            for (const auto& t : row.terms) {
+                int p = -1;
+                if (t.name.rfind("/cut", 0) == 0) {
+                    const int j = std::atoi(t.name.c_str() + 4);
+                    if (j >= 1 && j <= J - 1) p = g.k + j - 1;
+                } else {
+                    for (int c = 0; c < g.k; ++c)
+                        if (g.names[static_cast<size_t>(c)] == t.name) p = c;
+                }
+                if (!(t.eq.empty() || t.eq == "#1") || p < 0) {
+                    bad = true;
+                    break;
+                }
+                line[static_cast<size_t>(p)] += t.coef;
+            }
+            if (bad) {
+                cns_dropped.push_back({{"row", ri}, {"rc", 111}});
+                continue;
+            }
+            R.insert(R.end(), line.begin(), line.end());
+            rr.push_back(row.rhs);
+        }
+        if (!rr.empty() && !ml_cns_build(R, rr, static_cast<int>(rr.size()), np, cns))
+            throw EngineError("bad_input", std::string(cmd) + ": the constraints are inconsistent");
+        for (size_t i = 0; i < rr.size(); ++i) {
+            if (std::find(cns.dropped.begin(), cns.dropped.end(), static_cast<int>(i)) != cns.dropped.end())
+                continue;
+            std::vector<double> line(R.begin() + static_cast<std::ptrdiff_t>(i) * np,
+                                     R.begin() + static_cast<std::ptrdiff_t>(i + 1) * np);
+            line.push_back(rr[i]);
+            cns_rows.push_back(std::move(line));
+        }
+    }
+    OglmResult r = oglm_fit(g.X.data(), g.n, g.k, cat.data(), J, link, max_iter, wt, off,
+                            cns.active() ? &cns : nullptr);
     if (!r.ok)
         throw EngineError("no_convergence",
             std::string(cmd) + ": MLE failed (singular information matrix or non-convergent fit).");
@@ -209,7 +258,18 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
     // (bank d8de89e3 `ologit rep78 mpg weight`: LR chi2(2) 14.35758750211474 =
     // 2(-86.513267 + 93.692061)); under vce(robust)/vce(cluster) it is the Wald
     // statistic above.
-    const bool lr = (vce == "iid") && off == nullptr;
+    // constraints(): ml's model test is the Wald test of the slopes, a slope the
+    // constraints fix dropping out of it (bank eae58c67 `ologit rep78 mpg weight,
+    // const(1)` with mpg = -.1: Wald chi2(1) 25.02 = (b_weight / se_weight)^2).
+    int df_chi2 = g.k;
+    if (cns.active()) {
+        std::vector<double> th = r.beta;
+        th.insert(th.end(), r.cuts.begin(), r.cuts.end());
+        std::vector<int> idx;
+        for (int c = 0; c < g.k; ++c) idx.push_back(c);
+        chi2 = ml_cns_wald(V, np, th, idx, &df_chi2);
+    }
+    const bool lr = (vce == "iid") && off == nullptr && !cns.active();
     if (lr) chi2 = 2.0 * (r.ll - r.ll_0);
     // e(N): the weight sum under fweights, the row count otherwise.
     int64_t n_obs = g.n;
@@ -223,7 +283,7 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
                 {"coefs", coefs}, {"cuts", cuts},
                 {"ll", r.ll}, {"ll_0", r.ll_0},
                 {"r2_pseudo", (r.ll_0 != 0) ? 1.0 - r.ll / r.ll_0 : 0.0},
-                {"chi2", chi2}, {"df_chi2", g.k}, {"p_chi2", chi2_pvalue(chi2, g.k)},
+                {"chi2", chi2}, {"df_chi2", df_chi2}, {"p_chi2", chi2_pvalue(chi2, df_chi2)},
                 {"chi2type", lr ? "LR" : "Wald"},
                 {"iters", r.iters}, {"converged", r.converged}};
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
@@ -235,6 +295,19 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
         out.erase("r2_pseudo");
         out["offset"] = offset_var;
     }
+    // Under constraints() there is no constant-only comparison model either; the
+    // kept constraint rows [R | r] (e(Cns)) and the coefficients they fix.
+    if (cns.active()) {
+        out.erase("ll_0");
+        out.erase("r2_pseudo");
+        out["cns"] = cns_rows;
+        out["rank"] = cns.nfree;
+        for (auto& c : out["coefs"])
+            if (c["se"].get<double>() == 0.0) c["constrained"] = true;
+        for (auto& c : out["cuts"])
+            if (c["se"].get<double>() == 0.0) c["constrained"] = true;
+    }
+    if (!cns_dropped.empty()) out["cns_dropped"] = cns_dropped;
     add_warnings(out, g.warnings);
     // --emit-v (BUG-1196): the fit's V, slopes then cutpoints -- Stata's e(V)
     // order and metric (StataBE 19.5 colfullnames e(b) `yo:x1 yo:x2 /cut1 /cut2`).

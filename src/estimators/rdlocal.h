@@ -50,7 +50,7 @@
 // rd_density_run is the CJM20 manipulation test: a local-polynomial density
 // estimator fit on each side of the cutoff, tested for a discontinuity at the
 // cutoff via a robust bias-corrected t-statistic, plus the exact two-sided
-// binomial counts over a ladder of symmetric windows around the cutoff.
+// binomial counts across expanding windows around the cutoff.
 //
 // rd_plot_run is the companion RD plot: binned local averages of y over x
 // either side of the cutoff (for the scatter) plus a global polynomial fit
@@ -143,9 +143,10 @@ RdRobustResult rd_robust_run(const double* y, const double* x, int64_t n,
 
 // One row of rddensity's binomial (H0: prob = .5) table.
 struct RdDensityBinomRow {
-    double window = 0;                // half-length of the symmetric window
+    double window = 0, window_right = 0;  // half-widths, left and right
     int64_t n_left = 0, n_right = 0;  // obs in [c-w, c) and [c, c+w]
     double p_value = 0;               // exact two-sided binomial test
+    double p_lower = 0, p_upper = 0;
 };
 
 struct RdDensityResult {
@@ -154,6 +155,7 @@ struct RdDensityResult {
     double se_conventional = 0, t_conventional = 0, p_conventional = 0;
 
     double f_left_q = 0, f_right_q = 0, diff_q = 0;
+    double se_left_q = 0, se_right_q = 0;
     double se_robust = 0, t_robust = 0, p_robust = 0;
 
     double h_left = 0, h_right = 0;

@@ -28,6 +28,7 @@
 // about the SEED, not about coverage, and is why the certificate uses a value that
 // must create a distinct level.
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -60,5 +61,19 @@ std::optional<std::vector<std::string>> referencedColumns(
 std::unique_ptr<Datastore> fetchColumns(SessionState& session,
                                         const std::vector<std::string>& cols,
                                         const std::string& workdir, std::string* pathOut);
+
+// One cell of a resident-dirty head, read inline (no projection file). Same
+// guards and the same "a miss costs a fallback, never an answer" rule as
+// fetchColumns: nullopt on every refusal, and the caller then takes that route.
+// `value` is the cell's double exactly as a projection's Column::f64() would give
+// it (bits included, so extended missings survive); `text` the string cell.
+struct FetchedCell {
+  bool isString = false;
+  int64_t nRows = 0;
+  bool inRange = false;
+  double value = 0.0;
+  std::string text;
+};
+std::optional<FetchedCell> fetchCell(SessionState& session, const std::string& col, long long row);
 
 }  // namespace piet

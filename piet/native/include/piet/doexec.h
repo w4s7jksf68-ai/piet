@@ -82,6 +82,15 @@ using BlockSink = std::function<void(const ojson&)>;
 // display "[a" _continue / display "b]" }` is `[ab]`). At the top level of a
 // do-file an echo closes the line instead (executeDoSource's own pushBlock).
 void appendJoiningBodyContinue(nlohmann::ordered_json& blocks, const nlohmann::ordered_json& b);
+// The same, for a block the caller gives up: it is moved into `blocks` rather
+// than copied (a loop's blocks are handed on this way once per iteration).
+void appendJoiningBodyContinue(nlohmann::ordered_json& blocks, nlohmann::ordered_json&& b);
+
+// Exactly b.dump(-1, ' ', false, error_handler_t::replace).size() -- the stored-
+// transcript budget's size proxy -- counted without building the text. Strings
+// with a byte >= 0x80, and floating-point numbers, are measured by dumping just
+// that value, so the count is the serializer's own wherever it is not plain.
+size_t dumpedJsonSize(const nlohmann::ordered_json& b);
 
 ExecuteResult executeDoSource(const std::string& source, SessionState& session,
                                const DispatchFn& dispatchFn,

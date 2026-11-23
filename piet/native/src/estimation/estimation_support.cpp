@@ -925,6 +925,9 @@ EstimationArgvResult buildEstimationArgvM4(const std::string& cobraCmd,
     // iteration log, so the output is that of Stata's `nolog` fit (bank b6682e46
     // `logit foreign mpg weight, nolog`).
     if (binaryMl && (k == "nolog" || k == "log") && v.isBool) continue;
+    // noheader / notable / nocoef: what the table shows, set on the block by
+    // runLogitProbit (the renderer draws the header or the table alone)
+    if (binaryMl && (k == "noheader" || k == "notable" || k == "nocoef") && v.isBool && v.boolValue) continue;
     res.errored = true;
     res.errorBlock = engineErrorBlockM4("option `" + k + "` not allowed", "unsupported_option");
     return res;

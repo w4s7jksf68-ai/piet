@@ -4,6 +4,7 @@
 #include "commands.h"
 
 #include "estimators/mlogit.h"
+#include "estimators/ml_constraints.h"
 #include "estimators/oglm.h"  // ord_categories — the outcome-recoding rule (sorted
                               // distinct values -> 0..K-1) is shared with the ordered
                               // models; one definition, not two spellings of it.
@@ -141,7 +142,76 @@ int cmd_mlogit(const std::vector<std::string>& a) {
     int cons_col = -1;
     for (int c = 0; c < g.k; ++c)
         if (g.names[static_cast<size_t>(c)] == "(intercept)") cons_col = c;
-    MlogitResult r = mlogit_fit(g.X.data(), g.n, g.k, cat.data(), K, base, cons_col, max_iter, wt);
+    // --cns: constraints() (ml_constraints.h). A term's EQ names an outcome by
+    // its value or its position among the sorted outcomes; the base outcome's coefficients are 0 by
+    // construction, so a term on them drops out (mlogit's own handling of the base
+    // equation), and a row left with no term holds only when its right side is 0.
+    // A row naming an equation the model does not have (r(303)) or a coefficient
+    // it does not have (r(111)) is dropped, as makecns drops a constraint that
+    // causes an error; cns_dropped reports each such row and its return code.
+    MlCns cns;
+    std::vector<std::vector<double>> cns_rows;  // the kept rows, [R | r] in θ order
+    json cns_dropped = json::array();
+    if (has(a, "--cns")) {
+        const std::vector<CnsRowSpec> spec = parse_cns_spec(opt(a, "--cns"));
+        std::vector<double> R, rr;
+        for (size_t ri = 0; ri < spec.size(); ++ri) {
+            const CnsRowSpec& row = spec[ri];
+            std::vector<double> line(static_cast<size_t>(np), 0.0);
+            bool any = false;
+            int bad = 0;
+            for (const auto& t : row.terms) {
+                int c = -1;
+                const std::string nm = t.name == "_cons" ? std::string("(intercept)") : t.name;
+                for (int j = 0; j < g.k; ++j)
+                    if (g.names[static_cast<size_t>(j)] == nm) c = j;
+                int m = -1;  // the outcome's position
+                if (t.eq.empty()) {
+                    m = 0;
+                } else if (t.eq[0] == '#') {
+                    m = std::atoi(t.eq.c_str() + 1) - 1;
+                } else if (t.eq[0] == '=') {
+                    const double v = std::strtod(t.eq.c_str() + 1, nullptr);
+                    for (int j = 0; j < K; ++j)
+                        if (cat_values[static_cast<size_t>(j)] == v) m = j;
+                }
+                if (m < 0 || m >= K) {
+                    bad = 303;
+                    break;
+                }
+                if (c < 0) {
+                    bad = 111;
+                    break;
+                }
+                if (m == base) continue;
+                const int e = (m < base) ? m : m - 1;
+                line[static_cast<size_t>(e) * g.k + c] += t.coef;
+                any = true;
+            }
+            if (bad != 0) {
+                cns_dropped.push_back({{"row", ri}, {"rc", bad}});
+                continue;
+            }
+            if (!any) {
+                if (row.rhs != 0.0) throw EngineError("bad_input", "mlogit: the constraints are inconsistent");
+                continue;
+            }
+            R.insert(R.end(), line.begin(), line.end());
+            rr.push_back(row.rhs);
+        }
+        if (!rr.empty() && !ml_cns_build(R, rr, static_cast<int>(rr.size()), np, cns))
+            throw EngineError("bad_input", "mlogit: the constraints are inconsistent");
+        for (size_t i = 0; i < rr.size(); ++i) {
+            if (std::find(cns.dropped.begin(), cns.dropped.end(), static_cast<int>(i)) != cns.dropped.end())
+                continue;
+            std::vector<double> line(R.begin() + static_cast<std::ptrdiff_t>(i) * np,
+                                     R.begin() + static_cast<std::ptrdiff_t>(i + 1) * np);
+            line.push_back(rr[i]);
+            cns_rows.push_back(std::move(line));
+        }
+    }
+    MlogitResult r = mlogit_fit(g.X.data(), g.n, g.k, cat.data(), K, base, cons_col, max_iter, wt,
+                                cns.active() ? &cns : nullptr);
     if (!r.ok)
         throw EngineError("no_convergence",
             "mlogit: MLE failed (singular information matrix or non-convergent fit).");
@@ -245,7 +315,16 @@ int cmd_mlogit(const std::vector<std::string>& a) {
     // (bank e9b3681e `mlogit race age grade wage`: LR chi2(6) 70.59563857956209 =
     // 2(-1383.0285584 + 1418.3263777)); under vce(robust)/vce(cluster) it is the
     // Wald statistic above.
-    const bool lr = (vce == "iid");
+    // constraints(): the Wald test, a slope the constraints fix dropping out of it
+    // (bank 908e6dce `mlogit race age grade wage, c(1)` with [2]age = 0: Wald chi2(5)).
+    if (cns.active()) {
+        std::vector<int> idx;
+        for (int e = 0; e < neq; ++e)
+            for (int c = 0; c < g.k; ++c)
+                if (g.names[static_cast<size_t>(c)] != "(intercept)") idx.push_back(e * g.k + c);
+        chi2 = ml_cns_wald(V, np, r.beta, idx, &df);
+    }
+    const bool lr = (vce == "iid") && !cns.active();
     if (lr && df > 0) chi2 = 2.0 * (r.ll - r.ll_0);
     int64_t n_obs = g.n;  // e(N): the weight sum under fweights
     if (wkind == cecon::WeightKind::Frequency) {
@@ -265,6 +344,19 @@ int cmd_mlogit(const std::vector<std::string>& a) {
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
     if (wkind != cecon::WeightKind::None) out["n_rows"] = g.n;  // the e(sample) handshake's rows
     if (level_set) out["level"] = level;
+    // Under constraints() there is no constants-only comparison model; the kept
+    // constraint rows [R | r] in θ's order (e(Cns)) and the coefficients they fix.
+    if (cns.active()) {
+        out.erase("ll_0");
+        out.erase("r2_pseudo");
+        out["cns"] = cns_rows;
+        out["rank"] = cns.nfree;
+        for (auto& eq : out["equations"])
+            if (eq.contains("coefs"))
+                for (auto& c : eq["coefs"])
+                    if (c["se"].get<double>() == 0.0) c["constrained"] = true;
+    }
+    if (!cns_dropped.empty()) out["cns_dropped"] = cns_dropped;
     add_warnings(out, g.warnings);
     // --emit-v (BUG-1196): the fit's V over the non-base equations in θ's order,
     // each name `<outcome value>:<coefficient>`. Stata's e(V) also carries the

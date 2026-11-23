@@ -29,6 +29,13 @@ ojson runIpolate(const std::vector<std::string>& varlist,
                             "syntax_error");
   const std::string& yvar = varlist[0];
   const std::string& xvar = varlist[1];
+  // varlist(numeric): a string variable is r(109) (vs-stata bank b50c50624a09da1c).
+  if (Datastore* tds = session.hasData() ? session.datastore() : nullptr) {
+    for (const auto* v : {&yvar, &xvar})
+      if (tds->has(*v) && tds->dtype(*v) == "factor")
+        return eval::errorBlock("engine_error", "type mismatch", std::nullopt, std::nullopt,
+                                std::nullopt, "r(109)");
+  }
   std::string newvar;
   std::string byVars;
   bool epolate = false;

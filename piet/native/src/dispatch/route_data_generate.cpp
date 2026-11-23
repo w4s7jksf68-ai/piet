@@ -8,6 +8,7 @@
 #include "handler_declarations.h"
 #include "piet/handlers/data_values.h"
 #include "piet/loops.h"
+#include "piet/regex_scans.h"
 namespace piet::dispatch_detail {
 std::optional<ojson> generatePlacementRequest(
     SessionState& session, const std::vector<std::pair<std::string, eval::OptValue>>& opts,
@@ -142,7 +143,9 @@ bool route_data_generate(std::string& cmd,
         return true;
       }
       static const std::regex reTwoNames(R"(^[A-Za-z_][A-Za-z0-9_]*\s+[A-Za-z_][A-Za-z0-9_]*$)");
-      if (std::regex_match(genTargetName(info.expr), reTwoNames)) {
+      const std::string targetText = genTargetName(info.expr);
+      // Two names need a blank between them; without one the regex is skipped.
+      if (rx::hasSpace(targetText) && std::regex_match(targetText, reTwoNames)) {
         blocks.push_back(ojson(eval::errorBlock("syntax_error", "too many variables specified",
                                                 std::nullopt, std::nullopt, std::nullopt,
                                                 "r(103)")));
@@ -459,12 +462,14 @@ bool route_data_generate(std::string& cmd,
     // is 5 in StataBE.
     std::string egenExpr = info.expr;
     {
-      static const std::regex reExpFn(
-          R"(^([^=]*=\s*)(count|iqr|kurt|mad|max|mdev|mean|median|min|pc|pctile|rank|sd|skew|std|sum|total)\s*\((.*)\)\s*$)");
-      std::smatch fm;
-      if (std::regex_match(info.expr, fm, reExpFn) && session.hasData()) {
-        const std::string fn = fm.str(2);
-        const std::string arg = fm.str(3);
+      // R"(^([^=]*=\s*)(count|iqr|kurt|mad|max|mdev|mean|median|min|pc|pctile|rank|sd|skew|std|sum|total)\s*\((.*)\)\s*$)",
+      // matched by hand (piet/regex_scans.h): lhs, fn, arg are its groups 1-3.
+      static const std::set<std::string> kExpFns = {
+          "count", "iqr", "kurt", "mad",  "max", "mdev", "mean", "median", "min",
+          "pc",    "pctile", "rank", "sd", "skew", "std",  "sum",  "total"};
+      std::string lhs, fn, arg;
+      if (rx::matchAssignFnCall(info.expr, &lhs, &fn, &arg) && kExpFns.count(fn) != 0 &&
+          session.hasData()) {
         const bool isCount = fn == "count";
         const bool engineCannot = strmutate::needsConditionMask(session, arg) ||
                                   (isCount && strmutate::needsStringCount(session, arg));
@@ -478,7 +483,7 @@ bool route_data_generate(std::string& cmd,
               session, arg, groupPositions ? byVal : std::string(), isCount);
           if (xi.ok) {
             conditionMask.columns.push_back(xi.column);
-            egenExpr = fm.str(1) + fm.str(2) + "(" + xi.column + ")";
+            egenExpr = lhs + fn + "(" + xi.column + ")";
           } else if (engineCannot && !xi.declined) {
             blocks.push_back(xi.error);
             return true;

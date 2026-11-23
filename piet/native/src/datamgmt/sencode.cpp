@@ -57,12 +57,12 @@
 namespace {
 
 // sencode: `fast` only skips the package's preserve/restore on Break, so it changes nothing
-// in the answer and is read as a no-op. `manyto1` (one code per observation group rather than
-// per string) and `noextend` (refuse strings the label lacks) change the codes and are not
-// served.
+// in the answer and is read as a no-op. `manyto1` gives every observation its own code (in
+// the visiting order) labelled with its string; `noextend` encodes with the label's own codes
+// and refuses a string the label lacks (sencode.ado's MANyto1 / noExtend).
 const piet::eval::OptVocab& kVocabSencode = piet::eval::registerOptVocab(
-    {"sencode"}, {{"generate", "replace", "label", "gsort", "fast"},
-                  {"manyto1", "noextend"},
+    {"sencode"}, {{"generate", "replace", "label", "gsort", "fast", "manyto1", "noextend"},
+                  {},
                   {{"g", "generate"}, {"l", "label"}}});
 
 }  // namespace
@@ -124,10 +124,52 @@ std::string compressedCodeType(long long maxCode) {
 // + 1 in that order (probe p3 slab: pre {7 c} -> b 8, a 9, c 7). The variable is stored as
 // `compress` leaves it (byte for <= 100 codes), %8.0g, with the string's variable label.
 // `replace` puts the codes in the string variable's place, label named after it.
+// The option names as typed, in order, from the raw line's option tail (depth-0 words; a
+// word followed by `(` is a valued option).
+static std::vector<std::pair<std::string, bool>> sencodeTypedOptions(const std::string& raw) {
+  std::vector<std::pair<std::string, bool>> out;
+  const long long comma = eval::findUnquotedComma(raw);
+  if (comma < 0) return out;
+  const std::string tail = raw.substr(static_cast<size_t>(comma) + 1);
+  int depth = 0;
+  size_t i = 0;
+  while (i < tail.size()) {
+    const char c = tail[i];
+    if (c == '(') { ++depth; ++i; continue; }
+    if (c == ')') { if (depth > 0) --depth; ++i; continue; }
+    if (depth == 0 && (std::isalnum(static_cast<unsigned char>(c)) || c == '_')) {
+      size_t j = i;
+      while (j < tail.size() && (std::isalnum(static_cast<unsigned char>(tail[j])) || tail[j] == '_')) ++j;
+      out.emplace_back(tail.substr(i, j - i), j < tail.size() && tail[j] == '(');
+      i = j;
+      continue;
+    }
+    ++i;
+  }
+  return out;
+}
+
 ojson runSencode(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabSencode.known,
                                             kVocabSencode.unimplemented))
     return ojson(*err);
+  // The package parses its options with `syntax`, which refuses an option given twice under
+  // the spelling of the repeat: `gen(mk) g(-price)` is r(198) "option g() not allowed" (bank
+  // d83142d03891f4bc).
+  {
+    std::set<std::string> seen;
+    const auto typed = sencodeTypedOptions(parsed.raw);
+    for (size_t k = 0; k < parsed.opts.size(); ++k) {
+      if (seen.insert(parsed.opts[k].first).second) continue;
+      std::string name = parsed.opts[k].first;
+      bool valued = !parsed.opts[k].second.isBool;
+      if (typed.size() == parsed.opts.size()) {
+        name = typed[k].first;
+        valued = typed[k].second;
+      }
+      return rcError("option " + name + (valued ? "()" : "") + " not allowed", 198);
+    }
+  }
   if (!session.hasData()) return ojson(eval::noDataLoaded());
   if (parsed.varlist.empty()) return rcError("varlist required", 100);
   std::vector<std::string> vars;
@@ -251,6 +293,88 @@ ojson runSencode(const eval::ParsedCommand& parsed, SessionState& session) {
       if (seen.insert(text[i]).second) sequence.push_back(text[i]);
   }
 
+  const bool manyto1 = hasFlag(parsed.opts, "manyto1");
+  const bool noextend = hasFlag(parsed.opts, "noextend");
+  if (noextend && session.labelDefs.find(lbl) == session.labelDefs.end())
+    return syntaxError("noextend cannot be specified as label " + lbl + " does not exist");
+  if (noextend && lreplace)
+    return syntaxError("You cannot specify noextend and the replace suboption of label()");
+  // ovalmax: the label's largest code (0 when it has none or is being replaced).
+  long long ovalmax = 0;
+  if (!lreplace) {
+    auto it = session.labelDefs.find(lbl);
+    if (it != session.labelDefs.end())
+      for (const auto& [codeStr, t] : it->second) {
+        try {
+          ovalmax = std::max(ovalmax, static_cast<long long>(std::ceil(std::stod(codeStr))));
+        } catch (const std::exception&) {
+        }
+      }
+  }
+  // The codes the package gives before it encodes: ovalmax + the rank of each string's first
+  // visit (manyto1: of each observation). Its last r-class step summarizes them (manyto1: the
+  // last code's observation number), so they are r() whatever the label does after.
+  std::vector<double> rowCode(n, NAN);
+  {
+    std::map<std::string, long long> rankOf;
+    long long rank = 0;
+    for (size_t i : order) {
+      if (manyto1) {
+        rowCode[i] = static_cast<double>(ovalmax + ++rank);
+        continue;
+      }
+      auto ins = rankOf.emplace(text[i], 0);
+      if (ins.second) ins.first->second = ++rank;
+      rowCode[i] = static_cast<double>(ovalmax + ins.first->second);
+    }
+  }
+  if (manyto1 && noextend) return syntaxError("You cannot specify noextend and manyto1");
+  auto postPackageR = [&]() {
+    if (manyto1) {
+      if (order.empty()) return;
+      const double obs = static_cast<double>(order.back() + 1);
+      eval::replaceRClass(session.eval);
+      session.eval.rValues.set("N", 1.0);
+      session.eval.rValues.set("sum_w", 1.0);
+      session.eval.rValues.set("mean", obs);
+      session.eval.rValues.set("Var", NAN);
+      session.eval.rValues.set("sd", NAN);
+      session.eval.rValues.set("min", obs);
+      session.eval.rValues.set("max", obs);
+      session.eval.rValues.set("sum", obs);
+      eval::declareRPosted(session.eval, "summarize",
+                           {"N", "sum_w", "mean", "Var", "sd", "min", "max", "sum"});
+      return;
+    }
+    double sum = 0, mn = INFINITY, mx = -INFINITY, cnt = 0;
+    for (double c : rowCode)
+      if (!std::isnan(c)) {
+        sum += c;
+        mn = std::min(mn, c);
+        mx = std::max(mx, c);
+        cnt += 1;
+      }
+    double var = NAN;
+    if (cnt > 1) {
+      const double mean = sum / cnt;
+      double ss = 0;
+      for (double c : rowCode)
+        if (!std::isnan(c)) ss += (c - mean) * (c - mean);
+      var = ss / (cnt - 1);
+    }
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", cnt);
+    session.eval.rValues.set("sum_w", cnt);
+    session.eval.rValues.set("mean", cnt > 0 ? sum / cnt : NAN);
+    session.eval.rValues.set("Var", var);
+    session.eval.rValues.set("sd", std::isnan(var) ? NAN : std::sqrt(var));
+    session.eval.rValues.set("min", cnt > 0 ? mn : NAN);
+    session.eval.rValues.set("max", cnt > 0 ? mx : NAN);
+    session.eval.rValues.set("sum", sum);
+    eval::declareRPosted(session.eval, "summarize",
+                         {"N", "sum_w", "mean", "Var", "sd", "min", "max", "sum"});
+  };
+
   // The label: an existing set (unless label(, replace)) keeps every code it has; a string it
   // lacks takes the set's largest code + 1.
   std::map<std::string, std::string> codeMap;
@@ -278,6 +402,10 @@ ojson runSencode(const eval::ParsedCommand& parsed, SessionState& session) {
     auto known = codeOfText.find(s);
     if (known != codeOfText.end()) {
       code = known->second;
+    } else if (noextend) {
+      // encode, noextend: the first string (in the visiting order) the label lacks
+      // (bank 09bc6fed4e9ff5f5: r(459) "Unexpected values encountered:" AMC Pacer).
+      return rcError("Unexpected values encountered:\n" + s, 459);
     } else {
       code = ++maxCode;
       codeMap[std::to_string(code)] = s;
@@ -285,6 +413,15 @@ ojson runSencode(const eval::ParsedCommand& parsed, SessionState& session) {
     }
     codeFor[s] = code;
     maxUsed = std::max(maxUsed, code);
+  }
+  if (manyto1) {
+    // every observation its own code, labelled with its own string (`label define ... add`).
+    maxUsed = 0;
+    for (size_t i : order) {
+      const long long code = static_cast<long long>(rowCode[i]);
+      codeMap[std::to_string(code)] = text[i];
+      maxUsed = std::max(maxUsed, code);
+    }
   }
 
   std::vector<std::string> cells;
@@ -294,7 +431,8 @@ ojson runSencode(const eval::ParsedCommand& parsed, SessionState& session) {
       cells.emplace_back();
       continue;
     }
-    cells.push_back(std::to_string(codeFor[text[i]]));
+    cells.push_back(manyto1 ? std::to_string(static_cast<long long>(rowCode[i]))
+                            : std::to_string(codeFor[text[i]]));
   }
   std::optional<std::string> srcLabel;
   {
@@ -314,10 +452,9 @@ ojson runSencode(const eval::ParsedCommand& parsed, SessionState& session) {
   if (haveGen && srcLabel.has_value() && !srcLabel->empty()) vm.label = srcLabel;
   session.implicitFloatVars.erase(target);
   session.userFormattedVars.erase(target);
-  // sencode.ado's last r-class command summarizes the coded variable.
   ojson done = haveGen ? mutationResult(session, "gen", {target})
                        : mutationResult(session, "gen", {}, {}, {target});
-  dispatch("quietly summarize " + target, session);
+  postPackageR();
   return done;
 }
 

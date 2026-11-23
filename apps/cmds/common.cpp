@@ -11,6 +11,7 @@
 #include "io/dta_reader.h"  // read_dta — open_using_frame's .dta branch (WS-D2)
 #include <algorithm>  // std::min/std::max (fe_group_sizes)
 #include <cstring>  // strlen — open_using_frame's extension match
+#include <numeric>
 #include <set>  // keepif_own_panels: the panels an `if` sample touches
 #include "estimators/feols.h"
 #include "estimators/fepois.h"
@@ -188,6 +189,44 @@ bool commit_frame(Frame&& fr, const std::string& out) {
     if (serve_resident_active()) { serve_stage_pending(std::move(fr)); return true; }
     if (!out.empty()) fr.write_hbin(out);
     return false;
+}
+
+std::vector<CnsRowSpec> parse_cns_spec(const std::string& s) {
+    std::vector<CnsRowSpec> rows;
+    auto num = [](const std::string& t) {
+        size_t used = 0;
+        double v = 0.0;
+        try {
+            v = std::stod(t, &used);
+        } catch (const std::exception&) {
+            used = 0;
+        }
+        if (used == 0 || used != t.size()) throw EngineError("bad_input", "--cns: not a number: '" + t + "'");
+        return v;
+    };
+    std::stringstream rs(s);
+    std::string row;
+    while (std::getline(rs, row, ';')) {
+        if (row.find_first_not_of(" \t") == std::string::npos) continue;
+        const size_t eqpos = row.rfind('=');
+        if (eqpos == std::string::npos) throw EngineError("bad_input", "--cns: a row has no '='");
+        CnsRowSpec r;
+        r.rhs = num(row.substr(eqpos + 1));
+        std::stringstream ts(row.substr(0, eqpos));
+        std::string term;
+        while (std::getline(ts, term, ',')) {
+            const size_t p1 = term.find('|'), p2 = term.find('|', p1 == std::string::npos ? 0 : p1 + 1);
+            if (p1 == std::string::npos || p2 == std::string::npos)
+                throw EngineError("bad_input", "--cns: a term is not COEF|EQ|NAME: '" + term + "'");
+            CnsTermSpec t;
+            t.coef = num(term.substr(0, p1));
+            t.eq = term.substr(p1 + 1, p2 - p1 - 1);
+            t.name = term.substr(p2 + 1);
+            r.terms.push_back(std::move(t));
+        }
+        rows.push_back(std::move(r));
+    }
+    return rows;
 }
 
 std::vector<std::string> split_csv(const std::string& s) {
@@ -1273,13 +1312,22 @@ PanelMeans capture_panel_means(const ModelData& md) {
 }
 
 // md must be post-feols_fit (md.dm.X is the DEMEANED, collinear-compacted design).
-void add_panel_scalars(json& out, const ModelData& md, const PanelMeans& pm, const FeolsResult& r) {
+void add_panel_scalars(json& out, const ModelData& md, const PanelMeans& pm,
+                       const FeolsResult& r, bool xtreg_fe) {
     if (!pm.ok || md.fe.size() != 1) return;
-    // Collinear omission renumbers the design columns after the capture; the xbar
-    // buffer is pre-drop, so defer that case rather than mis-pair columns (same
-    // deferral GAP B's _cons reconstruction already takes in feols.cpp).
-    if (!r.omitted.empty() || md.dm.k != pm.kd) return;
-    const int k = pm.kd;
+    const int k = md.dm.k;
+    // The group means retain the pre-omission design. Map each fitted slope
+    // back to its original column before reconstructing Xb on the raw scale.
+    std::vector<int> source;
+    if (k != pm.kd || !r.omitted.empty()) {
+        if (!xtreg_fe || r.full_names.size() < static_cast<size_t>(pm.kd)) return;
+        const auto last_slope = r.full_names.begin() + pm.kd;
+        for (const auto& name : md.dm.xnames) {
+            const auto col = std::find(r.full_names.begin(), last_slope, name);
+            if (col == last_slope) return;
+            source.push_back(static_cast<int>(col - r.full_names.begin()));
+        }
+    }
     const int64_t n = md.dm.n;
     // r.beta is the k design slopes, optionally followed by GAP B's appended "_cons"
     // row (r.k == k+1). Only the first k enter Xβ.
@@ -1297,9 +1345,10 @@ void add_panel_scalars(json& out, const ModelData& md, const PanelMeans& pm, con
     for (int g = 0; g < ng_levels; ++g) {
         if (pm.cnt[static_cast<size_t>(g)] == 0) continue;
         double xb = 0;
-        for (int c = 0; c < k; ++c)
-            xb += pm.xbar[static_cast<size_t>(g) * static_cast<size_t>(k) + static_cast<size_t>(c)] *
-                  r.beta[static_cast<size_t>(c)];
+        for (int c = 0; c < k; ++c) {
+            const int col = source.empty() ? c : source[c];
+            xb += pm.xbar[static_cast<size_t>(g) * pm.kd + col] * r.beta[c];
+        }
         xbg[static_cast<size_t>(g)] = xb;
         u[static_cast<size_t>(g)] = pm.ybar[static_cast<size_t>(g)] - xb;
         su += u[static_cast<size_t>(g)];
@@ -1582,13 +1631,14 @@ json run_feols(const std::string& data, const std::string& y,
                bool level_set, const std::string& weight_var,
                cecon::WeightKind weight_kind, EsampleRows* esample,
                bool keep_nested_fe_dof, bool emit_v, bool multiway_subset_factors,
-               bool fe_nested_in_clusters, bool regress_exact_fit, bool collinear_forward) {
+               bool fe_nested_in_clusters, bool regress_exact_fit, bool collinear_forward,
+               bool xtreg_fe, bool absorb_test, bool aw_negative_drops) {
     auto t0 = std::chrono::steady_clock::now();
     const Dataset& ds = acquire_data(data);
     auto t1 = std::chrono::steady_clock::now();
     IbnNoInterceptScope ibn_scope(no_intercept && fes.empty());
     ModelData md = build_model(ds, y, xs, fes, clusters, "", drop_singleton, ts, if_mask,
-                               weight_var, weight_kind);
+                               weight_var, weight_kind, aw_negative_drops);
     md.collinear_forward = collinear_forward;  // BUG-1067
     if (esample) { esample->keep = md.keep; esample->loaded = &ds; }  // e(sample) T1a
     auto t2 = std::chrono::steady_clock::now();
@@ -1619,6 +1669,21 @@ json run_feols(const std::string& data, const std::string& y,
     // absorbed FE and any weight is constant within its levels (xtreg,fe's own
     // requirement; BUG-1292).
     const PanelMeans panel_means = capture_panel_means(md);
+    std::optional<ModelData> restricted;
+    if ((xtreg_fe || absorb_test) && vt == Vcov::IID && md.fe.size() == 1) {
+        // Preserve the original rows before demeaning. The pooled comparison
+        // fit uses only the regressors that the within fit keeps.
+        restricted.emplace();
+        restricted->dm = md.dm;
+        restricted->weights = md.weights;
+        restricted->weight_kind = md.weight_kind;
+        restricted->has_intercept = true;
+    }
+    double log_weight = 0.0;
+    if (xtreg_fe && md.weight_kind == WeightKind::Analytic && !md.weights.empty()) {
+        const double mean = std::accumulate(md.weights.begin(), md.weights.end(), 0.0) / md.dm.n;
+        for (double w : md.weights) log_weight += 0.5 * std::log(w / mean);
+    }
     FeolsResult r = feols_fit(md, vt, 0, no_intercept, keep_nested_fe_dof, multiway_subset_factors,
                               regress_exact_fit);
     auto t3 = std::chrono::steady_clock::now();
@@ -1737,7 +1802,71 @@ json run_feols(const std::string& data, const std::string& y,
     // Single-FE panel models (Stata xtreg,fe / areg): the six header scalars —
     // r2_between/r2_overall (since 1.5.1, §19; factor-expansion hole closed in §35 /
     // BUG-156) and sigma_u/sigma_e/rho/corr_u_xb (since §35). One producer for all six.
-    if (fes.size() == 1) add_panel_scalars(out, md, panel_means, r);
+    if (fes.size() == 1) add_panel_scalars(out, md, panel_means, r, xtreg_fe);
+    if (xtreg_fe && fes.size() == 1) {
+        out["sum_w"] = r.n_eff > 0.0 ? r.sum_w : static_cast<double>(r.n);
+        if (out.contains("sigma_u") && out["sigma_u"].is_number() &&
+            out.contains("sigma_e") && out["sigma_e"].is_number()) {
+            out["ui"] = out["sigma_u"];
+            out["sigma"] = std::hypot(out["sigma_u"].get<double>(), out["sigma_e"].get<double>());
+        }
+        // The within likelihood uses the RSS and the null within TSS.
+        const double n = r.n_eff > 0.0 ? r.n_eff : static_cast<double>(r.n);
+        auto log_likelihood = [n, log_weight](double ss) {
+            return log_weight - 0.5 * n * (1 + std::log(2 * M_PI * ss / n));
+        };
+        if (n > 0.0 && r.rss > 0.0) out["ll"] = log_likelihood(r.rss);
+        if (n > 0.0 && r.tss_within > 0.0) out["ll_0"] = log_likelihood(r.tss_within);
+        if (restricted) {
+            auto& design = restricted->dm;
+            std::vector<double> columns(design.n, 1.0);
+            std::vector<std::string> names{"(intercept)"};
+            for (int j = 0; j < design.k; ++j) {
+                const auto& name = design.xnames[j];
+                if (std::find(r.names.begin(), r.names.end(), name) == r.names.end()) continue;
+                columns.insert(columns.end(), design.col(j), design.col(j) + design.n);
+                names.push_back(name);
+            }
+            design.k = static_cast<int>(names.size());
+            design.X = std::move(columns);
+            design.xnames = std::move(names);
+            try {
+                const auto pooled = feols_fit(*restricted, Vcov::IID);
+                out["r2_c"] = pooled.r2;
+                const double df1 = pooled.df_r_exact - r.df_r_exact;
+                if (df1 > 0.0 && r.df_r_exact > 0.0 && r.rmse > 0.0) {
+                    const double f = std::max(0.0, pooled.rss - r.rss) / (df1 * r.sigma2);
+                    out["F_f"] = f;
+                    out["p_f"] = f_pvalue(f, df1, r.df_r_exact);
+                }
+            } catch (const EngineError&) {
+                // The within fit still has a result if the comparison fit fails.
+            }
+        }
+    }
+    // --absorb-test (areg's default-VCE test of the absorbed indicators): the R-squared
+    // of the comparison regression of y on the regressors the absorbed fit kept, with a
+    // constant, the same weights and the same sample (e(r2_c)); PIET forms
+    // e(F_absorb) = ((r2 - r2_c)/df_a) / ((1 - r2)/df_r) from it.
+    if (absorb_test && !xtreg_fe && restricted && fes.size() == 1) {
+        auto& design = restricted->dm;
+        std::vector<double> columns(design.n, 1.0);
+        std::vector<std::string> names{"(intercept)"};
+        for (int j = 0; j < design.k; ++j) {
+            const auto& name = design.xnames[j];
+            if (std::find(r.names.begin(), r.names.end(), name) == r.names.end()) continue;
+            columns.insert(columns.end(), design.col(j), design.col(j) + design.n);
+            names.push_back(name);
+        }
+        design.k = static_cast<int>(names.size());
+        design.X = std::move(columns);
+        design.xnames = std::move(names);
+        try {
+            out["r2_c"] = feols_fit(*restricted, Vcov::IID).r2;
+        } catch (const EngineError&) {
+            // no comparison fit: e(r2_c)/e(F_absorb) stay unposted
+        }
+    }
     // xtreg, fe's e(g_min)/e(g_avg)/e(g_max): the row counts of the panels in the
     // estimation sample (observations per panel). One
     // absorbed factor only; the consumer (PIET's xtreg, fe route) copies them to

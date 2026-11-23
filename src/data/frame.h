@@ -1284,6 +1284,13 @@ public:
     // the head — Stata's own documented ordering.
     Frame expand(int64_t n, int64_t* n_added_out) const;
 
+    // Row gather in the given order, repeats allowed: row k of the result is row
+    // idx[k] (0-based) of this frame. Every column, its identity metadata and its
+    // storage width carry through take_rows exactly as for expand/gsort; the sort
+    // claim does not (a resample is unsorted). Throws bad_input on an index outside
+    // [0, n_rows()). The bootstrap prefix's per-replicate resample (`cobra take`).
+    Frame take(const std::vector<int64_t>& idx) const;
+
     // `fillin v1 v2 [...]` — rectangularize: add the rows needed so that every
     // combination of the OBSERVED values of the listed variables is present.
     // New rows carry missing in every other column (a factor's missing code),

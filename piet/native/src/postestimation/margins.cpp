@@ -2561,6 +2561,12 @@ ojson runMargins(const std::vector<std::string>& marginlist,
   if (lm.esample == LastModel::EsampleState::kNone)
     return eval::errorBlock("engine_error", "e(sample) does not identify the estimation sample",
                             std::nullopt, std::nullopt, std::nullopt, "r(322)");
+  // teffects posts no margins contract: every margins form after any teffects
+  // estimator is r(322) "command margins not appropriate after teffects"
+  // (StataBE 19.5, bank b2b0c7e539225323 `margins` after `teffects ra`).
+  if (lm.stataCmd == "teffects")
+    return eval::errorBlock("engine_error", "command margins not appropriate after teffects",
+                            std::nullopt, std::nullopt, std::nullopt, "r(322)");
   // `poisson ..., iterate(#)` posts ml's iterate there; margins' poisson refits run
   // to convergence and would answer for other coefficients than e(b)'s.
   if (postestPoissonIterateFitM4(lm))

@@ -6,6 +6,7 @@
 #include "options.h"
 #include "handler_declarations.h"
 #include "piet/handlers/session_commands.h"
+#include "piet/regex_scans.h"
 namespace piet::dispatch_detail {
 bool interceptDefinition(SessionState& session,
     ojson& echo,
@@ -184,7 +185,8 @@ bool interceptXiPrefix(SessionState& session,
     static const std::regex reXiPrefix(R"(^\s*xi\s*(?:,\s*([^:]*?))?\s*:\s*(\S.*)$)",
                                        std::regex::icase);
     std::smatch mxi;
-    if (std::regex_match(cmdForDispatch, mxi, reXiPrefix)) {
+    if (rx::mayStartWithWordCI(cmdForDispatch, "xi") &&
+        std::regex_match(cmdForDispatch, mxi, reXiPrefix)) {
       const std::string optText = mxi.str(1);
       // xi-glued-comma: `xi: qreg2 y i.mr, cl(cid)` (w2j_e3_qreg2.log:1672, rc 0)
       // glues the options comma to the last i. term, so the token `i.mr,` named a

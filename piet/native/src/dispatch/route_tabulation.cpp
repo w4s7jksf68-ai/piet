@@ -123,19 +123,14 @@ bool route_tabulation(std::string& cmd,
       if (k == "all") chi2 = true;
       tabStatWords.push_back(k == "v" ? std::string("V") : k);
     }
-    // expected, cchi2, clrchi2 and plot change what the table shows (extra cell lines, a bar
-    // column) and no renderer draws them: they are in kVocabTabulate's `unimplemented` set and
-    // refused by name before this point.
+    // expected, cchi2 and clrchi2 are two-way cell lines drawn from the counts and margins
+    // (cellLines below); plot is a one-way bar column (tabPlot).
     bool tabSubpop = false;
     std::string tabSubpopVar;
     for (const auto& [k, v] : parsed.opts)
       if (k == "subpop" && !v.isBool) { tabSubpop = true; tabSubpopVar = strutil::trim(v.strValue); }
     // BS-097: chi2/sum/summarize/missing/generate/sort are the tabulate/tab1/
     // tab2 options this arm actually READS (with BUG-1514's statistics above).
-    // `cell`/`col`/
-    // `row`/`nofreq` are in kVocabTabulate's KNOWN set (rc 0, matching the
-    // oracle) but are validated no-ops here on purpose — see kVocabTabulate's
-    // own comment for the measured/unmeasured boundary that decision rests on.
     // BUG-233: the one copy of this vocabulary now lives in the file-scope
     // registration block (see top of file); this binding keeps every existing
     // use — including the reject net below — reading the same set.
@@ -185,6 +180,24 @@ bool route_tabulation(std::string& cmd,
     if (auto err = eval::rejectUnknownOptions(parsed.opts, kTabulateKnownOpts,
                                               kVocabTabulate.unimplemented)) {
       return tabRefuse(ojson(*err));
+    }
+    // `plot` draws a one-way table as its frequencies and a bar of asterisks; a two-way table
+    // refuses it before anything else on the line (bank: `tab2 rep78 foreign, plot sort` prints
+    // "option plot not allowed" under the first heading, 54ef41c9). With summarize() the table
+    // holds means, so no bar is drawn there either: that pairing keeps the named refusal.
+    bool tabPlot = false;
+    for (const auto& kv : parsed.opts)
+      if (kv.first == "plot" && kv.second.isBool && kv.second.boolValue) tabPlot = true;
+    if (tabPlot) {
+      const bool twoWayLine = cmd == "tab2" || (cmd != "tab1" && parsed.varlist.size() == 2);
+      bool withSum = false;
+      for (const auto& kv : parsed.opts)
+        if ((kv.first == "sum" || kv.first == "summarize") && !kv.second.isBool) withSum = true;
+      if (twoWayLine)
+        return tabRefuse(ojson(eval::engineError("option `plot` not allowed", "unsupported_option")));
+      if (withSum)
+        return tabRefuse(ojson(eval::unsupportedOption(
+            "plot", "tabulate: plot is not implemented with summarize() in this version of PIET")));
     }
     // `sort` orders a one-way table's rows; a two-way tabulate refuses it (bank:
     // `tabulate rep78 foreign, sort` r(198) "option sort not allowed").
@@ -278,6 +291,26 @@ bool route_tabulation(std::string& cmd,
       blocks.push_back(ojson(eval::engineError("option `" + word + "` not allowed", "unsupported_option")));
       return true;
     }
+    // The cell lines are two-way options: a one-way table refuses the first one typed with
+    // r(198) "option row not allowed", which tab1 prints under its first heading and ends rc 0
+    // (bank: `tab1 rep78 foreign, nofreq row`; `tab1 rep78 foreign, expected cchi2 clrchi2`
+    // answers "option expected not allowed", cf904f88, 807a816d).
+    if (!tabTwoWay && !sumvar.has_value()) {
+      for (const auto& kv : parsed.opts) {
+        const std::string& k = kv.first;
+        if (k == "row" || k == "col" || k == "cell" || k == "expected" || k == "cchi2" || k == "clrchi2")
+          return tabRefuse(ojson(eval::engineError("option `" + k + "` not allowed", "unsupported_option")));
+      }
+    }
+    // With summarize() the table holds means, not counts: no cell line can be drawn from it.
+    if (sumvar.has_value()) {
+      for (const auto& kv : parsed.opts) {
+        const std::string& k = kv.first;
+        if (k == "expected" || k == "cchi2" || k == "clrchi2")
+          return tabRefuse(ojson(eval::unsupportedOption(
+              k, "tabulate: option " + k + " is not implemented with summarize() in this version of PIET")));
+      }
+    }
     {
       std::string oneWayRefused;
       if (tabTwoWay && tabSubpop) oneWayRefused = "subpop";
@@ -296,16 +329,8 @@ bool route_tabulation(std::string& cmd,
         return tabRefuse(ojson(eval::engineError("option `" + oneWayRefused + "` not allowed",
                                                  "unsupported_option")));
     }
-    // summarize()'s column options choose which of Mean, Std. dev., Freq. and Obs a table shows. The
-    // one-way table draws them (the block carries `columns`); the two-way summarize table has no
-    // renderer for them, so they are refused by name rather than accepted and ignored.
-    if (sumvar.has_value() && tabTwoWay) {
-      for (const auto& kv : parsed.opts)
-        if (kv.first == "nomeans" || kv.first == "nostandard" || kv.first == "noobs" || kv.first == "means" ||
-            kv.first == "standard" || kv.first == "freq" || kv.first == "obs")
-          return tabRefuse(ojson(eval::unsupportedOption(
-              kv.first, "tabulate: option " + kv.first + " of summarize() is not implemented for a two-way table in this version of PIET")));
-    }
+    // summarize()'s column options choose which of Mean, Std. dev., Freq. and Obs a table shows;
+    // the one-way and the two-way renderers draw the lines the block's `columns` keeps.
     // BUG-1514: the statistics count frequencies. Under [aw=] StataBE 19.5 answers
     // r(406) "lrchi2 not allowed with aweights" (chi2, V, gamma, taub and all alike),
     // under [iw=] r(198) "option lrchi2 not allowed" (chi2 ... all alike).
@@ -395,22 +420,48 @@ bool route_tabulation(std::string& cmd,
     // missing`, `, nofreq matcell(mm)` and `tab2 c d e, nofreq`: `return list` is
     // empty, `matrix list mm` r(111)); with `row`, `cell` or a statistic it posts
     // r(N) r(r) r(c) as usual. One-way `nofreq` posts r(N) r(r) (`tabulate c, nofreq`).
-    if (tabTwoWay && tabStatWords.empty() && !sumvar.has_value() && tabGenStub.empty()) {
-      bool nofreq = false, cellLines = false;
-      for (const auto& [k, v] : parsed.opts) {
-        if (k == "nofreq") nofreq = true;
-        if (k == "cell" || k == "col" || k == "row") cellLines = true;
-      }
-      if (nofreq && !cellLines) {
+    auto tabFlag = [&](const std::string& name) {
+      return std::any_of(parsed.opts.begin(), parsed.opts.end(), [&](const auto& opt) {
+        return opt.first == name && opt.second.isBool && opt.second.boolValue;
+      });
+    };
+    std::optional<ojson> cellLines;
+    if (tabTwoWay && !sumvar.has_value()) {
+      const bool nofreq = tabFlag("nofreq");
+      ojson requested = ojson::array();
+      if (!nofreq) requested.push_back("frequency");
+      // Stata stacks the cell lines in this fixed order whatever order they were typed in
+      // (bank eb3a65a9: `expected row column cchi2` shows frequency, expected, chi2
+      // contribution, row, column; 99a9cf32: `cchi2 clrchi2`).
+      for (const char* line : {"expected", "cchi2", "clrchi2", "row", "col", "cell"})
+        if (tabFlag(line)) requested.push_back(line);
+      if (nofreq && requested.empty() && tabStatWords.empty() && tabGenStub.empty()) {
         eval::replaceRClass(session.eval);
         eval::declareRPosted(session.eval, "tabulate", {});
         return true;
       }
+      if (nofreq || requested.size() > 1) cellLines = std::move(requested);
     }
     ojson tabBlock =
         handlers::runTabulate(*ds, parsed.varlist, chi2, cmd, sumvar, parsed.weightVar,
                               tabMissing, tabSort, parsed.weightType, tabStats, tabExactWork,
                               tabFirstOnly, tabSubpopVar);
+    if (tabPlot && tabBlock.is_object() && tabBlock.value("type", std::string()) != "error") {
+      tabBlock["plot"] = true;
+      if (tabBlock.contains("tables"))
+        for (auto& panel : tabBlock["tables"]) panel["plot"] = true;
+    }
+    if (cellLines && tabBlock.is_object() && tabBlock.value("type", std::string()) != "error") {
+      const bool noKey = tabFlag("nokey");
+      auto setDisplay = [&](ojson& panel) {
+        if (!panel.contains("table")) return;
+        panel["cell_lines"] = *cellLines;
+        if (noKey) panel["no_key"] = true;
+      };
+      setDisplay(tabBlock);
+      if (tabBlock.contains("tables"))
+        for (auto& panel : tabBlock["tables"]) setDisplay(panel);
+    }
     // B4-W3b: the RAW level keys, snapshotted here — the value-label
     // substitution a few lines down rewrites tabBlock["table"]["rows"] in
     // place, and a dummy built from a LABEL ("Domestic") instead of its code
@@ -823,6 +874,61 @@ bool route_tabulation(std::string& cmd,
   }
 
 
+  // `collect` (Stata 17 collections). PIET keeps no collection store; what is served
+  // is collect export's file-type rule. With no as(), the document type comes from
+  // the file's suffix ([TABLES] collect export: docx html pdf xlsx xls tex smcl txt
+  // markdown md), and any other suffix is r(198) "option as() required; could not
+  // determine filetype from filename" (vs-stata bank 2ad86a0b64ba1d4f `collect export
+  // "t.csv", name(a) replace`). Writing the document, and every other collect
+  // subcommand, is refused by name.
+  if (cmd == "collect") {
+    const std::string args = rawArgsAfterCmd(parsed.raw);
+    const size_t s0 = args.find_first_not_of(" \t");
+    const size_t s1 = s0 == std::string::npos ? std::string::npos : args.find_first_of(" \t,", s0);
+    const std::string sub = s0 == std::string::npos
+                                ? std::string()
+                                : args.substr(s0, s1 == std::string::npos ? std::string::npos : s1 - s0);
+    if (sub == "export") {
+      const std::string rest = s1 == std::string::npos ? std::string() : args.substr(s1);
+      const size_t f0 = rest.find_first_not_of(" \t");
+      std::string fname, opts;
+      if (f0 != std::string::npos && rest[f0] == '"') {
+        const size_t q = rest.find('"', f0 + 1);
+        fname = rest.substr(f0 + 1, (q == std::string::npos ? rest.size() : q) - f0 - 1);
+        opts = q == std::string::npos ? std::string() : rest.substr(q + 1);
+      } else if (f0 != std::string::npos && rest[f0] != ',') {
+        const size_t q = rest.find_first_of(" \t,", f0);
+        fname = rest.substr(f0, q == std::string::npos ? std::string::npos : q - f0);
+        opts = q == std::string::npos ? std::string() : rest.substr(q);
+      }
+      bool hasAs = false;
+      const size_t comma = opts.find(',');
+      for (size_t k = comma == std::string::npos ? opts.size() : comma; k + 1 < opts.size(); ++k) {
+        if (opts.compare(k, 2, "as") != 0) continue;
+        const char before = k == 0 ? ' ' : opts[k - 1];
+        if (!(before == ' ' || before == '\t' || before == ',')) continue;
+        size_t p = k + 2;
+        while (p < opts.size() && (opts[p] == ' ' || opts[p] == '\t')) ++p;
+        if (p < opts.size() && opts[p] == '(') hasAs = true;
+      }
+      std::string suffix;
+      const size_t dot = fname.find_last_of('.');
+      const size_t slash = fname.find_last_of("/\\");
+      if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        suffix = fname.substr(dot + 1);
+      static const std::set<std::string> kSuffixTypes = {"docx", "html", "pdf",  "xlsx",     "xls",
+                                                         "tex",  "smcl", "txt", "markdown", "md"};
+      if (!fname.empty() && !hasAs && kSuffixTypes.count(suffix) == 0) {
+        blocks.push_back(ojson(eval::errorBlock(
+            "syntax_error", "option as() required; could not determine filetype from filename",
+            std::nullopt, std::nullopt, std::nullopt, "r(198)")));
+        return true;
+      }
+    }
+    blocks.push_back(ojson(eval::refusedCommand("collect", "no_collection_store")));
+    return true;
+  }
+
   if (cmd == "table") {
     if (!session.hasData()) {
       blocks.push_back(ojson(eval::noDataLoaded()));
@@ -1188,6 +1294,17 @@ bool route_tabulation(std::string& cmd,
     };
     if (parsed.varlist.empty())
       { blocks = failed(ojson(eval::engineError("tabstat requires at least one variable"))); return true; }
+    // A dataset with no observations: r(2000) "no observations" (vs-stata bank
+    // 4a70f3831ec105d2, `set obs 0` then `tabstat x`).
+    int64_t tsRows = -1;
+    if (std::optional<int64_t> r = session.residentRowsIfCurrent()) tsRows = *r;
+    else if (session.hasData())
+      if (Datastore* tds = session.datastore()) tsRows = tds->nRows();
+    if (session.hasData() && tsRows == 0) {
+      blocks = failed(ojson(eval::errorBlock("engine_error", "no observations", std::nullopt,
+                                             std::nullopt, std::nullopt, "r(2000)")));
+      return true;
+    }
     // BUG-1014: tabstat as tabstat.ado (StataNow 19.5, v2.9.6) runs it -- every
     // statistic is `summarize` on the group's rows, the statistic list is parsed
     // by its Stats subprogram, and r() is replaced by the command whether or not
@@ -1600,6 +1717,11 @@ bool route_tabulation(std::string& cmd,
     return true;
   }
 
+
+  if (cmd == "ttesti") {
+    blocks.push_back(ojson(handlers::runTtesti(parsed, session)));
+    return true;
+  }
 
   if (cmd == "ttest") {
     // BUG-1015: runTtest posts r() itself, every name of the form run and no

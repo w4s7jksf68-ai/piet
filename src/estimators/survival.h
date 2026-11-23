@@ -180,6 +180,52 @@ WeibullResult weibull_fit(const double* X, int64_t n, int k, const double* t0, c
                           const double* d, int cons_col);
 
 // ---------------------------------------------------------------------------
+// streg, the parametric families on Stata's ml path
+// ---------------------------------------------------------------------------
+//
+// Every family is fitted as Stata's ado fits it: a constant-only model first
+// (its log likelihood is e(ll_0)), then the full model by ml's modified
+// Newton-Raphson (logit.h ml_newton_path: same step rule, same stopping rule)
+// from the constant-only estimates with the slopes at 0, in the ado's own
+// parametrization. The log likelihood is Stata's: the record's
+// d ln f(t) + (1-d) ln S(t) - ln S(t0) plus d ln t (the log-time metric; see
+// weib::ll_grad), for every family.
+//
+//   exponential  ln h = xb                                  (PH)
+//   weibull      ln h = xb + ln p + (p-1) ln t, p = exp(/ln_p)  (PH; the ado fits
+//                it with ln t centred on its sample mean and moves _cons back
+//                after the fit, or into the AFT metric under `time`)
+//   gompertz     ln h = xb + gamma t, gamma = /gamma         (PH)
+//   loglogistic  S = 1 / (1 + exp(z)), z = (ln t - xb) / g, g = exp(/lngamma)  (AFT)
+//   lognormal    S = 1 - Phi(z),       z = (ln t - xb) / s, s = exp(/lnsigma)  (AFT)
+//
+// The ancillary parameter is an equation of its own: `Z` (n*kz, col-major, the
+// constant LAST) is its design -- one column of ones without ancillary().
+enum class StregDist { Exponential, Weibull, Gompertz, Loglogistic, Lognormal };
+
+struct StregFit {
+    std::vector<double> theta;      // reported metric: k main coefficients, then kz ancillary
+    std::vector<double> V;          // np*np, reported metric (row-major, symmetric)
+    std::vector<double> V_fit;      // np*np, the fitted metric: inverse of -H at the optimum
+    std::vector<double> J;          // np*np, d reported / d fitted (identity but for weibull's)
+    std::vector<double> gradient;   // d ll / d theta at the last iterate (the fitted metric)
+    std::vector<double> ilog;       // full model: ll at iteration 0..ic
+    std::vector<double> scores;     // n*np col-major, the fitted metric (a sandwich's meat)
+    double ll = 0, ll_0 = 0;
+    int ic = 0;
+    bool converged = false, converged_cons = false;
+    bool ok = false;
+    std::string err;
+};
+
+// `cons_col`: the constant's column of X (-1: none -- noconstant is not offered).
+// `time_metric`: weibull's AFT form (the PH fit remetricked, as the ado does).
+StregFit streg_fit(StregDist dist, bool time_metric, const double* X, int64_t n, int k, int cons_col,
+                   const double* Z, int kz, const double* t0, const double* t, const double* d);
+// J * Vf * J' (np*np row-major), symmetrized: a fitted-metric covariance in the reported metric.
+std::vector<double> streg_remetric(const std::vector<double>& J, const std::vector<double>& Vf, int np);
+
+// ---------------------------------------------------------------------------
 // shared robust/cluster sandwich
 // ---------------------------------------------------------------------------
 

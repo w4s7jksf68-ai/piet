@@ -115,6 +115,10 @@ std::string estatPadLeft(const std::string& s, size_t w) {
   return s.size() >= w ? s : std::string(w - s.size(), ' ') + s;
 }
 
+std::string estatPadRight(const std::string& s, size_t w) {
+  return s.size() >= w ? s : s + std::string(w - s.size(), ' ');
+}
+
 double estatE(const std::string& name, SessionState& session) {
   const std::optional<double> v = evalScalarExpr("e(" + name + ")", session);
   if (!v.has_value() || std::isnan(*v) || *v >= eval::kStataMissingSentinel)
@@ -374,11 +378,12 @@ ojson estatSummarizeM4(const std::vector<std::string>& varlist,
                        const std::optional<std::string>& ifExpr, SessionState& session,
                        const std::string& ecmd) {
   if (ifExpr.has_value()) return estatRefuse("if not allowed", "r(101)");
-  bool noWeights = false;
+  bool noWeights = false, byEquation = false;
   for (const auto& [k0, v] : opts) {
     (void)v;
     const std::string k = strutil::lower(k0);
     if (estatAbbrev(k, "noweights", 5)) noWeights = true;
+    else if (estatAbbrev(k, "equation", 2)) byEquation = true;
     else if (estatAbbrev(k, "labels", 3) || estatAbbrev(k, "noheader", 5) || k == "vsquish") {
     } else {
       return estatNotImplemented("summarize, " + k0, ecmd);
@@ -388,80 +393,138 @@ ojson estatSummarizeM4(const std::vector<std::string>& varlist,
   const auto& lm = session.lastModel();
   if (!lm.has_value()) return estatNotImplemented("summarize", ecmd);
   if (!lm->fitWeight.empty() && !noWeights) return estatNotImplemented("summarize after a weighted fit", ecmd);
-  const auto ba = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kNames);
-  if (!ba.matrix.has_value()) return estatNotImplemented("summarize", ecmd);
+  // The groups of rows: one list (e(depvar) and every equation's variables, each
+  // once) or, under `equation`, `depvar` then each equation with variables
+  // (estat_summ's _ms_lf_info walk; bank a98c1e62 `estat summarize, equation`
+  // after sureg: depvar:price depvar:trunk price:mpg price:weight trunk:mpg
+  // trunk:weight). _cons, o._cons, _se and an ancillary `/name` parameter
+  // (nbreg's /lnalpha, ologit's /cut1) are no variables; `o.x` is x.
+  std::vector<std::pair<std::string, std::vector<std::string>>> groups;
   std::string depvar;
   if (const std::string* d = session.eval.eStrings.find("depvar")) depvar = *d;
   if (depvar.empty()) depvar = lm->depvar;
-  std::vector<std::string> vars;
-  if (!depvar.empty()) {
-    if (depvar.find(' ') != std::string::npos) return estatNotImplemented("summarize", ecmd);
-    vars.push_back(depvar);
+  std::vector<std::string> depTokens;
+  {
+    std::istringstream in(depvar);
+    std::string tok;
+    while (in >> tok) depTokens.push_back(tok);
   }
-  for (const auto& full : ba.matrix->colnames) {
-    const size_t c = full.rfind(':');
-    if (c != std::string::npos && full.substr(0, c) != depvar) return estatNotImplemented("summarize", ecmd);
-    const std::string nm = c == std::string::npos ? full : full.substr(c + 1);
-    if (nm == "_cons" || nm == "o._cons" || nm == "_se") continue;
-    if (nm.find('#') != std::string::npos) return estatNotImplemented("summarize", ecmd);
-    if (nm.find('.') != std::string::npos) {
-      // A factor level: its indicator, the base level left out (bank ee20372b
-      // `regress price mpg weight i.foreign`: rows price mpg weight 1.foreign).
-      double lv = 0;
-      std::string fv;
-      if (!cecon::postest::parse_level_ref(nm, lv, fv)) return estatNotImplemented("summarize", ecmd);
-      const std::string flags = nm.substr(0, nm.find('.'));
-      if (flags.find('o') != std::string::npos) return estatNotImplemented("summarize", ecmd);
-      if (flags.find('b') != std::string::npos && flags.find("bn") == std::string::npos) continue;
+  if (ecmd == "pca") {
+    // After pca the variables are e(C)'s (pca_estat's Summarize; bank ade39e7b:
+    // r(stats) 6 x 4 over price mpg weight length turn displacement).
+    const auto ca = session.eval.resolveEMatrixFor("C", eval::EvalSession::EReader::kNames);
+    if (!ca.matrix.has_value() || ca.matrix->colnames.empty()) return estatNotImplemented("summarize", ecmd);
+    groups.push_back({std::string(), ca.matrix->colnames});
+  } else {
+    const auto ba = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kNames);
+    if (!ba.matrix.has_value()) return estatNotImplemented("summarize", ecmd);
+    std::vector<std::pair<std::string, std::vector<std::string>>> eqs;
+    for (const auto& full : ba.matrix->colnames) {
+      const size_t c = full.rfind(':');
+      const std::string eq = c == std::string::npos ? std::string() : full.substr(0, c);
+      std::string nm = c == std::string::npos ? full : full.substr(c + 1);
+      if (!nm.empty() && nm[0] == '/') continue;
+      if (nm == "_cons" || nm == "o._cons" || nm == "_se") continue;
+      if (nm.find('#') != std::string::npos) return estatNotImplemented("summarize", ecmd);
+      if (nm.compare(0, 2, "o.") == 0) nm = nm.substr(2);
+      if (nm.find('.') != std::string::npos) {
+        // A factor level: its indicator, the base level left out (bank ee20372b
+        // `regress price mpg weight i.foreign`: rows price mpg weight 1.foreign).
+        double lv = 0;
+        std::string fv;
+        if (!cecon::postest::parse_level_ref(nm, lv, fv)) return estatNotImplemented("summarize", ecmd);
+        const std::string flags = nm.substr(0, nm.find('.'));
+        if (flags.find('o') != std::string::npos) return estatNotImplemented("summarize", ecmd);
+        if (flags.find('b') != std::string::npos && flags.find("bn") == std::string::npos) continue;
+      }
+      auto it = std::find_if(eqs.begin(), eqs.end(), [&eq](const auto& g) { return g.first == eq; });
+      if (it == eqs.end()) {
+        eqs.push_back({eq, {}});
+        it = eqs.end() - 1;
+      }
+      if (std::find(it->second.begin(), it->second.end(), nm) == it->second.end()) it->second.push_back(nm);
     }
-    if (std::find(vars.begin(), vars.end(), nm) == vars.end()) vars.push_back(nm);
+    if (byEquation) {
+      if (!depTokens.empty()) groups.push_back({"depvar", depTokens});
+      for (const auto& g : eqs)
+        if (!g.second.empty()) groups.push_back({g.first.empty() ? std::string("_") : g.first, g.second});
+    } else {
+      std::vector<std::string> all = depTokens;
+      for (const auto& g : eqs)
+        for (const auto& v : g.second)
+          if (std::find(all.begin(), all.end(), v) == all.end()) all.push_back(v);
+      groups.push_back({std::string(), all});
+    }
   }
   const auto rows = est_detail::esampleRowsM4(session, *lm);
   if (!rows.has_value() || rows->empty()) return estatNotImplemented("summarize", ecmd);
   Datastore* ds = session.datastore();
   if (ds == nullptr) return estatNotImplemented("summarize", ecmd);
+  // Every variable is read first; one with missing values in the sample is
+  // estat_summ's r(498) unless its name occurs in e(depvar) (bank c0a1007e after
+  // heckman: "tenure has 9 missing observations", lw's own missing tolerated).
+  std::map<std::string, std::vector<double>> cols;
+  for (const auto& g : groups)
+    for (const auto& v : g.second) {
+      if (cols.count(v)) continue;
+      std::vector<double> col;
+      std::string err;
+      double lv = 0;
+      std::string src = v;
+      const bool level = v.find('.') != std::string::npos && cecon::postest::parse_level_ref(v, lv, src);
+      if (!ds->has(src) || !statcmd_detail::numericColumn(*ds, src, &col, &err))
+        return estatNotImplemented("summarize", ecmd);
+      if (level)
+        for (double& x : col)
+          if (!(std::isnan(x) || x >= eval::kStataMissingSentinel)) x = x == lv ? 1.0 : 0.0;
+      size_t nMiss = 0;
+      for (const int64_t r : *rows) {
+        const double x = col[static_cast<size_t>(r)];
+        if (std::isnan(x) || x >= eval::kStataMissingSentinel) ++nMiss;
+      }
+      if (nMiss > 0 && depvar.find(src) == std::string::npos)
+        return estatRefuse(src + " has " + std::to_string(nMiss) + " missing observation" + (nMiss == 1 ? "" : "s"),
+                           "r(498)");
+      cols[v] = std::move(col);
+    }
   eval::EvalMatrix st;
   st.colnames = {"mean", "sd", "min", "max"};
   std::string t = "\n  Estimation sample " + ecmd + "          Number of obs = " + std::to_string(rows->size()) +
                   "\n\n  -------------------------------------------------------------------\n"
                   "      Variable |         Mean      Std. dev.          Min          Max\n"
                   "  -------------+-----------------------------------------------------\n";
-  for (const auto& v : vars) {
-    std::vector<double> col;
-    std::string err;
-    double lv = 0;
-    std::string src = v;
-    const bool level = v.find('.') != std::string::npos && cecon::postest::parse_level_ref(v, lv, src);
-    if (!ds->has(src) || !statcmd_detail::numericColumn(*ds, src, &col, &err))
-      return estatNotImplemented("summarize", ecmd);
-    if (level)
-      for (double& x : col)
-        if (!(std::isnan(x) || x >= eval::kStataMissingSentinel)) x = x == lv ? 1.0 : 0.0;
-    double sum = 0, mn = HUGE_VAL, mx = -HUGE_VAL;
-    size_t n = 0;
-    for (const int64_t r : *rows) {
-      const double x = col[static_cast<size_t>(r)];
-      if (std::isnan(x) || x >= eval::kStataMissingSentinel) {
-        // estat_summ refuses a variable with missing values in the sample
-        return estatRefuse(v + " has missing observations", "r(498)");
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const auto& g = groups[gi];
+    if (byEquation) {
+      if (gi > 0) t += "  -------------+-----------------------------------------------------\n";
+      t += "  " + estatPadRight(g.first.substr(0, 12), 13) + "|\n";
+    }
+    for (const auto& v : g.second) {
+      const std::vector<double>& col = cols.at(v);
+      double sum = 0, mn = HUGE_VAL, mx = -HUGE_VAL;
+      size_t n = 0;
+      for (const int64_t r : *rows) {
+        const double x = col[static_cast<size_t>(r)];
+        if (std::isnan(x) || x >= eval::kStataMissingSentinel) continue;
+        sum += x;
+        mn = std::min(mn, x);
+        mx = std::max(mx, x);
+        ++n;
       }
-      sum += x;
-      mn = std::min(mn, x);
-      mx = std::max(mx, x);
-      ++n;
+      const double mean = n > 0 ? sum / static_cast<double>(n) : std::numeric_limits<double>::quiet_NaN();
+      double ss = 0;
+      for (const int64_t r : *rows) {
+        const double x = col[static_cast<size_t>(r)];
+        if (std::isnan(x) || x >= eval::kStataMissingSentinel) continue;
+        ss += (x - mean) * (x - mean);
+      }
+      const double sd = n > 1 ? std::sqrt(ss / static_cast<double>(n - 1)) : std::numeric_limits<double>::quiet_NaN();
+      st.rownames.push_back(byEquation ? g.first + ":" + v : v);
+      st.data.push_back({mean, sd, mn, mx});
+      t += estatPadLeft(v.substr(0, 13), 15) + " |" + estatPadLeft(estatFmt("%9.0g", mean), 13) +
+           estatPadLeft(estatFmt("%9.0g", sd), 14) + estatPadLeft(estatFmt("%9.0g", mn), 13) +
+           estatPadLeft(estatFmt("%9.0g", mx), 13) + "\n";
     }
-    const double mean = sum / static_cast<double>(n);
-    double ss = 0;
-    for (const int64_t r : *rows) {
-      const double d = col[static_cast<size_t>(r)] - mean;
-      ss += d * d;
-    }
-    const double sd = n > 1 ? std::sqrt(ss / static_cast<double>(n - 1)) : std::numeric_limits<double>::quiet_NaN();
-    st.rownames.push_back(v);
-    st.data.push_back({mean, sd, mn, mx});
-    t += estatPadLeft(v.substr(0, 13), 15) + " |" + estatPadLeft(estatFmt("%9.0g", mean), 13) +
-         estatPadLeft(estatFmt("%9.0g", sd), 14) + estatPadLeft(estatFmt("%9.0g", mn), 13) +
-         estatPadLeft(estatFmt("%9.0g", mx), 13) + "\n";
   }
   t += "  -------------------------------------------------------------------\n";
   auto& ev = session.eval;
@@ -636,6 +699,98 @@ ojson estatBinaryM4(const std::string& what, const std::vector<std::pair<std::st
   return estatDisplay(t);
 }
 
+// estat gof after poisson (poiss_g): the deviance and Pearson goodness-of-fit
+// statistics over e(sample) at the posted e(b) -- chi2_d = 2 sum[y ln(y/mu) -
+// (y - mu)], chi2_p = sum (y - mu)^2/mu with mu = exp(xb + offset) -- on N -
+// e(rank) degrees of freedom (bank 0d0879dd `poisson fatal beertax unemp`: chi2_d
+// 233036.455821, chi2_p 321684.410838, df 333; d4387abe under exposure(pop)).
+ojson estatPoissonGofM4(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                        const std::optional<std::string>& ifExpr, SessionState& session) {
+  const std::string ecmd = "poisson";
+  if (!opts.empty()) return estatNotImplemented("gof, " + opts.front().first, ecmd);
+  if (ifExpr.has_value()) return estatNotImplemented("gof with if/in", ecmd);
+  const auto& lm = session.lastModel();
+  if (!lm.has_value() || !lm->fitWeight.empty()) return estatNotImplemented("gof", ecmd);
+  const auto ba = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kCopy);
+  if (!ba.matrix.has_value() || ba.matrix->data.size() != 1) return estatNotImplemented("gof", ecmd);
+  std::string depvar;
+  if (const std::string* d = session.eval.eStrings.find("depvar")) depvar = *d;
+  if (depvar.empty() || depvar.find(' ') != std::string::npos) return estatNotImplemented("gof", ecmd);
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return estatNotImplemented("gof", ecmd);
+  std::string err;
+  std::vector<double> y;
+  if (!ds->has(depvar) || !statcmd_detail::numericColumn(*ds, depvar, &y, &err))
+    return estatNotImplemented("gof", ecmd);
+  std::vector<std::vector<double>> X;
+  std::vector<double> bx;
+  double bcons = 0;
+  for (size_t j = 0; j < ba.matrix->colnames.size(); ++j) {
+    const std::string& full = ba.matrix->colnames[j];
+    const size_t c = full.rfind(':');
+    if (c != std::string::npos && full.substr(0, c) != depvar) return estatNotImplemented("gof", ecmd);
+    const std::string nm = c == std::string::npos ? full : full.substr(c + 1);
+    if (nm == "_cons") {
+      bcons = ba.matrix->data[0][j];
+      continue;
+    }
+    std::vector<double> col;
+    if (nm.find_first_of(".#") != std::string::npos || !ds->has(nm) ||
+        !statcmd_detail::numericColumn(*ds, nm, &col, &err))
+      return estatNotImplemented("gof", ecmd);
+    X.push_back(std::move(col));
+    bx.push_back(ba.matrix->data[0][j]);
+  }
+  std::vector<double> off;
+  bool offLog = false;
+  if (const std::string* o = session.eval.eStrings.find("offset"); o != nullptr && !o->empty()) {
+    std::string ov = *o;
+    if (ov.rfind("ln(", 0) == 0 && ov.back() == ')') {
+      ov = ov.substr(3, ov.size() - 4);
+      offLog = true;
+    }
+    if (!ds->has(ov) || !statcmd_detail::numericColumn(*ds, ov, &off, &err))
+      return estatNotImplemented("gof", ecmd);
+  }
+  const auto er = est_detail::esampleRowsM4(session, *lm);
+  if (!er.has_value() || er->empty()) return estatNotImplemented("gof", ecmd);
+  // e(rank): the e(b) columns e(V) does not hold at zero
+  const auto va = session.eval.resolveEMatrixFor("V", eval::EvalSession::EReader::kCopy);
+  if (!va.matrix.has_value() || va.matrix->data.size() != ba.matrix->colnames.size())
+    return estatNotImplemented("gof", ecmd);
+  double rank = 0;
+  for (size_t j = 0; j < va.matrix->data.size(); ++j) rank += va.matrix->data[j][j] > 0 ? 1.0 : 0.0;
+  const double* rk = &rank;
+  double dev = 0, pear = 0;
+  for (const int64_t r : *er) {
+    const size_t i = static_cast<size_t>(r);
+    double xb = bcons;
+    for (size_t j = 0; j < X.size(); ++j) xb += bx[j] * X[j][i];
+    if (!off.empty()) xb += offLog ? std::log(off[i]) : off[i];
+    const double mu = std::exp(xb), yi = y[i];
+    dev += (yi > 0 ? yi * std::log(yi / mu) : 0.0) - (yi - mu);
+    pear += (yi - mu) * (yi - mu) / mu;
+  }
+  dev *= 2.0;
+  const double N = static_cast<double>(er->size());
+  const double df = N - *rk;
+  const double pd = df > 0 ? chi2UpperTailIntegerDf(df, dev) : std::numeric_limits<double>::quiet_NaN();
+  const double pp = df > 0 ? chi2UpperTailIntegerDf(df, pear) : std::numeric_limits<double>::quiet_NaN();
+  auto& ev = session.eval;
+  eval::replaceRClass(ev);
+  ev.rValues.set("chi2_d", dev);
+  ev.rValues.set("p_d", pd);
+  ev.rValues.set("chi2_p", pear);
+  ev.rValues.set("p_p", pp);
+  ev.rValues.set("df", df);
+  eval::declareRPosted(ev, "estat", {"chi2_d", "p_d", "chi2_p", "p_p", "df"});
+  std::string t = "\nDeviance goodness-of-fit  = " + estatFmt("%9.0g", dev) +
+                  "\nProb > chi2(" + estatNum(df) + ")         = " + estatFmt("%9.4f", pd) +
+                  "\n\nPearson goodness-of-fit   = " + estatFmt("%9.0g", pear) +
+                  "\nProb > chi2(" + estatNum(df) + ")         = " + estatFmt("%9.4f", pp) + "\n";
+  return estatDisplay(t);
+}
+
 // Subcommands an estimator's own estat handler serves beyond the defaults
 // (Stata's <cmd>_estat programs; minimum abbreviation lengths are theirs).
 // After a command listed here, any other subcommand is r(321) "estat X not
@@ -671,6 +826,533 @@ std::optional<ojson> estatSyntaxRefusalM4(const std::string& sub, const std::vec
   return std::nullopt;
 }
 
+// estat imtest after regress: Cameron & Trivedi's decomposition of the
+// information-matrix test (imtest's own steps): with e = the residual and s2
+// = e(rss)/e(N), heteroskedasticity N (1 - rss/uss) of e^2 - s2 on X and the
+// centred cross products x_i x_j (i <= j), skewness of e^3 - 3 s2 e on X,
+// kurtosis of e^4 - 6 s2 e^2 + 3 s2^2 on a constant, uss the uncentred sum of
+// squares of the left-hand side; white: N R^2 of e^2 on X and the products.
+// The generated variables are stored as float unless `double` (imtest's
+// `type`), and so are they here. Bank 6a0c1b31 (decomposition), e63318f5
+// (white).
+ojson estatImtestM4(const std::vector<std::string>& varlist,
+                    const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                    const std::optional<std::string>& ifExpr, SessionState& session) {
+  if (!varlist.empty()) return estatRefuse("varlist not allowed", "r(101)");
+  if (ifExpr.has_value()) return estatRefuse("if not allowed", "r(101)");
+  bool dbl = false, white = false;
+  for (const auto& [k0, v] : opts) {
+    const std::string k = strutil::lower(k0);
+    if (estatAbbrev(k, "double", 1) && v.isBool) dbl = true;
+    else if (estatAbbrev(k, "white", 1) && v.isBool) white = true;
+    else if (estatAbbrev(k, "preserve", 1) && v.isBool) {
+    } else return estatRefuse("option " + k0 + " not allowed", "r(198)");
+  }
+  const auto& lm = session.lastModel();
+  if (!lm.has_value()) return estatNotImplemented("imtest", "regress");
+  if (!lm->fitWeight.empty()) return estatRefuse("weights not allowed", "r(101)");
+  if (const std::string* cv = session.eval.eStrings.find("clustvar"); cv != nullptr && !cv->empty())
+    return estatRefuse("imtest not appropriate after vce(cluster)", "r(498)");
+  if (const std::string* vt = session.eval.eStrings.find("vcetype"); vt != nullptr && *vt == "HAC")
+    return estatRefuse("imtest not appropriate after vce(hac)", "r(498)");
+  const auto ba = session.eval.resolveEMatrixFor("b", eval::EvalSession::EReader::kNames);
+  if (!ba.matrix.has_value() || ba.matrix->data.size() != 1) return estatNotImplemented("imtest", "regress");
+  std::string depvar;
+  if (const std::string* d = session.eval.eStrings.find("depvar")) depvar = *d;
+  if (depvar.empty()) depvar = lm->depvar;
+  std::vector<std::string> xs;
+  std::vector<double> bx;
+  double bcons = 0.0;
+  for (size_t j = 0; j < ba.matrix->colnames.size(); ++j) {
+    const std::string& nm = ba.matrix->colnames[j];
+    if (nm == "_cons") {
+      bcons = ba.matrix->data[0][j];
+      continue;
+    }
+    if (nm.find_first_of(".#:") != std::string::npos)
+      return estatNotImplemented("imtest after a fit with factor-variable or time-series terms", "regress");
+    xs.push_back(nm);
+    bx.push_back(ba.matrix->data[0][j]);
+  }
+  if (xs.empty()) return estatDisplay("(imtest not allowed without covariates)");
+  const double rss = estatE("rss", session), nObs = estatE("N", session);
+  if (!std::isfinite(rss) || !(nObs > 0)) return estatNotImplemented("imtest", "regress");
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return estatNotImplemented("imtest", "regress");
+  std::vector<double> y;
+  std::vector<std::vector<double>> X(xs.size());
+  std::string err;
+  if (!ds->has(depvar) || !statcmd_detail::numericColumn(*ds, depvar, &y, &err))
+    return estatNotImplemented("imtest", "regress");
+  for (size_t j = 0; j < xs.size(); ++j)
+    if (!ds->has(xs[j]) || !statcmd_detail::numericColumn(*ds, xs[j], &X[j], &err))
+      return estatNotImplemented("imtest", "regress");
+  const auto er = est_detail::esampleRowsM4(session, *lm);
+  if (!er.has_value() || er->empty()) return estatNotImplemented("imtest", "regress");
+  const std::vector<int64_t>& rows = *er;
+  const size_t n = rows.size(), q = xs.size();
+  auto store = [dbl](double v) { return dbl ? v : static_cast<double>(static_cast<float>(v)); };
+  // The residual (predict `type' res) and the centred products.
+  std::vector<double> res(n);
+  for (size_t i = 0; i < n; ++i) {
+    long double xb = bcons;
+    for (size_t j = 0; j < q; ++j) xb += static_cast<long double>(bx[j]) * X[j][static_cast<size_t>(rows[i])];
+    res[i] = store(y[static_cast<size_t>(rows[i])] - static_cast<double>(xb));
+  }
+  std::vector<double> mean(q, 0.0);
+  for (size_t j = 0; j < q; ++j) {
+    long double sm = 0.0L;
+    for (size_t i = 0; i < n; ++i) sm += X[j][static_cast<size_t>(rows[i])];
+    mean[j] = static_cast<double>(sm / static_cast<long double>(n));
+  }
+  std::vector<std::vector<double>> prod;
+  for (size_t a = 0; a < q; ++a)
+    for (size_t b = 0; b <= a; ++b) {
+      std::vector<double> c(n);
+      for (size_t i = 0; i < n; ++i) {
+        const size_t r = static_cast<size_t>(rows[i]);
+        c[i] = store((X[a][r] - mean[a]) * (X[b][r] - mean[b]));
+      }
+      prod.push_back(std::move(c));
+    }
+  // OLS of `lhs` on the given columns plus a constant: rss, and the rank of
+  // the regressors (collinear columns dropped, as regress omits them).
+  auto ols = [&](const std::vector<double>& lhs, const std::vector<const std::vector<double>*>& cols,
+                 double& rssOut, int& dfm) {
+    const size_t p = cols.size() + 1;
+    std::vector<long double> A(p * (p + 1), 0.0L);
+    std::vector<double> row(p);
+    for (size_t i = 0; i < n; ++i) {
+      row[0] = 1.0;
+      for (size_t c = 0; c < cols.size(); ++c) row[c + 1] = (*cols[c])[i];
+      for (size_t a = 0; a < p; ++a) {
+        for (size_t b = 0; b < p; ++b) A[a * (p + 1) + b] += static_cast<long double>(row[a]) * row[b];
+        A[a * (p + 1) + p] += static_cast<long double>(row[a]) * lhs[i];
+      }
+    }
+    // Sweep with a relative pivot tolerance; a dropped column keeps coef 0.
+    std::vector<bool> used(p, false);
+    std::vector<long double> diag0(p);
+    for (size_t a = 0; a < p; ++a) diag0[a] = A[a * (p + 1) + a];
+    std::vector<size_t> pivRow(p, p);
+    std::vector<bool> rowUsed(p, false);
+    dfm = 0;
+    for (size_t c = 0; c < p; ++c) {
+      size_t piv = p;
+      for (size_t r = 0; r < p; ++r) {
+        if (rowUsed[r]) continue;
+        if (piv == p || std::fabs(static_cast<double>(A[r * (p + 1) + c])) >
+                            std::fabs(static_cast<double>(A[piv * (p + 1) + c])))
+          piv = r;
+      }
+      if (piv == p || !(std::fabs(static_cast<double>(A[piv * (p + 1) + c])) >
+                        1e-13 * std::max(1.0L, std::fabs(diag0[c]))))
+        continue;
+      rowUsed[piv] = true;
+      pivRow[c] = piv;
+      used[c] = true;
+      if (c > 0) ++dfm;
+      const long double d = A[piv * (p + 1) + c];
+      for (size_t k = 0; k <= p; ++k) A[piv * (p + 1) + k] /= d;
+      for (size_t r = 0; r < p; ++r) {
+        if (r == piv) continue;
+        const long double f = A[r * (p + 1) + c];
+        if (f == 0.0L) continue;
+        for (size_t k = 0; k <= p; ++k) A[r * (p + 1) + k] -= f * A[piv * (p + 1) + k];
+      }
+    }
+    std::vector<long double> beta(p, 0.0L);
+    for (size_t c = 0; c < p; ++c)
+      if (used[c]) beta[c] = A[pivRow[c] * (p + 1) + p];
+    long double s2 = 0.0L;
+    for (size_t i = 0; i < n; ++i) {
+      long double fit = beta[0];
+      for (size_t c = 0; c < cols.size(); ++c) fit += beta[c + 1] * (*cols[c])[i];
+      const long double e = lhs[i] - fit;
+      s2 += e * e;
+    }
+    rssOut = static_cast<double>(s2);
+  };
+  std::vector<std::vector<double>> Xs(q, std::vector<double>(n));
+  for (size_t j = 0; j < q; ++j)
+    for (size_t i = 0; i < n; ++i) Xs[j][i] = X[j][static_cast<size_t>(rows[i])];
+  std::vector<const std::vector<double>*> rhsAll, rhs1;
+  for (auto& c : Xs) {
+    rhsAll.push_back(&c);
+    rhs1.push_back(&c);
+  }
+  for (auto& c : prod) rhsAll.push_back(&c);
+  const double s2 = rss / nObs;
+  auto uncentredRatio = [&](const std::vector<double>& lhs, const std::vector<const std::vector<double>*>& cols,
+                            int& dfm) {
+    long double uss = 0.0L;
+    for (double v : lhs) {
+      const double y2 = store(v * v);
+      uss += y2;
+    }
+    double r = 0.0;
+    ols(lhs, cols, r, dfm);
+    return nObs * (1.0 - r / static_cast<double>(uss));
+  };
+  auto& ev = session.eval;
+  eval::replaceRClass(ev);
+  std::vector<std::string> posted;
+  std::string t;
+  if (white) {
+    std::vector<double> lhs(n);
+    long double sm = 0.0L;
+    for (size_t i = 0; i < n; ++i) {
+      lhs[i] = store(res[i] * res[i]);
+      sm += lhs[i];
+    }
+    const long double mu = sm / static_cast<long double>(n);
+    long double tss = 0.0L;
+    for (double v : lhs) tss += (v - mu) * (v - mu);
+    double r = 0.0;
+    int dfm = 0;
+    ols(lhs, rhsAll, r, dfm);
+    const double chi2 = nObs * (1.0 - r / static_cast<double>(tss));
+    const double p = chi2UpperTailIntegerDf(dfm, chi2);
+    ev.rValues.set("chi2", chi2);
+    ev.rValues.set("df", static_cast<double>(dfm));
+    ev.rValues.set("p", p);
+    posted.insert(posted.end(), {"chi2", "df", "p"});
+    t += "\nWhite's test\nH0: Homoskedasticity\nHa: Unrestricted heteroskedasticity\n\n" +
+         estatPadLeft("chi2(" + std::to_string(dfm) + ")", 11) + " = " + estatFmt("%7.2f", chi2) +
+         "\nProb > chi2 = " + estatFmt("%6.4f", p) + "\n";
+  }
+  std::vector<double> lh(n), ls(n), lk(n);
+  for (size_t i = 0; i < n; ++i) {
+    const double e = res[i];
+    lh[i] = store(e * e - s2);
+    ls[i] = store(e * e * e - 3.0 * s2 * e);
+    lk[i] = store(e * e * e * e - 6.0 * s2 * e * e + 3.0 * s2 * s2);
+  }
+  int dfH = 0, dfS = 0, dfK = 0;
+  const double chiH = uncentredRatio(lh, rhsAll, dfH);
+  const double chiS = uncentredRatio(ls, rhs1, dfS);
+  const double chiK = uncentredRatio(lk, {}, dfK);
+  dfK = 1;
+  const double chiT = chiH + chiS + chiK;
+  const int dfT = dfH + dfS + dfK;
+  const std::vector<std::pair<const char*, double>> items = {
+      {"chi2_h", chiH}, {"df_h", static_cast<double>(dfH)}, {"chi2_s", chiS}, {"df_s", static_cast<double>(dfS)},
+      {"chi2_k", chiK}, {"df_k", 1.0}, {"chi2_t", chiT}, {"df_t", static_cast<double>(dfT)}};
+  for (const auto& [k, v] : items) {
+    ev.rValues.set(k, v);
+    posted.push_back(k);
+  }
+  eval::declareRPosted(ev, "estat", std::move(posted));
+  auto line = [&](const std::string& src, double c, int df) {
+    return estatPadLeft(src, 20) + " |" + estatPadLeft(estatFmt("%7.2f", c), 11) +
+           estatPadLeft(std::to_string(df), 7) + estatPadLeft(estatFmt("%6.4f", chi2UpperTailIntegerDf(df, c)), 10) + "\n";
+  };
+  const std::string rule = std::string(50, '-');
+  t += "\nCameron & Trivedi's decomposition of IM-test\n\n" + rule + "\n" + estatPadLeft("Source", 20) +
+       " |       chi2     df         p\n" + std::string(21, '-') + "+" + std::string(28, '-') + "\n" +
+       line("Heteroskedasticity", chiH, dfH) + line("Skewness", chiS, dfS) + line("Kurtosis", chiK, 1) +
+       std::string(21, '-') + "+" + std::string(28, '-') + "\n" + line("Total", chiT, dfT) + rule + "\n";
+  return estatDisplay(t);
+}
+
+// estat after pca (pca_estat): loadings, residuals, smc, anti and kmo, from
+// the posted e(C), e(L), e(Ev) and e(f), by pca_estat's own steps --
+// loadings L scaled by sqrt(Ev) / 1/sqrt(Ev) under cnorm(eigen|inveigen)
+// (r(A), r(norm)); residuals C - L diag(Ev) L' (r(fit), r(residual)); smc
+// 1 - 1/inv(R)_jj (r(smc)); anti-image D inv(R) D with D = diag(inv(R))^-1/2
+// (r(acorr)) and D acorr D (r(acov)); kmo sum c_ij^2 / (sum c_ij^2 + sum
+// acorr_ij^2) over i != j, overall and per variable (r(kmo), r(kmow)), R =
+// corr(e(C)). Bank 4f11635f, 0b107f28, 93058bc3, e79bb0ef, 727da7ff.
+std::optional<ojson> estatPcaM4(const std::string& sub, const std::vector<std::string>& varlist,
+                                const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                SessionState& session) {
+  const bool loadings = estatAbbrev(sub, "loadings", 3), residuals = estatAbbrev(sub, "residuals", 3);
+  const bool smc = sub == "smc", anti = sub == "anti", kmo = sub == "kmo";
+  if (!loadings && !residuals && !smc && !anti && !kmo) return std::nullopt;
+  if (!varlist.empty()) return estatRefuse("varlist not allowed", "r(101)");
+  using Reader = eval::EvalSession::EReader;
+  const auto ca = session.eval.resolveEMatrixFor("C", Reader::kNames);
+  if (!ca.matrix.has_value()) return estatNotImplemented(sub, "pca");
+  const eval::EvalMatrix& C = *ca.matrix;
+  const size_t k = C.colnames.size();
+  if (k == 0 || C.data.size() != k) return estatNotImplemented(sub, "pca");
+  const std::vector<std::string>& names = C.colnames;
+  // Options: format() for the display; each subcommand's own switches.
+  std::string fmt, cnorm = "unit";
+  bool showObs = false, showFit = false, noCorr = false, noCov = false, noVar = false;
+  for (const auto& [k0, v] : opts) {
+    const std::string key = strutil::lower(k0);
+    if (estatAbbrev(key, "format", 3) && !v.isBool) {
+      fmt = strutil::trim(v.strValue);
+      if (fmt.empty() || fmt[0] != '%') return estatRefuse("invalid format " + fmt, "r(120)");
+    } else if (loadings && estatAbbrev(key, "cnorm", 2) && !v.isBool) {
+      const std::string c = strutil::lower(strutil::trim(v.strValue));
+      if (estatAbbrev(c, "unit", 1)) cnorm = "unit";
+      else if (estatAbbrev(c, "eigen", 1)) cnorm = "eigen";
+      else if (estatAbbrev(c, "inveigen", 1)) cnorm = "inveigen";
+      else return estatRefuse("option " + c + " not allowed", "r(198)");
+    } else if (residuals && estatAbbrev(key, "obs", 1) && v.isBool) {
+      showObs = true;
+    } else if (residuals && estatAbbrev(key, "fitted", 1) && v.isBool) {
+      showFit = true;
+    } else if (anti && (key == "nocorr" || key == "nocov") && v.isBool) {
+      (key == "nocorr" ? noCorr : noCov) = true;
+    } else if (kmo && key == "novar" && v.isBool) {
+      noVar = true;
+    } else {
+      return estatRefuse("option " + k0 + " not allowed", "r(198)");
+    }
+  }
+  const double fRet = estatE("f", session);
+  auto mat = [&](std::vector<std::vector<double>> d, std::vector<std::string> rn,
+                 std::vector<std::string> cn) {
+    eval::EvalMatrix m;
+    m.data = std::move(d);
+    m.rownames = std::move(rn);
+    m.colnames = std::move(cn);
+    return m;
+  };
+  auto text = [&](const std::string& title, const eval::EvalMatrix& m, const std::string& f) {
+    std::string t = "\n" + title + "\n\n";
+    std::string head = estatPadLeft("Variable", 12) + " |";
+    for (const auto& c : m.colnames) head += estatPadLeft(c.substr(0, 9), 10);
+    const std::string rule = std::string(13, '-') + "+" + std::string(head.size() - 14, '-');
+    t += "    " + std::string(head.size(), '-') + "\n    " + head + "\n    " + rule + "\n";
+    for (size_t i = 0; i < m.data.size(); ++i) {
+      std::string line = estatPadLeft(m.rownames[i].substr(0, 12), 12) + " |";
+      for (double x : m.data[i]) line += estatPadLeft(estatFmt(f, x), 10);
+      t += "    " + line + "\n";
+    }
+    t += "    " + std::string(head.size(), '-') + "\n";
+    return t;
+  };
+  auto& ev = session.eval;
+  if (loadings || residuals) {
+    if (!(fRet >= 1)) return estatRefuse(loadings ? "no components retained" : "no retained components", "r(198)");
+    const auto la = ev.resolveEMatrixFor("L", Reader::kNames);
+    const auto ea = ev.resolveEMatrixFor("Ev", Reader::kNames);
+    if (!la.matrix.has_value() || !ea.matrix.has_value() || ea.matrix->data.size() != 1)
+      return estatNotImplemented(sub, "pca");
+    const eval::EvalMatrix& L = *la.matrix;
+    const std::vector<double>& Ev = ea.matrix->data[0];
+    const size_t m = static_cast<size_t>(fRet);
+    if (L.data.size() != k || Ev.size() < m) return estatNotImplemented(sub, "pca");
+    for (const auto& row : L.data)
+      if (row.size() < m) return estatNotImplemented(sub, "pca");
+    if (loadings) {
+      std::vector<std::vector<double>> A(k, std::vector<double>(m));
+      for (size_t i = 0; i < k; ++i)
+        for (size_t j = 0; j < m; ++j) {
+          const double s = cnorm == "eigen" ? std::sqrt(Ev[j]) : cnorm == "inveigen" ? 1.0 / std::sqrt(Ev[j]) : 1.0;
+          A[i][j] = L.data[i][j] * s;
+        }
+      std::vector<std::string> cn(L.colnames.begin(), L.colnames.begin() + static_cast<std::ptrdiff_t>(m));
+      eval::EvalMatrix Am = mat(A, names, cn);
+      const std::string tnorm = cnorm == "unit" ? "sum of squares(column) = 1"
+                                : cnorm == "eigen" ? "sum of squares(column) = eigenvalue"
+                                                   : "sum of squares(column) = 1/eigenvalue";
+      const std::string* rc = ev.eStrings.find("r_criterion");
+      const std::string t = text("Principal component loadings" +
+                                     std::string(rc == nullptr || rc->empty() ? " (unrotated)" : "") +
+                                     "\n    component normalization: " + tnorm,
+                                 Am, fmt.empty() ? "%8.4g" : fmt);
+      eval::replaceRClass(ev);
+      ev.rStrings.set("norm", cnorm);
+      ev.rMatrices.emplace_back("A", std::move(Am));
+      eval::declareRPosted(ev, "estat", {"norm", "A"});
+      return estatDisplay(t);
+    }
+    std::vector<std::vector<double>> Fit(k, std::vector<double>(k, 0.0)), Res(k, std::vector<double>(k));
+    for (size_t i = 0; i < k; ++i)
+      for (size_t j = 0; j < k; ++j) {
+        long double s = 0.0L;
+        for (size_t c = 0; c < m; ++c) s += static_cast<long double>(L.data[i][c]) * Ev[c] * L.data[j][c];
+        Fit[i][j] = static_cast<double>(s);
+      }
+    for (size_t i = 0; i < k; ++i)
+      for (size_t j = 0; j < i; ++j) Fit[i][j] = Fit[j][i] = (Fit[i][j] + Fit[j][i]) / 2.0;
+    for (size_t i = 0; i < k; ++i)
+      for (size_t j = 0; j < k; ++j) Res[i][j] = C.data[i][j] - Fit[i][j];
+    eval::EvalMatrix Fm = mat(Fit, names, names), Rm = mat(Res, names, names);
+    std::string t;
+    const std::string f = fmt.empty() ? "%7.4f" : fmt;
+    if (showObs) t += text("Observed correlations", mat(C.data, names, names), f);
+    if (showFit) t += text("Fitted values", Fm, f);
+    t += text("Residuals", Rm, f);
+    eval::replaceRClass(ev);
+    ev.rMatrices.emplace_back("residual", std::move(Rm));
+    ev.rMatrices.emplace_back("fit", std::move(Fm));
+    eval::declareRPosted(ev, "estat", {"residual", "fit"});
+    return estatDisplay(t);
+  }
+  // R = corr(C) and its inverse (Gauss-Jordan; a singular R is r(498)).
+  std::vector<std::vector<long double>> M(k, std::vector<long double>(2 * k, 0.0L));
+  for (size_t i = 0; i < k; ++i) {
+    for (size_t j = 0; j < k; ++j)
+      M[i][j] = static_cast<long double>(C.data[i][j]) / std::sqrt(static_cast<long double>(C.data[i][i]) * C.data[j][j]);
+    M[i][k + i] = 1.0L;
+  }
+  for (size_t c = 0; c < k; ++c) {
+    size_t piv = c;
+    for (size_t r = c + 1; r < k; ++r)
+      if (std::fabs(static_cast<double>(M[r][c])) > std::fabs(static_cast<double>(M[piv][c]))) piv = r;
+    if (!(std::fabs(static_cast<double>(M[piv][c])) > 1e-13)) return estatRefuse("correlation matrix is singular", "r(498)");
+    std::swap(M[c], M[piv]);
+    const long double d = M[c][c];
+    for (auto& x : M[c]) x /= d;
+    for (size_t r = 0; r < k; ++r) {
+      if (r == c || M[r][c] == 0.0L) continue;
+      const long double f = M[r][c];
+      for (size_t j = 0; j < 2 * k; ++j) M[r][j] -= f * M[c][j];
+    }
+  }
+  std::vector<std::vector<double>> IR(k, std::vector<double>(k));
+  for (size_t i = 0; i < k; ++i)
+    for (size_t j = 0; j < k; ++j) IR[i][j] = static_cast<double>(M[i][k + j]);
+  if (smc) {
+    std::vector<std::vector<double>> S(k, std::vector<double>(1));
+    for (size_t j = 0; j < k; ++j) S[j][0] = 1.0 - 1.0 / IR[j][j];
+    eval::EvalMatrix Sm = mat(S, names, {"smc"});
+    const std::string t = text("Squared multiple correlations of variables with all other variables", Sm,
+                               fmt.empty() ? "%7.4f" : fmt);
+    eval::replaceRClass(ev);
+    ev.rMatrices.emplace_back("smc", std::move(Sm));
+    eval::declareRPosted(ev, "estat", {"smc"});
+    return estatDisplay(t);
+  }
+  std::vector<double> D(k);
+  for (size_t i = 0; i < k; ++i) D[i] = 1.0 / std::sqrt(IR[i][i]);
+  std::vector<std::vector<double>> AC(k, std::vector<double>(k)), AV(k, std::vector<double>(k));
+  for (size_t i = 0; i < k; ++i)
+    for (size_t j = 0; j < k; ++j) AC[i][j] = D[i] * IR[i][j] * D[j];
+  for (size_t i = 0; i < k; ++i)
+    for (size_t j = 0; j < k; ++j) AV[i][j] = D[i] * AC[i][j] * D[j];
+  if (anti) {
+    for (size_t i = 0; i < k; ++i)
+      for (size_t j = 0; j < i; ++j) {
+        AC[i][j] = AC[j][i] = 0.5 * (AC[i][j] + AC[j][i]);
+        AV[i][j] = AV[j][i] = 0.5 * (AV[i][j] + AV[j][i]);
+      }
+    eval::EvalMatrix Cm = mat(AC, names, names), Vm = mat(AV, names, names);
+    std::string t;
+    if (noCorr && noCov) t = "(nothing to display)";
+    if (!noCorr)
+      t += text("Anti-image correlation coefficients --- partialing out all other variables", Cm,
+                fmt.empty() ? "%8.4f" : fmt);
+    if (!noCov)
+      t += text("Anti-image covariance coefficients --- partialing out all other variables", Vm,
+                fmt.empty() ? "%9.0g" : fmt);
+    eval::replaceRClass(ev);
+    ev.rMatrices.emplace_back("acov", std::move(Vm));
+    ev.rMatrices.emplace_back("acorr", std::move(Cm));
+    eval::declareRPosted(ev, "estat", {"acov", "acorr"});
+    return estatDisplay(t);
+  }
+  // kmo
+  long double coff = 0.0L, acoff = 0.0L;
+  for (size_t i = 0; i < k; ++i)
+    for (size_t j = 0; j < i; ++j) {
+      coff += static_cast<long double>(C.data[i][j]) * C.data[i][j];
+      acoff += static_cast<long double>(AC[i][j]) * AC[i][j];
+    }
+  const double kmoAll = static_cast<double>(coff / (coff + acoff));
+  eval::replaceRClass(ev);
+  ev.rValues.set("kmo", kmoAll);
+  std::string t;
+  std::vector<std::string> posted = {"kmo"};
+  if (!noVar) {
+    std::vector<std::vector<double>> W(k + 1, std::vector<double>(1, 1.0));
+    for (size_t i = 0; i < k; ++i) {
+      long double c1 = 0.0L, a1 = 0.0L;
+      for (size_t j = 0; j < k; ++j) {
+        if (i == j) continue;
+        c1 += static_cast<long double>(C.data[i][j]) * C.data[i][j];
+        a1 += static_cast<long double>(AC[i][j]) * AC[i][j];
+      }
+      W[i][0] = static_cast<double>(c1 / (c1 + a1));
+    }
+    W[k][0] = kmoAll;
+    std::vector<std::string> rn = names;
+    rn.push_back("Overall");
+    eval::EvalMatrix Wm = mat(W, rn, {"kmo"});
+    t = text("Kaiser-Meyer-Olkin measure of sampling adequacy", Wm, fmt.empty() ? "%7.4f" : fmt);
+    ev.rMatrices.emplace_back("kmow", std::move(Wm));
+    posted.push_back("kmow");
+  } else {
+    t = "\nKaiser-Meyer-Olkin measure of sampling adequacy = " + estatFmt(fmt.empty() ? "%7.4f" : fmt, kmoAll);
+  }
+  eval::declareRPosted(ev, "estat", std::move(posted));
+  return estatDisplay(t);
+}
+
+// estat sd after mean (svy_estat sd -> mean_estat_sd): each column of e(b) with its
+// population variance e(_N)[i] * V[i,i] and standard deviation, V being e(V) or,
+// after pweights or vce(cluster), e(V_srs). r(mean) = e(b), r(variance), r(sd)
+// (row y1, e(b)'s columns). Bank 223024c2 `estat sd` after `mean price mpg`:
+// sd 2949.496 5.785503. `variance` shows the variances; iweights / fweights (which
+// read e(_N_subp)) and the survey forms are not implemented here.
+ojson estatSdMeanM4(const std::vector<std::pair<std::string, eval::OptValue>>& opts, SessionState& session,
+                    const std::string& ecmd) {
+  bool showVar = false, srsSub = false;
+  for (const auto& [k0, v] : opts) {
+    (void)v;
+    const std::string k = strutil::lower(k0);
+    if (estatAbbrev(k, "variance", 3)) showVar = true;
+    else if (estatAbbrev(k, "srssubpop", 3)) srsSub = true;
+    else if (estatAbbrev(k, "nolegend", 5) || estatAbbrev(k, "verbose", 4)) {
+    } else {
+      return estatNotImplemented("sd, " + k0, ecmd);
+    }
+  }
+  auto eStr = [&session](const char* n) {
+    const std::string* s = session.eval.eStrings.find(n);
+    return s != nullptr ? *s : std::string();
+  };
+  if (!eStr("prefix").empty()) return estatNotImplemented("sd after a prefixed mean", ecmd);
+  if (srsSub && eStr("subpop").empty() && eStr("over").empty())
+    return estatRefuse("option srssubpop requires subpopulation estimation results", "r(322)");
+  const std::string wtype = eStr("wtype");
+  if (wtype == "iweight" || wtype == "fweight") return estatNotImplemented("sd after a weighted mean", ecmd);
+  const bool srs = wtype == "pweight" || !eStr("cluster").empty() || !eStr("clustvar").empty();
+  using Reader = eval::EvalSession::EReader;
+  const auto eb = session.eval.resolveEMatrixFor("b", Reader::kCopy);
+  const auto en = session.eval.resolveEMatrixFor("_N", Reader::kCopy);
+  const auto ev = session.eval.resolveEMatrixFor(srs ? "V_srs" : "V", Reader::kCopy);
+  if (!eb.matrix.has_value() || !ev.matrix.has_value()) return estatRefuse("last estimates not found", "r(301)");
+  if (!en.matrix.has_value()) return estatNotImplemented("sd", ecmd);
+  const size_t k = eb.matrix->colnames.size();
+  if (eb.matrix->data.size() != 1 || en.matrix->data.size() != 1 || en.matrix->data[0].size() != k ||
+      ev.matrix->data.size() != k)
+    return estatNotImplemented("sd", ecmd);
+  eval::EvalMatrix mean = *eb.matrix, var = *eb.matrix, sd = *eb.matrix;
+  mean.rownames = var.rownames = sd.rownames = {"y1"};
+  std::string t = "\n-------------------------------------\n             |       Mean   " +
+                  std::string(showVar ? " Variance" : "Std. dev.") +
+                  "\n-------------+-----------------------\n";
+  for (size_t i = 0; i < k; ++i) {
+    if (ev.matrix->data[i].size() != k) return estatNotImplemented("sd", ecmd);
+    const double vp = en.matrix->data[0][i] * ev.matrix->data[i][i];
+    var.data[0][i] = vp;
+    sd.data[0][i] = std::sqrt(vp);
+    t += estatPadLeft(eb.matrix->colnames[i].substr(0, 12), 13) + " |" +
+         estatPadLeft(estatFmt("%9.0g", mean.data[0][i]), 11) +
+         estatPadLeft(estatFmt("%9.0g", showVar ? vp : std::sqrt(vp)), 12) + "\n";
+  }
+  t += "-------------------------------------\n";
+  auto& evs = session.eval;
+  eval::replaceRClass(evs);
+  // copies of e(b): each needs a generation of its own, or the r() lifecycle reads
+  // them as left over from before this command
+  mean.gen = eval::nextStoreGeneration();
+  var.gen = eval::nextStoreGeneration();
+  sd.gen = eval::nextStoreGeneration();
+  evs.rMatrices.emplace_back("mean", std::move(mean));
+  evs.rMatrices.emplace_back("variance", std::move(var));
+  evs.rMatrices.emplace_back("sd", std::move(sd));
+  eval::declareRPosted(evs, "estat", {"mean", "variance", "sd"});
+  return estatDisplay(t);
+}
+
 ojson estatAfterFitM4(const std::string& sub, const std::vector<std::string>& varlist,
                       const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                       const std::optional<std::string>& ifExpr, SessionState& session) {
@@ -694,10 +1376,13 @@ ojson estatAfterFitM4(const std::string& sub, const std::vector<std::string>& va
       if (ecmd != "mean") return estatRefuse("mean estimation results not found", "r(301)");
       if (const std::string* sz = session.eval.eStrings.find("stdize"); sz != nullptr && !sz->empty())
         return estatRefuse("estat sd is not allowed with direct standardization", "r(322)");
-      return estatNotImplemented(sub, ecmd);
+      return estatSdMeanM4(opts, session, ecmd);
     }
     if (!estatAbbrev(sub, "bootstrap", 4)) return estatRefuse("invalid subcommand " + sub, "r(321)");
   }
+  if (ecmd == "pca")
+    if (auto served = estatPcaM4(sub, varlist, opts, session)) return *served;
+  if (ecmd == "regress" && estatAbbrev(sub, "imtest", 3)) return estatImtestM4(varlist, opts, ifExpr, session);
   if (sub == "ic") return estatIcM4(opts, session, ecmd);
   if (sub == "vce") return estatVceM4(opts, session, ecmd);
   if (estatAbbrev(sub, "summarize", 2)) return estatSummarizeM4(varlist, opts, ifExpr, session, ecmd);
@@ -718,6 +1403,7 @@ ojson estatAfterFitM4(const std::string& sub, const std::vector<std::string>& va
   if ((ecmd == "logit" || ecmd == "logistic" || ecmd == "probit") &&
       (estatAbbrev(sub, "classification", 4) || estatAbbrev(sub, "gof", 3)))
     return estatBinaryM4(estatAbbrev(sub, "gof", 3) ? "gof" : "classification", opts, ifExpr, session, ecmd);
+  if (ecmd == "poisson" && estatAbbrev(sub, "gof", 3)) return estatPoissonGofM4(opts, ifExpr, session);
   const auto& table = estatOwnSubcommands();
   const auto it = table.find(ecmd);
   if (it == table.end()) return estatNotImplemented(sub, ecmd);
@@ -971,7 +1657,10 @@ ojson runEstat(const std::string& subcmdIn, const std::vector<std::string>& rawV
     // hettest, rhs: the explanatory variables of the variance test are the
     // fit's own regressors instead of the fitted values (bank 6dc113cd: chi2(3)
     // 11.181101957129172 after `regress price mpg weight foreign`).
-    static const std::unordered_set<std::string> kHettestKnownOpts = {"rhs"};
+    // normal (the default), iid and fstat choose the statistic (hettest's own
+    // three r() forms: e(mss)/2, N R^2 and the auxiliary regression's F; bank
+    // 6363769f `, normal`, e498bbd9 `mpg, iid`, 25f567a7 `, rhs fstat`).
+    static const std::unordered_set<std::string> kHettestKnownOpts = {"rhs", "normal", "iid", "fstat"};
     if (auto err = eval::rejectUnknownOptions(
             opts, diagCmdPeek == "durbinalt"  ? kDurbinaltKnownOpts
                   : diagCmdPeek == "bgodfrey" ? kBgodfreyKnownOpts
@@ -1003,9 +1692,17 @@ ojson runEstat(const std::string& subcmdIn, const std::vector<std::string>& rawV
       if (diagCmdPeek == "durbinalt" && robust)
         return refuse198("you must specify force after regress, robust");
     }
-    bool hettestRhs = false;
-    for (const auto& [k, v] : opts)
+    bool hettestRhs = false, hettestNormal = false, hettestIid = false, hettestFstat = false;
+    for (const auto& [k, v] : opts) {
       if (k == "rhs" && v.isBool && v.boolValue) hettestRhs = true;
+      if (k == "normal" && v.isBool && v.boolValue) hettestNormal = true;
+      if (k == "iid" && v.isBool && v.boolValue) hettestIid = true;
+      if (k == "fstat" && v.isBool && v.boolValue) hettestFstat = true;
+    }
+    if (diagCmdPeek == "hettest" && hettestNormal && (hettestIid || hettestFstat))
+      return ojson(eval::errorBlock("engine_error",
+                                    "option normal may not be specified with option iid or fstat",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(498)"));
     if (hettestRhs && !rawVarlistAfterSub.empty())
       return engineErrorBlockM4("estat hettest with both a varlist and rhs is not implemented in this "
                                 "version of PIET; nothing was computed.",
@@ -1279,6 +1976,34 @@ ojson runEstat(const std::string& subcmdIn, const std::vector<std::string>& rawV
         return raw.contains(k) && raw[k].is_number() ? raw[k].get<double>()
                                                      : std::numeric_limits<double>::quiet_NaN();
       };
+      // hettest, iid: N R^2 of the auxiliary regression; fstat: its F (iid wins
+      // when both are given, as in hettest's own order). The block carries the
+      // statistic the renderer draws and the assumption line.
+      if (diagCmd == "hettest" && (hettestIid || hettestFstat)) {
+        diagBlock["assumption"] = "i.i.d. error terms";
+        if (hettestIid) {
+          diagBlock["chi2"] = raw.contains("chi2_iid") ? raw["chi2_iid"] : ojson(nullptr);
+          diagBlock["p"] = raw.contains("p_iid") ? raw["p_iid"] : ojson(nullptr);
+          raw["chi2"] = diagBlock["chi2"];
+          raw["p"] = diagBlock["p"];
+        } else {
+          const double F = num("F"), dfm = num("df"), dfr = num("df_r"), pF = num("p_F");
+          diagBlock.erase("chi2");
+          diagBlock["F"] = F;
+          diagBlock["df_m"] = dfm;
+          diagBlock["df_r"] = dfr;
+          diagBlock["p"] = pF;
+          eval::replaceRClass(session.eval);
+          session.eval.rValues.set("p", pF);
+          session.eval.rValues.set("df_r", dfr);
+          session.eval.rValues.set("df_m", dfm);
+          session.eval.rValues.set("F", F);
+          eval::declareRPosted(session.eval, "estat", {"p", "df_r", "df_m", "F"});
+          return diagBlock;
+        }
+      } else if (diagCmd == "hettest") {
+        diagBlock["assumption"] = "Normal error terms";
+      }
       const std::vector<std::pair<std::string, double>> posted =
           diagCmd == "hettest"
               ? std::vector<std::pair<std::string, double>>{{"chi2", num("chi2")},
@@ -1431,6 +2156,29 @@ ojson runEstat(const std::string& subcmdIn, const std::vector<std::string>& rawV
   // absent rather than fabricated (same "show what's real, never fabricate
   // the rest" precedent as reg3's r2_within/dof_resid null fallback,
   // cobraToEstimationM4 above).
+  // estat overid after gmm: Hansen's J of the fit, e(J) on e(J_df) degrees of
+  // freedom (gmm_estat; vs-stata bank 7a85ec97 J 8.6729901 chi2(2) p .0130823);
+  // refused after the one-step estimator, whose weight matrix is not the
+  // efficient one (378748fe r(498)).
+  if (sub == "overid" && session.lastModel().has_value() && session.lastModel()->cobraCmd == "gmm") {
+    if (auto err = eval::rejectUnknownOptions(opts, {})) return *err;
+    const std::string* est = session.eval.eStrings.find("estimator");
+    if (est != nullptr && *est == "onestep")
+      return estatRefuse("not available after one-step estimation", "r(498)");
+    const double* jp = session.eval.eScalars.find("J");
+    const double* dfp = session.eval.eScalars.find("J_df");
+    if (jp == nullptr || dfp == nullptr || !(*dfp > 0)) return estatNotImplemented("overid", "gmm");
+    const double J = *jp, df = *dfp;
+    const double pv = chi2UpperTailIntegerDf(df, J);
+    auto& ev = session.eval;
+    eval::replaceRClass(ev);
+    ev.rValues.set("J", J);
+    ev.rValues.set("J_df", df);
+    ev.rValues.set("J_p", pv);
+    eval::declareRPosted(ev, "estat", {"J", "J_df", "J_p"});
+    return estatDisplay("\n  Test of overidentifying restriction:\n\n  Hansen's J chi2(" + estatNum(df) +
+                        ") = " + estatFmt("%g", J) + " (p = " + estatFmt("%6.4f", pv) + ")\n");
+  }
   if (sub == "endogenous" || sub == "overid" || sub == "firststage") {
     if (auto err = eval::rejectUnknownOptions(opts, {})) return *err;
     const auto& lmOptIv = session.lastModel();

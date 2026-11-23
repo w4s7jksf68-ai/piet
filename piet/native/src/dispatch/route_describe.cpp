@@ -11,11 +11,59 @@
 #include "piet/handlers/variables.h"
 #include "piet/cclass.h"  // kSetMarkerPrefix: `set varabbrev off` for unab
 #include "piet/strutil.h"
+#include "piet/stata_format.h"  // summarize, format: the g-family field rule
+#include "engine/scratch_columns.h"  // summarize: factor-variable and operator terms
 
 #include <algorithm>
+#include <cmath>
+#include <optional>
 #include <regex>
 #include <sstream>
 namespace piet::dispatch_detail {
+namespace {
+// summarize, format: one statistic in the variable's display format, as the
+// summary table's 9-wide field shows it (vs-stata bank 92211d372bc1fcab,
+// 1e1ab2930d32d576, 68b7e504dbc136ea, ec817ff3aa8a7bbd, 816a293b4b9a6153,
+// a52d7b59ed11c9f8, 4c799ed38fe70e4b, 98cd68e8221e7fa2).
+//  - A `g` format (%w.dg, %w.dgc) is drawn as %9.dg whatever w is: at most 8
+//    characters, and with `c` the separators are paid for out of that budget by
+//    shedding decimals, down to none; when even the whole number grouped does not
+//    fit, it is shown without separators. %8.0gc 6165.2568 is 6,165.26, %12.0gc
+//    326277.78 is 326,278 and 4518149.44 is 4518149, 23667902 is 2.37e+07.
+//  - Any other format is drawn as it shows the value when that fits the 9
+//    characters (%6.1f 3.0, %12.2fc 15,906.00, %td 05apr2020), else as the g
+//    rule above draws it (%20.2fc 6.17e+09, %12.4e 6165.257).
+//  - The standard deviation of a date (%t) variable is a length of time, not a
+//    date: %9.0g (%td: 2150.581).
+std::string summarizeGField(double v, int prec, bool group) {
+  constexpr int kField = 9;
+  const std::string g = fmt::general(v, kField, prec);
+  if (!group || g.empty()) return g;
+  const size_t budget = fmt::fieldBudget(v, kField);
+  const std::string grouped = fmt::insertGroups(g, ',');
+  if (grouped.size() <= budget || grouped == g) return grouped;
+  const size_t dot = g.find('.');
+  const int decimals = dot == std::string::npos ? 0 : static_cast<int>(g.size() - dot - 1);
+  for (int d = decimals - 1; d >= 0; --d) {
+    const std::string cand = fmt::insertGroups(fmt::trimNumber(fmt::fixedHalfAway(v, d)), ',');
+    if (cand.size() <= budget) return cand;
+  }
+  return g;
+}
+
+std::string summarizeFormatted(double v, const std::string& fmt, bool isSd) {
+  if (std::isnan(v)) return handlers::listDisplayNumber(v, fmt);
+  static const std::regex reG(R"(^%-?0?(\d+)\.(\d+)g(c?)$)");
+  std::smatch m;
+  if (std::regex_match(fmt, m, reG)) return summarizeGField(v, std::stoi(m.str(2)), !m.str(3).empty());
+  if (isSd && fmt.rfind("%t", 0) == 0) return summarizeGField(v, 0, false);
+  const std::string shown = handlers::listDisplayNumber(v, fmt);
+  if (shown.size() <= 9) return shown;
+  const bool group = fmt.size() > 1 && fmt.back() == 'c' && fmt.rfind("%t", 0) != 0;
+  return summarizeGField(v, 0, group);
+}
+}  // namespace
+
 bool route_describe(std::string& cmd,
     eval::ParsedCommand& parsed,
     SessionState& session,
@@ -292,6 +340,23 @@ bool route_describe(std::string& cmd,
         return true;
       }
     }
+    // numbers abbreviates the names and fullnames forbids that: together they
+    // are r(198) (vs-stata bank 762500ff449bc7df).
+    {
+      bool fNumbers = false, fFull = false;
+      for (const auto& [k, v] : parsed.opts) {
+        (void)v;
+        if (k == "numbers") fNumbers = true;
+        if (k == "fullnames") fFull = true;
+      }
+      if (fNumbers && fFull) {
+        blocks.push_back(ojson(eval::errorBlock("syntax_error",
+                                                "options numbers and fullnames may not be combined",
+                                                std::nullopt, std::nullopt, std::nullopt,
+                                                "r(198)")));
+        return true;
+      }
+    }
     // describe.ado: `simple` may not be combined with another option (r(198));
     // with `replace` the call is describe_mk's, which takes only clear/replace.
     {
@@ -487,6 +552,38 @@ bool route_describe(std::string& cmd,
     // the edition limits and r(datalabel) when the dataset has a label
     // (handlers::postDescribeResults).
     handlers::postDescribeResults(session);
+    // numbers: each variable's position in the dataset before its name; detail:
+    // the header's Observations, Variables and Width (r(N), r(k), r(width)).
+    // Both are drawn by table-format.js formatDescribe (vs-stata bank
+    // b9b558d38f02e76a `describe, numbers`, ab0016c3297af6a4 `describe, detail`).
+    if (desc.is_object() && desc.value("type", std::string()) == "describe") {
+      bool dNumbers = false, dDetail = false;
+      for (const auto& [k, v] : parsed.opts) {
+        (void)v;
+        if (k == "numbers") dNumbers = true;
+        if (k == "detail") dDetail = true;
+      }
+      if (dNumbers && desc.contains("variables")) {
+        std::vector<std::string> all;
+        if (const std::vector<VarInfo>* card = session.residentReadCard()) {
+          for (const auto& v : *card) all.push_back(v.name);
+        } else if (Datastore* nds = session.datastore()) {
+          all = nds->names();
+        }
+        for (auto& v : desc["variables"]) {
+          const auto it = std::find(all.begin(), all.end(), v.value("name", std::string()));
+          if (it != all.end()) v["number"] = static_cast<int>(it - all.begin()) + 1;
+        }
+        desc["numbers"] = true;
+      }
+      if (dDetail) {
+        ojson hdr;
+        if (const double* n = session.eval.rValues.find("N")) hdr["observations"] = *n;
+        if (const double* k = session.eval.rValues.find("k")) hdr["variables"] = *k;
+        if (const double* w = session.eval.rValues.find("width")) hdr["width"] = *w;
+        desc["detail"] = hdr;
+      }
+    }
     blocks.push_back(desc);
     return true;
   }
@@ -522,9 +619,50 @@ bool route_describe(std::string& cmd,
     // switched to rejectUnknownOptions) because it predates the registry and is
     // the summarize arm's only gate; widening it in place is the smaller change.
     long summarizeSeparator = -1;  // -1 = not given; the renderer defaults to 5
+    // `format` shows the statistics in each variable's display format (the last of
+    // format / noformat wins; `f` .. `forma` are format, the bank's ladder).
+    bool summarizeFormat = false;
+    bool summarizeNoFvLabel = false, summarizeNoEmpty = false, summarizeVsquish = false;
+    bool summarizeNoLstretch = false;
     for (const auto& [k, v] : parsed.opts) {
       if (k == "meanonly" && (!v.isBool || v.boolValue)) {
         meanonly = true;
+        continue;
+      }
+      if ((k == "format" || k == "noformat") && v.isBool) {
+        summarizeFormat = k == "format";
+        continue;
+      }
+      // factor-variable display options (read by the fv branch below; baselevels and
+      // allbaselevels list every level, as summarize always does, bank d465147d8becd940).
+      // Abbreviations as the help gives them: noempty[cells], base[levels],
+      // allbase[levels], nofvlab[el].
+      auto abbrevOf = [&](const std::string& full, size_t minLen) {
+        return k.size() >= minLen && k.size() <= full.size() && full.compare(0, k.size(), k) == 0;
+      };
+      if (v.isBool && (k == "vsquish" || abbrevOf("nofvlabel", 7) || abbrevOf("noemptycells", 7) ||
+                       abbrevOf("baselevels", 4) || abbrevOf("allbaselevels", 7))) {
+        if (abbrevOf("nofvlabel", 7)) summarizeNoFvLabel = true;
+        if (abbrevOf("noemptycells", 7)) summarizeNoEmpty = true;
+        if (k == "vsquish") summarizeVsquish = true;
+        continue;
+      }
+      // fvwrap(#) lets a long level label take # lines and fvwrapon() says where it breaks;
+      // with one line (the default) nothing wraps and fvwrapon has nothing to do. More
+      // than one line is not drawn yet: an honest refusal rather than an ignored option.
+      if (k == "fvwrapon" && !v.isBool) continue;
+      if (k == "fvwrap" && !v.isBool) {
+        if (strutil::trim(v.strValue) == "1") continue;
+        blocks.push_back(ojson(eval::unsupportedOption(
+            "fvwrap(" + v.strValue + ")",
+            "summarize's fvwrap() with more than one line is not implemented in this version of "
+            "PIET.")));
+        return true;
+      }
+      // nolstretch keeps the variable column at its default width; that is what PIET
+      // draws whenever every name fits it (checked once the varlist is known, below).
+      if (k == "nolstretch" && v.isBool) {
+        summarizeNoLstretch = true;
         continue;
       }
       if (k == "detail" || k == "d") continue;
@@ -549,6 +687,202 @@ bool route_describe(std::string& cmd,
       blocks.push_back(
           ojson(eval::engineError("option `" + k + "` not allowed", "unsupported_option")));
       return true;
+    }
+    // Factor variables and time-series operators (`i.foreign`, `i.a#i.b`, `c.x#c.y`,
+    // `L(0/3).price`): fvexpand's terms, each a scratch column generate builds over the
+    // if/in sample -- a level's indicator (missing where its variable is), a product,
+    // an operated series -- summarized in order; the block's `fvrows` lays out Stata's
+    // stub (the variable header, then the level or operator rows, a blank row between
+    // terms unless vsquish; bank a44ddebb8a4abeae, 0e775ed86a0a27d0, 6820eb0441cc7001).
+    {
+      bool fvts = false;
+      for (const auto& t : parsed.varlist)
+        if (t.find('.') != std::string::npos || t.find('#') != std::string::npos) fvts = true;
+      if (fvts && parsed.weightType.has_value()) {
+        blocks.push_back(ojson(eval::unsupportedOption(
+            "[" + *parsed.weightType + "=" + parsed.weightVar.value_or("") + "]",
+            "a weight with factor variables or time-series operators in summarize's varlist is "
+            "not implemented in this version of PIET.")));
+        return true;
+      }
+      if (fvts && (detail || summarizeFormat)) {
+        // the fv layout below draws the five-column table only; detail's per-term
+        // tables and format's display formats are not laid out for these terms yet.
+        blocks.push_back(ojson(eval::unsupportedOption(
+            detail ? "detail" : "format",
+            "summarize's detail and format options with factor variables or time-series "
+            "operators in the varlist are not implemented in this version of PIET.")));
+        return true;
+      }
+      if (fvts) {
+        const bool vsquish = summarizeVsquish, nofvlabel = summarizeNoFvLabel,
+                   noempty = summarizeNoEmpty;
+        std::string spec;
+        for (const auto& t : parsed.varlist) spec += (spec.empty() ? "" : " ") + t;
+        std::string qual;
+        if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) qual += " if " + *parsed.ifExpr;
+        if (parsed.inRange.has_value() && !parsed.inRange->empty()) qual += " in " + *parsed.inRange;
+        // the levels are those of the if/in sample (bank 9a892ed6094d1008
+        // `summarize i.rep78 if foreign` lists 3, 4 and 5 only).
+        ojson fx = dispatch("quietly fvexpand " + spec + qual, session);
+        for (const auto& b : fx)
+          if (b.is_object() && b.value("type", std::string()) == "error") {
+            blocks.push_back(b);
+            return true;
+          }
+        const std::string* expanded = session.eval.rStrings.find("varlist");
+        std::vector<std::string> tokens;
+        if (expanded != nullptr) {
+          std::istringstream in(*expanded);
+          for (std::string w; in >> w;) tokens.push_back(w);
+        }
+        // fvexpand was only a helper: its r(varlist) and r(fvops)/r(tsops) are not
+        // summarize's results, which are its eight scalars alone (bank a44ddebb8a4abeae).
+        eval::replaceRClass(session.eval);
+        handlers::ScratchColumns scratch(session);
+        static const std::regex reAtom(R"(^(?:(\d+)[bno]*\.|c\.|([LFDSlfds][0-9LFDSlfds]*)\.)?([A-Za-z_]\w*)$)");
+        auto levelText = [&](const std::string& var, const std::string& lev) {
+          if (nofvlabel) return lev;
+          auto ln = session.varLblname.find(var);
+          if (ln == session.varLblname.end()) return lev;
+          auto defs = session.labelDefs.find(ln->second);
+          if (defs == session.labelDefs.end()) return lev;
+          auto hit = defs->second.find(lev);
+          return hit == defs->second.end() ? lev : hit->second;
+        };
+        auto opLabel = [](std::string op) {
+          if (op.empty()) return std::string("--.");
+          std::string out;
+          for (size_t i = 0; i < op.size();) {
+            const char c = static_cast<char>(std::toupper(static_cast<unsigned char>(op[i++])));
+            std::string n;
+            while (i < op.size() && std::isdigit(static_cast<unsigned char>(op[i]))) n += op[i++];
+            out += std::string(1, c) + (n.empty() ? "1" : n);
+          }
+          return out + ".";
+        };
+        struct Row { std::string group, stub, key; bool empty = false; };
+        std::vector<Row> rows;
+        std::vector<std::string> names;
+        for (const auto& tok : tokens) {
+          std::vector<std::string> atoms;
+          {
+            std::string cur;
+            for (char c : tok) {
+              if (c == '#') { atoms.push_back(cur); cur.clear(); } else cur += c;
+            }
+            atoms.push_back(cur);
+          }
+          std::string expr, group, stub;
+          bool factor = false, tsop = false, emptyCell = tok.find("o.") != std::string::npos;
+          for (const auto& a : atoms) {
+            std::smatch m;
+            if (!std::regex_match(a, m, reAtom)) {
+              blocks.push_back(ojson(eval::engineError("variable " + a + " not found")));
+              return true;
+            }
+            const std::string var = m.str(3);
+            std::string term;
+            if (m[1].matched) {
+              factor = true;
+              term = "cond(missing(" + var + "),.," + var + "==" + m.str(1) + ")";
+              group += (group.empty() ? "" : "#") + var;
+              stub += (stub.empty() ? "" : "#") + levelText(var, m.str(1));
+            } else if (m[2].matched) {
+              tsop = true;
+              term = m.str(2) + "." + var;
+              group = var;
+              stub = opLabel(m.str(2));
+            } else {
+              term = var;
+              const bool cpref = a.rfind("c.", 0) == 0;
+              group += (group.empty() ? "" : "#") + std::string(cpref ? "c." : "") + var;
+            }
+            expr += (expr.empty() ? "" : "*") + term;
+          }
+          if (!factor && !tsop) {
+            // a plain variable, or an interaction of continuous ones (one row, no stub)
+            if (atoms.size() == 1) group.clear();
+            stub.clear();
+          }
+          // L(0/3).price's L0 term reaches here as the bare variable inside its group.
+          std::string name;
+          if (auto failed = scratch.add(expr, qual, &name)) {
+            blocks.push_back(*failed);
+            return true;
+          }
+          Row r{group, stub, name, emptyCell};
+          rows.push_back(r);
+          names.push_back(name);
+        }
+        // An operated series' group takes in the bare variable listed just before it
+        // (`L(0/3).price` -> price, L.price, ...): Stata shows it as `--.` under price.
+        for (size_t i = 0; i + 1 < rows.size(); ++i)
+          if (rows[i].group.empty() && rows[i].stub.empty() && !rows[i + 1].stub.empty() &&
+              rows[i + 1].stub.back() == '.' && tokens[i] == rows[i + 1].group) {
+            rows[i].group = rows[i + 1].group;
+            rows[i].stub = "--.";
+          }
+        ojson sb = ojson(handlers::runSummarize(names, detail, session, std::nullopt, std::nullopt,
+                                                std::nullopt));
+        if (sb.value("type", std::string()) == "summarize" && sb.contains("stats")) {
+          ojson layout = ojson::array();
+          std::string lastGroup = "\x01";
+          for (size_t i = 0; i < rows.size(); ++i) {
+            const Row& r = rows[i];
+            const ojson* st = sb["stats"].contains(r.key) ? &sb["stats"][r.key] : nullptr;
+            // all observations 0 (an indicator no row of the sample sets); a cell with
+            // no nonmissing observation has null min / max and is not "(empty)".
+            const bool isEmpty = st != nullptr && st->contains("max") && (*st)["max"].is_number() &&
+                                 st->contains("min") && (*st)["min"].is_number() &&
+                                 (*st)["max"].get<double>() == 0.0 &&
+                                 (*st)["min"].get<double>() == 0.0 && !r.stub.empty() &&
+                                 r.stub.back() != '.';
+            if (noempty && isEmpty) continue;
+            if (r.group != lastGroup) {
+              if (i > 0 && !vsquish && (!r.group.empty() || !lastGroup.empty()))
+                layout.push_back(ojson{{"blank", true}});
+              if (!r.group.empty()) {
+                ojson h;
+                h["header"] = r.group;
+                // a group that is one continuous interaction carries its row on the header
+                if (r.stub.empty()) h["key"] = r.key;
+                layout.push_back(h);
+              }
+              lastGroup = r.group;
+              if (!r.group.empty() && r.stub.empty()) continue;  // carried on the header
+            }
+            ojson row;
+            row["stub"] = r.stub.empty() ? r.key : r.stub;
+            if (r.group.empty() && r.stub.empty()) {
+              // a plain variable: its own name
+              std::string tok = tokens[i];
+              row["stub"] = tok.rfind("c.", 0) == 0 ? tok.substr(2) : tok;
+              row["plain"] = true;
+            }
+            row["key"] = r.key;
+            if (isEmpty) row["empty"] = true;
+            layout.push_back(row);
+          }
+          sb["fvrows"] = layout;
+          if (summarizeNoLstretch)
+            for (const auto& l : layout) {
+              const std::string s = l.contains("header") ? l.value("header", std::string())
+                                                         : l.value("stub", std::string());
+              if (s.size() > 12) {
+                blocks.push_back(ojson(eval::unsupportedOption(
+                    "nolstretch",
+                    "summarize's nolstretch with a term or level label longer than 12 "
+                    "characters is not implemented in this version of PIET.")));
+                return true;
+              }
+            }
+        }
+        if (summarizeSeparator >= 0 && sb.value("type", "") != "error") sb["separator"] = summarizeSeparator;
+        captureSummarizeR(sb, meanonly, detail, session);
+        blocks.push_back(sb);
+        return true;
+      }
     }
     std::optional<std::vector<std::string>> vl;
     if (!parsed.varlist.empty()) vl = parsed.varlist;
@@ -589,6 +923,43 @@ bool route_describe(std::string& cmd,
     // asked, so every existing summarize fixture stays byte-identical.
     if (summarizeSeparator >= 0 && summBlock.value("type", "") != "error")
       summBlock["separator"] = summarizeSeparator;
+    // nolstretch: a name longer than the default 12-column stub would be abbreviated
+    // to fit it; that abbreviation is not drawn yet, so refuse rather than draw the
+    // stretched column the option asked to avoid.
+    if (summarizeNoLstretch && summBlock.value("type", "") == "summarize" &&
+        summBlock.contains("stats") && summBlock["stats"].is_object()) {
+      for (auto it = summBlock["stats"].begin(); it != summBlock["stats"].end(); ++it)
+        if (it.key().size() > 12) {
+          blocks.push_back(ojson(eval::unsupportedOption(
+              "nolstretch",
+              "summarize's nolstretch with a variable name longer than 12 characters is not "
+              "implemented in this version of PIET.")));
+          return true;
+        }
+    }
+    // `format`: each statistic in the variable's format as the summary table draws
+    // it (summarizeFormatted above); the renderer draws these strings
+    // (table-format.js formatSummarize).
+    if (summarizeFormat && summBlock.value("type", "") == "summarize" && summBlock.contains("stats") &&
+        summBlock["stats"].is_object()) {
+      if (Datastore* fds = session.datastore()) {
+        std::vector<std::string> names;
+        for (auto it = summBlock["stats"].begin(); it != summBlock["stats"].end(); ++it)
+          if (fds->has(it.key())) names.push_back(it.key());
+        const auto fmts = session.displayFormatMap(fds->formatCard(names));
+        ojson formatted = ojson::object();
+        for (const auto& [name, fmt] : fmts) {
+          const ojson& st = summBlock["stats"][name];
+          ojson f = ojson::object();
+          for (const char* key : {"mean", "sd", "min", "max"}) {
+            if (!st.contains(key) || !st[key].is_number()) continue;
+            f[key] = summarizeFormatted(st[key].get<double>(), fmt, std::string(key) == "sd");
+          }
+          formatted[name] = f;
+        }
+        summBlock["formatted"] = formatted;
+      }
+    }
     captureSummarizeR(summBlock, meanonly, detail, session);
     blocks.push_back(summBlock);
     return true;
@@ -712,6 +1083,24 @@ bool route_describe(std::string& cmd,
     bool listNoLabel = false;
     for (const auto& kv : parsed.opts)
       if (kv.first == "nolabel") listNoLabel = true;
+    if (cmd == "list" || cmd == "l") {
+      // Stata's listing layout (handlers::runListStata): the browse block keeps
+      // its rows and gains the `listing` the Results pane draws.
+      handlers::ListLayout lo;
+      if (auto bad = handlers::parseListLayout(parsed.opts, parsed.raw, &lo)) {
+        blocks.push_back(ojson(*bad));
+        return true;
+      }
+      std::vector<std::string> names;
+      if (!parsed.varlist.empty()) {
+        std::string spec;
+        for (const auto& t : parsed.varlist) spec += (spec.empty() ? "" : " ") + t;
+        auto lvr = piet::loops::expandVarlist(spec, session);
+        if (!lvr.isError) names = lvr.tokens;
+      }
+      blocks.push_back(ojson(handlers::runListStata(names, parsed, session, lo)));
+      return true;
+    }
     blocks.push_back(
         ojson(handlers::runList(vl, parsed.ifExpr, parsed.inRange, session, listNoLabel)));
     return true;
@@ -745,6 +1134,28 @@ bool route_describe(std::string& cmd,
     };
     handlers::LevelsofRequest req;
     req.vars = parsed.varlist;
+    // glevelsof's [+|-]varname: `-` sorts that variable descending (and,
+    // without nods, Stata warns that it read `-` as a sign).
+    std::vector<ojson> signNote;
+    if (gtools) {
+      bool anyMinus = false;
+      for (auto& v : req.vars) {
+        bool d = false;
+        if (v.size() > 1 && (v[0] == '-' || v[0] == '+')) {
+          d = v[0] == '-';
+          anyMinus = anyMinus || d;
+          v = v.substr(1);
+        }
+        req.desc.push_back(d);
+      }
+      if (anyMinus) {
+        ojson note;
+        note["type"] = "display";
+        note["text"] = "'-' interpreted as negative; use option -ds- to interpret as varlist\n"
+                       "(to suppress this warning, use option -nods-)";
+        signNote.push_back(note);
+      }
+    }
     req.ifExpr = parsed.ifExpr;
     req.inRange = parsed.inRange;
     req.gtools = gtools;
@@ -752,6 +1163,8 @@ bool route_describe(std::string& cmd,
     if (gtools) {
       known.insert("colseparate");
       known.insert("silent");
+      known.insert("numfmt");
+      known.insert("nolocalvar");
     }
     for (const auto& [k, v] : parsed.opts) {
       if (k == "local" && !v.isBool) req.localName = v.strValue;
@@ -761,12 +1174,15 @@ bool route_describe(std::string& cmd,
       if (gtools && k == "colseparate" && !v.isBool)
         req.colseparate = unquoteOpt(v.strValue);
       if (gtools && k == "silent" && v.isBool && v.boolValue) req.silent = true;
+      if (gtools && k == "numfmt" && !v.isBool) req.numfmt = unquoteOpt(v.strValue);
+      if (gtools && k == "nolocalvar") req.noLocalvar = true;
     }
     if (auto err = eval::rejectUnknownOptions(parsed.opts, known)) {
       blocks.push_back(ojson(*err));
       return true;
     }
     ojson lv = handlers::runLevelsofCommand(req, session);
+    for (auto& nb : signNote) blocks.push_back(std::move(nb));
     if (!(lv.is_object() && lv.value("silent", false))) blocks.push_back(std::move(lv));
     return true;
   }
@@ -836,6 +1252,132 @@ bool route_describe(std::string& cmd,
     return true;
   }
 
+
+  // `xttrans varname [if] [in] [, freq i(varname) t(varname)]` ([XT] xttab):
+  // the transition table of varname from one period of a panel to the next --
+  // within each panel (sorted by panel and time), the value at t against the
+  // value at t+1, over the pairs whose two rows are both in the sample -- drawn as
+  // `tabulate was is, row nofreq nokey` (freq keeps the frequencies), with both
+  // axes titled by the variable's label. r(n_trans) r(n_rows) r(n_cols) and the
+  // hidden r(N) r(r) r(c) (r(c) carries the row count, as xttrans posts it).
+  // The data are left as they were (vs-stata bank cae2f2caa4628b09,
+  // 31f2329215ef41aa, 089a02de5620b0d4).
+  if (cmd == "xttrans") {
+    if (auto err = eval::rejectUnknownOptions(parsed.opts, {"freq", "i", "t"}, {})) {
+      blocks.push_back(ojson(*err));
+      return true;
+    }
+    if (!session.hasData()) {
+      blocks.push_back(ojson(eval::noDataLoaded()));
+      return true;
+    }
+    auto refuse = [&](const std::string& msg, const char* rc) {
+      blocks.push_back(ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt,
+                                              std::nullopt, rc)));
+      return true;
+    };
+    if (parsed.varlist.empty()) return refuse("varname required", "r(100)");
+    if (parsed.varlist.size() > 1) return refuse("too many variables specified", "r(103)");
+    std::vector<std::string> one = parsed.varlist;
+    if (auto err = piet::loops::checkKnownVarlist(one, session)) {
+      blocks.push_back(*err);
+      return true;
+    }
+    const std::string var = one.front();
+    std::string ivar, tvar;
+    bool freq = false;
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "freq") freq = true;
+      if (k == "i" && !v.isBool) ivar = strutil::trim(v.strValue);
+      if (k == "t" && !v.isBool) tvar = strutil::trim(v.strValue);
+    }
+    if (ivar.empty() && session.panelvar.has_value()) ivar = *session.panelvar;
+    if (tvar.empty() && session.timevar.has_value()) tvar = *session.timevar;
+    if (ivar.empty()) return refuse("must specify panelvar; use xtset", "r(459)");
+    if (tvar.empty()) return refuse("must specify timevar; use xtset", "r(459)");
+    Datastore* xds = session.datastore();
+    if (xds == nullptr || xds->dtype(var) == "factor")
+      return refuse("string variables not allowed in varlist;\n" + var + " is a string variable",
+                    "r(109)");
+    std::string lbl;
+    {
+      auto it = session.varMeta.find(var);
+      if (it != session.varMeta.end() && it->second.label.has_value()) lbl = *it->second.label;
+      if (lbl.empty()) lbl = var;
+    }
+    std::string qual;
+    if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) qual += " if " + *parsed.ifExpr;
+    if (parsed.inRange.has_value() && !parsed.inRange->empty()) qual += " in " + *parsed.inRange;
+    const std::string u = "__xttrans_u", was = "__xttrans_was", is = "__xttrans_is";
+    // xttrans leaves the data, their sort order and any preserve of the caller as
+    // they were (it is a sortpreserve program with temporary variables and no
+    // preserve of its own). The working copy here is a snapshot one preserve level
+    // below the caller (BUG-922's level rule), so a user's `preserve` is neither
+    // r(621) nor consumed by the closing restore.
+    DoFileLevelGuard ownLevel(session);
+    for (const auto& b : dispatch("preserve", session))
+      if (b.is_object() && b.value("type", std::string()) == "error") {
+        blocks.push_back(b);
+        return true;
+      }
+    std::vector<std::string> steps = {
+        "quietly generate byte " + u + " = 0",
+        "quietly replace " + u + " = 1" + qual,
+        "quietly replace " + u + " = 0 if missing(" + var + ") | missing(" + ivar +
+            ") | missing(" + tvar + ")",
+        "quietly sort " + ivar + " " + tvar,
+        "quietly by " + ivar + ": generate float " + was + " = " + var + " if _n<_N",
+        "quietly by " + ivar + ": generate float " + is + " = " + var + "[_n+1] if _n<_N",
+        "quietly by " + ivar + ": replace " + u + " = 0 if " + u + "[_n+1]==0 & _n<_N",
+    };
+    ojson failure;
+    for (const auto& line : steps) {
+      ojson r = dispatch(line, session);
+      for (const auto& b : r)
+        if (b.is_object() && b.value("type", std::string()) == "error") failure = b;
+      if (!failure.is_null()) break;
+    }
+    ojson tab;
+    double rN = 0, rr = 0, rc = 0;
+    if (failure.is_null()) {
+      // `freq` keeps tabulate's default frequencies beside the row percentages.
+      ojson r = dispatch("tabulate " + was + " " + is + " if " + u + ", row" +
+                             (freq ? "" : " nofreq") + " nokey",
+                         session);
+      for (const auto& b : r) {
+        if (!b.is_object()) continue;
+        const std::string t = b.value("type", std::string());
+        if (t == "error") failure = b;
+        else if (t != "echo") tab = b;
+      }
+      if (const double* p = session.eval.rValues.find("N")) rN = *p;
+      if (const double* p = session.eval.rValues.find("r")) rr = *p;
+      if (const double* p = session.eval.rValues.find("c")) rc = *p;
+    }
+    // A failed restore of the snapshot is reported, never dropped.
+    for (const auto& b : dispatch("restore", session))
+      if (b.is_object() && b.value("type", std::string()) == "error" && failure.is_null())
+        failure = b;
+    if (!failure.is_null()) {
+      blocks.push_back(failure);
+      return true;
+    }
+    if (tab.is_object() && tab.contains("vars") && tab["vars"].is_array())
+      for (auto& v : tab["vars"]) v = lbl;
+    eval::replaceRClass(session.eval);
+    session.eval.rValues.set("N", rN);
+    session.eval.rValues.set("r", rr);
+    session.eval.rValues.set("c", rr);
+    session.eval.rValues.set("n_trans", rN);
+    session.eval.rValues.set("n_rows", rr);
+    session.eval.rValues.set("n_cols", rc);
+    session.eval.markRHidden("N");
+    session.eval.markRHidden("r");
+    session.eval.markRHidden("c");
+    eval::declareRPosted(session.eval, "xttrans", {"N", "r", "c", "n_trans", "n_rows", "n_cols"});
+    if (tab.is_object()) blocks.push_back(tab);
+    return true;
+  }
 
   if (cmd == "xttab") {
     // With the data xtset, Stata reads the varlist and the options before it looks

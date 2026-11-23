@@ -218,6 +218,11 @@ ojson handleProgramManage(const std::string& sub, const std::vector<std::string>
 // brief.
 bool handleReturnStmt(const std::string& rawLine, SessionState& session, ojson& outErrorBlock);
 
+// [P] return's subcommand words at their documented minimum abbreviations --
+// li:st, sca:lar, loc:al, mat:rix -- spelled out (lower-cased); any other word
+// comes back lower-cased as typed.
+std::string canonicalReturnSubcommand(const std::string& word);
+
 // Case-insensitive lookup; returns the canonical stored name or nullopt.
 std::optional<std::string> findProgram(const SessionState& session, const std::string& name);
 

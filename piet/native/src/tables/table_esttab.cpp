@@ -918,7 +918,8 @@ ojson esttabImpl(const ojson& esttabBlock, const std::string& path,
                             str("equations").has_value() || str("lastend").has_value() ||
                             str("topfile").has_value() ||
                             str("bottomfile").has_value();
-    if (cellsGiven || str("main").has_value() || str("aux").has_value() || writerOnly) {
+    if (cellsGiven || str("main").has_value() || str("aux").has_value() || writerOnly ||
+        esttabBlock.value("writer_selection", false)) {
       std::string body = text;
       while (!body.empty() && body.back() == '\n') body.pop_back();
       return displayBlock("\n" + body);

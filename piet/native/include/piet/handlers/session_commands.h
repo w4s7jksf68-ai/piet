@@ -144,6 +144,8 @@ nlohmann::ordered_json runDots(const eval::ParsedCommand& parsed, SessionState& 
 
 // `markout markvar [varlist] [, strok]`.
 nlohmann::ordered_json runMarkout(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runMark(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runMatname(const eval::ParsedCommand& parsed, SessionState& session);
 
 }  // namespace piet::handlers
 

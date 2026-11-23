@@ -435,6 +435,22 @@ ojson runFileCmd(const std::string& rawLine, SessionState& session) {
   const std::string sub = strutil::lower(sp == std::string::npos ? rest : rest.substr(0, sp));
   rest = (sp == std::string::npos) ? std::string() : trimc(rest.substr(sp));
 
+  // `file query` takes no arguments (`file query h1` is r(198) invalid syntax,
+  // vs-stata bank 6b121ef724517ca4) and with no file open prints nothing
+  // (f7255a5af6bf2973). Its listing of open handles is not drawn by this
+  // build, so with a handle open it stays a named refusal.
+  if (sub == "query") {
+    if (!rest.empty())
+      return ojson(eval::errorBlock("syntax_error", "invalid syntax", std::nullopt, std::nullopt,
+                                    std::nullopt, "r(198)"));
+    if (session.fileHandles.empty()) {
+      // r(N), the number of open files (0; f7255a5af6bf2973).
+      eval::replaceRClass(session.eval);
+      session.eval.rValues.set("N", 0.0);
+      eval::declareRPosted(session.eval, "file query", {"N"});
+      return ojson::array();
+    }
+  }
   // Refuse the unimplemented sub-verbs by NAME — never a generic "unknown".
   if (sub == "query" || sub == "sersetfile")
     return err("file " + sub + " is not implemented in this build "

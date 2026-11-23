@@ -1231,19 +1231,27 @@ void testBS097OptionNetAndBS018DoNostop() {
           "BS-097 hausman over-rejection guard: plain `hausman A B` (D5e oracle shape) still "
           "succeeds");
 
-    // BUG-105 secondary ⑤: `tconsistent()` is real Stata `hausman` syntax ([R]
+    // BUG-105 secondary ⑤: `syminv` is real Stata `hausman` syntax ([R]
     // hausman) this handler doesn't implement — distinct wording from the
     // `bogusopt` typo case just above, same "not allowed" code both ways.
     // (`alleqs`, the option this arm used to name, is served since stage-3 lane
-    // s3b_post: vs-stata bank b479e666 `hausman tsls tsls3, alleqs` rc 0.)
-    auto rejReal = piet::dispatch("hausman feHausBS097 reHausBS097, tconsistent(FixedFX)", session);
+    // s3b_post: vs-stata bank b479e666 `hausman tsls tsls3, alleqs` rc 0;
+    // `tconsistent()`, its successor here, since stage-4 lane s4_post: bank
+    // 30280271c2143616 `hausman fe re, tcon(FixedFX)` rc 0, the title drawn.)
+    {
+      auto served = piet::dispatch("hausman feHausBS097 reHausBS097, tconsistent(FixedFX)", session);
+      check(firstBlockOfType(served, "error").is_null() &&
+                firstBlockOfType(served, "estimation").value("b_title", std::string()) == "FixedFX",
+            "hausman tconsistent(): answered, the (b) column titled FixedFX (bank 30280271c2143616)");
+    }
+    auto rejReal = piet::dispatch("hausman feHausBS097 reHausBS097, syminv", session);
     auto realErr = firstBlockOfType(rejReal, "error");
     check(!realErr.is_null() &&
               realErr.value("code", std::string()) == "unsupported_option" &&
               realErr.value("message", std::string())
                       .find("is a valid Stata option that this version of PIET does not yet "
                             "implement") != std::string::npos,
-          "BUG-105 secondary ⑤: hausman's `tconsistent()` (a real Stata option this build doesn't "
+          "BUG-105 secondary ⑤: hausman's `syminv` (a real Stata option this build doesn't "
           "implement) is named as such, not lumped with a bogus typo");
   }
 

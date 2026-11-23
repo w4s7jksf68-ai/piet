@@ -427,14 +427,15 @@ void testBUG105UnsupportedCommandHonesty() {
           "BUG-105(1): unknown-token does not also claim the other two causes");
   }
 
-  // Arm 2 — kNotImplemented: `graph pie` IS valid Stata; PIET just lacks it.
+  // Arm 2 — kNotImplemented: `graph replay` IS valid Stata; PIET just lacks it.
   // Telling this user to check their spelling would be the same class of lie
   // the retired sentence told, pointed the other way. (graph-family AI-1:
-  // `graph bar`, the arm's first subject, is implemented now.)
+  // `graph bar`, the arm's first subject, is implemented now, and graph pie, its
+  // second, too: vs-stata bank be8eeae95146260d.)
   {
-    nlohmann::json b = errOf("graph pie beertax, over(state)");
+    nlohmann::json b = errOf("graph replay g1");
     check(b.value("code", std::string()) == "unsupported_command",
-          "BUG-105(1): `graph pie` is still an honest unsupported_command");
+          "BUG-105(1): `graph replay` is still an honest unsupported_command");
     check(says(b, kGapSig),
           "BUG-105(1): a known gap is named as unimplemented, not as a spelling problem");
     check(!says(b, kRetiredTail) && !says(b, kRetiredDoubt),
@@ -443,12 +444,15 @@ void testBUG105UnsupportedCommandHonesty() {
           "BUG-105(1): known-gap does not also claim the other two causes");
   }
 
-  // Arm 3 — kUnknownSubcommand: `label` is implemented, `nosuchsub` is not.
-  // "PIET has no entry under that name" would be false — it has `label`.
+  // Arm 3 — kUnknownSubcommand: `datasignature` is implemented, its `report`
+  // subcommand is not. "PIET has no entry under that name" would be false — it
+  // has `datasignature`. (Earlier subjects answer Stata's own refusal now:
+  // `label nosuchsub` is r(198) "invalid syntax" (vs-stata bank 43b4a61857d277c8)
+  // and an unknown `gstats` word is gtools' r(198) "Unknown stat" (stage 4).)
   {
-    nlohmann::json b = errOf("label nosuchsub beertax");
+    nlohmann::json b = errOf("datasignature report");
     check(b.value("code", std::string()) == "unsupported_command",
-          "BUG-105(1): an unknown `label` subcommand is still an honest unsupported_command");
+          "BUG-105(1): `datasignature report` is still an honest unsupported_command");
     check(says(b, kSubSig),
           "BUG-105(1): the subcommand arm says the head command IS implemented");
     check(!says(b, kRetiredTail) && !says(b, kRetiredDoubt),
@@ -526,9 +530,11 @@ void testBUG105InQualPrescan() {
           "BUG-105(2): a routed command that ALLOWS `in` still parses it (no regression)");
   }
   {
-    nlohmann::json b = errOf("tobit wage in 1/5");
+    // tobit takes `in` since vs-stata bank stage 4 (bank ffbb7112); nbreg's syntax
+    // takes `in` (nbreg.ado) and PIET's arm does not yet.
+    nlohmann::json b = errOf("nbreg wage in 1/5");
     check(b.value("code", std::string()) == "unsupported_option" && says(b, kInGapSig) &&
-              says(b, "tobit"),
+              says(b, "nbreg"),
           "BUG-105(2): a routed command that REJECTS `in` keeps its feature-gap message");
   }
   {
@@ -567,9 +573,9 @@ void testBUG105InQualPrescan() {
                 "`, not a PIET gap -- got: " + b.dump());
     }
     // ...while a form Stata ACCEPTS and PIET lacks keeps the honest gap.
-    nlohmann::json g = errOf("tobit wage in 1/5");
+    nlohmann::json g = errOf("nbreg wage in 1/5");  // tobit takes `in` now (bank ffbb7112)
     check(g.value("code", std::string()) == "unsupported_option" && says(g, kInGapSig),
-          "Stata-syntax step: `tobit ... in` (Stata takes `in`) stays a PIET gap");
+          "Stata-syntax step: `nbreg ... in` (Stata takes `in`) stays a PIET gap");
     // An operator token is refused only where Stata's varlist refuses it:
     // `keep i.foreign` is r(101), `summarize i.rep78` is not judged here.
     nlohmann::json k = errOf("keep i.foreign");

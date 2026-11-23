@@ -156,6 +156,10 @@ std::optional<ojson> parseNumlist(const std::string& text, std::vector<double>* 
     out->push_back(a);
     ++plainRun;
   }
+  // The ado hands each numlist to `capture numlist`, whose default cap is 2,500
+  // elements (`numlist "1/2500"` runs, `"1/3000"` is r(123)); any numlist failure
+  // is reported as this r(121) (bank 7ae98dcc31df7d1f: mv(0/5000)).
+  if (out->size() > 2500) return rcError(bad, 121);
   return std::nullopt;
 }
 
@@ -164,10 +168,11 @@ std::optional<ojson> parseNumlist(const std::string& text, std::vector<double>* 
 // mvbad r(121), mvbadcode r(198)). An extended-missing code (.a-.z) cannot be stored by this
 // build, which has one missing value, so that rule is refused by name.
 std::optional<ojson> parseMv(const std::string& spec, std::vector<double>* values,
-                             std::vector<double>* lastLhs) {
+                             std::vector<double>* lastLhs, std::vector<std::string>* codes) {
   if (spec.find_first_of("=\\") == std::string::npos) {
     if (auto e = parseNumlist(spec, values)) return e;
     *lastLhs = *values;
+    codes->assign(values->size(), ".");
     return std::nullopt;
   }
   std::vector<std::string> toks;
@@ -197,12 +202,8 @@ std::optional<ojson> parseMv(const std::string& spec, std::vector<double>* value
     const bool sysmiss = code == ".";
     const bool extended = code.size() == 2 && code[0] == '.' && code[1] >= 'a' && code[1] <= 'z';
     if (!sysmiss && !extended) return syntaxError(code + " is not a missing value code");
-    if (extended)
-      return ojson(eval::unsupportedOption(
-          "mv(" + spec + ")",
-          "mvdecode: the rule `= " + code + "' stores an extended missing value; this version "
-          "of PIET stores one missing value (.), so .a-.z cannot be kept apart. Use `= .`."));
     values->insert(values->end(), lhs.begin(), lhs.end());
+    codes->insert(codes->end(), lhs.size(), code);
     *lastLhs = lhs;
     const std::string sep = next();
     if (!sep.empty() && sep != "\\") return syntaxError(sep + " found, where \\ expected");
@@ -239,7 +240,10 @@ ojson runMvdecode(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   std::vector<double> values;
   std::vector<double> lastLhs;  // the numlist of the last rule: what r(numlist) holds
-  if (auto e = parseMv(*mv, &values, &lastLhs)) return *e;
+  std::vector<std::string> codes;  // the missing code each value becomes (. or .a-.z)
+  if (auto e = parseMv(*mv, &values, &lastLhs, &codes)) return *e;
+  const bool anyExtended =
+      std::any_of(codes.begin(), codes.end(), [](const std::string& c) { return c != "."; });
 
   // The ado's `capture numlist` is the last r-class command before the loop, and `count`
   // (inside the loop, once per numeric variable) replaces it: r(N) is the number of
@@ -274,6 +278,31 @@ ojson runMvdecode(const eval::ParsedCommand& parsed, SessionState& session) {
       lastMissing = static_cast<double>(nMiss);
     }
     if (changed == 0) continue;
+    if (anyExtended) {
+      // an extended code (.a-.z) is stored by replace, rule by rule in the order given
+      // (vs-stata bank a492838d4b819796 `mvdecode rep78, mv(1=.a \ 5=.b)`); a value
+      // already turned missing by an earlier rule is not matched again.
+      std::string qual;
+      if (parsed.ifExpr.has_value() && !strutil::trim(*parsed.ifExpr).empty())
+        qual += " & (" + *parsed.ifExpr + ")";
+      std::string inq;
+      if (parsed.inRange.has_value() && !strutil::trim(*parsed.inRange).empty())
+        inq = " in " + *parsed.inRange;
+      for (size_t r = 0; r < values.size(); ++r) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.17g", values[r]);
+        const std::string lit = isFloat ? "float(" + std::string(buf) + ")" : std::string(buf);
+        ojson res = dispatch("quietly replace " + v + " = " + codes[r] + " if " + v + " == " + lit +
+                                 qual + inq,
+                             session);
+        for (const auto& b : res)
+          if (b.is_object() && b.value("type", std::string()) == "error") return b;
+      }
+      if (std::find(rewritten.begin(), rewritten.end(), v) == rewritten.end()) rewritten.push_back(v);
+      text += rightAlign(abbrev12(v), 12) + ": " + std::to_string(changed) + " missing value" +
+              (changed > 1 ? "s" : "") + " generated\n";
+      continue;
+    }
     std::vector<std::string> cells;
     cells.reserve(col.size());
     for (double x : col) cells.push_back(numCell(x));

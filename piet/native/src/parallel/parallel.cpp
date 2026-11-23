@@ -459,6 +459,7 @@ ojson buildTaskSpec(const std::vector<std::string>& tasks, const SessionState& s
     ojson pd = ojson::object();
     pd["name"] = def.name.empty() ? name : def.name;
     pd["rclass"] = def.rclass;
+    pd["byable"] = def.byable;
     ojson body = ojson::array();
     for (const auto& l : def.body) body.push_back(l);
     pd["body"] = body;
@@ -616,6 +617,7 @@ int runParallelWorker(const std::string& specPath) {
       def.name = pd.value("name", std::string());
       if (def.name.empty()) continue;
       def.rclass = pd.value("rclass", false);
+      def.byable = pd.value("byable", std::string());
       for (const auto& l : pd.value("body", ojson::array()))
         if (l.is_string()) def.body.push_back(l.get<std::string>());
       session.programs[def.name] = def;

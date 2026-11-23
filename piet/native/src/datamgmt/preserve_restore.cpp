@@ -45,6 +45,7 @@
 
 #include "engine/command_support.h"
 #include "estimation/estimation_options.h"
+#include "piet/handlers/data_combine.h"  // runWithFrameCurrent: the unwinder restores another frame's copy
 #include "piet/handlers/session_commands.h"
 
 namespace piet::handlers {
@@ -175,6 +176,7 @@ std::optional<ojson> pushPreserveSnapshot(SessionState& session, int level) {
   frame.characteristics = session.characteristics;
   frame.changed = session.datasetChanged;
   frame.level = level;
+  frame.frameName = session.currentFrame;
   session.preserveStack.push_back(std::move(frame));
   return std::nullopt;
 }
@@ -250,13 +252,14 @@ ojson runPreserve(SessionState& session) {
 }
 
 namespace command_detail {
-// BUG-922: restore (and with `rearm` re-arm) the top preserved copy, whoever
-// owns it. Two callers only: runRestore, after its reach test, and the
-// unwinder program::restorePreservesDeeperThan below, which restores the
-// copies of a level that has already concluded.
-ojson restoreTopFrame(SessionState& session, bool rearm) {
-  PreserveFrame frame = std::move(session.preserveStack.back());
-  session.preserveStack.pop_back();
+// BUG-922: restore (and with `rearm` re-arm) the preserved copy at `idx`,
+// whoever owns it, into the current frame (which must be the copy's frame).
+// Two callers only: runRestore, after its reach test, and the unwinder
+// program::restorePreservesDeeperThan below, which restores the copies of a
+// level that has already concluded.
+ojson restoreFrameAt(SessionState& session, size_t idx, bool rearm) {
+  PreserveFrame frame = std::move(session.preserveStack[idx]);
+  session.preserveStack.erase(session.preserveStack.begin() + static_cast<std::ptrdiff_t>(idx));
   if (piet::SessionState::scratchTraceOn()) {
     std::error_code tec;
     piet::SessionState::scratchTrace(
@@ -358,7 +361,8 @@ ojson restoreTopFrame(SessionState& session, bool rearm) {
 }  // namespace
 
 ojson runRestore(SessionState& session, bool rearm) {
-  if (!session.ownPreserveFrame()) {
+  std::optional<size_t> own = session.ownPreserveIndex();
+  if (!own.has_value()) {
     // B5-D14 (BUG-454, measured B5REC|restore|preserve_nopreserve|622|,
     // tests/eval/golden/aer_b4/b5_misc_pins.log:90-91): `restore, preserve`
     // on an EMPTY stack is r(622), not the generic "1". BUG-922: so is bare
@@ -372,10 +376,15 @@ ojson runRestore(SessionState& session, bool rearm) {
     // where it is (oracle w2ad_prog_preserve_nest pn_d_restore_caller,
     // pn_p_restore_caller, pn_d_rp_caller, pn_r_rp_caller, pn_p_rp_caller:
     // in1 622:4:30, then the caller's own restore brings its copy back).
+    //
+    // And so is a restore in a frame that has no copy of its own, while
+    // another frame holds one: Stata keeps one preserve per frame ([D] frames
+    // intro, "preserve and restore"), so the other frame's copy is neither
+    // loaded here nor consumed.
     return engineErrorBlockRc(
         "restore: no previous preserve — use `preserve` before `restore`", 622);
   }
-  return restoreTopFrame(session, rearm);
+  return restoreFrameAt(session, *own, rearm);
 }
 
 }  // namespace piet::handlers
@@ -387,7 +396,23 @@ namespace piet::program {
 // now running: the level that owned them has concluded.
 void restorePreservesDeeperThan(int callerLevel, SessionState& session, ojson& blocks) {
   while (!session.preserveStack.empty() && session.preserveStack.back().level > callerLevel) {
-    ojson rb = handlers::restoreTopFrame(session, false);
+    const size_t idx = session.preserveStack.size() - 1;
+    const std::string owner = session.preserveStack[idx].frameName;
+    ojson rb;
+    if (owner == session.currentFrame) {
+      rb = handlers::restoreFrameAt(session, idx, false);
+    } else if (session.frames.count(owner) != 0) {
+      // A copy of another frame goes back into THAT frame: Stata restores
+      // each frame's preserve when the program concludes, whatever frame is
+      // current then.
+      rb = handlers::runWithFrameCurrent(owner, session, [&session, idx]() {
+        return handlers::restoreFrameAt(session, idx, false);
+      });
+    } else {
+      // The frame is gone (dropped or reset): nothing to restore into.
+      session.preserveStack.pop_back();
+      continue;
+    }
     if (rb.is_object() && rb.value("type", std::string()) == "error") {
       blocks.push_back(std::move(rb));
       break;

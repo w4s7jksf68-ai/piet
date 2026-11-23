@@ -199,17 +199,29 @@ bool SessionState::residentRestore(const std::string& stashName,
   return true;
 }
 
-void SessionState::discardTopPreserve() {
-  if (preserveStack.empty()) return;
-  const PreserveFrame& top = preserveStack.back();
-  if (!top.stashName.empty() && cobraSession_ && cobraSession_->hasWorker())
-    (void)cobraSession_->frameStashDrop(top.stashName);
-  preserveStack.pop_back();
+void SessionState::discardOwnPreserve() {
+  std::optional<size_t> idx = ownPreserveIndex();
+  if (!idx.has_value()) return;
+  const PreserveFrame& own = preserveStack[*idx];
+  if (!own.stashName.empty() && cobraSession_ && cobraSession_->hasWorker())
+    (void)cobraSession_->frameStashDrop(own.stashName);
+  preserveStack.erase(preserveStack.begin() + static_cast<std::ptrdiff_t>(*idx));
+}
+
+std::optional<size_t> SessionState::ownPreserveIndex() const {
+  // The newest copy of the current frame decides: a deeper level that has not
+  // preserved this frame leaves its caller's copy out of reach (BUG-922).
+  for (size_t i = preserveStack.size(); i-- > 0;) {
+    if (preserveStack[i].frameName != currentFrame) continue;
+    if (preserveStack[i].level != preserveLevel()) return std::nullopt;
+    return i;
+  }
+  return std::nullopt;
 }
 
 const PreserveFrame* SessionState::ownPreserveFrame() const {
-  if (preserveStack.empty() || preserveStack.back().level != preserveLevel()) return nullptr;
-  return &preserveStack.back();
+  std::optional<size_t> idx = ownPreserveIndex();
+  return idx.has_value() ? &preserveStack[*idx] : nullptr;
 }
 
 bool SessionState::residentSaveVirtual(const std::string& path) {

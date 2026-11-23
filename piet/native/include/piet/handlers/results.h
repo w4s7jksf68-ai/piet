@@ -57,7 +57,7 @@ std::string matrixNameAsListed(const std::string& name);
 // `return list` prints what `ereturn list` prints, from the other store, so it
 // reuses that handler's formatter rather than growing a second one that can
 // drift from it (results/scalar_results.cpp::runEreturnList).
-nlohmann::ordered_json runReturnList(SessionState& session);
+nlohmann::ordered_json runReturnList(SessionState& session, bool all = false);
 // `sreturn list`: the s() macros (`sreturn local` in an sclass program),
 // newest first under a `macros:` header; nothing at all when s() is empty
 // (StataBE 19.5: an empty array, no block). `sreturn clear` empties s().

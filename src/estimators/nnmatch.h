@@ -53,4 +53,31 @@ NnmatchResult nnmatch_fit(const double* y, const double* t,
                           const std::vector<const double*>& fvcols,
                           const std::vector<char>& keep, const NnmatchOpts& o);
 
+// ---- teffects ra: regression adjustment with a linear outcome model ---------
+// One OLS outcome model per treatment level; the potential-outcome means are
+// the sample (ATE, POmeans) or treated-group (ATET) averages of each model's
+// prediction. V is the robust sandwich A^-1 B A^-T of the stacked estimating
+// equations (POM rows and the OLS normal equations), B weighted by fw/iw
+// (w) or pw (w^2); no small-sample factor.
+struct TeRaOpts {
+    int stat = 0;              // 0 ate, 1 atet, 2 pomeans
+    bool hasControl = false, hasTreated = false;
+    double control = 0, treated = 0;
+    std::string wtype;         // "", fw, iw, pw
+    bool tvarHasNegative = false;  // a negative treatment value anywhere in the data
+};
+struct TeRaResult {
+    std::vector<std::string> names;   // e(b) stripe, eq:name
+    std::vector<double> b, V;         // V row-major
+    std::vector<double> levels, counts;
+    double N = 0, control = 0, treated = 0;
+    std::vector<char> sample;         // per input row
+};
+// xcols: the outcome-model columns (a factor's every level, base first), xnames
+// their e(b) names; keep: the candidate rows (if/in); w: empty or weights.
+TeRaResult teffects_ra_fit(const double* y, const double* t, const std::vector<std::string>& xnames,
+                           const std::vector<std::vector<double>>& xcols, const std::vector<double>& w,
+                           const std::vector<char>& keep, int64_t n, const std::string& tvar,
+                           const TeRaOpts& o);
+
 }  // namespace cecon

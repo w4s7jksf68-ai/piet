@@ -1460,7 +1460,12 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut, E
                 }
               } else {
                 const EoV x = eoElemValue(em, key, el.name);
-                if (x.kind == EoV::kVacant) {
+                // A `.z` in an added e() matrix (estadd summ / vif / beta leave it for _cons and
+                // the columns they cannot compute) is an empty cell, as estout draws it (bank
+                // 2cd4ffdf: the _cons row of `cells("mean sd")` is blank); another missing value
+                // prints as `.`.
+                const bool dotZ = x.kind == EoV::kNum && x.v == eval::stataMissingWithKind(26);
+                if (x.kind == EoV::kVacant || dotZ) {
                   v = el.vacant;
                 } else if (el.name == "_star") {
                   v = starAllowed(key) ? eoStars(starlevels, pValue(em, key, el)) : std::string();
@@ -1472,7 +1477,7 @@ bool eoRender(const EoSpec& sp, std::string* out, EoError* err, int* ccolsOut, E
                   err->rc = 198;
                   return false;
                 } else {
-                  double num = x.kind == EoV::kNum ? x.v : kEoNaN;
+                  double num = x.kind == EoV::kNum && x.v < 8.98846567431158e307 ? x.v : kEoNaN;
                   if (el.abs && (el.name == "t" || el.name == "z") && !std::isnan(num)) num = std::fabs(num);
                   if (!eoVFormat(num, fmtFor(el, fr), sp.lz,
                                  el.hasPar ? el.par : std::vector<std::string>{}, &v, sp.dmarker, sp.msign)) {

@@ -1775,7 +1775,13 @@ ojson runIvRegress(const std::string& method, const eval::ParsedCommand& parsed,
       ivNoConstant = true;
       continue;
     }
-    if (k == "level" && !v.isBool && stataCmd == "ivregress") {
+    // ivreg2 and ivreghdfe draw their table at level(#) the same way (bank 749ad38b
+    // ivreg2 `l(90)`: z, [90% conf. interval]; d5726474 ivreghdfe absorb() `l(90)`: t);
+    // xtivreg2 accepts level(#) and still draws 95% limits (bank 7d7de3e0 `fe l(90)`
+    // prints [95% conf. interval] -1.40... 26.69...), so its table is left at 95.
+    if (k == "level" && !v.isBool &&
+        (stataCmd == "ivregress" || stataCmd == "ivreg2" || stataCmd == "ivreghdfe" ||
+         stataCmd == "xtivreg2")) {
       // ivregress / ivreg: the interval at level(#) is b -/+ crit*se on the fit's own
       // reference (z, or t(e(df_r)) under small / ivreg), set on the table below;
       // nothing else in the fit depends on it (bank 918bc860 `level(90)`, 019b7896
@@ -1785,7 +1791,7 @@ ojson runIvRegress(const std::string& method, const eval::ParsedCommand& parsed,
       const double lv = std::strtod(t.c_str(), &end);
       if (t.empty() || end == nullptr || *end != '\0' || !(lv >= 10.0 && lv <= 99.99))
         return stataRefusalM4b("level() must be between 10 and 99.99 inclusive", 198);
-      ivLevel = lv;
+      if (stataCmd != "xtivreg2") ivLevel = lv;
       continue;
     }
     if (k == "level" && !v.isBool) {
@@ -2037,12 +2043,31 @@ ojson runIvRegress(const std::string& method, const eval::ParsedCommand& parsed,
   // block's reference distribution (t(df_r) when the block carries a df_r, z otherwise).
   if (ivLevel.has_value() && block.contains("coeftable") && block["coeftable"].is_array()) {
     const double alpha = 1.0 - *ivLevel / 100.0;
-    const bool tRef = block.contains("df_r") && block["df_r"].is_number() &&
-                      block["df_r"].get<double>() > 0 && !isLiml;
-    const bool tRefLiml = isLiml && (smallDefault || forceSmall) && block.contains("df_r") &&
-                          block["df_r"].is_number() && block["df_r"].get<double>() > 0;
-    const double crit = (tRef || tRefLiml) ? cecon::t_critical(alpha, block["df_r"].get<double>())
-                                           : cecon::z_critical(alpha);
+    const bool hasDfR = block.contains("df_r") && block["df_r"].is_number() &&
+                        block["df_r"].get<double>() > 0;
+    const bool tRef = hasDfR && !isLiml;
+    const bool tRefLiml = isLiml && (smallDefault || forceSmall) && hasDfR;
+    // ivreg2 / ivreghdfe: t(e(df_r)) only for a small-sample fit (ivreghdfe's absorb()
+    // default included), z otherwise
+    // (ivreghdfe with absorb() reports t(e(df_r)): bank d5726474 `absorb(rep78) l(90)`
+    // ll -84.71809 = b - invttail(62, .05) * se)
+    double dfR = hasDfR ? block["df_r"].get<double>() : 0.0;
+    // ivreg2 and ivreghdfe: their e(df_r) is posted with the e() contract further
+    // down, so the block has none here; read it off the reply as that contract forms
+    // it (ivreg2 small: N - K, or the cluster count less one under cluster()).
+    if ((stataCmd == "ivreghdfe" || stataCmd == "ivreg2") && !hasDfR) {
+      const bool ivreg2Cluster = stataCmd == "ivreg2" &&
+                                 raw.value("vcov_type", std::string()).rfind("cluster", 0) == 0;
+      if (raw.contains("df_r") && raw["df_r"].is_number()) dfR = raw["df_r"].get<double>();
+      else if (ivreg2Cluster && raw.contains("n_clusters") && raw["n_clusters"].is_number())
+        dfR = raw["n_clusters"].get<double>() - 1.0;
+      else if (raw.contains("dof_resid") && raw["dof_resid"].is_number())
+        dfR = raw["dof_resid"].get<double>();
+    }
+    const bool useT = stataCmd == "ivreg2"      ? (smallDefault || forceSmall) && dfR > 0
+                      : stataCmd == "ivreghdfe" ? (sawAbsorb || smallDefault || forceSmall) && dfR > 0
+                                                : (tRef || tRefLiml);
+    const double crit = useT ? cecon::t_critical(alpha, dfR) : cecon::z_critical(alpha);
     for (auto& row : block["coeftable"]) {
       if (!row.is_object() || !row.contains("b") || !row["b"].is_number() || !row.contains("se") ||
           !row["se"].is_number() || !(row["se"].get<double>() > 0))
@@ -2051,6 +2076,7 @@ ojson runIvRegress(const std::string& method, const eval::ParsedCommand& parsed,
       row["ci_lo"] = b - crit * se;
       row["ci_hi"] = b + crit * se;
     }
+    block["level"] = *ivLevel;  // the table's interval header (estimation-format.js)
   }
   // The LIML reply carries its residual dof whatever `small` says; without `small` the
   // fit is large-sample (z, no e(df_r): erased from the cached reply below), so the
@@ -3069,7 +3095,7 @@ ojson runIvMl(const std::string& cobraCmd, const eval::ParsedCommand& parsed,
   pushLevelIfGivenM4(parsed, argv);
   argv.push_back("--emit-v");
   ojson raw;
-  ojson block = runP7Mle(cobraCmd, argv, session, &raw);
+  ojson block = runP7Mle(cobraCmd, argv, session, &raw, /*recordSample=*/true);
   if (block.value("type", std::string()) == "error") return block;
   if (!postNamedMleFitM4b(session, raw))
     return engineErrorBlockM4("the IV-ML fit returned an incomplete parameter covariance");

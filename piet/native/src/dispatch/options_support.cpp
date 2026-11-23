@@ -145,7 +145,7 @@ const piet::eval::OptVocab& kVocabAppend = piet::eval::registerOptVocab(
      {}});
 
 const piet::eval::OptVocab& kVocabFramePut = piet::eval::registerOptVocab(
-    {"frame"}, {{"into"},
+    {"frame"}, {{"into", "replace", "frames"},
      {}});
 
 const piet::eval::OptVocab& kVocabFrlink = piet::eval::registerOptVocab(
@@ -153,7 +153,7 @@ const piet::eval::OptVocab& kVocabFrlink = piet::eval::registerOptVocab(
      {}});
 
 const piet::eval::OptVocab& kVocabFrget = piet::eval::registerOptVocab(
-    {"frget"}, {{"from"},
+    {"frget"}, {{"from", "prefix", "suffix", "exclude"},
      {}});
 
 // B4-W3b: `force` joins the KNOWN set. In Stata it is an ACKNOWLEDGEMENT, not
@@ -186,8 +186,10 @@ const piet::eval::OptVocab& kVocabLevelsof = piet::eval::registerOptVocab(
      {}});
 
 const piet::eval::OptVocab& kVocabWinsor2 = piet::eval::registerOptVocab(
-    {"winsor2"}, {{"cuts", "suffix", "by", "trim", "replace"},
-     {}});
+    {"winsor2"}, {{"cuts", "suffix", "by", "trim", "replace", "label"},
+     {},
+     // winsor2.ado's `Label`: `l` .. `labe` are label (vs-stata bank 352a386f569e145d).
+     {{"l", "label"}}});
 
 // B4-W3b: `generate(stub)` (13 corpus uses) joins the KNOWN set — it now
 // creates the level dummies rather than answering r(198).
@@ -201,13 +203,8 @@ const piet::eval::OptVocab& kVocabWinsor2 = piet::eval::registerOptVocab(
 // `sort` is the one with an observable, cheap, IN-SCOPE effect (row order in
 // the JSON `table.rows` this file already builds), so it is genuinely
 // implemented — see runTabulate/tabulateOne's `sortByFreq` param.
-// `cell`/`col`/`row` (percentage lines) and `nofreq` (suppress the frequency
-// line) are accepted as VALIDATED NO-OPS, deliberately: this backend never
-// invents percentage-line formatting to pin against an oracle cell that does
-// not exist, and there is no renderer here (or byte-pin) for this lane to
-// wire one into anyway. The rendered output under these four options is
-// UNMEASURED and this build does NOT claim Stata parity for that layout —
-// only rc and the option vocabulary are.
+// On two-way tables the route sends the requested frequency and percentage
+// lines to the renderer. The stored counts and margins supply the denominators.
 // W1a-1 (2026-09-14): `nolabel` and `nokey` join the KNOWN set. Both are rc 0
 // in StataBE 19.5 at the full spelling (tests/eval/golden/aer_w1/
 // w1a_optmin_pins3.log), and their ABSENCE is what BUG-485 was made of: with
@@ -215,8 +212,7 @@ const piet::eval::OptVocab& kVocabWinsor2 = piet::eval::registerOptVocab(
 // ([R] tabulate oneway: "display numeric codes rather than value labels",
 // minimum `nol` -- measured `n`/`no` r(198), `nol` rc 0) is IMPLEMENTED: the
 // arm below skips the BUG-355 value-label substitution. `nokey` (the two-way
-// key line printed above cell/col/row percentages) is a validated no-op for
-// the same reason cell/col/row are: this build draws no key to suppress.
+// key printed above cell/col/row percentages) suppresses that key.
 // BUG-1514: the two-way statistics lrchi2, V (keys arrive lower-cased: `v`), gamma
 // and taub, and `all` (= chi2 lrchi2 V gamma taub), are implemented (runTabulate's
 // twoWayStats). `column` is the full name of `col` (StataBE 19.5 `tabulate c d,
@@ -228,21 +224,27 @@ const piet::eval::OptVocab& kVocabWinsor2 = piet::eval::registerOptVocab(
 // `exp` is expected). `nolog`, the FEXACT enumeration log's switch, is allowed
 // only with it (`tabulate c d, chi2 nolog` r(198)); `nol` stays nolabel through
 // the measured minimums table. The cell-content options cchi2, clrchi2 and
-// expected are real options this build does not compute, refused by name.
+// expected are two-way cell lines the renderer draws from the counts, and `plot` the one-way
+// bar column (route_tabulation.cpp).
 const piet::eval::OptVocab& kVocabTabulate = piet::eval::registerOptVocab(
     {"tabulate", "tab", "ta", "tab1", "tab2"},
     {{"chi2", "sum", "summarize", "missing", "generate", "sort", "cell", "col", "row", "nofreq",
       "nolabel", "nokey", "matcell", "matrow", "matcol", "lrchi2", "v", "gamma", "taub", "all",
       "wrap", "exact", "nolog", "firstonly", "nomeans",
-      "nostandard", "noobs", "means", "standard", "freq", "obs", "subpop"},
-     {"cchi2", "clrchi2", "expected", "plot"},
+      "nostandard", "noobs", "means", "standard", "freq", "obs", "subpop", "cchi2", "clrchi2",
+      "expected", "plot"},
+     {},
      {{"column", "col"}, {"colu", "col"}, {"colum", "col"}, {"ex", "exact"}}});
 
 const piet::eval::OptVocab& kVocabTable = piet::eval::registerOptVocab(
     {"table"}, {{"statistic", "stat", "contents", "missing", "nototals", "totals", "listwise",
                  "zerocounts",
                  // pre-17 `contents()` form only (`row` the Total row, `column` the Total column)
-                 "row", "column"},
+                 "row", "column",
+                 // name(cname) [replace] only name the collection the results go to; the table
+                 // printed is the same (bank e7b585ab `table foreign, statistic(mean price)
+                 // name(tbl1)`); `collect` itself is not served, so the name is never read back
+                 "name", "replace"},
      // title, note, nformat, sformat, notestyles and cidelimiter only change how the table is
      // printed and showcounts adds sample-size rows: no renderer draws a `table` result, so they are
      // refused by name rather than accepted and dropped
@@ -332,15 +334,18 @@ const piet::eval::OptVocab& kVocabCodebook = piet::eval::registerOptVocab(
 // never abbreviates, so `fullnames` is satisfied by construction. Measured
 // B4REC|describe|fullname|0| (tests/eval/golden/aer_b4/pins_oracle_r.log:
 // 130-131) and the in-tree StataBE rendered table at tests/eval/golden/
-// f16_tw_transport_oracle.log:43,85 (`describe, fullnames`). short/simple/
-// numbers/detail stay unimplemented -- those DO change what prints.
+// f16_tw_transport_oracle.log:43,85 (`describe, fullnames`). numbers and
+// detail (vs-stata bank b9b558d38f02e76a, ab0016c3297af6a4) are drawn by
+// table-format.js formatDescribe: the variable-number column and the
+// Observations/Variables/Width header.
 // short/simple/varlist/replace/clear (aer_w2 w2b_dataio log:162-238): short
 // prints the header and posts r(N) r(k) r(changed); simple lists the names;
 // varlist posts r(varlist) and r(sortlist); replace [clear] makes the
 // description the dataset.
 const piet::eval::OptVocab& kVocabDescribe = piet::eval::registerOptVocab(
-    {"describe"}, {{"fullnames", "short", "simple", "varlist", "replace", "clear"},
-     {"numbers", "detail"}});
+    {"describe"}, {{"fullnames", "short", "simple", "varlist", "replace", "clear", "numbers",
+      "detail"},
+     {}});
 
 // rename's 1:1 and wildcard forms read no option at all and Stata's own 1:1
 // form has none either (dispatcher.cpp's rename arm). Registering the EMPTY
@@ -366,7 +371,15 @@ const piet::eval::OptVocab& kVocabReplace = piet::eval::registerOptVocab(
      {}});
 
 const piet::eval::OptVocab& kVocabNlGmm = piet::eval::registerOptVocab(
-    {"nl", "gmm"}, {{"instruments", "onestep", "vce", "vcov", "robust", "cluster", "level"},
+    {"nl"}, {{"instruments", "onestep", "vce", "vcov", "robust", "cluster", "level"},
+     {}});
+
+// gmm's interactive syntax (gmm.sthlp). `robust`, `cluster()` and `vcov()` are not
+// options of the interactive version (bank 3e172cb0 "robust not allowed with
+// interactive version", 754172e1 vcov(), r(198)).
+const piet::eval::OptVocab& kVocabGmm = piet::eval::registerOptVocab(
+    {"gmm"}, {{"instruments", "onestep", "twostep", "igmm", "winitial", "wmatrix", "vce", "level",
+               "nolog", "log"},
      {}});
 
 const piet::eval::OptVocab& kVocabMixed = piet::eval::registerOptVocab(
@@ -410,27 +423,35 @@ std::unordered_set<std::string> p7MlUnwired(std::initializer_list<const char*> m
   for (const char* m : more) s.insert(m);
   return s;
 }
+// The same set less the options a handler now reads (runOrdered / runMlogit
+// fit constraints(): vs-stata bank eae58c67, 908e6dce).
+std::unordered_set<std::string> p7MlUnwiredBut(std::initializer_list<const char*> more,
+                                               std::initializer_list<const char*> wired) {
+  std::unordered_set<std::string> s = p7MlUnwired(more);
+  for (const char* w : wired) s.erase(w);
+  return s;
+}
 }  // namespace
 const piet::eval::OptVocab& kVocabOlogit = piet::eval::registerOptVocab(
     // offset(): runOrdered forwards it (vs-stata bank 13941585).
     {"ologit"}, {{"vce", "vcov", "robust", "cluster", "level", "nolog", "log", "iterate", "or",
-      "offset"},
-     p7MlUnwired({"nowarning", "doopt"})});
+      "offset", "constraints"},
+     p7MlUnwiredBut({"nowarning", "doopt"}, {"constraints"})});
 const piet::eval::OptVocab& kVocabOprobit = piet::eval::registerOptVocab(
     {"oprobit"}, {{"vce", "vcov", "robust", "cluster", "level", "nolog", "log", "iterate",
-      "offset"},
-     p7MlUnwired({"nowarning", "doopt"})});
+      "offset", "constraints"},
+     p7MlUnwiredBut({"nowarning", "doopt"}, {"constraints"})});
 const piet::eval::OptVocab& kVocabMlogit = piet::eval::registerOptVocab(
     {"mlogit"}, {{"vce", "vcov", "robust", "cluster", "level", "nolog", "log", "baseoutcome",
-      "base", "rrr", "iterate"},
-     p7MlUnwired({"noconstant", "nowarning", "doopt"})});
+      "base", "rrr", "iterate", "constraints"},
+     p7MlUnwiredBut({"noconstant", "nowarning", "doopt"}, {"constraints"})});
 const piet::eval::OptVocab& kVocabStreg = piet::eval::registerOptVocab(
     // noshow: streg's whole effect is to leave out the st settings header
     // ("Failure _d: ..."), which PIET's streg output never prints, so the fit and
     // its table are exactly Stata's `noshow` output.
     {"streg"}, {{"distribution", "dist", "d", "nohr", "vce", "vcov", "robust", "cluster", "level",
-      "nolog", "log", "noshow"},
-     p7MlUnwired({"time", "tratio", "frailty", "shared", "ancillary", "anc2", "strata",
+      "nolog", "log", "noshow", "time", "ancillary"},
+     p7MlUnwired({"tratio", "frailty", "shared", "anc2", "strata",
                   "offset", "noconstant", "iterate", "nolrtest", "cmd", "forceshared",
                   "sttewt"})});
 
@@ -481,12 +502,26 @@ const piet::eval::OptVocab& kVocabRecode = piet::eval::registerOptVocab(
 // the corpus spelling is `abbreviate(40)` -- "do not shorten" -- which is what
 // the grid already does. A # smaller than a name would shorten Stata's header
 // and not ours; that layout is UNMEASURED and this build does not claim it.
+// vs-stata stage 4 (2026-11-22): every layout option of [D] list is served --
+// runListStata attaches the `listing` object the frontend's list-format.js
+// draws as Stata's table/display layout. The one-letter abbreviations are the
+// help file's (c:ompress, d:isplay, t:able, h:eader) and `co`/`di`/`ab` mean
+// compress/display/abbreviate in Stata, not constant/divider/absolute (bank
+// 3aeb1bb3e87c35ec `co`, ab4497bdf842f6f6 `di`). `N` is case-sensitive and the
+// net sees it lower-cased: parseListLayout checks the spelling typed.
+// sepbyexp() is not served.
 const piet::eval::OptVocab& kVocabList = piet::eval::registerOptVocab(
-    {"list"}, {{"noobs", "clean", "separator", "abbreviate", "nolabel"},
-     {"mean", "sum", "noheader", "sepby", "divider",
-      "table", "display", "nocompress", "compress", "fast", "header", "notrim", "nodotz",
-      "absolute", "subvarname"},
-     {{"sep", "separator"}}});
+    {"list"}, {{"noobs", "clean", "separator", "abbreviate", "nolabel",
+                "mean", "sum", "noheader", "sepby", "divider",
+                "table", "display", "nocompress", "compress", "fast", "header", "notrim", "nodotz",
+                "absolute", "subvarname", "string", "linesize", "labvar", "constant", "n",
+                "relative", "ds", "fvall", "footer"},
+     {"sepbyexp"},
+     {{"sep", "separator"}, {"c", "compress"}, {"co", "compress"}, {"d", "display"},
+      {"di", "display"}, {"t", "table"}, {"h", "header"}, {"ab", "abbreviate"},
+      // `not` is Stata's no-table, i.e. the display layout (b81e442c0f6e725c);
+      // `f` is fast (the bank's list ladder, `list ..., f` rc 0 = nocompress).
+      {"not", "display"}, {"f", "fast"}}});
 
 // B5-D3/D4: BUG-475 -- `label define LB ...` without add/modify/replace on an
 // EXISTING label now rejects r(110) ("label already defined", matching
@@ -622,8 +657,8 @@ const piet::eval::OptVocab& kVocabExpand = piet::eval::registerOptVocab(
 // NAME is accepted here; the VALUE is what the dispatch site still polices --
 // `master`/`both` stay named, honest gaps.
 const piet::eval::OptVocab& kVocabJoinby = piet::eval::registerOptVocab(
-    {"joinby"}, {{"unmatched", "_merge", "nolabel"},
-     {"update", "replace"}});
+    {"joinby"}, {{"unmatched", "_merge", "nolabel", "update", "replace"},
+     {}});
 
 // `g' and `ge' (w2ah_data_verbs.log ah_encode_g: `encode es, g(sector)' at rc
 // 0) are below the prefix rule's 2-character floor or ambiguous, so declared.
@@ -692,9 +727,12 @@ const piet::eval::OptVocab& kVocabXtreg = piet::eval::registerOptVocab(
 // 12 papers. The fix is upstream of W2: adjudicate summarize's remaining
 // options so it can join kOptMinComplete. testBUG264 pins both sides today.
 const piet::eval::OptVocab& kVocabSummarize = piet::eval::registerOptVocab(
-    {"summarize"}, {{"detail", "separator"},
+    {"summarize"}, {{"detail", "separator", "format", "noformat", "vsquish", "nofvlabel",
+                     "noemptycells", "baselevels", "allbaselevels", "nolstretch", "fvwrap",
+                     "fvwrapon"},
      {},
-     {{"d", "detail"}}});
+     // `nof` is noformat (the bank's 5a85631a15c31d9f runs `summarize i.foreign price, nof`).
+     {{"d", "detail"}, {"f", "format"}, {"nof", "noformat"}}});
 
 // save: dispatcher.cpp's save arm re-parses the RAW tail, so canonicalization
 // cannot reach it — registering is pure measurement here, exactly the case the
@@ -1064,6 +1102,11 @@ const std::unordered_map<std::string, std::string> kGraphAliases = [] {
             {"s", "msymbol"},  {"co", "connect"}, {"p", "pstyle"},  {"r", "recast"},
             {"l", "lstyle"},   {"al", "alcolor"}, {"b", "bcolor"},  {"bl", "blcolor"},
             {"mlabs", "mlabsize"}});
+  // `fi` is FIntensity on every twoway plot type (its minimum in the common plot class),
+  // although the union vocabulary also holds lfitci/qfitci's FITPlot (minimum `fit`), so the
+  // prefix rule finds two words: bank rows `scatter`/`line`/`twoway area`/`histogram`/`kdensity`
+  // `fi(...)` = fintensity, 45b21b7290442d2d `twoway bar le year, fi(50)` rc 0; `f(50)` r(198).
+  m.insert({"fi", "fintensity"});
   return m;
 }();
 
@@ -1402,6 +1445,12 @@ OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::s
   // are keyed "<command> <subcommand>", so a spelling measured under `graph
   // bar` says nothing about `graph export`; an abbreviated or missing
   // subcommand simply finds no row and falls through to the rules below.
+  if (cmd == "esttab" && form == 1 && (key == "non" || key == "nob" || key == "obs")) {
+    OptKeyResolution bare;
+    bare.resolved = key;
+    bare.exactOnly = true;
+    return bare;
+  }
   if (form == 1 || form == 2) {
     static const std::set<std::string> kBankSubcommandKeyed = {
         "bcal", "duplicates", "estat", "estpost", "export", "graph", "import", "reshape", "twoway"};
@@ -1546,6 +1595,12 @@ OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::s
       {"ologit", {{"robust", 1}, {"level", 1}}},
       {"oprobit", {{"robust", 1}, {"level", 1}}},
       {"streg", {{"robust", 1}, {"level", 1}}},
+      // zip / zinb Robust and Level(cilevel), the one-letter minimums of zip.ado's and
+      // zinb.ado's syntax lines (their CLuster() two letters, INFlate() / OFFset() /
+      // EXPosure() three and NOLOg four resolve through the registered vocabulary and
+      // the floors below).
+      {"zip", {{"robust", 1}, {"level", 1}}},
+      {"zinb", {{"robust", 1}, {"level", 1}}},
       // xtset hands `panelvar timevar` to tsset, whose syntax line is `Daily ... Clocktime`:
       // `, d` is daily and `, c` / `, cl` are clocktime (vs-stata bank 77e4c3680e4788e6,
       // 53d1f92b4932a2b3, 0649268420a54afd); `clear` takes no abbreviation.
@@ -1555,6 +1610,9 @@ OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::s
       // tobit NOLOg (ml's display option; bank 8e721902 `tobit mpg weight, ll(17) nol`
       // rc 0, the plain fit; `n` and `no` are r(198)).
       {"tobit", {{"nolog", 3}}},
+      // glm Family(string): `f(poisson)` is family(poisson) (bank 50aa7b57 rc 0, the
+      // family(poisson) fit).
+      {"glm", {{"family", 1}}},
       // stset: the minimums of its syntax line's capitals (`Failure(string)`,
       // `EXit(string)`, `noShow`, `noHEADer`, `Origin()`, `ENter()`, `ENTRy()`,
       // `SCale()`, `IFopt()`, `EVER()`, `NEVER()`, `BEFORe()`, `AFTER()`, `TIME0()`):
@@ -1569,6 +1627,13 @@ OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::s
       // runs `proportion race, nol` (bank 6652367d) with the plain table.
       {"mean", {{"nolegend", 3}}},
       {"proportion", {{"nolegend", 3}}},
+      // teffects ra / nnmatch `l:evel(#)` (teffects_ra.sthlp, teffects_nnmatch.sthlp).
+      {"teffects", {{"level", 1}}},
+      // estadd: the capitals of its sub-verbs' syntax lines (summ / ysumm `MEan SUm MIn MAx
+      // RAnge sd Var cv SEMean SKewness Kurtosis MEDian ...`, every sub-verb's `Prefix()
+      // Replace`): `me` is mean beside MEDian, `v` var, `k` kurtosis, `r` replace and `p()`
+      // prefix(). Quietly is left out: summ's own `q` option is spelled in full.
+      {"estadd", {{"mean", 2}, {"var", 1}, {"kurtosis", 1}, {"replace", 1}, {"prefix", 1}}},
   };
   // Commands whose whole vocabulary a later oracle adjudicated: kOptMinComplete's
   // statement for the rows above. collapse_17's BY CW FAST CLABEL frame() and
@@ -1736,6 +1801,9 @@ OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::s
       // BUG-1500: ivprobit's TWOstep. StataBE 19.5 `ivprobit yb2 x1 (xe = z2), two`
       // rc 0, `, tw` r(198) "option tw not allowed" (scratch-laneA2 feat/i1.do).
       {"ivprobit", "twostep", 3},
+      // oaxaca's `eform` is lower case in the ado's syntax line: no abbreviation
+      // (vs-stata bank a176e098 `oaxaca ..., ef` r(198) "option ef incorrectly specified").
+      {"oaxaca", "eform", 5},
       // parmest REName() is `ren`: `parmest, norestore re(estimate b stderr se)` is r(198)
       // "option re() incorrectly specified" (vs-stata bank 2dc79b4f78e88e61), and
       // `ren(...)` rc 0 (8dd39ee8389af45b).
@@ -1829,6 +1897,32 @@ OptKeyResolution resolveOptionKeyForCommand(const std::string& cmd, const std::s
       {"var", "lags", 2},
       //   xtabond likewise (`l(2)` is level(2), 8e734ba5b2e26756).
       {"xtabond", "lags", 2},
+      //   zip / zinb INFlate() and OFFset() take three letters and NOLOg four (zip.ado's
+      //   and zinb.ado's syntax lines; the bank's `zip ..., i(..)` is r(198)): `in()`,
+      //   `of()` and `nol` are not those options, and the registered vocabulary's
+      //   two-letter prefix rule must not make them so.
+      {"zip", "inflate", 3},
+      {"zip", "offset", 3},
+      {"zip", "nolog", 4},
+      {"zinb", "inflate", 3},
+      {"zinb", "offset", 3},
+      {"zinb", "nolog", 4},
+      //   estadd, the narrowing half of its minimums row above: SEMean, MEDian, vif's TOLerance
+      //   and SQRvif, expb's noCONStant (`se`, `to`, `sq`, `noc` are not the option in Stata).
+      {"estadd", "semean", 3},
+      {"estadd", "median", 3},
+      {"estadd", "tolerance", 3},
+      {"estadd", "sqrvif", 3},
+      {"estadd", "noconstant", 6},
+      //   gmm (gmm.sthlp `INSTruments()`, `ONEstep`, `TWOstep`, `WINITial()`, `WMATrix()`):
+      //   `on` and `in()`/`ins()` are r(198) in StataBE 19.5 (bank b7ee0760, 87c7f323,
+      //   45c23653); `one`, `inst()`, `two`, `winit()`, `wmat()` run.
+      {"gmm", "onestep", 3},
+      {"gmm", "instruments", 4},
+      {"gmm", "twostep", 3},
+      {"gmm", "winitial", 5},
+      {"gmm", "wmatrix", 4},
+      {"gmm", "vce", 3},  // `vc()` r(198) "not allowed with interactive version" (bank eaae4f89)
   };
   {
     // An exact member of the command's own vocabulary is a spelling, not an

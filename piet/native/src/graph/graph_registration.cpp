@@ -86,16 +86,15 @@ void registerGraph(SessionState& session, ojson& block, const std::string& nameO
   if (!g.name.empty()) block["name"] = nm;
 }
 
-std::pair<std::string, std::string> schemeGraphSize(const std::string& schemeIn) {
-  // {scheme, its #include parent, graphsize y, graphsize x} as shipped in
-  // /Applications/StataNow/ado/base/s/scheme-*.scheme ("" = inherited).
-  struct Row {
+namespace {
+  // Scheme names, parents and default graph dimensions. Empty dimensions are inherited.
+  struct SchemeRow {
     const char* name;
     const char* parent;
     const char* y;
     const char* x;
   };
-  static const Row kRows[] = {
+  constexpr SchemeRow kSchemes[] = {
       {"s2color", "", "4", "5.5"},          {"s2color8", "s2color", "", ""},
       {"s2mono", "s2color", "", ""},        {"s1color", "s2color", "", ""},
       {"s1mono", "s1color", "", ""},        {"s1rcolor", "s1color", "", ""},
@@ -111,12 +110,22 @@ std::pair<std::string, std::string> schemeGraphSize(const std::string& schemeIn)
       {"stgcolor_mv", "stgcolor_alt", "", ""}, {"stmono1", "s1mono", "4.5", "7.5"},
       {"stmono2", "s2mono", "4.5", "7.5"},  {"sttrans", "s2color", "4.5", "7.5"},
   };
+const SchemeRow* findScheme(const std::string& name) {
+  for (const auto& row : kSchemes)
+    if (name == row.name) return &row;
+  return nullptr;
+}
+}  // namespace
+
+bool hasGraphScheme(const std::string& name) {
+  return findScheme(strutil::lower(name)) != nullptr;
+}
+
+std::pair<std::string, std::string> schemeGraphSize(const std::string& schemeIn) {
   std::string cur = strutil::lower(schemeIn);
   std::string y, x;
   for (int guard = 0; guard < 16 && !cur.empty(); ++guard) {
-    const Row* row = nullptr;
-    for (const Row& r : kRows)
-      if (cur == r.name) row = &r;
+    const auto* row = findScheme(cur);
     if (row == nullptr) break;
     if (y.empty() && row->y[0] != '\0') y = row->y;
     if (x.empty() && row->x[0] != '\0') x = row->x;

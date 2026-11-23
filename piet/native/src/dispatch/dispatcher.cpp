@@ -7,6 +7,7 @@
 #include "handler_declarations.h"
 #include "piet/handlers/estimation.h"
 #include "piet/handlers/results.h"
+#include "piet/regex_scans.h"
 namespace piet {
 using namespace dispatch_detail;
 nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState& session) {
@@ -479,8 +480,8 @@ void applyChangedRule(SessionState& session, const ojson& result, const std::str
   if (cmd == "generate") {
     // [type] name = exp: the name is the first word that is not a storage type.
     std::string nameTok = word(w2);
-    static const std::regex reType(R"(^(byte|int|long|float|double|str\d+|strl)$)");
-    if (std::regex_match(nameTok, reType)) nameTok = word(w3);
+    // R"(^(byte|int|long|float|double|str\d+|strl)$)", matched by hand (piet/regex_scans.h).
+    if (rx::matchLowerTypeWord(nameTok)) nameTok = word(w3);
     nameTok = nameTok.substr(0, nameTok.find('='));
     if (nameTok.size() > 2 && nameTok.compare(0, 2, "__") == 0) session.datasetChanged = changedAtEntry;
     return;

@@ -22,11 +22,14 @@
 
 #include "io/win_compat.h"  // cecon::to_native_path, cecon::native_exists
 #include "piet/cobra_runner.h"
+#include "piet/stata_format.h"  // string(): a numeric rownames()/roweq() value is %9.0g
 #include "piet/datastore.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/exprfns.h"  // stataExtendedMissingKind (BUG-1511); stataMissingToken for a `.a` cell (BUG-1399)
 #include "piet/eval/session.h"
 #include "piet/eval/tokenizer.h"
+#include "data/missing.h"  // cecon::is_missing
+#include "piet/handlers/variables.h"  // resolveByKeyNames
 #include "piet/inrange_filter.h"
 #include "piet/loops.h"
 #include "piet/mata_subset.h"
@@ -65,7 +68,7 @@ namespace {
 // silently ignore an equation-name or name-truncation request.
 const eval::OptVocab& kMkmatVocab = eval::registerOptVocab(
     {"mkmat"},
-    {{"matrix", "mat", "rownames", "nomissing", "obs", "rowprefix"}, {"roweq", "nchar"}});
+    {{"matrix", "mat", "rownames", "nomissing", "obs", "rowprefix", "roweq", "nchar"}, {}});
 
 // Replace-or-append into session.eval.matrices. matrix_expression_internal.h's
 // storeMatrixResult does the same three lines, but this copy is file-local
@@ -151,6 +154,8 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
   std::string rowPrefix = "r";
   bool nomissing = false;
   bool useObsNumbers = false;
+  std::string roweqVar;
+  int nchar = 32;
   for (const auto& kv : parsed.opts) {
     const std::string& k = kv.first;
     const eval::OptValue& v = kv.second;
@@ -171,6 +176,23 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
       nomissing = true;
     } else if (k == "obs") {
       useObsNumbers = true;
+    } else if (k == "roweq") {
+      if (v.isBool || v.strValue.empty()) return aerErrorRc("option roweq() incorrectly specified", 198);
+      roweqVar = strutil::trim(v.strValue);
+    } else if (k == "nchar") {
+      // numlist integer max=1 >=1 <=32
+      const std::string t = strutil::trim(v.strValue);
+      try {
+        size_t pos = 0;
+        const double d = std::stod(t, &pos);
+        if (pos != t.size()) throw std::invalid_argument("n");
+        if (d != std::floor(d)) return aerErrorRc("nchar() invalid -- invalid numlist has noninteger elements", 126);
+        if (d < 1 || d > 32)
+          return aerErrorRc("nchar() invalid -- invalid numlist has elements outside of allowed range", 125);
+        nchar = static_cast<int>(d);
+      } catch (const std::exception&) {
+        return aerErrorRc("nchar() invalid -- invalid number", 121);
+      }
     }
   }
   // StataBE 19.5: `mkmat x y, matrix(M) obs rownames(v)` is r(198), with or
@@ -234,6 +256,13 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!rowVar.empty() && !ds->has(rowVar)) {
     return aerError("mkmat: variable " + rowVar + " not found");
   }
+  if (!roweqVar.empty()) {
+    std::vector<std::string> one = {roweqVar};
+    if (auto bad = resolveByKeyNames(session, one)) return *bad;
+    roweqVar = one[0];
+    if (!ds->has(roweqVar)) return aerError("mkmat: variable " + roweqVar + " not found");
+  }
+  std::vector<std::string> rowEqs;
 
   const int64_t nRows = ds->nRows();
   std::vector<const double*> cols;
@@ -253,22 +282,57 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
     obsIndex = ds->col(indexVar).f64();
   }
 
+  // The sample: LISTWISE, not per-cell -- `nomissing` drops the OBSERVATION
+  // when any selected variable is missing there, which is what keeps the k
+  // columns of the result aligned to one another. Without the option a missing
+  // value is carried into the matrix as missing rather than silently dropped.
+  std::vector<int64_t> sample;
+  for (int64_t i = 0; i < nRows; ++i) {
+    bool anyMissing = false;
+    for (const double* p : cols) anyMissing = anyMissing || std::isnan(p[i]);
+    if (nomissing && anyMissing) continue;
+    sample.push_back(i);
+  }
+  // A rownames() or roweq() variable is checked over the whole sample, rownames()
+  // first, each r(198): a string one must have no empty value; a numeric one no
+  // missing value, then integer values only, then none below zero (vs-stata
+  // bank d1ca14d19d129ebd for the missing-value refusal). A numeric value
+  // becomes its string(), i.e. %9.0g: 123456792 is 1.23e+08.
+  const auto checkStripeVar = [&](const std::string& optn,
+                                  const std::string& var) -> std::optional<ojson> {
+    if (var.empty()) return std::nullopt;
+    if (ds->dtype(var) == "factor") {
+      for (int64_t i : sample)
+        if (rowNameFromValue(*ds, var, i).empty())
+          return aerErrorRc(optn + "() invalid; " + var + " contains empty strings", 198);
+      return std::nullopt;
+    }
+    const double* v = ds->col(var).f64();
+    if (v == nullptr) return aerErrorRc(optn + "() invalid; " + var + " contains missing values", 198);
+    for (int64_t i : sample)
+      if (cecon::is_missing(v[i]))
+        return aerErrorRc(optn + "() invalid; " + var + " contains missing values", 198);
+    for (int64_t i : sample)
+      if (v[i] != std::round(v[i]))
+        return aerErrorRc(optn + "() invalid; " + var + " is not integer valued", 198);
+    for (int64_t i : sample)
+      if (v[i] < 0) return aerErrorRc(optn + "() invalid; " + var + " is not strictly positive", 198);
+    return std::nullopt;
+  };
+  if (auto e = checkStripeVar("rownames", rowVar)) return *e;
+  if (auto e = checkStripeVar("roweq", roweqVar)) return *e;
+  const auto stripeText = [&](const std::string& var, int64_t i) -> std::string {
+    if (ds->dtype(var) == "factor") return rowNameFromValue(*ds, var, i);
+    const double v = ds->col(var).f64()[i];
+    return fmt::general(v == 0.0 ? 0.0 : v, 9, 0);
+  };
+
   std::vector<std::vector<double>> rows;
   std::vector<std::string> rowNames;
-  for (int64_t i = 0; i < nRows; ++i) {
+  for (int64_t i : sample) {
     std::vector<double> row;
     row.reserve(cols.size());
-    bool anyMissing = false;
-    for (const double* p : cols) {
-      const double v = p[i];
-      if (std::isnan(v)) anyMissing = true;
-      row.push_back(v);
-    }
-    // LISTWISE, not per-cell: `nomissing` drops the OBSERVATION when any
-    // selected variable is missing there, which is what keeps the k columns of
-    // the result aligned to one another. Without the option a missing value is
-    // carried into the matrix as missing rather than silently dropped.
-    if (nomissing && anyMissing) continue;
+    for (const double* p : cols) row.push_back(p[i]);
     rows.push_back(std::move(row));
     // The row NUMBER a default name is built from is the position in the
     // matrix: `r3` is its third row. `obs` names the row after its observation
@@ -276,16 +340,9 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
     // observations 1 and 3 are r1 r3, `if y > 3` gives r4 r5 r6, and
     // rowprefix(p) p3 p4 ...).
     const size_t k = rows.size();
+    if (!roweqVar.empty()) rowEqs.push_back(stripeText(roweqVar, i));
     if (!rowVar.empty()) {
-      // A numeric rownames() variable that is missing in a selected row is
-      // r(198) (StataBE 19.5 `mkmat price mpg in 1/4, matrix(X)
-      // rownames(rep78)`, vs-stata bank d1ca14d19d129ebd).
-      if (ds->dtype(rowVar) != "factor") {
-        const double* rv = ds->col(rowVar).f64();
-        if (rv != nullptr && std::isnan(rv[i]))
-          return aerErrorRc("rownames() invalid; " + rowVar + " contains missing values", 198);
-      }
-      rowNames.push_back(rowNameFromValue(*ds, rowVar, i));
+      rowNames.push_back(stripeText(rowVar, i));
     } else if (useObsNumbers) {
       const int64_t obs =
           obsIndex != nullptr ? static_cast<int64_t>(std::llround(obsIndex[i])) : i + 1;
@@ -307,6 +364,28 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
     // Stata's r(2000). coarseRc has no message rule for this phrase, so the rc
     // is stated explicitly.
     return aerErrorRc("mkmat: no observations", 2000);
+  }
+
+  // A row name has its blanks and periods made underscores and is cut to
+  // nchar() characters (default 32); so is a string roweq() equation, while a
+  // numeric one is its string() unchanged. Each row is then eq:name (StataBE
+  // 19.5, vs-stata bank 365324ea, 532ce902, 696ef3d2).
+  const auto cleanUp = [nchar](std::string t) {
+    for (char& ch : t)
+      if (ch == ' ' || ch == '.') ch = '_';
+    size_t cut = 0, cps = 0;
+    while (cut < t.size() && cps < static_cast<size_t>(nchar)) {
+      const unsigned char b = static_cast<unsigned char>(t[cut]);
+      cut += b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+      ++cps;
+    }
+    return t.substr(0, std::min(cut, t.size()));
+  };
+  for (auto& nm : rowNames) nm = cleanUp(nm);
+  if (!roweqVar.empty()) {
+    const bool strEq = ds->dtype(roweqVar) == "factor";
+    for (size_t r = 0; r < rowNames.size() && r < rowEqs.size(); ++r)
+      rowNames[r] = (strEq ? cleanUp(rowEqs[r]) : rowEqs[r]) + ":" + rowNames[r];
   }
 
   if (!matName.empty()) {

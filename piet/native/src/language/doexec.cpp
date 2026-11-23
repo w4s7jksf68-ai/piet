@@ -64,6 +64,19 @@ std::optional<int> parseCleanExitMessage(const std::string& message) {
   }
 }
 
+// True when some block of `blocks` is an error block, captured or not -- or is
+// shaped so that the caller should take its general path (not an object, or a
+// non-string "type"). False means handleUncapturedError would pass every one.
+bool anyErrorBlock(const ojson& blocks) {
+  for (const auto& b : blocks) {
+    if (!b.is_object()) return true;
+    const auto it = b.find("type");
+    if (it == b.end()) continue;
+    if (!it->is_string() || it->get_ref<const std::string&>() == "error") return true;
+  }
+  return false;
+}
+
 bool handleUncapturedError(const ojson& block, int lineno, ExecuteResult& out) {
   if (block.value("type", "") != "error" || block.value("captured", false)) return false;
   out.stoppedAtLine = lineno;
@@ -607,8 +620,16 @@ ojson elisionBlock(const std::string& reason) {
 void coalesceMutationVarlists(ojson& blocks) {
   if (!blocks.is_array()) return;
   auto isMutWithVarlist = [](const ojson& b) {
-    return b.is_object() && b.value("type", std::string()) == "data_mutation" &&
-           b.contains("varlist_after");
+    if (!b.is_object()) return false;
+    // The type is compared in place: this runs over every block of every
+    // dispatched line, and value("type", std::string()) built a string copy
+    // each time. A non-string "type" still goes through value(), which is what
+    // decides that case (it throws, as before).
+    const auto it = b.find("type");
+    if (it == b.end()) return false;
+    if (!it->is_string())
+      return b.value("type", std::string()) == "data_mutation" && b.contains("varlist_after");
+    return it->get_ref<const std::string&>() == "data_mutation" && b.contains("varlist_after");
   };
   long lastIdx = -1;
   for (long i = 0; i < static_cast<long>(blocks.size()); ++i) {
@@ -621,7 +642,11 @@ void coalesceMutationVarlists(ojson& blocks) {
   }
 }
 
-void appendJoiningBodyContinue(ojson& blocks, const ojson& b) {
+namespace {
+
+// True when `b` was joined onto an open `display ... _continue` line in `blocks`
+// (and so must not be appended itself).
+bool joinBodyContinue(ojson& blocks, const ojson& b) {
   if (b.is_object() && b.value("type", std::string()) == "display") {
     for (size_t k = blocks.size(); k-- > 0;) {
       ojson& prev = blocks[k];
@@ -635,10 +660,94 @@ void appendJoiningBodyContinue(ojson& blocks, const ojson& b) {
       } else {
         prev.erase("continue");
       }
-      return;
+      return true;
     }
   }
-  blocks.push_back(b);
+  return false;
+}
+
+size_t dumpedStringSize(const std::string& s) {
+  size_t n = 2;  // the quotes
+  for (const char ch : s) {
+    const auto c = static_cast<unsigned char>(ch);
+    // A byte >= 0x80 is UTF-8 the serializer validates (and, with `replace`,
+    // repairs); its own count is the answer there.
+    if (c >= 0x80) return ojson(s).dump(-1, ' ', false, ojson::error_handler_t::replace).size();
+    switch (c) {
+      case '"':
+      case '\\':
+      case '\b':
+      case '\f':
+      case '\n':
+      case '\r':
+      case '\t':
+        n += 2;
+        break;
+      default:
+        n += c < 0x20 ? 6 : 1;  // other control characters are \u00XX
+    }
+  }
+  return n;
+}
+
+size_t decimalDigits(unsigned long long v) {
+  size_t n = 1;
+  while (v >= 10) {
+    v /= 10;
+    ++n;
+  }
+  return n;
+}
+
+}  // namespace
+
+void appendJoiningBodyContinue(ojson& blocks, const ojson& b) {
+  if (!joinBodyContinue(blocks, b)) blocks.push_back(b);
+}
+
+void appendJoiningBodyContinue(ojson& blocks, ojson&& b) {
+  if (!joinBodyContinue(blocks, b)) blocks.push_back(std::move(b));
+}
+
+size_t dumpedJsonSize(const ojson& b) {
+  switch (b.type()) {
+    case ojson::value_t::null:
+      return 4;
+    case ojson::value_t::boolean:
+      return b.get<bool>() ? 4 : 5;
+    case ojson::value_t::number_integer: {
+      const auto v = b.get<std::int64_t>();
+      // Negated in unsigned arithmetic, so INT64_MIN has its 19 digits too.
+      return v < 0 ? 1 + decimalDigits(0ULL - static_cast<unsigned long long>(v))
+                   : decimalDigits(static_cast<unsigned long long>(v));
+    }
+    case ojson::value_t::number_unsigned:
+      return decimalDigits(b.get<std::uint64_t>());
+    case ojson::value_t::string:
+      return dumpedStringSize(b.get_ref<const std::string&>());
+    case ojson::value_t::object: {
+      if (b.empty()) return 2;
+      size_t n = 1;  // '{'
+      bool first = true;
+      for (auto it = b.begin(); it != b.end(); ++it) {
+        n += (first ? 0 : 1) + dumpedStringSize(it.key()) + 1 + dumpedJsonSize(it.value());
+        first = false;
+      }
+      return n + 1;
+    }
+    case ojson::value_t::array: {
+      if (b.empty()) return 2;
+      size_t n = 1;  // '['
+      bool first = true;
+      for (const auto& e : b) {
+        n += (first ? 0 : 1) + dumpedJsonSize(e);
+        first = false;
+      }
+      return n + 1;
+    }
+    default:  // a float (its shortest round-trip text), binary, discarded
+      return b.dump(-1, ' ', false, ojson::error_handler_t::replace).size();
+  }
 }
 
 ExecuteResult executeDoSource(const std::string& source, SessionState& session,
@@ -884,7 +993,9 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
   // selftest) nothing streams, the count stays 0, and out.blocks is returned
   // whole and byte-identical. Storing is independent of onBlock, so out.blocks
   // is byte-identical with and without the hook (N6 freeze leg).
-  auto pushBlock = [&](const ojson& b) {
+  // `owned` is `b` itself when the caller gives the block up (pushBlockOwned):
+  // it is then moved into out.blocks instead of copied.
+  auto pushBlockImpl = [&](const ojson& b, ojson* owned) {
     // ATTR-20260812 coverage fingerprint. Counted HERE, before the budget trip,
     // and only at the outermost depth: a loop body's blocks pass through its own
     // nested pushBlock and then again through this one as they bubble up, so
@@ -938,7 +1049,8 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
       // and a throwing dump() failed the whole run; such a byte is counted
       // as the U+FFFD the transcript will carry. So is a byte that is not
       // UTF-8 at all (`type` of a Latin-1 file, BUG-1131).
-      size_t est = b.is_null() ? 0 : b.dump(-1, ' ', false, ojson::error_handler_t::replace).size();
+      // (dumpedJsonSize is that length, counted without building the text.)
+      size_t est = b.is_null() ? 0 : dumpedJsonSize(b);
       const bool isEcho = b.is_object() && b.value("type", std::string()) == "echo";
       if ((!isEcho && storedCounted >= kMaxRunBlocks) || storedBytes + est > byteBudget) {
         std::string reason =
@@ -955,11 +1067,15 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
         truncated = true;
         return;
       }
-      out.blocks.push_back(b);
+      if (owned != nullptr) {
+        out.blocks.push_back(std::move(*owned));
+      } else {
+        out.blocks.push_back(b);
+      }
       storedBytes += est;
       if (!isEcho) ++storedCounted;
       if (onBlock) {
-        onBlock(b);
+        onBlock(out.blocks.back());
         ++out.streamedCount;
       }
     } else {
@@ -969,6 +1085,8 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
       if (onBlock) onBlock(b);
     }
   };
+  auto pushBlock = [&](const ojson& b) { pushBlockImpl(b, nullptr); };
+  auto pushBlockOwned = [&](ojson&& b) { pushBlockImpl(b, &b); };
 
   // P9 automode (default OFF). Hoisted once: with the switch absent this whole
   // layer costs one predictable branch per top-level item.
@@ -1368,9 +1486,15 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
       // U7/S11: a nested if/loop may bubble a _control sentinel as the LAST
       // block. Filter it out and propagate.
       std::optional<std::string> ctrl;
-      for (const auto& b : blocks) {
+      // Moved, not copied, into the transcript when no block is an error: the
+      // halt scan below reads `blocks` again, but it only acts on an error
+      // block, so with none there it has nothing to read.
+      const bool movable = !anyErrorBlock(blocks);
+      for (auto& b : blocks) {
         if (b.value("type", "") == "_control") {
           ctrl = b.value("action", "");
+        } else if (movable) {
+          pushBlockOwned(std::move(b));
         } else {
           pushBlock(b);
         }
@@ -1381,6 +1505,7 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
         return out;
       }
       for (const auto& b : blocks) {
+        if (movable) break;  // no error block: nothing halts (and `blocks` was moved from)
         // BS-127: capture-forwarded errors (tagged captured:true by the
         // dispatcher's capture arm) are display-only — Stata shows them,
         // sets _rc, and CONTINUES the do-file. Only untagged errors halt.
@@ -1416,9 +1541,15 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
       }
       coalesceMutationVarlists(blocks);  // F8: one varlist card per top-level command
       std::optional<std::string> ctrl;
-      for (const auto& b : blocks) {
+      // Moved, not copied, into the transcript when no block is an error: the
+      // halt scan below reads `blocks` again, but it only acts on an error
+      // block, so with none there it has nothing to read.
+      const bool movable = !anyErrorBlock(blocks);
+      for (auto& b : blocks) {
         if (b.value("type", "") == "_control") {
           ctrl = b.value("action", "");
+        } else if (movable) {
+          pushBlockOwned(std::move(b));
         } else {
           pushBlock(b);
         }
@@ -1429,6 +1560,7 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
         return out;
       }
       for (const auto& b : blocks) {
+        if (movable) break;  // no error block: nothing halts (and `blocks` was moved from)
         // BS-127: capture-forwarded errors (tagged captured:true by the
         // dispatcher's capture arm) are display-only — Stata shows them,
         // sets _rc, and CONTINUES the do-file. Only untagged errors halt.

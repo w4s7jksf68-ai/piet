@@ -479,6 +479,9 @@ ojson runRlasso(const eval::ParsedCommand& parsed, SessionState& session) {
     if (!e3::expandVars(tk, session, &v, &err)) return fail(err);
     for (const auto& x : v) terms.push_back({x, false});
   }
+  // An empty varlist reaches lassopack's own parsing, which fails with r(109)
+  // "type mismatch" (vs-stata bank 1521aab2 `rlasso , zzabbrprobe`).
+  if (terms.empty()) return fail(rcError("type mismatch", 109));
   if (terms.size() < 2) return fail(rcError("too few variables specified", 102));
   {
     Datastore* ds = session.datastore();

@@ -645,6 +645,39 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
       }
       continue;
     }
+    // Display options of the fit's own table (regress; areg's ado declares noheader
+    // and notable too): noheader drops the header above the table, notable the
+    // coefficient table, depname(name) names the dependent variable in the table and
+    // in e(depvar) (StataBE 19.5, vs-stata bank c329367f `depname(cost)`: the table's
+    // first column "cost", M|e|depvar 'cost'; f77e0ea5 noheader, c22e3b01 notable:
+    // e() as the plain fit's). Set on the block below.
+    if ((k == "noheader" || k == "notable") && v.isBool && v.boolValue &&
+        (stataCmd == "regress" || stataCmd == "reg" || stataCmd == "areg"))
+      continue;
+    if (k == "depname" && (stataCmd == "regress" || stataCmd == "reg")) {
+      const std::string dn = v.isBool ? std::string() : strutil::trim(v.strValue);
+      if (dn.empty() || dn.find_first_of(" \t") != std::string::npos)
+        return engineErrorBlock("depname() requires a name", "unsupported_option");
+      // a Stata name: a letter or _ first, then letters, digits or _, at most 32
+      bool validName = dn.size() <= 32 && (std::isalpha(static_cast<unsigned char>(dn[0])) || dn[0] == '_');
+      for (const char ch : dn)
+        if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')) validName = false;
+      if (!validName) return engineErrorBlock(dn + " invalid name", "unsupported_option");
+      continue;
+    }
+    // beta: the table shows the standardized coefficients (e(beta), which every
+    // non-cluster regress fit posts) in place of the confidence interval (bank
+    // 23a1222407 `regress price mpg weight, beta`: e() as the plain fit's; the table's
+    // last column "Beta", `.` on _cons).
+    if (k == "beta" && v.isBool && v.boolValue && (stataCmd == "regress" || stataCmd == "reg")) {
+      // [R] regress: beta may not be combined with vce(cluster) (no e(beta) there)
+      for (const auto& [k2, v2] : parsed.opts) {
+        const std::string t = v2.isBool ? std::string() : strutil::lower(strutil::trim(v2.strValue));
+        if (k2 == "cluster" || ((k2 == "vce" || k2 == "vcov") && t.rfind("cl", 0) == 0))
+          return engineErrorBlock("option beta not allowed with vce(cluster)", "unsupported_option");
+      }
+      continue;
+    }
     if (k == "beta") {
       return engineErrorBlock("Option `" + k + "` is a valid Stata option that this version of "
                               "PIET does not yet implement.",
@@ -744,7 +777,11 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
         return engineErrorBlock(cs.errorMsg, "unsupported_option");
       }
       for (const auto& a : cs.vcovArgv) argv.push_back(a);
-    } else if (lv == "iid" || (stataCmd == "reghdfe" && isReghdfeUnadjustedVce(*vceVal))) {
+    } else if (lv == "iid" || (stataCmd == "reghdfe" && isReghdfeUnadjustedVce(*vceVal)) ||
+               // vce(ols): regress's and areg's own name for the default VCE (bank
+               // ff703d7d `regress price mpg weight, vce(ols)`: e() as the plain fit's)
+               ((stataCmd == "regress" || stataCmd == "reg" || stataCmd == "areg") &&
+                strutil::lower(strutil::trim(*vceVal)) == "ols")) {
       argv.push_back("--vcov");
       argv.push_back("iid");
     } else if (!unimplementedVceType(*vceVal).empty()) {
@@ -925,6 +962,19 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
         (stataCmd == "areg" || std::find(argv.begin(), argv.end(), "--fe") == argv.end()))
       argv.push_back("--regress-exact-fit");
   }
+  // The builtin `regress` drops a row whose aweight is negative, as it drops a
+  // zero one: `regress price mpg [aw=w]`, w = +-0.5 on auto, fits the 22 rows of
+  // weight .5 (vs-stata bank bf3a397b1ed2f096). areg, reghdfe and xtreg mark their
+  // sample with the weight and stop with r(402) (the engine's default), so only
+  // the regress word asks for the rule. The refits forward it from LastModel.
+  if (stataCmd == "regress" || stataCmd == "reg") {
+    bool aw = false;
+    for (size_t i = 0; i + 1 < argv.size(); ++i)
+      if (argv[i] == "--wtype" && argv[i + 1] == "aw") aw = true;
+    if (aw && std::find(argv.begin(), argv.end(), "--fe") == argv.end() &&
+        std::find(argv.begin(), argv.end(), "--svy") == argv.end())
+      argv.push_back("--aw-negative-drops");
+  }
 
   // TS-context injection (MI-083, CONTRACT-engine §16, M3a): when any y/x
   // token is a time-series operator expression (L./F./D./S.), inject
@@ -1063,6 +1113,11 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
   // refuses it with --svy, so an svy fit's e(V) stays the named refusal.
   if (std::find(cobraArgs.begin(), cobraArgs.end(), "--svy") == cobraArgs.end())
     cobraArgs.push_back("--emit-v");
+  // areg's test of the absorbed indicators (default VCE): the engine adds the
+  // comparison fit's R-squared, e(r2_c) (fit_default_e_macros.cpp
+  // postAregClassicEContract). Fit call only, like --emit-v.
+  if (stataCmd == "areg" && std::find(cobraArgs.begin(), cobraArgs.end(), "--fe") != cobraArgs.end())
+    cobraArgs.push_back("--absorb-test");
   // e(sample) T2: the engine writes the fit's admitted rows (installed below).
   std::string esampleValues;
   if (dataOverride == nullptr) {
@@ -1894,6 +1949,29 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
   // setLastModel() on the same model (setEstHandleM4) republishes `ols` too.
   if ((stataCmd == "regress" || stataCmd == "areg" || stataCmd == "reghdfe") && lm.vcov == "iid")
     lm.eVce = "ols";
+  // The display options accepted by the option net above.
+  std::string depName;
+  for (const auto& [k, v] : parsed.opts) {
+    if ((k == "noheader" || k == "notable") && v.isBool && v.boolValue) block[k] = true;
+    if (k == "depname" && !v.isBool) depName = strutil::trim(v.strValue);
+    if (k == "beta" && v.isBool && v.boolValue && raw.contains("beta_std") &&
+        raw["beta_std"].is_object() && block.contains("coeftable") && block["coeftable"].is_array()) {
+      // each row's standardized coefficient by its engine name; _cons has none
+      for (auto& row : block["coeftable"]) {
+        if (!row.is_object() || !row.contains("name") || !row["name"].is_string()) continue;
+        const auto it = raw["beta_std"].find(row["name"].get<std::string>());
+        if (it != raw["beta_std"].end() && it->is_number()) row["beta"] = *it;
+      }
+      block["beta"] = true;
+    }
+  }
+  // depname(name) is the fit's e(depvar) for everything that reads it afterwards
+  // (help regress: predict's residual is then a deviation from `name`; prediction
+  // refuses the dependent-variable statistics of such a fit by name).
+  if (!depName.empty()) {
+    block["depvar"] = depName;
+    lm.depvar = depName;
+  }
   session.setLastModel(lm);
   session.lastEstBlock = block;
   session.attachFitCovariance(raw);  // eb-order T-P1: e(V) is the fit's own (w2g_ebmat.log:365)
@@ -1973,6 +2051,10 @@ ojson runRegress(const eval::ParsedCommand& parsed, SessionState& session,
   // regress/areg paths (w2s_multiway_class mw_reg_*/mw_areg_*; w2v_estpost_ematrix
   // ep15d_ematrices `b V beta`).
   postENameListsRegressM4(session, raw, parsed, stataCmd, builtinMultiway, noConstant);
+  if (!depName.empty()) {
+    session.eval.setEString("depvar", depName);
+    session.noteEOnFit("depvar");
+  }
 
   // BUG-539: e(resid) names the column made by THIS fit (w2_smalls.log
   // reghdfe_e_resid); setLastModel() just erased the previous fit's. The

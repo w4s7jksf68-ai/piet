@@ -3,6 +3,7 @@
 #include "common.h"
 #include "commands.h"
 
+#include "core/collinear.h"
 #include "estimators/ivml.h"
 #include "estimators/logit.h"
 #include "estimators/probit.h"
@@ -43,6 +44,11 @@ namespace cli {
 
 // cmds_mle.cpp: compact_glm_rows, the rows a perfect-prediction rule leaves.
 void glm_keep_rows(GlmInputs& g, const std::vector<char>& keep);
+std::vector<BinaryBaseLevel> binary_base_levels(const Dataset& ds, const std::vector<std::string>& xs,
+                                                const GlmInputs& g);
+BinaryPerfectScreen binary_screen_with_bases(const double* X, int64_t n, int k, int ncheck,
+                                             const double* y, const std::vector<BinaryBaseLevel>& bases);
+std::string binary_rule_name(const BinaryPerfectRule& r, const std::vector<std::string>& names, bool stripe);
 
 namespace {
 
@@ -388,7 +394,9 @@ int run_ivml(const std::vector<std::string>& a, IvKind kind, const char* cmd) {
                 throw EngineError("bad_input",
                     std::string(cmd) + ": '" + v + "' is listed in both --x and --instruments");
 
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    const EsampleRequest esreq = esample_request(a, cmd);
+    const std::string original_data = data, keepif = opt(a, "--keepif");
+    data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
     std::vector<std::string> cluster_names;
     if (!cluster_var.empty()) cluster_names.push_back(cluster_var);
@@ -437,22 +445,31 @@ int run_ivml(const std::vector<std::string>& a, IvKind kind, const char* cmd) {
     // ivprobit's perfect-prediction screen over the structural regressors, included
     // exogenous first, as `probit` itself screens them ([R] logit, Model identification).
     std::vector<char> x_omitted(ix.size(), 0);
+    std::vector<BinaryBaseLevel> bases;
     if (!is_tobit) {
         std::vector<int> scol(ix);
         scol.insert(scol.end(), ie.begin(), ie.end());
         scol.push_back(icons);
+        std::vector<const double*> structural_cols;
+        std::vector<std::string> structural_names;
+        for (int c : scol) {
+            structural_cols.push_back(g.X.data() + static_cast<std::ptrdiff_t>(c) * g.n);
+            structural_names.push_back(g.names[static_cast<size_t>(c)]);
+        }
+        const auto Xc = gather_columns(structural_cols, g.n);
         const int kscr = static_cast<int>(scol.size());
-        std::vector<double> Xc(static_cast<size_t>(g.n) * kscr);
-        for (int c = 0; c < kscr; ++c)
-            std::copy(g.X.begin() + static_cast<std::ptrdiff_t>(scol[static_cast<size_t>(c)]) * g.n,
-                      g.X.begin() + static_cast<std::ptrdiff_t>(scol[static_cast<size_t>(c)] + 1) * g.n,
-                      Xc.begin() + static_cast<std::ptrdiff_t>(c) * g.n);
-        const BinaryPerfectScreen s = binary_perfect_screen(Xc.data(), g.n, kscr, kscr - 1, g.y.data());
+        bases = binary_base_levels(ds, exog, g);
+        // The base-level positions are in the loaded design (endogenous,
+        // instruments, exogenous, constant). Here the exogenous columns go
+        // first and retain their original relative order.
+        for (auto& b : bases)
+            b.before = static_cast<int>(std::lower_bound(ix.begin(), ix.end(), b.before) - ix.begin());
+        const BinaryPerfectScreen s =
+            binary_screen_with_bases(Xc.data(), g.n, kscr, kscr - 1, g.y.data(), bases);
         if (s.inestimable) {
             const BinaryPerfectRule& r = s.rules.back();
             std::fprintf(stderr, "%s: outcome = %s %s %.17g predicts data perfectly; r(2000)\n", cmd,
-                         g.names[static_cast<size_t>(scol[static_cast<size_t>(r.col)])].c_str(),
-                         r.op == 2 ? ">" : "<", r.rhs);
+                         binary_rule_name(r, structural_names, false).c_str(), r.op == 2 ? ">" : "<", r.rhs);
             return 2;
         }
         if (twostep) {
@@ -481,13 +498,15 @@ int run_ivml(const std::vector<std::string>& a, IvKind kind, const char* cmd) {
                                         has(a, "--emit-v"), opt(a, "--out"));
         }
         for (const BinaryPerfectRule& r : s.rules) {
-            const size_t j = static_cast<size_t>(r.col);
-            const std::string& nm = g.names[static_cast<size_t>(scol[j])];
-            if (j >= ix.size())
-                throw EngineError("bad_input",
-                    std::string(cmd) + ": " + nm + " predicts the outcome perfectly; "
-                    "may not drop an endogenous regressor");
-            x_omitted[j] = 1;
+            const std::string nm = binary_rule_name(r, structural_names, false);
+            if (r.col >= 0) {
+                const size_t j = static_cast<size_t>(r.col);
+                if (j >= ix.size())
+                    throw EngineError("bad_input",
+                        std::string(cmd) + ": " + nm + " predicts the outcome perfectly; "
+                        "may not drop an endogenous regressor");
+                x_omitted[j] = 1;
+            }
             if (r.op == 1)
                 std::fprintf(stderr, "note: %s != %.17g predicts %s perfectly; %s omitted and %lld obs not used.\n",
                              nm.c_str(), r.rhs, r.interp == 1 ? "success" : "failure", nm.c_str(),
@@ -497,7 +516,39 @@ int run_ivml(const std::vector<std::string>& a, IvKind kind, const char* cmd) {
                              "subsample; %s omitted and %lld obs not used.\n", nm.c_str(), r.op == 2 ? ">" : "<",
                              r.rhs, nm.c_str(), r.rhs, nm.c_str(), static_cast<long long>(r.dropped));
         }
-        if (!s.rules.empty()) glm_keep_rows(g, s.keep_row);
+        if (!s.rules.empty()) {
+            glm_keep_rows(g, s.keep_row);
+            require_sample(g.n);
+            // Removing an indicator's rows can make the remaining indicators
+            // sum to one. Sweep the constant first and keep the earlier levels,
+            // as for the single-equation binary fit.
+            auto column = [&](int index) {
+                return g.X.data() + static_cast<std::ptrdiff_t>(index) * g.n;
+            };
+            std::vector<const double*> remaining{column(icons)};
+            std::vector<size_t> kept_exog;
+            for (size_t j = 0; j < ix.size(); ++j) {
+                if (x_omitted[j]) continue;
+                remaining.push_back(column(ix[j]));
+                kept_exog.push_back(j);
+            }
+            for (int c : ie) remaining.push_back(column(c));
+            const auto restricted = gather_columns(remaining, g.n);
+            const auto keep = collinear_keep_mask(restricted.data(), g.n, static_cast<int>(remaining.size()));
+            for (size_t j = 0; j < kept_exog.size(); ++j) {
+                if (keep[j + 1]) continue;
+                const size_t x = kept_exog[j];
+                x_omitted[x] = 1;
+                std::fprintf(stderr, "note: %s omitted because of collinearity.\n",
+                             g.names[static_cast<size_t>(ix[x])].c_str());
+            }
+            for (size_t j = 0; j < ie.size(); ++j)
+                if (!keep[1 + kept_exog.size() + j])
+                    throw EngineError("bad_input",
+                        std::string(cmd) + ": an endogenous regressor is collinear on the screened sample");
+            if (vce == "cluster" && g.cluster[0].n_levels < 2)
+                throw EngineError("bad_input", std::string(cmd) + ": vce(cluster) requires at least 2 clusters");
+        }
     }
     // The exogenous regressors the fit keeps (ix_all keeps every one, for the stripe).
     const std::vector<int> ix_all = ix;
@@ -693,9 +744,26 @@ int run_ivml(const std::vector<std::string>& a, IvKind kind, const char* cmd) {
                 order.push_back(base + static_cast<size_t>(c));
             }
             int c = at;
-            for (size_t j = 0; j < ix_all.size(); ++j) {
+            for (size_t j = 0; j <= ix_all.size(); ++j) {
+                for (const auto& factor : bases) {
+                    if (factor.before != static_cast<int>(j)) continue;
+                    BinaryPerfectRule rule;
+                    rule.col = -1;
+                    rule.base_var = factor.var;
+                    rule.base_level = factor.level;
+                    names.push_back(eq + ":" + binary_rule_name(rule, nm, true));
+                    order.push_back(kNone);
+                }
+                if (j == ix_all.size()) break;
                 if (x_omitted[j]) {
-                    names.push_back(eq + ":o." + g.names[static_cast<size_t>(ix_all[j])]);
+                    std::string name = g.names[static_cast<size_t>(ix_all[j])];
+                    const size_t dot = name.find('.');
+                    if (dot != std::string::npos && name.find('#') == std::string::npos &&
+                        name.find_first_not_of("0123456789", name.front() == '-' ? 1 : 0) == dot)
+                        name.insert(dot, "o");
+                    else
+                        name.insert(0, "o.");
+                    names.push_back(eq + ":" + name);
                     order.push_back(kNone);
                 } else {
                     names.push_back(eq + ":" + nm[static_cast<size_t>(c)]);
@@ -732,6 +800,7 @@ int run_ivml(const std::vector<std::string>& a, IvKind kind, const char* cmd) {
         add_e_v(out, names, fullV);
     }
     add_warnings(out, g.warnings);
+    if (esreq.active()) emit_esample(esreq, cmd, original_data, keepif, false, {g.keep, &ds}, out);
     emit(out, opt(a, "--out"));
     return 0;
 }

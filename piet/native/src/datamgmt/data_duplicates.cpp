@@ -3,6 +3,7 @@
 // data duplicates.
 #include "data_mutation_internal.h"
 #include "piet/handlers/observations.h"
+#include "piet/handlers/descriptive.h"  // ListLayout / buildListing: list and examples are list's tables
 namespace piet::handlers::data_mutation_detail {
 
 
@@ -536,9 +537,117 @@ ojson runDuplicatesTag(const std::optional<std::vector<std::string>>& varlist,
 }
 
 
+namespace {
+
+// duplicates.ado's groups: the sample (if/in) with each row's observation number,
+// the groups of two or more rows sharing their varlist values (a number by its
+// bits, so `.a` is not `.`), in the varlist's sort order (numbers ascending then
+// the missing codes, strings by their bytes), each group's rows in observation
+// order (`bysort touse varlist (order)`, `sort dgroup order`).
+struct DupGroups {
+  std::optional<Datastore> sampleFile;
+  const Datastore* sample = nullptr;
+  std::vector<int64_t> obs;                  // per sample row
+  std::vector<std::vector<int64_t>> groups;  // sample rows
+};
+
+std::optional<ojson> dupGroups(SessionState& session, Datastore* ds,
+                               const std::vector<std::string>& cols,
+                               const std::optional<std::string>& ifExpr,
+                               const std::optional<std::string>& inRange, const std::string& verb,
+                               DupGroups* out) {
+  out->sample = ds;
+  if ((ifExpr.has_value() && !ifExpr->empty()) || (inRange.has_value() && !inRange->empty())) {
+    const std::string ridCol = "__dup_rid__";
+    const std::string idPath = nextPath(session.workdir(), "dup_grp_id");
+    InRangeFilterResult fr;
+    try {
+      runCobraJson({"eval", "--data", ds->path(), "--egen", ridCol + "=seq()", "--out", idPath});
+      fr = applyIfAndInFilter(session, idPath, ifExpr, inRange);
+    } catch (const CobraError& ce) {
+      return engineErrorBlock(cobraErrorStr(ce), ce.code);
+    }
+    if (!fr.ok) return inRangeRejectError(fr, inRange.value_or(std::string()), verb);
+    out->sampleFile.emplace(fr.dataPath);
+    out->sample = &*out->sampleFile;
+    const double* rid = out->sample->col(ridCol).f64();
+    for (int64_t i = 0; i < out->sample->nRows(); ++i)
+      out->obs.push_back(static_cast<int64_t>(rid[i]));
+  } else {
+    for (int64_t i = 0; i < ds->nRows(); ++i) out->obs.push_back(i + 1);
+  }
+  const Datastore* sample = out->sample;
+  std::vector<const cecon::Column*> keyCols;
+  for (const auto& c : cols) keyCols.push_back(&sample->col(c));
+  auto cellKey = [](const cecon::Column& c, int64_t i) -> std::string {
+    if (c.dtype == cecon::DType::Factor) {
+      const int32_t code = c.codes()[i];
+      return code < 0 || static_cast<size_t>(code) >= c.levels.size()
+                 ? std::string()
+                 : std::string(c.levels[static_cast<size_t>(code)]);
+    }
+    uint64_t bits;
+    const double v = c.f64()[i] == 0.0 ? 0.0 : c.f64()[i];
+    std::memcpy(&bits, &v, sizeof bits);
+    return std::to_string(bits);
+  };
+  std::map<std::vector<std::string>, std::vector<int64_t>> byKey;
+  for (int64_t i = 0; i < sample->nRows(); ++i) {
+    std::vector<std::string> key;
+    for (const cecon::Column* c : keyCols) key.push_back(cellKey(*c, i));
+    byKey[std::move(key)].push_back(i);
+  }
+  for (auto& [key, members] : byKey)
+    if (members.size() > 1) out->groups.push_back(std::move(members));
+  std::sort(out->groups.begin(), out->groups.end(),
+            [&](const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
+              for (const cecon::Column* c : keyCols) {
+                int d = 0;
+                if (c->dtype == cecon::DType::Factor) {
+                  d = cellKey(*c, a.front()).compare(cellKey(*c, b.front()));
+                } else {
+                  d = cecon::stata_cmp(c->f64()[a.front()], c->f64()[b.front()]);
+                }
+                if (d != 0) return d < 0;
+              }
+              return false;
+            });
+  return std::nullopt;
+}
+
+std::string dupTitle(const std::optional<std::vector<std::string>>& varlist,
+                     const std::vector<std::string>& cols) {
+  std::string text = "Duplicates in terms of ";
+  if (!varlist.has_value() || varlist->empty()) return text + "all variables";
+  for (size_t i = 0; i < cols.size(); ++i) text += (i ? " " : "") + cols[i];
+  return text;
+}
+
+// `list [Group] Obs|# e.g.obs varlist, subvarname noobs <options>` over the
+// rows `rows` of the groups' sample.
+std::optional<ojson> dupListing(SessionState& session, const DupGroups& g,
+                                const std::vector<int64_t>& rows,
+                                const std::vector<std::string>& cols,
+                                std::vector<ListLeadCol> lead, const ListLayout* given,
+                                const std::string& title, ojson* listing) {
+  ListLayout lo = given != nullptr ? *given : ListLayout{};
+  lo.noobs = true;
+  lo.subvarname = true;
+  std::vector<int64_t> obs;
+  for (int64_t r : rows) obs.push_back(g.obs[static_cast<size_t>(r)]);
+  ojson err;
+  *listing = buildListing(session, *g.sample, rows, obs, cols, lo, &err, lead);
+  if (listing->is_null()) return err;
+  (*listing)["title"] = title;
+  (*listing)["omitted"] = 0;
+  return std::nullopt;
+}
+
+}  // namespace
+
 ojson runDuplicatesList(const std::optional<std::vector<std::string>>& varlist,
                         SessionState& session, const std::optional<std::string>& ifExpr,
-                        const std::optional<std::string>& inRange) {
+                        const std::optional<std::string>& inRange, const ListLayout* listLayout) {
   Datastore* ds = session.datastore();
   if (ds == nullptr) return eval::noDataLoaded();
   std::vector<std::string> cols;
@@ -621,6 +730,30 @@ ojson runDuplicatesList(const std::optional<std::vector<std::string>>& varlist,
                                   session.displayFormatMap(filteredDs.formatCard(browseVars)));
   block["editable"] = false;
   block["note"] = std::to_string(filteredDs.nRows()) + " duplicate observations";
+  // Stata's table: `list [Group] Obs varlist if dgroup, subvarname noobs <options>`.
+  {
+    DupGroups g;
+    if (auto bad = dupGroups(session, ds, cols, ifExpr, inRange, "duplicates list", &g)) return *bad;
+    std::vector<int64_t> rows;
+    // dgroup is a float (%9.0g); order is c(obs_t), an int (%8.0g) up to 32,740
+    // observations and a long (%12.0g) past it.
+    const long long obsW = ds->nRows() <= 32740 ? 8 : 12;
+    ListLeadCol groupCol{"Group", {}, 9}, obsCol{"Obs", {}, obsW};
+    for (size_t k = 0; k < g.groups.size(); ++k)
+      for (int64_t r : g.groups[k]) {
+        rows.push_back(r);
+        groupCol.values.push_back(static_cast<double>(k + 1));
+        obsCol.values.push_back(static_cast<double>(g.obs[static_cast<size_t>(r)]));
+      }
+    std::vector<ListLeadCol> lead;
+    if (g.groups.size() > 1) lead.push_back(groupCol);
+    lead.push_back(obsCol);
+    ojson listing;
+    if (auto bad = dupListing(session, g, rows, cols, lead, listLayout, dupTitle(varlist, cols),
+                              &listing))
+      return *bad;
+    block["listing"] = std::move(listing);
+  }
   return block;
 }
 
@@ -653,183 +786,54 @@ ojson runDuplicatesList(const std::optional<std::vector<std::string>>& varlist,
 // line Stata allows, which Stata always lists in its display format.
 ojson runDuplicatesExamples(const std::optional<std::vector<std::string>>& varlist,
                             SessionState& session, const std::optional<std::string>& ifExpr,
-                            const std::optional<std::string>& inRange) {
+                            const std::optional<std::string>& inRange,
+                            const ListLayout* listLayout) {
   Datastore* ds = session.datastore();
   if (ds == nullptr) return eval::noDataLoaded();
   std::vector<std::string> cols;
   auto err = resolveVarlist(ds, varlist, cols);
   if (err.has_value()) return engineErrorBlock(*err);
-
-  // The sample, with each row's observation number in the whole data.
-  std::optional<Datastore> sampleFile;
-  const Datastore* sample = ds;
-  std::vector<int64_t> obs;
-  if ((ifExpr.has_value() && !ifExpr->empty()) || (inRange.has_value() && !inRange->empty())) {
-    const std::string ridCol = "__dup_rid__";
-    const std::string idPath = nextPath(session.workdir(), "dup_ex_id");
-    InRangeFilterResult fr;
-    try {
-      runCobraJson({"eval", "--data", ds->path(), "--egen", ridCol + "=seq()", "--out", idPath});
-      fr = applyIfAndInFilter(session, idPath, ifExpr, inRange);
-    } catch (const CobraError& ce) {
-      return engineErrorBlock(cobraErrorStr(ce), ce.code);
-    }
-    if (!fr.ok) return inRangeRejectError(fr, inRange.value_or(std::string()), "duplicates examples");
-    sampleFile.emplace(fr.dataPath);
-    sample = &*sampleFile;
-    const double* rid = sample->col(ridCol).f64();
-    for (int64_t i = 0; i < sample->nRows(); ++i) obs.push_back(static_cast<int64_t>(rid[i]));
-  } else {
-    for (int64_t i = 0; i < sample->nRows(); ++i) obs.push_back(i + 1);
-  }
-  if (auto bad = postDuplicatesR(session, sample->nRows(), {})) return *bad;
-
-  // Group the rows by their cells (a number by its bits, so `.a` is not `.`).
-  std::vector<const cecon::Column*> keyCols;
-  for (const auto& c : cols) keyCols.push_back(&sample->col(c));
-  auto cellText = [](const cecon::Column& c, int64_t i) -> std::string {
-    if (c.dtype == cecon::DType::Factor) {
-      const int32_t code = c.codes()[i];
-      return code < 0 || static_cast<size_t>(code) >= c.levels.size()
-                 ? std::string()
-                 : std::string(c.levels[static_cast<size_t>(code)]);
-    }
-    uint64_t bits;
-    const double v = c.f64()[i] == 0.0 ? 0.0 : c.f64()[i];
-    std::memcpy(&bits, &v, sizeof bits);
-    return std::to_string(bits);
-  };
-  struct Group {
-    int64_t first = 0;  // the sample row of its first member
-    int64_t size = 0;
-  };
-  std::map<std::vector<std::string>, Group> groups;
-  for (int64_t i = 0; i < sample->nRows(); ++i) {
-    std::vector<std::string> key;
-    for (const cecon::Column* c : keyCols) key.push_back(cellText(*c, i));
-    auto [it, fresh] = groups.emplace(std::move(key), Group{i, 0});
-    (void)fresh;
-    ++it->second.size;
-  }
-  std::vector<Group> dups;
-  for (const auto& [key, g] : groups)
-    if (g.size > 1) dups.push_back(g);
-  // Stata's sort order of the varlist: numbers ascending then the missing
-  // codes, strings by their bytes.
-  std::sort(dups.begin(), dups.end(), [&](const Group& a, const Group& b) {
-    for (const cecon::Column* c : keyCols) {
-      int d = 0;
-      if (c->dtype == cecon::DType::Factor) {
-        d = cellText(*c, a.first).compare(cellText(*c, b.first));
-      } else {
-        d = cecon::stata_cmp(c->f64()[a.first], c->f64()[b.first]);
-      }
-      if (d != 0) return d < 0;
-    }
-    return false;
-  });
-
-  const bool allVars = !varlist.has_value() || varlist->empty();
-  std::string text = "Duplicates in terms of ";
-  if (allVars) {
-    text += "all variables";
-  } else {
-    for (size_t i = 0; i < cols.size(); ++i) text += (i ? " " : "") + cols[i];
-  }
-  if (dups.empty()) {
+  DupGroups g;
+  if (auto bad = dupGroups(session, ds, cols, ifExpr, inRange, "duplicates examples", &g))
+    return *bad;
+  if (auto bad = postDuplicatesR(session, g.sample->nRows(), {})) return *bad;
+  const std::string title = dupTitle(varlist, cols);
+  if (g.groups.empty()) {
     ojson block;
     block["type"] = "display";
-    block["text"] = text + "\n\n(0 observations are duplicates)";
+    block["text"] = title + "\n\n(0 observations are duplicates)";
     return block;
   }
-
-  std::vector<std::string> head;
-  if (dups.size() > 1) head.push_back("Group");
-  head.push_back("#");
-  head.push_back("e.g. obs");
-  const size_t firstVar = head.size();
-  for (const auto& c : cols) head.push_back(c);
-  // Each variable's display format, from the one resolver list uses.
-  std::map<std::string, std::string> fmtOf;
-  for (const auto& [name, fmt] : session.displayFormatMap(ds->formatCard(cols)))
-    fmtOf[name] = fmt;
-  std::vector<bool> left(head.size(), false);
-  for (size_t k = 0; k < cols.size(); ++k)
-    left[firstVar + k] = fmtOf[cols[k]].compare(0, 2, "%-") == 0;
-  std::vector<std::vector<std::string>> rows;
-  for (size_t g = 0; g < dups.size(); ++g) {
-    std::vector<std::string> row;
-    if (dups.size() > 1) row.push_back(std::to_string(g + 1));
-    row.push_back(std::to_string(dups[g].size));
-    row.push_back(std::to_string(obs[static_cast<size_t>(dups[g].first)]));
-    for (size_t k = 0; k < cols.size(); ++k) {
-      const cecon::Column& c = *keyCols[k];
-      if (c.dtype == cecon::DType::Factor) {
-        row.push_back(cellText(c, dups[g].first));
-        continue;
-      }
-      const double v = c.f64()[dups[g].first];
-      const int kind = cecon::missing_kind(v);
-      if (kind >= 0) {
-        row.push_back(cecon::missing_text(kind));
-        continue;
-      }
-      auto vl = session.valueLabels.find(cols[k]);
-      if (vl != session.valueLabels.end() && v == std::floor(v)) {
-        auto lab = vl->second.find(static_cast<int>(v));
-        if (lab != vl->second.end()) {
-          row.push_back(lab->second);
-          continue;
-        }
-      }
-      row.push_back(trim(eval::applyStataFmt(v, fmtOf[cols[k]])));
-    }
-    rows.push_back(std::move(row));
+  // `list [Group] # e.g.obs varlist if example, subvarname noobs <options>`: one
+  // line per group, its first observation.
+  std::vector<int64_t> rows;
+  const long long obsW = ds->nRows() <= 32740 ? 8 : 12;  // c(obs_t): int, else long
+  ListLeadCol groupCol{"Group", {}, 9}, sizeCol{"#", {}, obsW}, firstCol{"e.g. obs", {}, obsW};
+  for (size_t k = 0; k < g.groups.size(); ++k) {
+    const int64_t r = g.groups[k].front();
+    rows.push_back(r);
+    groupCol.values.push_back(static_cast<double>(k + 1));
+    sizeCol.values.push_back(static_cast<double>(g.groups[k].size()));
+    firstCol.values.push_back(static_cast<double>(g.obs[static_cast<size_t>(r)]));
   }
-  std::vector<size_t> width(head.size());
-  for (size_t j = 0; j < head.size(); ++j) {
-    size_t widest = 0;
-    for (const auto& r : rows) widest = std::max(widest, displayCols(r[j]));
-    if (j >= firstVar) head[j] = abbrevName(head[j], std::max<size_t>(8, widest));
-    width[j] = std::max(displayCols(head[j]), widest);
-  }
-  auto line = [&](const std::vector<std::string>& cells) {
-    std::string s = "  |";
-    for (size_t j = 0; j < cells.size(); ++j) {
-      const std::string pad(width[j] - displayCols(cells[j]), ' ');
-      s += (j ? "   " : " ") + (left[j] ? cells[j] + pad : pad + cells[j]);
-    }
-    return s + " |\n";
-  };
-  size_t inner = 2 + 3 * (head.size() - 1);
-  for (size_t w : width) inner += w;
-  if (inner + 4 > 255) {
-    return eval::errorBlock(
-        "unsupported_command",
-        "duplicates examples: these groups make a table " + std::to_string(inner + 4) +
-            " columns wide, wider than Stata's widest line (linesize 255), so Stata lists them "
-            "in list's display format, which this build does not implement; name fewer "
-            "variables",
-        std::string("duplicates"), std::nullopt, std::nullopt, "refused:list-display-format");
-  }
-  const std::string box = "  +" + std::string(inner, '-') + "+\n";
-  const std::string rule = "  |" + std::string(inner, '-') + "|\n";
-  text += "\n\n" + box + line(head) + rule;
-  for (size_t r = 0; r < rows.size(); ++r) {
-    if (r > 0 && r % 5 == 0) text += rule;
-    text += line(rows[r]);
-  }
-  text += box;
-  text.pop_back();  // the block carries no trailing newline
+  std::vector<ListLeadCol> lead;
+  if (g.groups.size() > 1) lead.push_back(groupCol);
+  lead.push_back(sizeCol);
+  lead.push_back(firstCol);
+  ojson listing;
+  if (auto bad = dupListing(session, g, rows, cols, lead, listLayout, title, &listing)) return *bad;
   ojson block;
-  block["type"] = "display";
-  block["text"] = text;
+  block["type"] = "browse";
+  block["editable"] = false;
+  block["columns"] = ojson::array();
+  block["rows"] = ojson::array();
+  block["listing"] = std::move(listing);
   return block;
 }
 ojson runDuplicates(const std::string& sub, const std::optional<std::vector<std::string>>& varlist,
                     const std::optional<std::string>& genvar, SessionState& session,
                     const std::optional<std::string>& ifExpr,
-                    const std::optional<std::string>& inRange) {
+                    const std::optional<std::string>& inRange, const ListLayout* listLayout) {
   std::string subLower = lower(sub);
   if (subLower == "report") return runDuplicatesReport(varlist, session, ifExpr, inRange);
   if (subLower == "drop") return runDuplicatesDrop(varlist, session, ifExpr, inRange);
@@ -839,8 +843,9 @@ ojson runDuplicates(const std::string& sub, const std::optional<std::vector<std:
     }
     return runDuplicatesTag(varlist, *genvar, session, ifExpr, inRange);
   }
-  if (subLower == "list") return runDuplicatesList(varlist, session, ifExpr, inRange);
-  if (subLower == "examples") return runDuplicatesExamples(varlist, session, ifExpr, inRange);
+  if (subLower == "list") return runDuplicatesList(varlist, session, ifExpr, inRange, listLayout);
+  if (subLower == "examples")
+    return runDuplicatesExamples(varlist, session, ifExpr, inRange, listLayout);
   return engineErrorBlock(
       "duplicates " + sub +
       ": unknown subcommand. Use: duplicates report|examples|drop|tag|list [VARLIST]");

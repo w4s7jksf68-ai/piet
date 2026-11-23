@@ -94,6 +94,7 @@ ojson runClear(const std::string& subIn, SessionState& session) {
     session.panelvar.reset();
     session.timevar.reset();
     session.programs.clear();       // ado's `program drop _all` under "all".
+    session.constraints.clear();    // ado's `constraint drop _all` under "all".
     ++session.programsEpoch;
     session.returnStaging.clear();  // ado's `_return drop _all` under "all".
     // BUG-392 (2026-09-02): the rest of clear.ado's `all` branch — `_est drop _all`,

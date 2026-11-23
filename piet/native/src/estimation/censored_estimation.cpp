@@ -34,6 +34,7 @@
 
 #include "extended_estimation_internal.h"
 #include "estimation_options.h"
+#include "estimation_families_internal.h"  // inRangeConditionM4
 
 namespace piet::handlers {
 using ojson = nlohmann::ordered_json;
@@ -99,6 +100,10 @@ ojson runTobit(const eval::ParsedCommand& parsed, SessionState& session) {
   }
 
   std::vector<std::string> argv = {"tobit", "--y", y, "--x", joinCommaM4(xs)};
+  // `in a/b`: folded into the fit's `if` (bank ee3b4109 `tobit mpg weight if price
+  // > 4000 in 1/60, ll(17)`), which the bare ll/ul sample reads too.
+  std::optional<std::string> fitIf;
+  if (auto err = inRangeConditionM4(session, parsed, fitIf, "tobit")) return *err;
 
   // Stata's BARE `ll`/`ul` (no numeric value) means "censor at the depvar's
   // own observed min/max" — cobra's tobit has no bare-flag equivalent
@@ -112,7 +117,7 @@ ojson runTobit(const eval::ParsedCommand& parsed, SessionState& session) {
     } else {
       double mn = 0, mx = 0;
       ojson errBlock;
-      if (!computeYMinMaxM4(session, y, parsed.ifExpr, mn, mx, errBlock)) return errBlock;
+      if (!computeYMinMaxM4(session, y, fitIf, mn, mx, errBlock)) return errBlock;
       char buf[64];
       std::snprintf(buf, sizeof(buf), "%.17g", mn);
       numStr = buf;
@@ -127,7 +132,7 @@ ojson runTobit(const eval::ParsedCommand& parsed, SessionState& session) {
     } else {
       double mn = 0, mx = 0;
       ojson errBlock;
-      if (!computeYMinMaxM4(session, y, parsed.ifExpr, mn, mx, errBlock)) return errBlock;
+      if (!computeYMinMaxM4(session, y, fitIf, mn, mx, errBlock)) return errBlock;
       char buf[64];
       std::snprintf(buf, sizeof(buf), "%.17g", mx);
       numStr = buf;
@@ -135,9 +140,9 @@ ojson runTobit(const eval::ParsedCommand& parsed, SessionState& session) {
     argv.push_back("--ul");
     argv.push_back(numStr);
   }
-  if (parsed.ifExpr.has_value()) {
+  if (fitIf.has_value()) {
     argv.push_back("--keepif");
-    argv.push_back(*parsed.ifExpr);
+    argv.push_back(*fitIf);
   }
 
   // level() — NEVER forwarded. cobra tobit's own usage banner does NOT list

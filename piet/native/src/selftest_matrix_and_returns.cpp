@@ -863,6 +863,31 @@ void testG_BUG373DeclaredReturnsLock() {
           "BUG-373: winsor2 publishes r(r1)=.0476695 r(r2)=2.4152541 — the cut values, matching "
           "the StataBE capture to every digit it printed");
 
+    // BUG-1990: the cutoffs and output must use the same rows. Out-of-sample
+    // values are deliberately extreme so an all-row percentile will differ.
+    const auto anyError = [](const auto& blocks) {
+      return std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
+        return block.value("type", std::string()) == "error";
+      });
+    };
+    (void)piet::dispatch("clear", s2);
+    (void)piet::dispatch("set obs 8", s2);
+    (void)piet::dispatch("generate double x = cond(_n<=2, -100, _n)", s2);
+    (void)piet::dispatch("replace x = .a in 5", s2);
+    const auto qualified = piet::dispatch("winsor2 x if _n>=3 in 2/7, cuts(25 75)", s2);
+    check(!anyError(qualified) && rv("r1") == "3.5" && rv("r2") == "6.5",
+          "winsor2: qualifiers and nonmissing values determine the published cutoffs");
+    check(!anyError(piet::dispatch(
+              "assert _N==8 & x_w==cond(inlist(_n,3,4,6,7),max(3.5,min(x,6.5)),.)", s2)),
+          "winsor2: new column clips only selected rows and preserves row order");
+    const auto trimmed = piet::dispatch("winsor2 x if _n>=3 in 2/7, cuts(25 75) replace trim", s2);
+    check(!anyError(trimmed) && !anyError(piet::dispatch(
+              "assert x==cond(_n<=2,-100,cond(_n==5,.a,cond(inlist(_n,3,7),.,_n)))", s2)),
+          "winsor2: qualified trim replace preserves excluded rows and extended missings");
+    const auto empty = piet::dispatch("winsor2 x if 0, suffix(_empty)", s2);
+    check(anyError(empty) && !s2.datastore()->has("x_empty"),
+          "winsor2: empty qualified sample leaves the dataset untouched");
+
     // estat vif: one name/value pair per regressor, 1-based.
     (void)piet::dispatch("sysuse fatalities, clear", s2);
     (void)piet::dispatch("regress fatal beertax unemp", s2);

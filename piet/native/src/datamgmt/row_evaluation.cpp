@@ -153,17 +153,45 @@ const std::set<std::string>& stringFnNames() {
 
 // Replace every "..." string literal with an empty "" (so operators/idents
 // inside a literal are not misread) — mirrors _STR_LITERAL_RE.sub('""', expr).
+// Hand scans with the regex's exact semantics (`"[^"]*"`, leftmost, non-overlapping):
+// a quote opens a literal that the NEXT quote closes; a quote with no partner is
+// left as it is. These three run on every gen/replace/count-if, and as std::regex
+// they were ~10% of PIET's time in a do-file loop of short commands.
 std::string maskStringLiterals(const std::string& expr) {
-  static const std::regex reStr(R"("[^"]*")");
-  return std::regex_replace(expr, reStr, "\"\"");
+  const size_t first = expr.find('"');
+  if (first == std::string::npos) return expr;
+  std::string out;
+  out.reserve(expr.size());
+  size_t i = 0;
+  while (i < expr.size()) {
+    const size_t open = expr.find('"', i);
+    if (open == std::string::npos) break;
+    const size_t close = expr.find('"', open + 1);
+    if (close == std::string::npos) break;
+    out.append(expr, i, open - i);
+    out += "\"\"";
+    i = close + 1;
+  }
+  out.append(expr, i, std::string::npos);
+  return out;
 }
 
 bool hasStringLiteral(const std::string& expr) {
-  static const std::regex reStr(R"("[^"]*")");
-  return std::regex_search(expr, reStr);
+  const size_t open = expr.find('"');
+  return open != std::string::npos && expr.find('"', open + 1) != std::string::npos;
 }
 
 bool usesStringFn(const std::string& expr) {
+  // A call the regex below could accept spells one of the names, so an expression in
+  // which no name occurs at all (case-insensitively, literals included -- masking
+  // only ever removes text) cannot match. That is nearly every numeric expression.
+  {
+    const std::string low = toLower(expr);
+    bool any = false;
+    for (const std::string& fn : stringFnNames())
+      if (low.find(fn) != std::string::npos) { any = true; break; }
+    if (!any) return false;
+  }
   std::string masked = maskStringLiterals(expr);
   // Unicode names (core/ident.h): a byte >= 0x80 is a name byte. The regex takes
   // a whole name leftmost-first, and a match whose left neighbour is a name byte
@@ -1221,7 +1249,8 @@ bool needsConditionMask(SessionState& session, const std::string& cond) {
   // A compare against the empty string: the literal `""` standing alone, not the
   // inside of a longer literal.
   static const std::regex reEmptyLit(R"re((^|[^"`])""([^"']|$))re");
-  if (std::regex_search(cond, reEmptyLit)) return true;
+  // The pattern needs two quotes in a row; most conditions have none.
+  if (cond.find("\"\"") != std::string::npos && std::regex_search(cond, reEmptyLit)) return true;
   // Any other use of a string column. The engine's factor compare reads
   // `s ==/!= "text"` in either operand order and nothing else: `missing(s)`,
   // `inlist(s, "b", "c")`, `s > "a"`, `s == t` and `s[_n-1]` are refused

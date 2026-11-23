@@ -31,7 +31,8 @@ int ols_solve(const double* X, int64_t n, int k, const double* y,
 }  // namespace
 
 XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
-                       const double* y_in, const double* ivar_in) {
+                       const double* y_in, const double* ivar_in, bool emit_within,
+                       const double* cluster_in, bool sa) {
     XtregReResult R;
     R.k = k;
 
@@ -64,11 +65,13 @@ XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
     int64_t N = n_obs;
     std::vector<double> X(static_cast<size_t>(N) * k);  // col-major N*k (no intercept)
     std::vector<double> y(static_cast<size_t>(N));
+    std::vector<double> clv(cluster_in != nullptr ? static_cast<size_t>(N) : 0);
     int64_t cur = 0;
     for (int64_t gi = 0; gi < n_g; ++gi) {
         const auto& rs = rows_per_g[static_cast<size_t>(gi)];
         groups[static_cast<size_t>(gi)] = {cur, cur + static_cast<int64_t>(rs.size())};
         for (int64_t r : rs) {
+            if (cluster_in != nullptr) clv[static_cast<size_t>(cur)] = cluster_in[r];
             y[static_cast<size_t>(cur)] = y_in[r];
             for (int c = 0; c < k; ++c)
                 X[static_cast<size_t>(c) * N + cur] = X_in[static_cast<int64_t>(c) * n_obs + r];
@@ -161,6 +164,33 @@ XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
     }
     double sigma_e2 = SSR_w / dof_e;
     R.sigma_e = std::sqrt(std::max(0.0, sigma_e2));
+    if (emit_within && dof_e > 0) {
+        // Recover the within fit on the original scale. The intercept is
+        // ȳ - x̄β; its covariance includes the sampling variance of ȳ and
+        // the variance of x̄β. Invariant columns stay zero on the full stripe.
+        const int width = k + 1;
+        R.within_beta.assign(static_cast<size_t>(width), 0.0);
+        R.within_vcov.assign(static_cast<size_t>(width) * width, 0.0);
+        double intercept = y_gm;
+        double intercept_var = sigma_e2 / static_cast<double>(N);
+        for (int j = 0; j < kv; ++j) {
+            const int column = var_cols[static_cast<size_t>(j)];
+            R.within_beta[column] = beta_w_v[j];
+            intercept -= X_gm[column] * beta_w_v[j];
+            double intercept_cov = 0.0;
+            for (int i = 0; i < kv; ++i) {
+                const int row = var_cols[static_cast<size_t>(i)];
+                const double cov = sigma_e2 * XtXi_w_v[i + static_cast<size_t>(j) * kv];
+                R.within_vcov[row + static_cast<size_t>(column) * width] = cov;
+                intercept_cov -= X_gm[row] * cov;
+            }
+            R.within_vcov[column + static_cast<size_t>(k) * width] = intercept_cov;
+            R.within_vcov[k + static_cast<size_t>(column) * width] = intercept_cov;
+            intercept_var -= X_gm[column] * intercept_cov;
+        }
+        R.within_beta[k] = intercept;
+        R.within_vcov[k + static_cast<size_t>(k) * width] = intercept_var;
+    }
 
     // ---- 4. Between OLS: ȳ_i ~ X̄_i + 1 (UNWEIGHTED on n_g obs). Returns
     // (α_b, β_b) and SSR_b = Σ (ȳ_i - α_b - X̄_i β_b)².
@@ -191,6 +221,43 @@ XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
 
     // σ_u² (Stata default σ_uT): max(0, SSR_b/(n - K) - σ_e² / T_h). Here K = k+1.
     double sigma_u2 = SSR_b / (static_cast<double>(n_g) - static_cast<double>(k + 1)) - sigma_e2 / T_h;
+    bool t_const = true;
+    for (const auto& g : groups)
+        if (g.end - g.start != groups.front().end - groups.front().start) { t_const = false; break; }
+    if (sa && !t_const) {
+        // Baltagi-Chang small-sample Swamy-Arora sigma_u (see the header).
+        const int ka = k + 1;
+        double ssr_star = 0;
+        std::vector<double> Xw(static_cast<size_t>(n_g) * ka);  // rows sqrt(T_i) x̄_i
+        std::vector<double> B(static_cast<size_t>(ka) * ka, 0.0);  // Σ T_i² x̄_i x̄_i'
+        for (int64_t gi = 0; gi < n_g; ++gi) {
+            const double Ti = static_cast<double>(groups[static_cast<size_t>(gi)].end
+                                                  - groups[static_cast<size_t>(gi)].start);
+            double yh = 0;
+            for (int c = 0; c < ka; ++c)
+                yh += Xb_aug[static_cast<size_t>(c) * n_g + gi] * beta_b[static_cast<size_t>(c)];
+            const double e = ybar[static_cast<size_t>(gi)] - yh;
+            ssr_star += Ti * e * e;
+            for (int c = 0; c < ka; ++c)
+                Xw[static_cast<size_t>(c) * n_g + gi] =
+                    std::sqrt(Ti) * Xb_aug[static_cast<size_t>(c) * n_g + gi];
+            for (int a = 0; a < ka; ++a)
+                for (int b = 0; b < ka; ++b)
+                    B[static_cast<size_t>(b) * ka + a] += Ti * Ti *
+                        Xb_aug[static_cast<size_t>(a) * n_g + gi] * Xb_aug[static_cast<size_t>(b) * n_g + gi];
+        }
+        std::vector<double> Ainv, unused;
+        if (ols_solve(Xw.data(), n_g, ka, ybar.data(), unused, Ainv) != 0) {
+            R.ok = false; return R;
+        }
+        double tr = 0;
+        for (int a = 0; a < ka; ++a)
+            for (int b = 0; b < ka; ++b)
+                tr += Ainv[static_cast<size_t>(b) * ka + a] * B[static_cast<size_t>(a) * ka + b];
+        sigma_u2 = (ssr_star - (static_cast<double>(n_g) - static_cast<double>(ka)) * sigma_e2) /
+                   (static_cast<double>(N) - tr);
+        if (!std::isfinite(sigma_u2)) sigma_u2 = 0;
+    }
     if (sigma_u2 < 0) sigma_u2 = 0;
     R.sigma_u = std::sqrt(sigma_u2);
     R.rho = (sigma_u2 + sigma_e2 > 0)
@@ -225,6 +292,30 @@ XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
             X_star[static_cast<size_t>(k) * N + i] = 1.0 - th;
     }
 
+    // The GLS regression with cluster() leaves out the rows whose cluster is missing;
+    // the variance components above used every row (see the header).
+    if (cluster_in != nullptr &&
+        std::any_of(clv.begin(), clv.end(), [](double v) { return std::isnan(v); })) {
+        int64_t Ng = 0;
+        for (double v : clv) if (!std::isnan(v)) ++Ng;
+        std::vector<double> Xg(static_cast<size_t>(Ng) * (k + 1)), yg(static_cast<size_t>(Ng)),
+            cg(static_cast<size_t>(Ng));
+        int64_t w = 0;
+        for (int64_t i = 0; i < N; ++i) {
+            if (std::isnan(clv[static_cast<size_t>(i)])) continue;
+            yg[static_cast<size_t>(w)] = y_star[static_cast<size_t>(i)];
+            cg[static_cast<size_t>(w)] = clv[static_cast<size_t>(i)];
+            for (int c = 0; c < k + 1; ++c)
+                Xg[static_cast<size_t>(c) * Ng + w] = X_star[static_cast<size_t>(c) * N + i];
+            ++w;
+        }
+        X_star.swap(Xg);
+        y_star.swap(yg);
+        clv.swap(cg);
+        N = Ng;
+        R.n_obs = Ng;
+        if (N <= k + 1) { R.ok = false; return R; }
+    }
     std::vector<double> beta_re, XtXi_re;
     if (ols_solve(X_star.data(), N, k + 1, y_star.data(), beta_re, XtXi_re) != 0) {
         R.ok = false; return R;
@@ -241,6 +332,7 @@ XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
         SSR_re += e * e;
     }
     double sigma2_re = SSR_re / (static_cast<double>(N) - static_cast<double>(k + 1));
+    R.rmse = std::sqrt(sigma2_re);
     R.beta.assign(beta_re.begin(), beta_re.end());
     R.se.assign(static_cast<size_t>(k + 1), 0.0);
     // Full FGLS covariance V = sigma2_re * (X*'X*)^{-1}  ((k+1)*(k+1), col-major),
@@ -248,6 +340,58 @@ XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
     R.vcov_matrix.assign(static_cast<size_t>(k + 1) * (k + 1), 0.0);
     for (size_t i = 0; i < R.vcov_matrix.size(); ++i)
         R.vcov_matrix[i] = sigma2_re * XtXi_re[i];
+    if (cluster_in != nullptr) {
+        // Stata's regress cluster() sandwich on the transformed system (see the header).
+        const int ka = k + 1;
+        std::unordered_map<double, int64_t> cidx;
+        std::vector<double> score;  // G * ka, row g = sum over the cluster of x*_i e*_i
+        for (int64_t i = 0; i < N; ++i) {
+            double yh = 0;
+            for (int c = 0; c < ka; ++c)
+                yh += X_star[static_cast<size_t>(c) * N + i] * beta_re[static_cast<size_t>(c)];
+            const double e = y_star[static_cast<size_t>(i)] - yh;
+            auto it = cidx.find(clv[static_cast<size_t>(i)]);
+            int64_t g;
+            if (it == cidx.end()) {
+                g = static_cast<int64_t>(cidx.size());
+                cidx.emplace(clv[static_cast<size_t>(i)], g);
+                score.resize(score.size() + static_cast<size_t>(ka), 0.0);
+            } else {
+                g = it->second;
+            }
+            for (int c = 0; c < ka; ++c)
+                score[static_cast<size_t>(g) * ka + c] += X_star[static_cast<size_t>(c) * N + i] * e;
+        }
+        const int64_t G = static_cast<int64_t>(cidx.size());
+        R.n_clusters = G;
+        if (G >= 2 && N > ka) {
+            std::vector<double> meat(static_cast<size_t>(ka) * ka, 0.0);
+            for (int64_t g = 0; g < G; ++g)
+                for (int a = 0; a < ka; ++a)
+                    for (int b = 0; b < ka; ++b)
+                        meat[static_cast<size_t>(b) * ka + a] +=
+                            score[static_cast<size_t>(g) * ka + a] * score[static_cast<size_t>(g) * ka + b];
+            const double fac = (static_cast<double>(N) - 1.0) / (static_cast<double>(N) - ka) *
+                               static_cast<double>(G) / (static_cast<double>(G) - 1.0);
+            std::vector<double> tmp(static_cast<size_t>(ka) * ka, 0.0);
+            for (int a = 0; a < ka; ++a)  // tmp = XtXi * meat
+                for (int b = 0; b < ka; ++b) {
+                    double acc = 0;
+                    for (int m = 0; m < ka; ++m)
+                        acc += XtXi_re[static_cast<size_t>(m) * ka + a] * meat[static_cast<size_t>(b) * ka + m];
+                    tmp[static_cast<size_t>(b) * ka + a] = acc;
+                }
+            for (int a = 0; a < ka; ++a)  // V = fac * tmp * XtXi
+                for (int b = 0; b < ka; ++b) {
+                    double acc = 0;
+                    for (int m = 0; m < ka; ++m)
+                        acc += tmp[static_cast<size_t>(m) * ka + a] * XtXi_re[static_cast<size_t>(b) * ka + m];
+                    R.vcov_matrix[static_cast<size_t>(b) * ka + a] = fac * acc;
+                }
+        } else {
+            std::fill(R.vcov_matrix.begin(), R.vcov_matrix.end(), std::nan(""));
+        }
+    }
     for (int c = 0; c < k + 1; ++c)
         R.se[static_cast<size_t>(c)] = std::sqrt(std::max(0.0,
             R.vcov_matrix[static_cast<size_t>(c) * (k + 1) + c]));

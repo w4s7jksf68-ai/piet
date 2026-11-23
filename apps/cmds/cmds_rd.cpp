@@ -235,8 +235,8 @@ int cmd_rddensity(const std::vector<std::string>& a) {
 
     json bino = json::array();
     for (const auto& r : R.binomial)
-        bino.push_back({{"window", r.window}, {"n_left", r.n_left},
-                        {"n_right", r.n_right}, {"p", r.p_value}});
+        bino.push_back({{"window", r.window}, {"window_right", r.window_right}, {"n_left", r.n_left},
+                        {"n_right", r.n_right}, {"p", r.p_value}, {"p_l", r.p_lower}, {"p_u", r.p_upper}});
 
     json out = {
         {"estimator", "rddensity"},
@@ -264,7 +264,8 @@ int cmd_rddensity(const std::vector<std::string>& a) {
                           {"se", R.se_conventional}, {"diff", R.diff}}},
         {"robust", {{"T", R.t_robust}, {"p", R.p_robust},
                     {"se", R.se_robust}, {"diff", R.diff_q},
-                    {"f_left", R.f_left_q}, {"f_right", R.f_right_q}}},
+                    {"f_left", R.f_left_q}, {"f_right", R.f_right_q},
+                    {"se_left", R.se_left_q}, {"se_right", R.se_right_q}}},
         {"T", R.t_robust},
         {"pvalue", R.p_robust},
         {"binomial", bino},

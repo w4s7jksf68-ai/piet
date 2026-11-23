@@ -185,8 +185,10 @@ ojson runInteg(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto e = sampleMask(session, parsed, &mask)) return *e;
   Datastore* ds = session.datastore();
   if (ds == nullptr) return ojson(eval::noDataLoaded());
+  // integ marks its sample with both variables: a string one leaves no
+  // observations, r(2000) (vs-stata bank 0587577e543d4fb0).
   if (ds->col(yvar).dtype == cecon::DType::Factor || ds->col(xvar).dtype == cecon::DType::Factor)
-    return rcError("type mismatch", 109);
+    return rcError("no observations", 2000);
   const std::vector<double> y = columnDoubles(*ds, yvar);
   const std::vector<double> x = columnDoubles(*ds, xvar);
   std::vector<KeyCol> keys;

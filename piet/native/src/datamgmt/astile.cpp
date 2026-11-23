@@ -145,8 +145,11 @@ ojson runAstile(const eval::ParsedCommand& parsed, SessionState& session) {
     const std::vector<std::string> words = splitWs(expText);
     const bool plainName = words.size() == 1 && strutil::isValidStataIdentifier(words.front());
     std::vector<std::string> one;
-    if (!plainName || resolveVars(session, {words.front()}, &one).has_value() || one.size() != 1)
-      return rcError("variable " + words.front() + " not found", 3598);
+    // Not a name at all: the Mata call fails, r(3598) (190cb793707dbb85); a
+    // name that is no variable: r(111) "X not found" (fdbe83be9d611c5c).
+    if (!plainName) return rcError("variable " + words.front() + " not found", 3598);
+    if (resolveVars(session, {words.front()}, &one).has_value() || one.size() != 1)
+      return rcError(words.front() + " not found", 111);
     srcvar = one.front();
   }
   double nqD = 0.0;

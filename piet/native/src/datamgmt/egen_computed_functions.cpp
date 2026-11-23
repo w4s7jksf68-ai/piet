@@ -36,6 +36,7 @@
 #include "piet/strutil.h"
 #include "piet/scratch_seq.h"
 #include "piet/storage_type.h"  // BUG-471 T2: --store-type
+#include "engine/scratch_columns.h"
 #include "egen_internal.h"
 
 namespace piet::handlers {
@@ -565,9 +566,675 @@ ojson computeConcat(const ComputedEgen& call, const std::string& punct, const st
   return mutationResult(session, "egen", {call.newvar});
 }
 
+// skew, kurt, mdev, mad, fill, diff, rowfirst/rowlast (rfirst/rlast),
+// rowmedian, rowpctile and ends (help egen; each ado's method, in our code).
+
+// A string payload line for installColumn: quoted, an embedded quote doubled.
+std::string quotedLine(const std::string& text) {
+  std::string line = "\"";
+  for (char c : text) {
+    if (c == '"') line += '"';
+    line += c;
+  }
+  return line + "\"\n";
+}
+
+// One value per row of the expression `rhs`, as generate evaluates it (a missing
+// value of any kind is a NaN).
+std::optional<ojson> evaluateColumn(SessionState& session, const std::string& rhs,
+                                    std::vector<double>* out) {
+  ScratchColumns scratch(session);
+  std::string col;
+  if (auto failed = scratch.add(rhs, "", &col)) return failed;
+  *out = scratch.values(col);
+  for (double& v : *out)
+    if (std::fabs(v) >= eval::kStataMissingSentinel) v = std::numeric_limits<double>::quiet_NaN();
+  return std::nullopt;
+}
+
+// Group number per row of the by-variables (equal values, a missing one
+// included, share a group); every row is group 0 without a by-list.
+std::optional<ojson> byGroups(SessionState& session, const std::string& byText,
+                              std::vector<long long>* group) {
+  const int64_t rows = session.datastore()->nRows();
+  group->assign(static_cast<size_t>(rows), 0);
+  if (trim(byText).empty()) return std::nullopt;
+  loops::VarlistExpandResult expanded = loops::expandVarlist(byText, session);
+  if (expanded.isError) return expanded.error;
+  if (auto unknown = loops::checkKnownVarlist(expanded.tokens, session)) return unknown;
+  Datastore* ds = session.datastore();
+  std::map<std::vector<double>, long long> ids;
+  std::vector<std::vector<double>> keys(static_cast<size_t>(rows));
+  for (const std::string& var : expanded.tokens) {
+    const cecon::Column& c = ds->col(var);
+    if (c.dtype == cecon::DType::Factor) {
+      const int32_t* codes = c.codes();
+      for (int64_t i = 0; i < rows; ++i) {
+        const int32_t code = codes[i];
+        const std::string text = code >= 0 && static_cast<size_t>(code) < c.levels.size()
+                                     ? c.levels[static_cast<size_t>(code)]
+                                     : std::string();
+        // Equal strings are one group: the key is the text's own hash and length.
+        keys[static_cast<size_t>(i)].push_back(static_cast<double>(std::hash<std::string>{}(text)));
+        keys[static_cast<size_t>(i)].push_back(static_cast<double>(text.size()));
+      }
+    } else {
+      const double* v = c.f64();
+      for (int64_t i = 0; i < rows; ++i) {
+        double x = v[i];
+        if (std::isnan(x)) x = eval::kStataMissingSentinel + 1.0;  // one key for a NaN
+        keys[static_cast<size_t>(i)].push_back(x);
+      }
+    }
+  }
+  for (int64_t i = 0; i < rows; ++i) {
+    auto it = ids.emplace(keys[static_cast<size_t>(i)], static_cast<long long>(ids.size())).first;
+    (*group)[static_cast<size_t>(i)] = it->second;
+  }
+  return std::nullopt;
+}
+
+double medianOfSorted(const std::vector<double>& v) {
+  if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
+  const size_t n = v.size();
+  return n % 2 == 1 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
+}
+
+// rowpctile's rule (also rowmedian's, p = 50): rank threshold n p / 100, the
+// two neighbours averaged when it is a whole number (within 1e-8).
+double rowPercentile(std::vector<double> v, double p) {
+  if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
+  std::sort(v.begin(), v.end());
+  const double threshold = static_cast<double>(v.size()) * p / 100.0;
+  double smallest = std::ceil(threshold);
+  if (std::fabs(smallest - threshold) < 1e-8) smallest += 1.0;
+  const size_t k = static_cast<size_t>(smallest);
+  if (std::fabs(threshold - (smallest - 1.0)) < 1e-8) {
+    if (k < 2 || k > v.size()) return std::numeric_limits<double>::quiet_NaN();
+    return (v[k - 2] + v[k - 1]) / 2.0;
+  }
+  if (k < 1 || k > v.size()) return std::numeric_limits<double>::quiet_NaN();
+  return v[k - 1];
+}
+
+std::optional<ojson> installTyped(SessionState& session, const std::string& newvar,
+                                  const std::string& declared, std::vector<double> values) {
+  const std::string type = declared.empty() ? std::string("float") : declared;
+  for (double& v : values) v = heldIn(type, v);
+  if (auto failed = installNumbers(session, newvar, values)) return failed;
+  noteResultType(session, newvar, type, type);
+  return std::nullopt;
+}
+
+// installTyped(), then the rows whose result is an extended missing value
+// (.a-.z) are set to that value: the values file of the engine's column install
+// carries numbers and `.` only.
+std::optional<ojson> installTypedKeepingKinds(SessionState& session, const std::string& newvar,
+                                              const std::string& declared,
+                                              const std::vector<double>& values) {
+  if (auto failed = installTyped(session, newvar, declared, values)) return failed;
+  std::vector<double> kinds(values.size(), std::numeric_limits<double>::quiet_NaN());
+  std::set<int> present;
+  for (size_t i = 0; i < values.size(); ++i) {
+    const int kind = cecon::missing_kind(values[i]);
+    if (kind < 1) continue;
+    kinds[i] = kind;
+    present.insert(kind);
+  }
+  if (present.empty()) return std::nullopt;
+  std::string marker;
+  {
+    int serial = 0;
+    do marker = "__egenkind" + std::to_string(++serial);
+    while (session.datastore()->has(marker));
+  }
+  if (auto failed = installNumbers(session, marker, kinds)) return failed;
+  std::optional<ojson> failure;
+  for (int kind : present) {
+    ojson blocks = dispatch("quietly replace " + newvar + " = ." +
+                                std::string(1, static_cast<char>('a' + kind - 1)) + " if " +
+                                marker + " == " + std::to_string(kind),
+                            session);
+    for (const auto& b : blocks)
+      if (b.is_object() && b.value("type", std::string()) == "error") failure = b;
+    if (failure) break;
+  }
+  {
+    SessionState::TempDropScope quietDrop(session);
+    (void)dispatch("quietly drop " + marker, session);
+  }
+  return failure;
+}
+
 }  // namespace
 
 namespace egen_detail {
+
+bool egenMoreFunction(const std::string& fn) {
+  static const std::set<std::string> kFns = {
+      "skew",  "kurt",    "mdev",   "mad",       "fill",      "diff", "rowfirst",
+      "rowlast", "rfirst", "rlast", "rowmedian", "rowpctile", "ends"};
+  return kFns.count(fn) != 0;
+}
+
+std::optional<ojson> runEgenMoreFunction(const std::string& fnTyped, const std::string& newvar,
+                                         const std::string& argText,
+                                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                         const std::optional<std::string>& ifExpr,
+                                         const std::optional<std::string>& inRange,
+                                         const std::string& storeType, SessionState& session) {
+  auto isMissingKey = [](const std::string& key) {
+    return key.size() >= 4 && key.size() <= 7 && std::string("missing").compare(0, key.size(), key) == 0;
+  };
+  // max()/min() with `missing` (the forms without it are the engine's).
+  const bool extremeWithMissing =
+      (fnTyped == "max" || fnTyped == "min") &&
+      std::any_of(opts.begin(), opts.end(), [&](const auto& kv) { return isMissingKey(kv.first); });
+  if (!egenMoreFunction(fnTyped) && !extremeWithMissing) return std::nullopt;
+  const std::string fn = fnTyped == "rfirst" ? "rowfirst" : fnTyped == "rlast" ? "rowlast" : fnTyped;
+  const bool isMoment = fn == "skew" || fn == "kurt" || fn == "mdev";
+  const bool isRow = fn == "rowfirst" || fn == "rowlast" || fn == "rowmedian" || fn == "rowpctile";
+  const std::string arg = trim(argText);
+
+  // Options, as each ado's syntax declares them.
+  std::string byText;
+  bool haveBy = false;
+  double p = 50.0;
+  std::string punct = " ";
+  int endsForms = 0;
+  bool head = false, tail = false, last = false, trimIt = false;
+  auto abbrevOf = [](const std::string& key, const std::string& full, size_t minLen) {
+    return key.size() >= minLen && key.size() <= full.size() && full.compare(0, key.size(), key) == 0;
+  };
+  for (const auto& [key, value] : opts) {
+    if (key == "by") {
+      haveBy = true;
+      byText = value.isBool ? std::string() : value.strValue;
+      continue;
+    }
+    if (extremeWithMissing && isMissingKey(key) && value.isBool) continue;
+    if (fn == "rowpctile" && key == "p") {
+      const std::optional<double> v = eval::pythonFloat(trim(value.strValue));
+      if (value.isBool || !v.has_value()) return egenRcError("option p() incorrectly specified", 198);
+      p = *v;
+      continue;
+    }
+    if (fn == "ends") {
+      if (abbrevOf(key, "punct", 1) && !value.isBool) {
+        punct = value.strValue;
+        if (punct.size() >= 2 && punct.front() == '"' && punct.back() == '"')
+          punct = punct.substr(1, punct.size() - 2);
+        if (punct.empty()) punct = " ";
+        continue;
+      }
+      // ends()'s options abbreviate to h, l, t and tr.
+      if (value.isBool && abbrevOf(key, "head", 1)) { head = true; ++endsForms; continue; }
+      if (value.isBool && abbrevOf(key, "tail", 1)) { tail = true; ++endsForms; continue; }
+      if (value.isBool && abbrevOf(key, "last", 1)) { last = true; ++endsForms; continue; }
+      if (value.isBool && abbrevOf(key, "trim", 2)) { trimIt = true; continue; }
+    }
+    return ojson(eval::errorBlock("unsupported_option", "option " + key + " not allowed",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+  }
+  if (fn == "rowpctile" && (p <= 0.0 || p >= 100.0))
+    return egenRcError("p(" + numberAsText(p, nullptr) + ") must be between 0 and 100", 198);
+  if (haveBy && !(isMoment || fn == "mad" || extremeWithMissing))
+    return egenRcError("egen ... " + fn + "() may not be combined with by", 190);
+  if (fn == "ends" && endsForms > 1)
+    return egenRcError("you can only specify one option, head, tail or last", 198);
+
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return eval::noDataLoaded();
+  const int64_t rows = ds->nRows();
+  const ComputedEgen call{newvar, {}, ifExpr, inRange, storeType, session};
+  std::vector<char> inside;
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+
+  if (fn == "fill") {
+    if (ifExpr.has_value() || inRange.has_value()) return egenRcError("invalid syntax", 198);
+    std::vector<double> given;
+    if (!expandEgenNumlist(arg, &given)) return egenRcError("invalid numlist", 121);
+    if (given.size() < 2) return egenRcError("too few elements in numlist", 122);
+    const std::string type = storeType.empty() ? std::string("float") : storeType;
+    const size_t k = given.size();
+    const size_t k2 = static_cast<size_t>(std::floor(static_cast<double>(k) / 2.0 + 0.5));
+    const size_t k3 = k2 + 1;
+    std::vector<double> v(static_cast<size_t>(rows), kNaN), d(static_cast<size_t>(rows), kNaN);
+    for (size_t i = 0; i < k && i < v.size(); ++i) v[i] = heldIn(type, given[i]);
+    for (size_t i = 0; i + 1 < v.size(); ++i) d[i] = heldIn("float", v[i + 1] - v[i]);
+    for (size_t i = k3; i <= v.size(); ++i) d[i - 1] = i > k2 ? d[i - 1 - k2] : kNaN;
+    for (size_t i = k3; i <= v.size(); ++i)
+      if (i >= 2) v[i - 1] = heldIn(type, v[i - 2] + d[i - 2]);
+    if (auto failed = installNumbers(session, newvar, v)) return *failed;
+    noteResultType(session, newvar, type, type);
+    return mutationResult(session, "egen", {newvar});
+  }
+
+  if (auto refusal = flagQualifiedRows(call, &inside)) return *refusal;
+
+  if (extremeWithMissing) {
+    // `missing`: a missing value takes part in the comparison, as Stata orders
+    // it (above every number; `.` < `.a` < ... < `.z`), over the rows of if/in.
+    std::vector<double> x;
+    {
+      ScratchColumns scratch(session);
+      std::string col;
+      if (auto failed = scratch.add(arg, "", &col)) return *failed;
+      x = scratch.values(col);
+    }
+    // Each missing value keeps its kind, so `.` < `.a` < ... < `.z` order it.
+    for (double& v : x)
+      if (std::isnan(v)) v = eval::stataMissingWithKind(std::max(0, cecon::missing_kind(v)));
+    std::vector<long long> group;
+    if (auto failed = byGroups(session, haveBy ? byText : std::string(), &group)) return *failed;
+    std::map<long long, double> result;
+    for (int64_t i = 0; i < rows; ++i) {
+      if (!inside[static_cast<size_t>(i)]) continue;
+      const double v = x[static_cast<size_t>(i)];
+      auto it = result.find(group[static_cast<size_t>(i)]);
+      if (it == result.end()) result[group[static_cast<size_t>(i)]] = v;
+      else it->second = fn == "max" ? std::max(it->second, v) : std::min(it->second, v);
+    }
+    std::vector<double> out(static_cast<size_t>(rows), kNaN);
+    for (int64_t i = 0; i < rows; ++i) {
+      if (!inside[static_cast<size_t>(i)]) continue;
+      const double v = result[group[static_cast<size_t>(i)]];
+      out[static_cast<size_t>(i)] =
+          v >= eval::kStataMissingSentinel
+              ? cecon::stata_missing(eval::stataExtendedMissingKind(v).value_or(0))
+              : v;
+    }
+    if (auto failed = installTypedKeepingKinds(session, newvar, storeType, out)) return *failed;
+    return mutationResult(session, "egen", {newvar});
+  }
+
+  if (isMoment || fn == "mad") {
+    std::vector<double> x;
+    if (auto failed = evaluateColumn(session, arg, &x)) return *failed;
+    std::vector<long long> group;
+    if (auto failed = byGroups(session, haveBy ? byText : std::string(), &group)) return *failed;
+    std::map<long long, std::vector<double>> members;
+    for (int64_t i = 0; i < rows; ++i)
+      if (inside[static_cast<size_t>(i)] && !std::isnan(x[static_cast<size_t>(i)]))
+        members[group[static_cast<size_t>(i)]].push_back(x[static_cast<size_t>(i)]);
+    std::map<long long, double> result;
+    for (auto& [g, xs] : members) {
+      const double n = static_cast<double>(xs.size());
+      double value = kNaN;
+      if (fn == "mad") {
+        std::sort(xs.begin(), xs.end());
+        const double med = medianOfSorted(xs);
+        std::vector<double> dev;
+        for (double v : xs) dev.push_back(std::fabs(v - med));
+        std::sort(dev.begin(), dev.end());
+        value = medianOfSorted(dev);
+      } else {
+        double sum = 0.0;
+        for (double v : xs) sum += v;
+        const double m = sum / n;
+        double s2 = 0.0, s3 = 0.0, s4 = 0.0, sa = 0.0;
+        for (double v : xs) {
+          const double e = v - m;
+          s2 += e * e;
+          s3 += e * e * e;
+          s4 += e * e * e * e;
+          sa += std::fabs(e);
+        }
+        const double m2 = s2 / n, m3 = s3 / n, m4 = s4 / n;
+        if (fn == "skew") value = m2 > 0.0 ? m3 / std::pow(std::sqrt(m2), 3) : kNaN;
+        if (fn == "kurt") value = m2 > 0.0 ? m4 / (m2 * m2) : kNaN;
+        if (fn == "mdev") value = sa / n;
+      }
+      result[g] = value;
+    }
+    std::vector<double> out(static_cast<size_t>(rows), kNaN);
+    for (int64_t i = 0; i < rows; ++i) {
+      if (!inside[static_cast<size_t>(i)]) continue;
+      auto it = result.find(group[static_cast<size_t>(i)]);
+      if (it != result.end()) out[static_cast<size_t>(i)] = it->second;
+    }
+    if (auto failed = installTyped(session, newvar, storeType, out)) return *failed;
+    // What the ados leave behind. Without a by-list skew() and kurt() end on
+    // their last moment (an r-class helper: r(moment) = m3, m4), mdev() on
+    // `summarize ..., meanonly` of |x - mean|; an =/exp that is one variable is
+    // s(varname) (the expression helper's sclass result; mad() reports it only
+    // without if/in). Bank 1b59372e2a7bcbf8, 77c2c90d0b492ea7, 6a4a17baede56029.
+    const bool qualified = (ifExpr.has_value() && !ifExpr->empty()) ||
+                           (inRange.has_value() && !inRange->empty());
+    const auto asVariable = isPlainVariableName(arg) ? resolveVarName(arg, session) : std::nullopt;
+    if (asVariable.has_value() && (fn != "mad" || !qualified))
+      session.eval.rStrings.set(std::string("\x01s:varname"), *asVariable);
+    if (!haveBy && isMoment) {
+      const std::vector<double>& xs = members[0];
+      if (!xs.empty()) {
+        const double n = static_cast<double>(xs.size());
+        double sum = 0.0;
+        for (double v : xs) sum += v;
+        const double m = sum / n;
+        eval::replaceRClass(session.eval);
+        if (fn == "mdev") {
+          double total = 0.0, lo = std::numeric_limits<double>::infinity(), hi = -lo;
+          for (double v : xs) {
+            const double a = std::fabs(v - m);
+            total += a;
+            lo = std::min(lo, a);
+            hi = std::max(hi, a);
+          }
+          session.eval.rValues.set("N", n);
+          session.eval.rValues.set("sum_w", n);
+          session.eval.rValues.set("sum", total);
+          session.eval.rValues.set("mean", total / n);
+          session.eval.rValues.set("min", lo);
+          session.eval.rValues.set("max", hi);
+          eval::declareRPosted(session.eval, "egen", {"N", "sum_w", "sum", "mean", "min", "max"});
+        } else {
+          const int power = fn == "skew" ? 3 : 4;
+          double moment = 0.0;
+          for (double v : xs) moment += std::pow(v - m, power);
+          session.eval.rValues.set("moment", moment / n);
+          eval::declareRPosted(session.eval, "egen", {"moment"});
+        }
+      }
+    }
+    return mutationResult(session, "egen", {newvar});
+  }
+
+  // Varlist functions.
+  loops::VarlistExpandResult expanded = loops::expandVarlist(arg, session);
+  if (expanded.isError) return expanded.error;
+  if (auto unknown = loops::checkKnownVarlist(expanded.tokens, session)) return unknown;
+  const std::vector<std::string>& vars = expanded.tokens;
+  ds = session.datastore();
+  if (vars.empty()) return egenRcError("too few variables specified", 102);
+
+  if (fn == "ends") {
+    if (vars.size() > 1) return egenRcError("too many variables specified", 103);
+    const cecon::Column& c = ds->col(vars.front());
+    if (c.dtype != cecon::DType::Factor) return egenRcError("type mismatch", 109);
+    const int32_t* codes = c.codes();
+    std::string payload;
+    size_t longest = 1;
+    for (int64_t i = 0; i < rows; ++i) {
+      const int32_t code = codes[i];
+      const std::string text = code >= 0 && static_cast<size_t>(code) < c.levels.size()
+                                   ? c.levels[static_cast<size_t>(code)]
+                                   : std::string();
+      std::string out;
+      if (inside[static_cast<size_t>(i)] && !text.empty()) {
+        if (last) {
+          // The separator is found left to right, each search starting after
+          // the previous match, and the text after the final match is kept
+          // as it is: trim applies only to head and tail.
+          size_t at = text.find(punct);
+          while (at != std::string::npos) {
+            const size_t next = text.find(punct, at + punct.size());
+            if (next == std::string::npos) break;
+            at = next;
+          }
+          out = at == std::string::npos ? text : text.substr(at + punct.size());
+        } else {
+          const size_t at = text.find(punct);
+          if (tail) out = at == std::string::npos ? std::string() : text.substr(at + punct.size());
+          else out = at == std::string::npos ? text : text.substr(0, at);
+          if (trimIt) out = trim(out);
+        }
+      }
+      longest = std::max(longest, out.size());
+      payload += quotedLine(out);
+    }
+    if (auto failed = installColumn(session, newvar, true, payload)) return *failed;
+    session.implicitFloatVars.erase(newvar);
+    session.varMeta[newvar].stataType =
+        longest > 2045 ? std::string("strL") : "str" + std::to_string(longest);
+    return mutationResult(session, "egen", {newvar});
+  }
+
+  std::vector<const double*> cols;
+  for (const std::string& var : vars) {
+    if (ds->dtype(var) != "f64") {
+      if (fn == "rowmedian" || fn == "rowpctile")
+        return egenRcError("string variable " + var + " not allowed", 109);
+      if (fn != "diff") return egenRcError("type mismatch", 109);
+      return ojson(eval::unsupportedCommand("egen diff() with string variables", std::nullopt,
+                                            std::nullopt, "refused:egen_diff_string",
+                                            eval::UnsupportedCommandKind::kNotImplemented));
+    }
+    cols.push_back(ds->col(var).f64());
+  }
+  if (fn == "diff" && vars.size() < 2) return egenRcError("too few variables specified", 102);
+  auto miss = [](double v) { return std::isnan(v) || std::fabs(v) >= eval::kStataMissingSentinel; };
+  std::vector<double> out(static_cast<size_t>(rows), kNaN);
+  for (int64_t i = 0; i < rows; ++i) {
+    if (!inside[static_cast<size_t>(i)]) continue;
+    const size_t r = static_cast<size_t>(i);
+    if (fn == "diff") {
+      // 1 when any later variable differs from the first (missing values compare as values).
+      double flag = 0.0;
+      for (size_t j = 1; j < cols.size(); ++j) {
+        const double a = cols[0][r], b = cols[j][r];
+        const bool equal = (miss(a) && miss(b)) ? (std::isnan(a) ? eval::kStataMissingSentinel : a) ==
+                                                      (std::isnan(b) ? eval::kStataMissingSentinel : b)
+                                                : a == b;
+        if (!equal) flag = 1.0;
+      }
+      out[r] = flag;
+    } else if (fn == "rowfirst" || fn == "rowlast") {
+      // rowfirst: the first non-missing value from the left; rowlast: from the
+      // right. A row with none keeps the missing value of the variable the scan
+      // starts from (rowfirst's last variable, rowlast's first), .a-.z included.
+      const bool fromLeft = fn == "rowfirst";
+      double v = cols[fromLeft ? cols.size() - 1 : 0][r];
+      for (size_t j = 0; j < cols.size(); ++j) {
+        const double c = cols[fromLeft ? j : cols.size() - 1 - j][r];
+        if (!miss(c)) {
+          v = c;
+          break;
+        }
+      }
+      if (miss(v)) v = std::isnan(v) ? v : cecon::stata_missing(eval::stataExtendedMissingKind(v).value_or(0));
+      out[r] = v;
+    } else {
+      std::vector<double> present;
+      for (const double* c : cols)
+        if (!miss(c[r])) present.push_back(c[r]);
+      out[r] = rowPercentile(present, fn == "rowmedian" ? 50.0 : p);
+    }
+  }
+  if (fn == "diff") {
+    if (auto failed = installNumbers(session, newvar, out)) return *failed;
+    const std::string type = storeType.empty() ? std::string("float") : storeType;
+    noteResultType(session, newvar, type, type);
+    session.setVarLabel(newvar, "diff " + [&] {
+      std::string names;
+      for (const auto& v : vars) names += (names.empty() ? "" : " ") + v;
+      return names;
+    }());
+    return mutationResult(session, "egen", {newvar});
+  }
+  if (auto failed = installTypedKeepingKinds(session, newvar, storeType, out)) return *failed;
+  return mutationResult(session, "egen", {newvar});
+}
+
+std::optional<ojson> egenWriteColumn(SessionState& session, const std::string& var,
+                                     const std::vector<double>& values, bool isNew,
+                                     const std::string& storeType) {
+  const std::string minted = mintScratchPath(session.workdir(), "egenval");
+  forgetScratchMint(minted);
+  const std::string valuesPath = minted.substr(0, minted.size() - 5) + ".csv";  // ".hbin"
+  registerScratchMint(valuesPath);
+  {
+    std::ofstream file(cecon::to_native_path(valuesPath), std::ios::binary);
+    char digits[40];
+    for (double v : values) {
+      if (!std::isnan(v)) {
+        std::snprintf(digits, sizeof digits, "%.17g", v);
+        file << digits;
+      }
+      file << '\n';
+    }
+    file.flush();
+    if (!file) {
+      cecon::native_unlink(valuesPath);
+      return egenRcError("could not write the values of " + var + " (disk full or I/O error)", 693);
+    }
+  }
+  const std::string outPath = nextPath(session.workdir(), "egenval");
+  std::vector<std::string> argv = {"setcol", "--data", *session.currentHbin(), "--var", var,
+                                   "--values", valuesPath, "--dtype", "f64"};
+  if (isNew) argv.push_back("--new");
+  if (!storeType.empty()) {
+    argv.push_back("--store-type");
+    argv.push_back(storeType);
+  }
+  argv.push_back("--out");
+  argv.push_back(outPath);
+  const CobraRunResult run = runCobra(argv);
+  cecon::native_unlink(valuesPath);
+  if (!run.ok) {
+    cecon::native_unlink(outPath);
+    return engineErrorBlock(cobraErrorStr(errorFromRaw(run)));
+  }
+  if (!cecon::native_exists(outPath))
+    return egenRcError("could not create " + var + " (disk full or I/O error)", 693);
+  session.load(outPath);
+  if (!storeType.empty()) {
+    session.implicitFloatVars.erase(var);
+    session.varMeta[var].stataType = storeType;
+  }
+  return std::nullopt;
+}
+
+bool gegenOwnFunction(const std::string& fn) {
+  static const std::set<std::string> kFns = {
+      "nunique", "select",   "cv",       "first",      "firstnm",   "last",    "lastnm",
+      "geomean", "kurtosis", "skewness", "nansum",     "nmissing",  "percent", "range",
+      "semean",  "sebinomial", "sepoisson", "variance"};
+  return kFns.count(fn) != 0;
+}
+
+// gtools' gegen statistics that egen has no function for, per by-group over the
+// if/in rows, by the same definitions gcollapse uses (src/data/frame.cpp's
+// collapse): sample sd for cv/semean/variance, population moments for
+// skewness/kurtosis, first/last raw and firstnm/lastnm non-missing, percent of
+// the non-missing count of the whole sample, select(), n(#) the #th smallest
+// (n(-#) the #th largest).
+std::optional<ojson> runGegenFunction(const std::string& fn, const std::string& newvar,
+                                      const std::string& argText,
+                                      const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                      const std::optional<std::string>& ifExpr,
+                                      const std::optional<std::string>& inRange,
+                                      const std::string& storeType, SessionState& session) {
+  if (!gegenOwnFunction(fn)) return std::nullopt;
+  std::string byText;
+  long long pick = 0;
+  bool havePick = false;
+  for (const auto& [key, value] : opts) {
+    if (key == "by") {
+      byText = value.isBool ? std::string() : value.strValue;
+      continue;
+    }
+    if (fn == "select" && key == "n" && !value.isBool) {
+      const std::optional<double> v = eval::pythonFloat(trim(value.strValue));
+      if (!v.has_value() || *v != std::floor(*v) || *v == 0.0)
+        return egenRcError("option n() incorrectly specified", 198);
+      pick = static_cast<long long>(*v);
+      havePick = true;
+      continue;
+    }
+    return ojson(eval::errorBlock("unsupported_option", "option " + key + " not allowed",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+  }
+  // gtools: select() without n() is r(110) (vs-stata bank e70a448ff5a6472e).
+  if (fn == "select" && !havePick)
+    return egenRcError("n() should be a positive or negative integer", 110);
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return eval::noDataLoaded();
+  const int64_t rows = ds->nRows();
+  const ComputedEgen call{newvar, {}, ifExpr, inRange, storeType, session};
+  std::vector<char> inside;
+  if (auto refusal = flagQualifiedRows(call, &inside)) return *refusal;
+  std::vector<double> x;
+  if (auto failed = evaluateColumn(session, trim(argText), &x)) return *failed;
+  std::vector<long long> group;
+  if (auto failed = byGroups(session, byText, &group)) return *failed;
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  std::map<long long, std::vector<int64_t>> members;
+  double sampleCount = 0.0;
+  for (int64_t i = 0; i < rows; ++i) {
+    if (!inside[static_cast<size_t>(i)]) continue;
+    members[group[static_cast<size_t>(i)]].push_back(i);
+    if (!std::isnan(x[static_cast<size_t>(i)])) sampleCount += 1.0;
+  }
+  std::map<long long, double> result;
+  for (const auto& [g, rs] : members) {
+    std::vector<double> s;
+    for (int64_t r : rs)
+      if (!std::isnan(x[static_cast<size_t>(r)])) s.push_back(x[static_cast<size_t>(r)]);
+    const double n = static_cast<double>(s.size());
+    double sum = 0.0;
+    for (double v : s) sum += v;
+    const double mean = n > 0 ? sum / n : kNaN;
+    double m2 = 0.0, m3 = 0.0, m4 = 0.0;
+    for (double v : s) {
+      const double d = v - mean;
+      m2 += d * d;
+      m3 += d * d * d;
+      m4 += d * d * d * d;
+    }
+    double agg = kNaN;
+    if (fn == "first") agg = x[static_cast<size_t>(rs.front())];
+    else if (fn == "last") agg = x[static_cast<size_t>(rs.back())];
+    else if (fn == "firstnm") agg = n > 0 ? s.front() : kNaN;
+    else if (fn == "lastnm") agg = n > 0 ? s.back() : kNaN;
+    else if (fn == "nmissing") agg = static_cast<double>(rs.size()) - n;
+    else if (fn == "nansum") agg = n > 0 ? sum : kNaN;
+    else if (fn == "percent") agg = sampleCount > 0 ? n / sampleCount * 100.0 : kNaN;
+    else if (fn == "nunique") {
+      std::sort(s.begin(), s.end());
+      agg = static_cast<double>(std::unique(s.begin(), s.end()) - s.begin());
+    } else if (n > 0) {
+      if (fn == "range") {
+        agg = *std::max_element(s.begin(), s.end()) - *std::min_element(s.begin(), s.end());
+      } else if (fn == "variance") {
+        if (n >= 2) agg = m2 / (n - 1);
+      } else if (fn == "cv") {
+        if (n >= 2) agg = std::sqrt(m2 / (n - 1)) / mean;
+      } else if (fn == "semean") {
+        if (n >= 2) agg = (1.0 / std::sqrt(n)) * std::sqrt(m2 / (n - 1));
+      } else if (fn == "skewness" || fn == "kurtosis") {
+        const double p2 = m2 / n, p3 = m3 / n, p4 = m4 / n;
+        if (p2 > 0) agg = fn == "skewness" ? p3 / std::pow(p2, 1.5) : p4 / (p2 * p2);
+      } else if (fn == "sebinomial") {
+        bool ok = true;
+        for (double v : s) ok = ok && (v == 0.0 || v == 1.0);
+        if (ok) agg = std::sqrt(mean * (1.0 - mean) / n);
+      } else if (fn == "sepoisson") {
+        bool ok = true;
+        for (double v : s) ok = ok && v >= 0.0;
+        if (ok) agg = std::sqrt(std::floor(mean * n + 0.5)) / n;
+      } else if (fn == "geomean") {
+        bool ok = true;
+        double logs = 0.0;
+        for (double v : s) {
+          ok = ok && v >= 0.0;
+          logs += std::log(v);
+        }
+        if (ok) agg = std::exp(logs / n);
+      } else if (fn == "select") {
+        std::sort(s.begin(), s.end());
+        const long long k = pick < 0 ? -pick : pick;
+        if (k <= static_cast<long long>(s.size()))
+          agg = pick > 0 ? s[static_cast<size_t>(k - 1)] : s[s.size() - static_cast<size_t>(k)];
+      }
+    }
+    result[g] = agg;
+  }
+  std::vector<double> out(static_cast<size_t>(rows), kNaN);
+  for (int64_t i = 0; i < rows; ++i)
+    if (inside[static_cast<size_t>(i)]) out[static_cast<size_t>(i)] = result[group[static_cast<size_t>(i)]];
+  if (auto failed = installTyped(session, newvar, storeType, out)) return *failed;
+  return mutationResult(session, "egen", {newvar});
+}
 
 std::optional<ojson> runEgenAdoFunction(const std::string& fn, const std::string& newvar,
                                         const std::string& argText,

@@ -244,6 +244,10 @@ struct ProgramDef {
   // (doexec's install sentinel), as opposed to the preprocess-time registration.
   // Reaching another definition of the name while this one stands is r(110).
   bool installed = false;
+  // `byable(recall)` / `byable(onecall)` on the `program define` line, lower
+  // case ("recall" / "onecall"); empty when the program is not byable, which a
+  // by prefix refuses as r(190) "NAME may not be combined with by".
+  std::string byable;
 };
 
 // Per-variable editor metadata (session._var_meta[name]): label / format /
@@ -306,6 +310,12 @@ struct PreserveFrame {
   // (oracle w2ad_prog_preserve_nest pn_*_restore_caller, pn_*_not_caller,
   // pn_*_rp_caller: in1 622:4:30). 0 = the top-level run.
   int level = 0;
+  // The frame (SessionState::currentFrame) whose data this copy holds. Stata
+  // keeps one preserve per frame: `preserve` preserves the current frame, and
+  // `restore` restores the current frame's copy, never another frame's ([D]
+  // frames intro, "preserve and restore"). Written by pushPreserveSnapshot;
+  // retargeted by `frame rename`.
+  std::string frameName = "default";
 };
 
 // postfile.py's PostHandle — an open `postfile` collector. names/types are

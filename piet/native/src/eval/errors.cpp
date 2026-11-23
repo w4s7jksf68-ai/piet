@@ -617,6 +617,9 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
         has("no variables specified") || has("variable name required") ||
         has("`using` filename required"))
       return "100";
+    // Stata's own words for a negative aweight/fweight/pweight: r(402) (the
+    // engine's model builder; vs-stata bank 0364c489f733be11, bc4516167c8c8a50).
+    if (has("negative weights encountered")) return "402";
     // A numeric variable where a string one is needed: r(109) (`split price`).
     if (has(" is a numeric variable")) return "109";
     // A matrix that must be positive definite and is not: r(506).

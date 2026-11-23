@@ -13,7 +13,9 @@ const piet::eval::OptVocab& kVocabEstadd = piet::eval::registerOptVocab(
     // W2AK: estadd_ysumm's statistic flags (estadd).
     {{"replace", "prefix", "quietly", "mean", "sum", "min", "max", "range", "sd", "var", "cv",
       "semean", "skewness", "kurtosis", "median", "p1", "p5", "p10", "p25", "p50", "p75", "p90",
-      "p95", "p99", "iqr", "q", "all"},
+      "p95", "p99", "iqr", "q", "all",
+      // estadd vif's tolerance / sqrvif and estadd expb's noconstant
+      "tolerance", "sqrvif", "noconstant"},
      {}});
 
 

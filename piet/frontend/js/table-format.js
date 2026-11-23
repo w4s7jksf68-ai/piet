@@ -8,10 +8,12 @@ import { fmtG, fmtP, fmtObs, padL, padR } from './util.js';
 // Stata BE 19.5 lower-triangular layout. The block (estimator==='corr') carries
 // the full matrix forwarded by the dispatcher: r (2D), variables (names),
 // and — for pwcorr,sig — p (2D p-values) and nobs (2D per-pair N).
+// covariance_display carries the preformatted lower triangle for correlate, covariance.
 export function formatCorrelate(block) {
   const names = block.variables || [];
-  const r = block.r || [];
-  if (!names.length || !r.length) return '(no correlation matrix)';
+  const covariance = block.covariance_display;
+  const matrix = covariance ?? block.r ?? [];
+  if (!names.length || !matrix.length) return '(no correlation matrix)';
 
   const isPwcorr = block.method === 'pwcorr' || block.pairwise === true;
   const showSig  = block.sig === true && Array.isArray(block.p);
@@ -83,12 +85,14 @@ export function formatCorrelate(block) {
       for (let j = 0; j <= i; j++) {
         if (!shown(i, j)) { row += ' '.repeat(COL); continue; }
         const star = i !== j && starLvl >= 0 && pOf(i, j) <= starLvl ? '*' : ' ';
-        row += padL(fmt4(r[i][j]), COL - 1) + star;
+        row += padL(fmt4(matrix[i][j]), COL - 1) + star;
       }
       lines.push(padL(names[i], stubW) + ' │' + row);
     } else {
       const coefCells = [];
-      for (let j = 0; j <= i; j++) coefCells.push(padL(fmt4(r[i][j]), COL));
+      for (let j = 0; j <= i; j++) {
+        coefCells.push(padL(covariance ? matrix[i][j] : fmt4(matrix[i][j]), COL));
+      }
       lines.push(padL(names[i], stubW) + ' │' + coefCells.join(''));
     }
 
@@ -124,6 +128,7 @@ export function formatCorrelate(block) {
 export function formatSummarize(block) {
   const { stats } = block;
   if (!stats) return '(no summary)';
+  if (Array.isArray(block.fvrows)) return formatSummarizeFv(block);
 
   const vars    = Object.keys(stats);
   // Stata BE 19.5 summarize: stub column ` |`-separated, then Obs/Mean/Std. dev./Min/Max.
@@ -131,14 +136,17 @@ export function formatSummarize(block) {
   const dataHdrs = ['Obs', 'Mean', 'Std. dev.', 'Min', 'Max'];
 
   // Pre-format the 5 data columns so widths can be computed dynamically.
+  // summarize, format: the native side sends each statistic already in the
+  // variable's display format (block.formatted); otherwise the default %9.0g.
   const dataRows = vars.map(v => {
     const s = stats[v];
+    const f = (block.formatted && block.formatted[v]) || {};
     return [
       fmtObs(s.N),
-      fmtG(s.mean) ?? '',
-      fmtG(s.sd)   ?? '',
-      fmtG(s.min)  ?? '',
-      fmtG(s.max)  ?? '',
+      f.mean ?? fmtG(s.mean) ?? '',
+      f.sd   ?? fmtG(s.sd)   ?? '',
+      f.min  ?? fmtG(s.min)  ?? '',
+      f.max  ?? fmtG(s.max)  ?? '',
     ];
   });
 
@@ -170,10 +178,86 @@ export function formatSummarize(block) {
   return lines.join('\n');
 }
 
+// summarize with factor variables / time-series operators: the native side sends
+// `fvrows`, Stata's stub in order -- a term's header line (`foreign`, `race#union`,
+// `price`), its level or operator rows (`Domestic`, `L1.`, `--.`), blank rows between
+// terms -- each data row naming its statistics by `key`; an all-zero indicator is
+// "(empty)". StataBE 19.5 draws this table at fixed widths (vs-stata bank a44ddebb8a4abeae,
+// 0e775ed86a0a27d0, 2d3b2c4f3cbea0e6, 09bd852f8a330971): a 12-column stub, Obs in 11
+// columns, Mean and Std. dev. in 12, Min and Max in 11, every statistic in %9.0g.
+//   header  `foreign#rep78` longer than 12 breaks after each `#`: `     foreign#|`, then
+//           `       rep78 |` (the last piece carries the row's statistics, if any);
+//   level   right-aligned in 11 columns then `  |`; an interaction label longer than 11
+//           breaks at each `#` as `      White #|` / `   Nonunion  |`; a single label longer
+//           than 11 is cut to 11: the first 9 characters and `..` when it holds a space,
+//           else the first 9, `~` and its last character (`Ag/Forest~s`).
+export function fmtSumG(x) {
+  // %9.0g: at most 8 characters besides the sign, as many significant digits as fit.
+  if (x === null || x === undefined) return '';
+  if (!Number.isFinite(x) || x === 0 || Math.abs(x) < 1e-4) return fmtG(x) ?? '';
+  const neg = x < 0, ax = Math.abs(x);
+  for (let sf = 8; sf >= 1; sf--) {
+    let t = ax.toPrecision(sf);
+    if (t.includes('e')) break;
+    if (t.includes('.')) t = t.replace(/0+$/, '').replace(/\.$/, '');
+    t = t.replace(/^0\./, '.');
+    if (t.length <= 8) return (neg ? '-' : '') + t;
+  }
+  return fmtG(x) ?? '';
+}
+
+function fvCutLabel(lab) {
+  if (lab.length <= 11) return lab;
+  return lab.includes(' ') ? lab.slice(0, 9) + '..' : lab.slice(0, 9) + '~' + lab.slice(-1);
+}
+
+function formatSummarizeFv(block) {
+  const { stats, fvrows } = block;
+  const cells = (key, empty) => {
+    const s = stats[key] || {};
+    const obs = padL(fmtObs(s.N), 11);
+    if (empty) return obs + '   (empty)';
+    return obs + padL(fmtSumG(s.mean), 12) + padL(fmtSumG(s.sd), 12) +
+      padL(fmtSumG(s.min), 11) + padL(fmtSumG(s.max), 11);
+  };
+  const rule = '─'.repeat(13) + '┼' + '─'.repeat(57);
+  const out = ['    Variable │        Obs        Mean    Std. dev.       Min        Max', rule];
+  const sep = (block.separator === undefined || block.separator === null) ? 5 : Number(block.separator);
+  let nData = 0;
+  const emit = (stubLines, data) => {
+    // stubLines: the stub's lines, each already 13 wide (its `|` follows)
+    if (data !== null && sep > 0 && nData > 0 && nData % sep === 0) out.push(rule);
+    for (let i = 0; i < stubLines.length; i++) {
+      const last = i === stubLines.length - 1;
+      out.push(stubLines[i] + '│' + (last && data !== null ? data : ''));
+    }
+    if (data !== null) nData++;
+  };
+  const headLines = (name) => {
+    if (name.length <= 12) return [padL(name, 12) + ' '];
+    const parts = name.split('#');
+    return parts.map((p, i) => i < parts.length - 1 ? padL(p + '#', 13) : padL(p, 12) + ' ');
+  };
+  const levelLines = (lab) => {
+    if (lab.length <= 11) return [padL(lab, 11) + '  '];
+    const parts = lab.split('#');
+    if (parts.length === 1) return [padL(fvCutLabel(lab), 11) + '  '];
+    return parts.map((p, i) => padL(fvCutLabel(p), 11) + (i < parts.length - 1 ? ' #' : '  '));
+  };
+  for (const r of fvrows) {
+    if (r.blank) out.push(' '.repeat(13) + '│');
+    else if (r.header !== undefined) emit(headLines(r.header), r.key ? cells(r.key, false) : null);
+    else if (r.plain) emit(headLines(r.stub), cells(r.key, false));
+    else if (/\.$/.test(r.stub)) emit([padL(r.stub, 12) + ' '], cells(r.key, false));
+    else emit(levelLines(r.stub), cells(r.key, r.empty));
+  }
+  return out.join('\n');
+}
+
 // ─── Tabulate ────────────────────────────────────────────────────────────────
 
 /** Format a one-way frequency table block (vars.length === 1). */
-function formatTabulateOneway(vars, table, chi2) {
+function formatTabulateOneway(vars, table, chi2, block = {}) {
   const lines = [];
   const [v] = vars;
   const values = table.values;
@@ -181,6 +265,26 @@ function formatTabulateOneway(vars, table, chi2) {
   const keys = Object.keys(values);
   const keyW = Math.max(v.length, ...keys.map(k => k.length));
   const numW = Math.max(5, String(total).length);
+
+  // `plot`: Stata replaces Percent and Cum. by a bar of asterisks, one per observation while the
+  // largest frequency fits the line (80 columns less the stub and frequency columns), otherwise
+  // scaled so that the largest fills it, each bar rounded (bank 54f73a3b: frequencies 2,000 ..
+  // 30,000 draw 4 .. 53 stars). The Total line shows the frequency alone.
+  if (block.plot) {
+    const barW = Math.max(10, 79 - (keyW + 3) - (numW + 3));
+    const maxN = Math.max(0, ...keys.map(k => values[k]));
+    const scale = maxN > barW ? barW / maxN : 1;
+    lines.push(padR(v, keyW) + ' │ ' + padL('Freq.', numW) + ' │');
+    const rule = '─'.repeat(keyW) + '─┼─' + '─'.repeat(numW) + '─┼' + '─'.repeat(barW);
+    lines.push(rule);
+    for (const k of keys) {
+      const n = values[k];
+      lines.push(padL(k, keyW) + ' │ ' + padL(String(n), numW) + ' │' + '*'.repeat(Math.round(n * scale)));
+    }
+    lines.push(rule);
+    lines.push(padL('Total', keyW) + ' │ ' + padL(String(total), numW));
+    return lines.join('\n');
+  }
 
   lines.push(padR(v, keyW) + ' │ ' + padL('Freq.', numW) + '   Percent   Cum.');
   lines.push('─'.repeat(keyW) + '─┼─' + '─'.repeat(numW + 22));
@@ -243,18 +347,32 @@ function formatTabulateTwoway(vars, table, block) {
   const [rowVar, colVar] = vars;
   const { rows, cols, values, margins } = table;
   const grandTotal = margins?.total ?? 0;
+  const cellLines = block.cell_lines ?? ['frequency'];
+  if (!cellLines.length) return formatTabulateStats(block).slice(1).join('\n');
+  const labels = {
+    frequency: 'frequency', expected: 'expected frequency', cchi2: 'chi2 contribution',
+    clrchi2: 'LR chi2 contribution', row: 'row percentage',
+    col: 'column percentage', cell: 'cell percentage',
+  };
+  const showPercents = cellLines.some(line => line !== 'frequency');
+  // Stata prints the key and the rules between rows only when a cell holds more than one line
+  // (`tabulate c d, row nofreq` and `, expected nofreq` draw neither).
+  const stacked = cellLines.length > 1;
+  if (stacked && !block.no_key) lines.push('Key', ...cellLines.map(line => labels[line]), '');
+  const minCellWidth = showPercents ? 6 : 5;
 
   // Compute column widths: each col cell is max(colLabel.length, max count width, total width)
   const colLabelW = cols.map(c => String(c).length);
+  // An expected frequency or a contribution is a count's digits plus a decimal place.
+  const decimals = cellLines.some(line => line === 'expected' || line === 'cchi2' || line === 'clrchi2') ? 2 : 0;
   const colCountW = cols.map((c, ci) => {
     const maxCount = Math.max(
       ...rows.map(r => String(values[r]?.[c] ?? 0).length),
-      String(margins?.col?.[c] ?? 0).length,
-      colLabelW[ci]
-    );
-    return Math.max(5, maxCount);
+      String(margins?.col?.[c] ?? 0).length
+    ) + decimals;
+    return Math.max(minCellWidth, maxCount, colLabelW[ci]);
   });
-  const totalColW = Math.max(5, String(grandTotal).length, 'Total'.length);
+  const totalColW = Math.max(minCellWidth, String(grandTotal).length + decimals, 'Total'.length);
 
   // Row stub width: max of rowVar name and row labels
   const stubW = Math.max(
@@ -276,21 +394,56 @@ function formatTabulateTwoway(vars, table, block) {
 
   // Separator rule
   const ruleRight = colCountW.map(w => '─'.repeat(w)).join('───') + '───' + '─'.repeat(totalColW);
-  lines.push('─'.repeat(stubW) + '─┼─' + ruleRight);
-
-  // Data rows
-  for (const r of rows) {
-    const rowTotal = margins?.row?.[r] ?? 0;
-    const cells = cols.map((c, ci) => padL(String(values[r]?.[c] ?? 0), colCountW[ci]));
-    cells.push(padL(String(rowTotal), totalColW));
-    lines.push(padL(String(r), stubW) + ' │ ' + cells.join('   '));
+  const rule = '─'.repeat(stubW) + '─┼─' + ruleRight;
+  lines.push(rule);
+  const colTotals = cols.map(c => margins?.col?.[c] ?? 0).concat(grandTotal);
+  const widths = colCountW.concat(totalColW);
+  // expected = row total x column total / N; the chi2 contribution (f - e)^2 / e and the LR chi2
+  // contribution 2 f ln(f / e) (0 for an empty cell) are summed over the cells a margin covers, so
+  // the corner holds Pearson's and the likelihood-ratio chi2. Expected and contributions print with
+  // one decimal, percentages with two.
+  const rowTotals = rows.map(r => margins?.row?.[r] ?? 0);
+  const count = (ri, ci) => values[rows[ri]]?.[cols[ci]] ?? 0;
+  const expected = (ri, ci) => (grandTotal > 0 ? rowTotals[ri] * colTotals[ci] / grandTotal : 0);
+  const contribution = (line, ri, ci) => {
+    const f = count(ri, ci), e = expected(ri, ci);
+    if (!(e > 0)) return 0;
+    if (line === 'cchi2') return (f - e) * (f - e) / e;
+    return f > 0 ? 2 * f * Math.log(f / e) : 0;
+  };
+  const sumOver = (line, ri, ci) => {
+    let total = 0;
+    for (let r = 0; r < rows.length; r++) {
+      if (ri >= 0 && r !== ri) continue;
+      for (let c = 0; c < cols.length; c++) if (ci < 0 || c === ci) total += contribution(line, r, c);
+    }
+    return total;
+  };
+  // ri / ci index a row / column of the table; -1 is its Total.
+  const drawRow = (label, ri) => {
+    const rowTotal = ri >= 0 ? rowTotals[ri] : grandTotal;
+    for (const [i, line] of cellLines.entries()) {
+      const cells = widths.map((w, wi) => {
+        const ci = wi < cols.length ? wi : -1;
+        const freq = ri >= 0 ? (ci >= 0 ? count(ri, ci) : rowTotal) : colTotals[wi];
+        if (line === 'frequency') return padL(String(freq), w);
+        if (line === 'expected') {
+          const e = ri >= 0 && ci >= 0 ? expected(ri, ci) : freq;
+          return padL(e.toFixed(1), w);
+        }
+        if (line === 'cchi2' || line === 'clrchi2') return padL(sumOver(line, ri, ci).toFixed(1), w);
+        const denom = line === 'row' ? rowTotal : line === 'col' ? colTotals[wi] : grandTotal;
+        return padL(denom > 0 ? (100 * (freq / denom)).toFixed(2) : '.', w);
+      });
+      lines.push(padL(i === 0 ? String(label) : '', stubW) + ' │ ' + cells.join('   '));
+    }
+  };
+  for (const [i, row] of rows.entries()) {
+    if (stacked && i > 0) lines.push(rule);
+    drawRow(row, i);
   }
-
-  // Total row
-  lines.push('─'.repeat(stubW) + '─┼─' + ruleRight);
-  const totCells = cols.map((c, ci) => padL(String(margins?.col?.[c] ?? 0), colCountW[ci]));
-  totCells.push(padL(String(grandTotal), totalColW));
-  lines.push(padL('Total', stubW) + ' │ ' + totCells.join('   '));
+  lines.push(rule);
+  drawRow('Total', -1);
 
   lines.push(...formatTabulateStats(block));
   return lines.join('\n');
@@ -348,11 +501,57 @@ function formatTabulateSummarize(block) {
   return lines.join('\n');
 }
 
+// `tabulate r c, summarize(v)`: every cell stacks the mean, standard deviation and frequency of v
+// (and, under a weight, the number of observations), in that order, for the lines `columns`
+// keeps (means / standard / freq / obs and their no- forms); a title names the lines shown, as
+// Stata's "Means, Standard Deviations and Frequencies of Price" does (bank 4ecda085, 82d7a614,
+// 16ba2aac). An empty cell shows `.` for its statistics and 0 for its counts.
+function formatTabulateSummarizeTwoway(block) {
+  const [rowVar, colVar] = block.vars ?? ['', ''];
+  const rows = block.rows ?? [], cols = block.cols ?? [];
+  const shown = Array.isArray(block.columns) ? block.columns : ['means', 'standard', 'freq'];
+  const LINES = {
+    means:    { title: 'Means', cell: c => (c?.mean == null ? '.' : fmtG8(c.mean)) },
+    standard: { title: 'Standard Deviations', cell: c => (c?.sd == null ? '.' : fmtG8(c.sd)) },
+    freq:     { title: 'Frequencies', cell: c => { const n = c?.N ?? 0; return Number.isInteger(n) ? String(n) : fmtG8(n); } },
+    obs:      { title: 'Number of observations', cell: c => String(c?.obs ?? c?.N ?? 0) },
+  };
+  const picked = ['means', 'standard', 'freq', 'obs'].filter(k => shown.includes(k));
+  if (!picked.length) return '';
+  const titles = picked.map(k => LINES[k].title);
+  const title = (titles.length > 1 ? titles.slice(0, -1).join(', ') + ' and ' + titles.at(-1) : titles[0]) +
+    ' of ' + (block.sumvar ?? '');
+  const grid = rows.map(r => cols.map(c => block.cells?.[r]?.[c]).concat([block.row_margins?.[r]]));
+  grid.push(cols.map(c => block.col_margins?.[c]).concat([block.grand]));
+  const text = grid.map(line => line.map(cell => picked.map(k => LINES[k].cell(cell))));
+  const widths = cols.map(String).concat(['Total']).map((h, ci) =>
+    Math.max(h.length, ...text.map(line => Math.max(...line[ci].map(t => t.length)))));
+  const stubW = Math.max(rowVar.length, 'Total'.length, ...rows.map(r => String(r).length));
+  const lines = [];
+  const totalW = widths.reduce((a, w) => a + w, 0) + (widths.length - 1) * 3;
+  lines.push(' '.repeat(stubW + 3 + Math.max(0, Math.floor((totalW - title.length) / 2))) + title);
+  lines.push(' '.repeat(stubW + 3 + Math.max(0, Math.floor((totalW - colVar.length) / 2))) + colVar);
+  lines.push(padR(rowVar, stubW) + ' │ ' + cols.map(String).concat(['Total']).map((h, ci) => padL(h, widths[ci])).join('   '));
+  const rule = '─'.repeat(stubW) + '─┼─' + widths.map(w => '─'.repeat(w)).join('───');
+  lines.push(rule);
+  const stacked = picked.length > 1;
+  text.forEach((line, ri) => {
+    const isTotal = ri === rows.length;
+    if (isTotal || (stacked && ri > 0)) lines.push(rule);
+    picked.forEach((_, li) => {
+      const label = li === 0 ? (isTotal ? 'Total' : String(rows[ri])) : '';
+      lines.push(padL(label, stubW) + ' │ ' + line.map((cell, ci) => padL(cell[li], widths[ci])).join('   '));
+    });
+  });
+  return lines.join('\n');
+}
+
 export function formatTabulate(block) {
   // A1: summarize mode — tabulate VAR, sum(SUMVAR)
   if (block.mode === 'summarize') {
     return formatTabulateSummarize(block);
   }
+  if (block.mode === 'summarize_twoway') return formatTabulateSummarizeTwoway(block);
 
   // A2: multi-table modes (tab1 / tab2) — delegate to per-subtable formatters
   if (block.mode === 'oneway_multi' || block.mode === 'pairwise') {
@@ -363,7 +562,7 @@ export function formatTabulate(block) {
   if (!table) return '(no tabulation)';
 
   if (vars.length === 1) {
-    return formatTabulateOneway(vars, table, chi2);
+    return formatTabulateOneway(vars, table, chi2, block);
   } else {
     // A5: two-way contingency table (was a literal-string stub)
     return formatTabulateTwoway(vars, table, block);
@@ -441,7 +640,29 @@ export function formatDescribe(block) {
     padL('',             vlblW),   // value label (none tracked)
   ].join(sep) + sep + (v.label || ''));
 
-  return [hdr1, hdr2, rule, ...rows].join('\n');
+  // `describe, numbers`: each variable's position in the dataset ("1.", "2.",
+  // ...) before its name, as Stata prints it (vs-stata bank b9b558d38f02e76a).
+  let lines = [hdr1, hdr2, rule, ...rows];
+  if (block.numbers) {
+    const tags = variables.map(v => (v.number === undefined || v.number === null) ? '' : `${v.number}.`);
+    const numW = Math.max(5, ...tags.map(t => t.length));
+    const blank = ' '.repeat(numW + 1);
+    lines = [blank + hdr1, blank + hdr2, '─'.repeat(totalW + numW + 1),
+             ...rows.map((r, i) => padL(tags[i], numW) + ' ' + r)];
+  }
+  // `describe, detail`: the header's Observations, Variables and Width
+  // (r(N), r(k), r(width); vs-stata bank ab0016c3297af6a4).
+  if (block.detail && typeof block.detail === 'object') {
+    const d = block.detail;
+    const val = x => (x === undefined || x === null || Number.isNaN(x)) ? '.' : String(x);
+    lines = [
+      ' Observations:' + padL(val(d.observations), 14),
+      '    Variables:' + padL(val(d.variables), 14),
+      '        Width:' + padL(val(d.width), 14),
+      ...lines,
+    ];
+  }
+  return lines.join('\n');
 }
 
 // ─── Estimates Table (esttab) ─────────────────────────────────────────────────

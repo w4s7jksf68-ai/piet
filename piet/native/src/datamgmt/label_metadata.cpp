@@ -39,6 +39,7 @@
 #include "piet/strmutate.h"  // BUG-532: needsStringCount, the string-condition test under by:
 #include "piet/stata_format.h"  // eb-order T-P1: `matrix list ..., format()`
 #include "piet/strutil.h"
+#include "piet/user_paths.h"  // label save: the file named relative to the session cwd
 #include "piet/scratch_seq.h"
 #include "io/win_compat.h"  // cecon::native_exists / to_native_path / env_utf8 (BUG-050/051)
 #include "data/missing.h"   // Stata `.` / `.a`-`.z` kinds + stata_cmp (shared with the engine)
@@ -1420,6 +1421,110 @@ ojson runLabelLanguage(const std::vector<std::string>& args,
 // (w2ao_label_family.log lb_drop: `: value label g1` is still grade_drop and
 // decode is r(111)). `_all` drops every set; a name that is not defined is
 // r(111) "value label X not found" and nothing is dropped (:1373 lb_drop_absent).
+// `label copy FROM TO [, replace]` and `label rename OLD NEW [, replace]`
+// ([D] label). A missing source is r(111) "label X not found" and an existing
+// target without replace r(110) "label X already defined" (vs-stata bank
+// 164c5ab49fc0a40f, d3f8c164839dc97c, da55b444de564dd7, 70b0c578e5657e9f).
+// rename re-points every variable that used the old name, in every label
+// language, to the new one (bccda4e70d799167, 0ec407c4e988483e).
+ojson runLabelCopyRename(bool rename, const std::string& from, const std::string& to, bool replace,
+                         SessionState& session) {
+  if (session.labelDefs.find(from) == session.labelDefs.end())
+    return engineErrorBlockRc("label " + from + " not found", 111);
+  if (session.labelDefs.count(to) != 0 && !replace)
+    return engineErrorBlockRc("label " + to + " already defined", 110);
+  if (from == to) return ojson::array();
+  auto defs = session.labelDefs.at(from);
+  session.labelDefs[to] = defs;
+  if (rename) {
+    auto seq = session.labelSeq.find(from);
+    if (seq != session.labelSeq.end()) {
+      session.labelSeq[to] = seq->second;
+      session.labelSeq.erase(seq);
+    } else {
+      session.labelSeq.erase(to);
+    }
+    session.labelDefs.erase(from);
+    for (auto& [var, lbl] : session.varLblname)
+      if (lbl == from) lbl = to;
+    for (auto& [lang, st] : session.labelLangStash)
+      for (auto& [var, lbl] : st.varLblname)
+        if (lbl == from) lbl = to;
+  } else {
+    session.stampLabelSet(to);
+  }
+  for (const auto& [var, lbl] : session.varLblname)
+    if (lbl == to) refreshValueLabelsForVar(session, var, to);
+  return ojson::array();
+}
+
+// `label save [LBLNAMES] using FILE [, replace]`: one `label define NAME CODE
+// `"TEXT"', modify` line per value, codes in value order (numbers, then .a-.z),
+// sets in the order named or, with none named, every set in `label dir` order;
+// `.do` is the default suffix; an existing file without replace is r(602) and
+// success prints "file FILE saved" (vs-stata bank 6cb3ce7a1bd7c2cd,
+// 081bcc559d6a1855, fbdb47c17bcbfe14, 381e832041aef2a9).
+ojson runLabelSave(const std::vector<std::string>& namesIn, const std::string& spellingIn,
+                   bool replace, SessionState& session) {
+  std::vector<std::string> names = namesIn;
+  if (names.empty()) names = session.labelSetOrder();
+  for (const auto& nm : names)
+    if (session.labelDefs.find(nm) == session.labelDefs.end())
+      return engineErrorBlockRc("value label " + nm + " not found", 111);
+  std::string spelling = spellingIn;
+  {
+    const size_t slash = spelling.find_last_of("/\\");
+    const size_t dot = spelling.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) spelling += ".do";
+  }
+  const std::string path = resolveUserPath(session, spelling);
+  if (!replace && cecon::native_exists(path))
+    return engineErrorBlockRc("file " + spelling + " already exists", 602);
+  std::string out;
+  for (const auto& nm : names) {
+    const auto& defs = session.labelDefs.at(nm);
+    std::vector<std::pair<long long, const std::string*>> nums;
+    std::vector<std::pair<std::string, const std::string*>> miss;
+    for (const auto& [code, text] : defs) {
+      long long v = 0;
+      if (!code.empty() && code[0] == '.') {
+        miss.emplace_back(code, &text);
+      } else {
+        size_t used = 0;
+        bool ok = false;
+        try {
+          v = std::stoll(code, &used);
+          ok = used == code.size();
+        } catch (const std::exception&) {
+        }
+        if (ok) {
+          nums.emplace_back(v, &text);
+        } else {
+          miss.emplace_back(code, &text);
+        }
+      }
+    }
+    std::sort(nums.begin(), nums.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::sort(miss.begin(), miss.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& [v, t] : nums)
+      out += "label define " + nm + " " + std::to_string(v) + " `\"" + *t + "\"', modify\n";
+    for (const auto& [c, t] : miss)
+      out += "label define " + nm + " " + c + " `\"" + *t + "\"', modify\n";
+  }
+  {
+    std::ofstream f(cecon::to_native_path(path), std::ios::binary | std::ios::trunc);
+    if (!f) return engineErrorBlockRc("file " + spelling + " could not be opened", 603);
+    f << out;
+    if (!f) return engineErrorBlockRc("file " + spelling + " could not be opened", 603);
+  }
+  ojson block;
+  block["type"] = "display";
+  block["text"] = "file " + spelling + " saved";
+  return block;
+}
+
 ojson runLabelDrop(const std::vector<std::string>& lblnamesIn, SessionState& session) {
   if (lblnamesIn.empty()) {
     return engineErrorBlock("label drop: specify at least one label name");

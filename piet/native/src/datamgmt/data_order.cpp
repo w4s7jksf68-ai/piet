@@ -217,11 +217,15 @@ ojson runOrder(const std::vector<std::string>& varlistIn,
       else afterVar = v.strValue;
     }
   }
+  // A bare before/after is syntax's r(198) "option ... incorrectly specified" (bank
+  // cd799c86b87f73b4 `order _all, a`).
   if (beforeIsBool) {
-    return engineErrorBlock("order, before(): requires a variable name, e.g. before(weight)");
+    return ojson(eval::errorBlock("syntax_error", "option before() incorrectly specified",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(198)"));
   }
   if (afterIsBool) {
-    return engineErrorBlock("order, after(): requires a variable name, e.g. after(make)");
+    return ojson(eval::errorBlock("syntax_error", "option after() incorrectly specified",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(198)"));
   }
   if (beforeVar.has_value()) *beforeVar = trim(*beforeVar);
   if (afterVar.has_value()) *afterVar = trim(*afterVar);

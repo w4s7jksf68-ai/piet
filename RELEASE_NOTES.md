@@ -1,3 +1,21 @@
+# PIET A.2.0 / CoBrA 1.2.0 — Stata command compatibility update
+
+PIET expands support for GMM, frame management, postestimation, result tables,
+and command options. Long `display` output now wraps in the console and in
+plain-text logs. Stata's example datasets are permanently unavailable through
+PIET's `sysuse`. `require` returns r(601) for unavailable packages.
+
+The recorded Stata comparisons omit graph internals, timestamps, elapsed
+times and serialization-dependent archive sizes as described in the
+[compatibility policy](https://github.com/w4s7jksf68-ai/piet/blob/A.2.0/docs/piet/COMPATIBILITY-POLICY.md).
+Some Stata commands and options remain unsupported. The policy also lists
+follow-ups for eigenvector signs, temporary names, graph schemes, signed ranks,
+table abbreviations and checksums.
+
+Downloads are available for macOS arm64, Windows x64 and Ubuntu 24.04+ x86-64.
+The release workflow builds each file from this repository at tag `A.2.0`.
+SHA-256 files are provided alongside the downloads.
+
 # PIET A.1.1 / CoBrA 1.1.0 — Linux desktop release
 
 PIET A.1.1 adds Linux downloads alongside macOS and Windows. The computation

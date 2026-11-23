@@ -130,6 +130,12 @@ struct ConditionMaskInstall {
 };
 ConditionMaskInstall installConditionMask(SessionState& session, const std::string& cond,
                                           const std::vector<std::string>& groupKeys = {});
+// installGroupConditionMask: the `if` of a built-in byable command run once per group on the
+// working frame (the data already in by-order): `_n`, `_N` and x[k] count within each group of
+// `groupKeys`. A condition the engine reads goes through its --bygen by(); one it cannot
+// (needsConditionMask) through installConditionMask's group numbering. Same contract.
+ConditionMaskInstall installGroupConditionMask(SessionState& session, const std::string& cond,
+                                               const std::vector<std::string>& groupKeys);
 // writeConditionMaskColumn: the same evaluation over the frame at `dataPath` (a
 // by: driver's sorted scratch copy, not the head), whose mask is written as the
 // f64 0/1 column `column` onto a copy at `outPath`; the session's frame is left

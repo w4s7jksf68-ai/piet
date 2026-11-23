@@ -45,10 +45,31 @@ export function formatEstimation(block) {
   if (estimator === 'ovtest') {
     return formatOvtestBlock(block);
   }
+  // vs-stata stage 4: hausman in Stata's own layout (column titles from the
+  // stored names or tconsistent()/tefficient(), the fits' commands in the
+  // footer). Blocks without the titles keep the generic table.
+  if (estimator === 'hausman' && block.b_title !== undefined) {
+    return formatHausmanBlock(block);
+  }
+  // vs-stata stage 4: ttesti in Stata's own one-/two-sample table.
+  if (estimator === 'ttest' && block.ttest_table) {
+    return formatTtestTable(block.ttest_table);
+  }
+
+  // teffects ra: the outcome-model equations (OME<level>) are printed only under
+  // aequations (StataBE 19.5, vs-stata bank 2b9789b5); the block carries every column
+  if (estimator === 'teffects' && block.subcmd === 'ra' && !block.aequations && Array.isArray(block.coeftable)) {
+    return formatOneTable({ ...block, coeftable: block.coeftable.filter(r => !String(r.name).startsWith('OME')) });
+  }
+
+  // oaxaca: the decomposition's header, definitions, equation-sectioned table
+  if (estimator === 'oaxaca') {
+    return formatOaxacaBlock(block);
+  }
 
   // Multi-equation: render each outcome sub-table
   if (outcomes && outcomes.length > 0) {
-    return outcomes.map((oc, i) => {
+    const tables = outcomes.map((oc, i) => {
       const sub = {
         estimator,
         depvar:     oc.depvar,
@@ -65,6 +86,10 @@ export function formatEstimation(block) {
       const label = `── ${oc.depvar} `;
       return label + '\n' + formatOneTable(sub);
     }).join('\n\n');
+    // constraints(): the constraint lines Stata prints above the table
+    // (`( 1)  [Black]o.age = 0`, mlogit ..., constraints(1)).
+    const cns = Array.isArray(block.constraint_lines) ? block.constraint_lines : [];
+    return cns.length ? cns.map(l => ' ' + l).join('\n') + '\n\n' + tables : tables;
   }
 
   if (!block.coeftable || !block.coeftable.length) return formatGenericBlock(block);
@@ -134,7 +159,10 @@ function formatTestBlock(block) {
   }
 
   // iid → F statistic; robust/cluster → Wald chi2 (matches buildStats footer).
-  if (block.vcov_type !== 'iid') {
+  // test/testparm df(#) replaces the chi2 by F(q, #) after any fit (the block
+  // then carries F, df2 and p_F and no chi2; bank 3b1dd274 after logit: r(F)
+  // 8.890745, r(df_r) 30), so the chi2 form is drawn only when a chi2 is there.
+  if (block.vcov_type !== 'iid' && Object.prototype.hasOwnProperty.call(block, 'chi2')) {
     lines.push(`chi2(${block.df1}) = ${stat(block.chi2)}`);
     lines.push(`Prob > chi2 = ${prob(block.p_chi2)}`);
   } else {
@@ -252,9 +280,21 @@ function formatVifBlock(block) {
  */
 function formatHettestBlock(block) {
   const { chi2, df, p } = block;
+  // hettest, fstat: the auxiliary regression's F (block F / df_m / df_r).
+  if (chi2 == null && block.F != null) {
+    return [
+      'Breusch-Pagan / Cook-Weisberg test for heteroskedasticity',
+      ...(block.assumption ? [`Assumption: ${block.assumption}`] : []),
+      '    Ho: Constant variance',
+      '',
+      `F(${block.df_m}, ${Math.round(block.df_r)}) = ${Number(block.F).toFixed(2)}`,
+      `Prob > F = ${Number(p).toFixed(4)}`,
+    ].join('\n');
+  }
   if (chi2 == null) return '(no results)';
   return [
     'Breusch-Pagan / Cook-Weisberg test for heteroskedasticity',
+    ...(block.assumption ? [`Assumption: ${block.assumption}`] : []),
     '    Ho: Constant variance',
     '',
     `    chi2(${df}) = ${Number(chi2).toFixed(2)}`,
@@ -277,6 +317,235 @@ function formatOvtestBlock(block) {
     `    F(${df_m}, ${Math.round(df_r)}) = ${Number(F).toFixed(2)}`,
     `    Prob > F = ${fmtP(p)}`,
   ].join('\n');
+}
+
+/**
+ * hausman: the coefficient-difference table and the chi2 test, laid out on
+ * Stata's columns (titles centred in 12 at columns 17 and 30, values %9.0g at
+ * columns 18, 31, 47 and 63, the footer right-aligned in 78).
+ */
+function formatHausmanBlock(block) {
+  const at = (line, col, text) => {
+    const s = line.length < col - 1 ? line + ' '.repeat(col - 1 - line.length) : line;
+    return s + text;
+  };
+  const abbrev12 = (t) => {
+    const s = String(t ?? '');
+    if (s === '') return '.';
+    return s.length <= 12 ? s : s.slice(0, 10) + '~' + s.slice(-1);
+  };
+  const centre12 = (t) => {
+    const s = abbrev12(t);
+    const left = Math.floor((12 - s.length) / 2);
+    return ' '.repeat(Math.max(0, left)) + s + ' '.repeat(Math.max(0, 12 - s.length - left));
+  };
+  // %9.0g: below 1 in magnitude Stata keeps at most seven decimals (bank
+  // 30280271c2143616: .060326952 prints .060327, .00078846 prints .0007885).
+  const g9 = (x) => {
+    if (x === null || x === undefined || !Number.isFinite(x)) return '.'.padStart(9);
+    let s = fmtG(x) ?? '.';
+    const dot = s.indexOf('.');
+    if (Math.abs(x) < 1 && !s.includes('e') && dot >= 0 && s.length - dot - 1 > 7) {
+      s = x.toFixed(7).replace(/0+$/, '').replace(/\.$/, '').replace(/^(-?)0\./, '$1.');
+    }
+    return s.padStart(9);
+  };
+  const ralign78 = (t) => t.padStart(78);
+  const lines = [''];
+  lines.push(at('', 18, '---- Coefficients ----'));
+  let h = at('', 14, '|');
+  h = at(h, 21, '(b)'); h = at(h, 34, '(B)'); h = at(h, 49, '(b-B)');
+  lines.push(at(h, 59, 'sqrt(diag(V_b-V_B))'));
+  let t = at('', 14, '|');
+  t = at(t, 17, centre12(block.b_title)); t = at(t, 30, centre12(block.B_title));
+  t = at(t, 46, 'Difference');
+  lines.push(at(t, 63, 'Std. err.'));
+  const rule = '-'.repeat(13) + '+' + '-'.repeat(64);
+  lines.push(rule);
+  let eqNow;
+  (block.coefs || []).forEach((c, i) => {
+    if (c.eq !== undefined && c.eq !== eqNow) {
+      if (i > 0) lines.push(rule);
+      lines.push(at(abbrev12(c.eq), 14, '|'));
+      eqNow = c.eq;
+    }
+    let r = abbrev12(c.name).padStart(12) + ' |';
+    r = at(r, 18, g9(c.b_fe)); r = at(r, 31, g9(c.b_re));
+    r = at(r, 47, g9(c.diff));
+    lines.push(at(r, 63, g9(c.se_diff)));
+  });
+  lines.push('-'.repeat(78));
+  lines.push(ralign78(`b = Consistent under H0 and Ha; obtained from ${block.b_cmd ?? ''}.`));
+  lines.push(ralign78(`B = Inconsistent under Ha, efficient under H0; obtained from ${block.B_cmd ?? ''}.`));
+  lines.push('');
+  lines.push('Test of H0: Difference in coefficients not systematic');
+  lines.push('');
+  const df = block.dof;
+  const dfText = Number.isInteger(df) ? String(df) : (fmtG(df) ?? String(df));
+  const chiLabel = `chi2(${dfText})`;
+  const chi2 = Number(block.chi2);
+  if (chi2 >= 0) {
+    const len = Math.max(11, chiLabel.length);
+    const a = chi2.toFixed(2);
+    const b = block.p === null || block.p === undefined || !Number.isFinite(Number(block.p))
+      ? '.' : Number(block.p).toFixed(4);
+    const w = Math.max(a.length, b.length);
+    lines.push(chiLabel.padStart(len) + " = (b-B)'[(V_b-V_B)^(-1)](b-B)");
+    lines.push(''.padStart(len) + ' = ' + a.padStart(w));
+    lines.push('Prob > chi2'.padStart(len) + ' = ' + b.padStart(w));
+  } else {
+    const len = chiLabel.length;
+    lines.push(chiLabel.padStart(len) + " = (b-B)'[(V_b-V_B)^(-1)](b-B)");
+    lines.push(' '.repeat(len) + ' = ' + chi2.toFixed(2));
+  }
+  for (const n of block.notes || []) lines.push(n);
+  return lines.join('\n');
+}
+
+// Stata's %w.0g: width-2 significant digits in the fixed form when its integer
+// part fits in width-2 digits and the value is at least 1e-5, the field budget
+// width-1 characters (the sign not counted), decimals shed until it fits; a
+// leading zero dropped; otherwise d.ddde+XX (piet::fmt::general, the native
+// twin). Missing is `.`.
+function stataGeneral(x, width) {
+  if (x === null || x === undefined || Number.isNaN(Number(x))) return '.';
+  const v = Number(x);
+  if (v === 0) return '0';
+  const sig = Math.max(1, width - 2);
+  const budget = width - 1 + (v < 0 ? 1 : 0);
+  const a = Math.abs(v);  // its magnitude decides the fixed form
+  const trim = (t) => {
+    let u = t;
+    if (u.includes('.')) u = u.replace(/0+$/, '').replace(/\.$/, '');
+    return u.replace(/^(-?)0\./, '$1.');
+  };
+  if (Number.isFinite(v)) {
+    const e10 = Math.floor(Math.log10(a));
+    const intDigits = e10 >= 0 ? e10 + 1 : 0;
+    if (intDigits <= Math.max(1, width - 2) && a >= 1e-5) {
+      let decimals = Math.max(0, e10 >= 0 ? sig - intDigits : sig + (-e10 - 1));
+      for (; decimals >= 0; --decimals) {
+        const t = trim(v.toFixed(decimals));
+        if (t === '0' || t === '-0') break;
+        if (t.length <= budget) return t;
+      }
+    }
+  }
+  if (!Number.isFinite(v)) return v > 0 ? '+Inf' : '-Inf';
+  // d.ddde+XX with min(sig-1, width-7) decimals, shed until it fits
+  let out = '';
+  for (let edec = Math.max(0, Math.min(sig - 1, width - 7)); edec >= 0; --edec) {
+    const [mant, ex] = v.toExponential(edec).split('e');
+    const e = parseInt(ex, 10);
+    out = mant + 'e' + (e >= 0 ? '+' : '-') + String(Math.abs(e)).padStart(2, '0');
+    if (out.length <= budget) break;
+  }
+  return out;
+}
+
+/**
+ * ttesti: Stata's one- and two-sample t-test table (the immediate form's
+ * display), from the block's `ttest_table` (descriptive_statistics.cpp
+ * runTtesti). Layout as StataBE 19.5 prints it (bank 3a8d742de94ef851
+ * one-sample, 5ae23a055c3c4d91 unequal, 19147700e0806102 welch):
+ *
+ *   One-sample t test
+ *   ------------------------------------------------------------------------------
+ *            |     Obs        Mean    Std. err.   Std. dev.   [95% conf. interval]
+ *   ---------+--------------------------------------------------------------------
+ *          x |      24        62.6    3.225161        15.8    55.92825    69.27175
+ *   ------------------------------------------------------------------------------
+ *       mean = mean(x)                                                t =  -3.8448
+ *   H0: mean = 75                                    Degrees of freedom =       23
+ *
+ *       Ha: mean < 75               Ha: mean != 75                 Ha: mean > 75
+ *    Pr(T < t) = 0.0004         Pr(|T| > |t|) = 0.0008          Pr(T > t) = 0.9996
+ *
+ * Each row: the name in %8s (abbreviated to 8 with ~), Obs %7.0fc at column
+ * 12, Mean / Std. err. / Std. dev. / the bounds %9.0g at columns 22, 34, 46,
+ * 58, 70; the diff row has no Obs and no Std. dev. The alternatives are
+ * centred about columns 11, 40 and 70 (79 - half its length when the third,
+ * markers counted, is longer than 20).
+ */
+function formatTtestTable(tt) {
+  const at = (line, col, text) => {
+    const s = line.length < col - 1 ? line + ' '.repeat(col - 1 - line.length) : line;
+    return s + text;
+  };
+  const abbrev = (t, n) => {
+    const s = String(t ?? '');
+    return s.length <= n ? s : s.slice(0, n - 2) + '~' + s.slice(-1);
+  };
+  const g = (x, w) => stataGeneral(x, w).padStart(w);
+  const missing = (x) => x === null || x === undefined || !Number.isFinite(Number(x));
+  const f = (x, w, d) => (missing(x) ? '.' : Number(x).toFixed(d)).padStart(w);
+  const obs = (n) => (missing(n) ? '.' : Math.round(Number(n)).toLocaleString('en-US')).padStart(7);
+  const rowLine = (r, withObs) => {
+    let l = abbrev(r.name, 8).padStart(8) + ' |';
+    if (withObs) l = at(l, 12, obs(r.n));
+    l = at(l, 22, g(r.mean, 9));
+    l = at(l, 34, g(r.se, 9));
+    if (withObs) l = at(l, 46, g(r.sd, 9));
+    l = at(l, 58, g(r.lb, 9));
+    return at(l, 70, g(r.ub, 9));
+  };
+  // Three strings centred about three columns, as Stata places them.
+  const centre3 = (a, b, c) => {
+    let line = '';
+    let last = 0;
+    const put = (str, center) => {
+      const skip = Math.max(last !== 0 ? 1 : 0, center - Math.floor(str.length / 2) - 1 - last);
+      line += ' '.repeat(skip) + str;
+      last += skip + str.length;
+    };
+    put(a, 11);
+    put(b, 40);
+    // the third column's width test counts the two colour markers around its value
+    put(c.text, c.markedLength > 20 ? 79 - Math.floor(c.markedLength / 2) : 70);
+    return line;
+  };
+  const third = (text, hasValue) => ({ text, markedLength: text.length + (hasValue ? 2 : 0) });
+
+  const lines = ['', tt.title];
+  const levelText = String(tt.level);
+  const cil = levelText.length;
+  const ciLabel = `[${levelText}% ${cil === 5 ? 'conf.interval' : 'conf. interval'}]`;
+  lines.push('-'.repeat(78));
+  let h = at(tt.col1 || '', 10, '|');
+  h = at(h, 16, 'Obs'); h = at(h, 27, 'Mean'); h = at(h, 35, 'Std. err.'); h = at(h, 47, 'Std. dev.');
+  lines.push(at(h, 61 - cil + (cil === 5 ? 1 : 0), ciLabel));
+  const divline = '-'.repeat(9) + '+' + '-'.repeat(68);
+  lines.push(divline);
+  for (const r of tt.rows || []) lines.push(rowLine(r, true));
+  if (tt.form === 'two') {
+    lines.push(divline);
+    lines.push(rowLine(tt.combined, true));
+    lines.push(divline);
+    lines.push(rowLine(tt.diff, false));
+  }
+  lines.push('-'.repeat(78));
+  const p1 = f(tt.p_l, 6, 4), p2 = f(tt.p, 6, 4), p3 = f(tt.p_u, 6, 4);
+  if (tt.form === 'two') {
+    const dfText = { welch: "Welch's degrees of freedom = ",
+                     satterthwaite: "Satterthwaite's degrees of freedom = " }[tt.df_kind] ||
+                   'Degrees of freedom = ';
+    const dfCol = { welch: 42, satterthwaite: 34 }[tt.df_kind] || 50;
+    lines.push(at(`    diff = mean(${abbrev(tt.xname, 16)}) - mean(${abbrev(tt.yname, 16)})`, 67,
+                  't = ' + f(tt.t, 8, 4)));
+    lines.push(at('H0: diff = 0', dfCol, dfText + g(tt.df, 8)));
+    lines.push('');
+    lines.push(centre3('Ha: diff < 0', 'Ha: diff != 0', third('Ha: diff > 0', false)));
+  } else {
+    // H0's value as typed; a typed value longer than 8 characters in %8.0g.
+    let m0 = String(tt.h0_text ?? '');
+    if (m0.length > 8) m0 = stataGeneral(tt.h0, 8);
+    lines.push(at(`    mean = mean(${tt.xname})`, 67, 't = ' + f(tt.t, 8, 4)));
+    lines.push(at(`H0: mean = ${m0}`, 50, 'Degrees of freedom = ' + f(tt.df, 8, 0)));
+    lines.push('');
+    lines.push(centre3(`Ha: mean < ${m0}`, `Ha: mean != ${m0}`, third(`Ha: mean > ${m0}`, true)));
+  }
+  lines.push(centre3(`Pr(T < t) = ${p1}`, `Pr(|T| > |t|) = ${p2}`, third(`Pr(T > t) = ${p3}`, true)));
+  return lines.join('\n');
 }
 
 /** Render estimation payloads that have useful scalars/rows but no coeftable. */
@@ -350,16 +619,27 @@ function formatOneTable(block) {
 
   if (!coeftable || coeftable.length === 0) return '(no results)';
 
+  // `ereturn display` (results/ereturn_commands.cpp runDisplay): e(b)'s columns in
+  // e(b)'s order, an `eq:name` column shown as `name` under a line naming its
+  // equation (StataBE 19.5 bank 88509ffa: `foreign      |` above mpg, weight, _cons).
+  const eretDisplay = block.estimator === 'ereturn_display';
+  const eqOf = r => {
+    const c = eretDisplay && typeof r.name === 'string' ? r.name.indexOf(':') : -1;
+    return c > 0 ? r.name.slice(0, c) : null;
+  };
+
   // Rename (intercept) → _cons (Stata convention)
   const renamedRows = coeftable.map(r => ({
     ...r,
-    displayName: r.name === '(intercept)' ? '_cons' : (r.stub || r.name),  // BUG-397: value-label display rides on `stub`; `name` stays the e(b) colname
+    displayName: r.name === '(intercept)' ? '_cons'
+      : eqOf(r) !== null ? r.name.slice(eqOf(r).length + 1)
+      : (r.stub || r.name),  // BUG-397: value-label display rides on `stub`; `name` stays the e(b) colname
   }));
 
   // A14: Stata renders the intercept/_cons row LAST, but the engine emits it
   // FIRST. Display-layer-only reorder: stable move-intercept-to-end.
   const isIntercept = r => r.name === '(intercept)' || r.name === '_cons';
-  const rows = [
+  const rows = eretDisplay ? renamedRows : [
     ...renamedRows.filter(r => !isIntercept(r)),
     ...renamedRows.filter(r => isIntercept(r)),
   ];
@@ -379,6 +659,7 @@ function formatOneTable(block) {
   const nameW = Math.max(
     depvar ? depvar.length : 0,
     ...rows.map(r => r.displayName.length),
+    ...rows.map(r => (eqOf(r) || '').length),
     4
   );
   const bW   = Math.max(11, ...fB.map(s => s.length));   // "Coefficient"
@@ -400,18 +681,23 @@ function formatOneTable(block) {
   // BUG-205(1): `lincom`'s own estimator label never changes with what it was
   // computed FROM — pass vcov_type too so statLetter can key `lincom` on the
   // fit (oim -> z) rather than on the verb (which would always say t).
-  const sl   = statLetter(block.estimator, vcov_type);
+  // ereturn display: t(e(df_r)) when the posting has a residual dof, z otherwise.
+  const sl   = eretDisplay ? (typeof df_r === 'number' && df_r > 0 ? 't' : 'z')
+                           : statLetter(block.estimator, vcov_type, block.df);
   const tHdr = sl;                 // 't' or 'z'
   const pHdr = 'P>|' + sl + '|';   // 'P>|t|' or 'P>|z|'
 
   const statsArr = buildStats({
-    n_obs, r2, r2_within, sigma2, dof_resid, absKeys,
+    n_obs, r2, r2_within, sigma2, dof_resid, absKeys, chi2type: block.chi2type,
     // MI-081 new scalars
     adj_r2, F, p_F, rmse, mss, rss, df_m, df_r, df_b,
     ll, ll_0, r2_pseudo, chi2, df_chi2, p_chi2,
     r2_between, r2_overall,
   });
   const statLines = formatStatLines(title, statsArr, nameW + 1 + dataRegionW);
+  // xtreg, re theta: the header's last line (Stata 19.5 "theta        = .86060683")
+  if (block.estimator === 'xtreg_re' && typeof block.theta === 'number')
+    statLines.push(`theta        = ${fmtG(block.theta)}`);
 
   // ── Rules ──────────────────────────────────────────────────────────────────
   // nameW+1 so that ┬/┼/┴ aligns with the │ that follows the 1-char space after name
@@ -421,11 +707,19 @@ function formatOneTable(block) {
   // ── Column header row ──────────────────────────────────────────────────────
   // "[95% Conf. Interval]" spans both CI columns (cLoW + 3 sep + cHiW wide)
   // mean / proportion record the level their intervals were built at (level(), a replay)
-  const ciLevel = (block.estimator === 'mean' || block.estimator === 'proportion') &&
+  // xtreg, re and the IV fits (ivregress, ivreg2, ivreghdfe) record their level(#)
+  // the same way (their limits are formed natively at that level)
+  const LEVEL_ESTIMATORS = new Set(['mean', 'proportion', 'xtreg_re', 'iv', 'iv2sls', 'ivregress',
+                                    'ivreg2', 'ivreghdfe', 'liml', 'gmm', 'ereturn_display']);
+  const ciLevel = LEVEL_ESTIMATORS.has(block.estimator) &&
     typeof block.level === 'number' && block.level !== 95 ? block.level : 95;
   const ciLabel  = `[${ciLevel}% conf. interval]`;
   const ciTotalW = cLoW + 3 + cHiW;
-  const ciHeaderSection = padR(ciLabel, ciTotalW); // left-align within CI region
+  // regress `beta`: the standardized coefficients take the interval's place, right-
+  // aligned, `.` on _cons (Stata 19.5 `regress price mpg weight, beta`)
+  const showBeta = block.beta === true;
+  const ciHeaderSection = showBeta ? padL('Beta', ciTotalW)
+                                   : padR(ciLabel, ciTotalW); // left-align within CI region
 
   // WS1 #1: Stata flips the SE label to lowercase under a non-iid VCE.
   //   iid → "Std. err." ; robust/hc1/cluster(...) → "std. err."
@@ -437,7 +731,9 @@ function formatOneTable(block) {
   // exponentiates the coeftable's b/se/ci to odds ratios (log-odds for `logit`
   // is untouched) — the coef column header must say so, or the values read as
   // a mislabeled "Coefficient" column.
+  // eform_label: an exponentiated table's column title (suest's eform(OR)).
   const bLabel = block.estimator === 'margins' ? 'dy/dx'
+    : typeof block.eform_label === 'string' && block.eform_label ? block.eform_label
     : block.estimator === 'logistic' ? 'Odds ratio'
     : pct ? 'Percent'
     : 'Coefficient';
@@ -480,8 +776,26 @@ function formatOneTable(block) {
     : null;
 
   // ── Data rows ──────────────────────────────────────────────────────────────
-  const dataRows = rows.map((r, i) => {
+  const dataRowsFlat = rows.map((r, i) => {
     const omitted = r.b === null;
+    // constraints(): a coefficient the constraints fix shows its value and
+    // `(constrained)` in place of the rest (bank eae58c67 `mpg |  -.1  (constrained)`).
+    if (r.constrained === true && !omitted) {
+      const note = r.b === 0 ? '  (omitted)' : '  (constrained)';
+      return [padL(r.displayName, nameW), ' │', padL(fB[i], bW + 1), note].join('');
+    }
+    if (showBeta) {
+      const bs = isIntercept(r) ? '.' : (typeof r.beta === 'number' ? (fmtG(r.beta) ?? '') : '');
+      return [
+        padL(r.displayName, nameW), ' │',
+        padL(fB[i],                  bW  + 1),
+        padL(omitted ? '' : fSE[i],  seW + 3),
+        padL(omitted ? '' : fT[i],   tW  + 3),
+        padL(omitted ? '' : fPv[i],  pW  + 3),
+        '     ',
+        padL(omitted ? '' : bs, ciTotalW),
+      ].join('');
+    }
     return [
       padL(r.displayName, nameW), ' │',
       padL(fB[i],                  bW  + 1),
@@ -495,18 +809,32 @@ function formatOneTable(block) {
     ].join('');
   });
 
+  // ereturn display: each equation's name on its own line ahead of its rows.
+  const dataRows = [];
+  let lastEq = null;
+  rows.forEach((r, i) => {
+    const eq = eqOf(r);
+    if (eq !== null && eq !== lastEq) dataRows.push(padR(eq, nameW) + ' │');
+    lastEq = eq;
+    dataRows.push(dataRowsFlat[i]);
+  });
+
   // ── Footers ────────────────────────────────────────────────────────────────
-  const footerLines = buildFooter({
+  const footerLines = eretDisplay ? [] : buildFooter({
     vcov_type, n_clusters, absKeys, absorbed,
     first_stage_F, kp_wald_F, hansen_j, hansen_j_p,
   });
 
   // ── Assemble ───────────────────────────────────────────────────────────────
   // mean / proportion `noheader`: no title, no Number of obs line
+  // regress / areg `notable`: the header alone, no coefficient table
+  if (block.notable) return block.noheader ? '' : statLines.join('\n');
   const lines = [
     ...(block.noheader ? [] : [...statLines,
       // mean / proportion stdize(): the number of standard strata (bank 56f2dacb)
       ...(block.n_stdize != null ? [`N. of std strata = ${block.n_stdize}`] : []), '']),
+    // constraints(): ` ( 1)  [rep78]mpg = -.1` between the header and the table
+    ...(Array.isArray(block.constraint_lines) ? block.constraint_lines.map(l => ' ' + l) : []),
     ruleN + '┬' + ruleD,
     ...(marginsBanner ? [marginsBanner] : []),   // WS1 #3: Delta-method banner (margins only)
     ...(ciTypeBanner ? [ciTypeBanner] : []),     // proportion's CI type / mean, proportion's Robust
@@ -520,6 +848,144 @@ function formatOneTable(block) {
       ? ['Note: The Agresti\u2013Coull CI was truncated at 1 at the upper endpoint.'] : []),
   ];
 
+  return lines.join('\n');
+}
+
+// ── oaxaca ────────────────────────────────────────────────────────────────────
+// Ben Jann's oaxaca display (StataBE 19.5, vs-stata bank 0016e9 / 299759b7):
+//   Blinder-Oaxaca decomposition                    Number of obs     =      2,229
+//                                                   Model             =     linear
+//   Group 1: south = 0                              N of obs 1        =      1,294
+//   Group 2: south = 1                              N of obs 2        =        935
+//
+//      endowments: (X1 - X2) * b2          <- the definitions (nodefinitions drops them)
+//    coefficients: X2 * (b1 - b2)
+//     interaction: (X1 - X2) * (b1 - b2)
+//
+// then one table, the rows grouped under their equation (overall, endowments, ...),
+// `eform` exponentiating b, se and the interval under an "exp(b)" header, the detail()
+// legend (nolegend drops it), "(adjusted by ...)", and with `xb` the models'
+// coefficients and means under "Coefficients (b) and means (x)". noheader / notable
+// drop those parts.
+function oaxacaDefinitions(block) {
+  const tf = block.tf;
+  if (tf === 1 || tf === 2) {
+    const rev = tf === 2;
+    return [
+      `   endowments: (X1 - X2) * ${rev ? 'b1' : 'b2'}`,
+      ` coefficients: ${rev ? 'X1' : 'X2'} * (b1 - b2)`,
+      `  interaction: (X1 - X2) * (${rev ? 'b2 - b1' : 'b1 - b2'})`,
+    ];
+  }
+  const w = block.weights_macro || '';
+  let bref = 'b', xref = '';
+  if (w === '1') { bref = 'b1'; xref = 'X2'; }
+  else if (w === '0') { bref = 'b2'; xref = 'X1'; }
+  const out = [`    explained: (X1 - X2) * ${bref}`];
+  if (block.split) {
+    out.push(` unexplained1: X1 * (b1 - ${bref})`);
+    out.push(` unexplained2: X2 * (${bref} - b2)`);
+  } else if (!xref) {
+    out.push(`  unexplained: X1 * (b1 - ${bref}) + X2 * (${bref} - b2)`);
+  } else {
+    out.push(`  unexplained: ${xref} * (b1 - b2)`);
+  }
+  if (!xref) {
+    let bdef;
+    if (block.ref === 'pooled') bdef = 'from pooled model (including group dummy)';
+    else if (block.ref === 'omega') bdef = 'from pooled model (without group dummy)';
+    else if (block.ref === 'reference') bdef = `from model ${block.refname || ''}`;
+    else {
+      const ws = w.split(/\s+/).filter(Boolean);
+      const wd = ws.length === 1 ? ws[0] : 'w';
+      bdef = `= ${wd} * b1  + (1 - ${wd}) * b2`;
+    }
+    out.push(`               with ${bref} ${bdef}`);
+  }
+  return out;
+}
+
+function oaxacaTable(rows, depvar, opts) {
+  const eform = !!opts.eform;
+  const withSe = opts.se !== false;
+  const tr = (x, f) => (x == null || !Number.isFinite(x)) ? null : (eform ? f(x) : x);
+  const cells = rows.map(r => {
+    const split = String(r.name).lastIndexOf(':');
+    const eq = split >= 0 ? r.name.slice(0, split) : '';
+    const nm = split >= 0 ? r.name.slice(split + 1) : r.name;
+    const omitted = r.b === 0 && r.se === 0;
+    const b = tr(r.b, Math.exp);
+    const se = withSe && r.se != null && Number.isFinite(r.se) ? (eform ? Math.exp(r.b) * r.se : r.se) : null;
+    return {
+      eq, nm, omitted,
+      b: omitted ? '0' : (b == null ? '.' : fmtG(b)),
+      se: omitted ? '(omitted)' : (se == null ? '.' : (se === 0 ? '.' : fmtG(se))),
+      t: omitted ? '' : (r.t == null ? '.' : fmtT(r.t)),
+      p: omitted ? '' : (r.p == null ? '.' : fmtP(r.p)),
+      lo: omitted ? '' : (r.ci_lo == null ? '.' : fmtG(tr(r.ci_lo, Math.exp))),
+      hi: omitted ? '' : (r.ci_hi == null ? '.' : fmtG(tr(r.ci_hi, Math.exp))),
+    };
+  });
+  const nameW = Math.max(12, (depvar || '').length, ...cells.map(c => c.nm.length), ...cells.map(c => c.eq.length));
+  const bW = 11, seW = 9, tW = 6, pW = 5, cW = 9;
+  const dataW = 1 + bW + 3 + seW + 3 + tW + 3 + pW + 5 + cW + 3 + cW;
+  const ruleN = '─'.repeat(nameW + 1), ruleD = '─'.repeat(dataW);
+  const lvl = typeof opts.level === 'number' ? opts.level : 95;
+  const lines = [ruleN + '┬' + ruleD];
+  if (opts.vcetype) lines.push(padL('', nameW) + ' │' + padL('', bW + 1) + padL(opts.vcetype, seW + 3));
+  lines.push([padL(depvar || '', nameW), ' │', padL(eform ? 'exp(b)' : 'Coefficient', bW + 1),
+    padL(withSe ? (opts.vcetype ? 'std. err.' : 'Std. err.') : '', seW + 3), padL('z', tW + 3), padL('P>|z|', pW + 3),
+    '     ', padR(`[${lvl}% conf. interval]`, cW + 3 + cW)].join(''));
+  let cur = null;
+  for (const c of cells) {
+    if (c.eq !== cur) {
+      lines.push(ruleN + '┼' + ruleD);
+      lines.push(padR(c.eq, nameW) + ' │');
+      cur = c.eq;
+    }
+    if (c.omitted) {
+      lines.push([padL(c.nm, nameW), ' │', padL(c.b, bW + 1), '  ', c.se].join(''));
+      continue;
+    }
+    lines.push([padL(c.nm, nameW), ' │', padL(c.b, bW + 1), padL(c.se, seW + 3), padL(c.t, tW + 3),
+      padL(c.p, pW + 3), '     ', padL(c.lo, cW), '   ', padL(c.hi, cW)].join(''));
+  }
+  lines.push(ruleN + '┴' + ruleD);
+  return lines;
+}
+
+function formatOaxacaBlock(block) {
+  const lines = [];
+  if (block.show_header !== false) {
+    const stats = [['Number of obs', fmtObs(block.n_obs)], ['Model', block.model || 'linear'],
+      ['N of obs 1', fmtObs(block.N_1)], ['N of obs 2', fmtObs(block.N_2)]];
+    const width = 78;
+    const lefts = ['Blinder-Oaxaca decomposition', '',
+      `Group 1: ${block.by} = ${block.group_1}`, `Group 2: ${block.by} = ${block.group_2}`];
+    stats.forEach(([k, v], i) => {
+      const right = padR(k, 17) + ' = ' + padL(String(v), 10);
+      lines.push(lefts[i] + ' '.repeat(Math.max(2, width - lefts[i].length - right.length)) + right);
+    });
+    lines.push('');
+    if (block.show_definitions !== false) {
+      lines.push(...oaxacaDefinitions(block));
+      lines.push('');
+    }
+  }
+  if (block.show_table !== false) {
+    lines.push(...oaxacaTable(block.coeftable || [], block.depvar,
+      { eform: block.eform, se: block.se, level: block.level, vcetype: block.vcetype }));
+    if (block.show_legend !== false && block.legend) {
+      const groups = String(block.legend).match(/"[^"]*"/g) || [];
+      for (const g of groups) lines.push(g.slice(1, -1));
+    }
+    if (block.adjusted && block.adjust) lines.push(`(adjusted by ${block.adjust})`);
+  }
+  if (Array.isArray(block.xb) && block.xb.length) {
+    lines.push('');
+    lines.push('Coefficients (b) and means (x)');
+    lines.push(...oaxacaTable(block.xb, '', { se: block.se, level: block.level }));
+  }
   return lines.join('\n');
 }
 
@@ -561,8 +1027,16 @@ const OLS_T_ESTIMATORS = new Set([
 // branch — it is already outside OLS_T_ESTIMATORS, i.e. always `z`, which is
 // correct for BOTH its OLS and ML paths (Stata's nlcom is always a delta-
 // method z, even after `regress`).
-function statLetter(est, vcov_type) {
-  if (est === 'lincom') return vcov_type === 'oim' ? 'z' : 't';
+// lincom ..., df(#) puts a t(#) reference on any fit, an ML one too, and the
+// block's df says which reference the statistics were computed from: a
+// positive df is t, a null one the normal (the same rule that posts r(t) or
+// r(z), route_postestimation.cpp). Blocks without df keep the vcov_type rule.
+function statLetter(est, vcov_type, df) {
+  if (est === 'lincom') {
+    if (df === null) return 'z';
+    if (typeof df === 'number') return df > 0 ? 't' : 'z';
+    return vcov_type === 'oim' ? 'z' : 't';
+  }
   return OLS_T_ESTIMATORS.has(est) ? 't' : 'z';
 }
 
@@ -631,7 +1105,7 @@ function estimatorTitle(est, absKeys) {
  *   fallback     : Number of obs / R² / Root MSE (legacy path)
  */
 function buildStats({
-  n_obs, r2, r2_within, sigma2, dof_resid, absKeys,
+  n_obs, r2, r2_within, sigma2, dof_resid, absKeys, chi2type,
   // OLS family
   adj_r2, F, p_F, rmse, mss, rss, df_m, df_r,
   // BUG-1291: xtreg, fe prints its model F as F(e(df_b), e(df_r))
@@ -688,7 +1162,8 @@ function buildStats({
   if (ll != null || r2_pseudo != null) {
     if (chi2 != null) {
       const dfStr = df_chi2 != null ? `(${df_chi2})` : '';
-      stats.push([`LR chi2${dfStr}`, fmt2f(chi2)]);
+      // a constraints() fit's model test is Wald (bank eae58c67 `Wald chi2(1) = 25.02`)
+      stats.push([`${chi2type === 'Wald' ? 'Wald' : 'LR'} chi2${dfStr}`, fmt2f(chi2)]);
     }
     if (p_chi2 != null) stats.push(['Prob > chi2', fmtP4h(p_chi2)]);
     if (ll     != null) stats.push(['Log likelihood', fmtG(ll) ?? '?']);

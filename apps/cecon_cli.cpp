@@ -28,6 +28,10 @@
 #include "core/eng_counters.h"  // W0: engine mechanism counters, read by the `counters` frame op
 #include "core/verb_diag.h"  // COBRA_VERB_DIAG: preserve/restore (stash/unstash) phase timing (measurement-only)
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <set>
@@ -159,6 +163,7 @@ int dispatch_command(const std::vector<std::string>& a) {
     if (a[0] == "joinby") return dispatch_guard(a, cmd_joinby(a));
     if (a[0] == "expand") return dispatch_guard(a, cmd_expand(a));
     if (a[0] == "fillin") return dispatch_guard(a, cmd_fillin(a));
+    if (a[0] == "take") return dispatch_guard(a, cmd_take(a));
     if (a[0] == "cross") return dispatch_guard(a, cmd_cross(a));
     if (a[0] == "contract") return dispatch_guard(a, cmd_contract(a));
     if (a[0] == "merge") return dispatch_guard(a, cmd_merge(a));
@@ -183,6 +188,7 @@ int dispatch_command(const std::vector<std::string>& a) {
     if (a[0] == "lowess") return dispatch_guard(a, cmd_lowess(a));
     if (a[0] == "oaxaca") return dispatch_guard(a, cmd_oaxaca(a));
     if (a[0] == "nnmatch") return dispatch_guard(a, cmd_nnmatch(a));
+    if (a[0] == "teffects-ra") return dispatch_guard(a, cmd_teffects_ra(a));
     if (a[0] == "pca") return dispatch_guard(a, cmd_pca(a));
     std::fprintf(stderr, "unknown command: %s\n", a[0].c_str());
     return 2;
@@ -232,14 +238,206 @@ static void serve_escape(std::string& dst, const std::string& s) {
     }
 }
 
-// Slurp a capture file back through its still-open fd (rewind + read to EOF).
-static std::string read_capture(int fd) {
+// Slurp a capture file back through its still-open fd. The file is reused by every
+// request (see ServeCapture below) and is not truncated between them, so what THIS
+// request wrote is the bytes from 0 up to the descriptor's current offset: fds 1/2
+// were dup2'ed from this descriptor, so they share its offset, and every write of the
+// dispatch advanced it. Anything beyond that offset is an older request's tail.
+// `end_out` receives that offset (-1 when it could not be read): the release step uses
+// it in place of asking the file again (serve_capture_release).
+static std::string read_capture(int fd, long long* end_out = nullptr) {
     std::string s;
-    if (::lseek(fd, 0, SEEK_SET) == -1) return s;
-    char buf[1 << 16];
-    for (ssize_t n; (n = ::read(fd, buf, sizeof buf)) > 0;)
-        s.append(buf, static_cast<size_t>(n));
+    const long long end = static_cast<long long>(::lseek(fd, 0, SEEK_CUR));
+    if (end_out != nullptr) *end_out = end;
+    if (end <= 0 || ::lseek(fd, 0, SEEK_SET) == -1) return s;
+    s.resize(static_cast<size_t>(end));
+    size_t got = 0;
+    while (got < s.size()) {
+        const size_t want = std::min<size_t>(s.size() - got, size_t{1} << 20);
+        const auto n = ::read(fd, &s[got], static_cast<unsigned>(want));
+        if (n <= 0) break;
+        got += static_cast<size_t>(n);
+    }
+    s.resize(got);
     return s;
+}
+
+// ---- `cobra serve` capture sinks: ONE pair of files per process ------------------
+// A dispatch runs with fds 1/2 redirected onto two scratch files (run_serve's long
+// note says why they are files). Until 2026-11 each request created its own pair and
+// removed it again: with the scratch-directory write probe that is three file
+// creations and five unlinks per request, about 0.3 ms of kernel time on APFS, and
+// it was 40% of the wall time of a do-file that runs half a million small commands
+// (measured on the AEA package openICPSR-226844: 168 s of 414 s). The pair is now
+// opened once and reused: a request rewinds it, and read_capture() reads back only
+// what that request wrote.
+//   * POSIX: the files are unlinked the moment they are open, so no exit path leaks
+//     them (unchanged).
+//   * Windows refuses to unlink an open file, so the two names live until the
+//     process ends; serve_capture_atexit removes them on a normal exit (stdin EOF),
+//     and O_TRUNC in the next process that gets the same pid covers a killed worker.
+//   * A dispatch that starts while the pair is installed (none does today) gets its
+//     own short-lived pair, the old per-request way.
+// 2026-11-20: the per-request system calls around the pair were cut as well, because
+// the same do-file still spent about 5 us of each ~24 us request on them, almost
+// always for a dispatch that printed nothing:
+//   * the real fds 1/2 are duplicated ONCE (sav1/sav2 below) instead of dup + close
+//     per request; outside a dispatch fds 1/2 are always the protocol streams, so the
+//     copy taken at the first request is the same one every later request would take;
+//   * read_capture() reports how far each file was written, so release no longer
+//     seeks to the end to learn the size, and the next acquire skips the rewind of a
+//     file that is known to be at offset 0 already (nothing was written to it).
+struct ServeCapture {
+    int out = -1, err = -1;  // the reusable pair
+    bool busy = false;       // installed on fds 1/2 by a dispatch that has not returned
+    std::string base;        // path stem of the reusable pair
+    int sav1 = -1, sav2 = -1;  // the real fds 1/2, duplicated once, restored after each dispatch
+    bool out_at0 = false, err_at0 = false;  // offset known to be 0 (no rewind needed)
+};
+static ServeCapture g_serve_cap;
+
+// One request's view of its capture files.
+struct ServeCapPair {
+    int out = -1, err = -1;
+    bool reused = false;     // false: a private pair, closed and unlinked at release
+    std::string base;
+    int sav1 = -1, sav2 = -1;  // where fds 1/2 go back to (serve_capture_restore)
+    bool sav_private = false;  // sav1/sav2 belong to this request: closed at restore
+    long long out_end = -1, err_end = -1;  // bytes this request wrote; -1 = not read back
+};
+
+static bool serve_capture_open(const std::string& base, int& out, int& err) {
+    out = native_open(base + "_out.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    err = native_open(base + "_err.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (out < 0 || err < 0) {
+        for (int f : {out, err}) if (f >= 0) ::close(f);
+        out = err = -1;
+        native_unlink(base + "_out.tmp");
+        native_unlink(base + "_err.tmp");
+        return false;
+    }
+    native_unlink(base + "_out.tmp");
+    native_unlink(base + "_err.tmp");
+    return true;
+}
+
+#ifdef _WIN32
+static void serve_capture_atexit() {
+    ServeCapture& c = g_serve_cap;
+    for (int f : {c.out, c.err}) if (f >= 0) ::close(f);
+    c.out = c.err = -1;
+    if (!c.base.empty()) {
+        native_unlink(c.base + "_out.tmp");
+        native_unlink(c.base + "_err.tmp");
+    }
+}
+#endif
+
+// Hand out the capture pair for one dispatch, rewound, together with the descriptors
+// fds 1/2 go back to afterwards. False = capture setup failed; nothing is left
+// acquired then, and the caller only calls serve_capture_release (a no-op).
+static void serve_capture_release(ServeCapPair& cap);
+static bool serve_capture_acquire(ServeCapPair& cap) {
+    ServeCapture& c = g_serve_cap;
+    const std::string stem = "cecon_serve_" + std::to_string(native_process_id());
+    if (c.busy) {
+        cap.reused = false;
+        cap.base = native_join_path(keepif_scratch_dir(), stem + "_nested");
+        if (!serve_capture_open(cap.base, cap.out, cap.err)) return false;
+        // fds 1/2 are the OUTER dispatch's capture right now: save exactly those.
+        cap.sav1 = ::dup(1);
+        cap.sav2 = ::dup(2);
+        cap.sav_private = true;
+        if (cap.sav1 < 0 || cap.sav2 < 0) {
+            for (int f : {cap.sav1, cap.sav2}) if (f >= 0) ::close(f);
+            cap.sav1 = cap.sav2 = -1;
+            serve_capture_release(cap);
+            return false;
+        }
+        return true;
+    }
+    if (c.sav1 < 0 || c.sav2 < 0) {
+        for (int f : {c.sav1, c.sav2}) if (f >= 0) ::close(f);
+        c.sav1 = ::dup(1);
+        c.sav2 = ::dup(2);
+        if (c.sav1 < 0 || c.sav2 < 0) {
+            for (int f : {c.sav1, c.sav2}) if (f >= 0) ::close(f);
+            c.sav1 = c.sav2 = -1;
+            return false;
+        }
+    }
+    if (c.out >= 0 &&
+        ((!c.out_at0 && ::lseek(c.out, 0, SEEK_SET) == -1) ||
+         (!c.err_at0 && ::lseek(c.err, 0, SEEK_SET) == -1))) {
+        ::close(c.out);  // the pair went bad under us: open a new one below
+        ::close(c.err);
+        c.out = c.err = -1;
+    }
+    if (c.out < 0) {
+        c.base = native_join_path(keepif_scratch_dir(), stem);
+        if (!serve_capture_open(c.base, c.out, c.err)) return false;
+#ifdef _WIN32
+        static bool registered = false;
+        if (!registered) {
+            registered = true;
+            std::atexit(serve_capture_atexit);
+        }
+#endif
+    }
+    c.busy = true;
+    c.out_at0 = c.err_at0 = false;  // re-established by this request's release
+    cap.reused = true;
+    cap.out = c.out;
+    cap.err = c.err;
+    cap.base = c.base;
+    cap.sav1 = c.sav1;
+    cap.sav2 = c.sav2;
+    cap.sav_private = false;
+    return true;
+}
+
+// Point fds 1/2 back at what they were before the dispatch. Call AFTER draining both
+// buffering layers into the capture fds (run_serve's note on the order).
+static void serve_capture_restore(ServeCapPair& cap) {
+    ::dup2(cap.sav1, 1);
+    ::dup2(cap.sav2, 2);
+    if (cap.sav_private) {
+        ::close(cap.sav1);
+        ::close(cap.sav2);
+        cap.sav1 = cap.sav2 = -1;
+    }
+}
+
+// Give the pair back after read_capture(). The reusable pair stays open; a file that
+// one request grew past 1 MiB is cut back so a single large listing does not hold
+// scratch space for the rest of the session.
+// The size test uses the length read_capture() saw when there is one. That gives the
+// same answer as asking the file: every request writes from offset 0, and a file is
+// cut to 0 the moment it passes 1 MiB, so it can only be past 1 MiB now if THIS
+// request wrote past 1 MiB. A file that was not read back (stdout dropped after a
+// throw) is asked, as before.
+static void serve_capture_release(ServeCapPair& cap) {
+    if (cap.out < 0) return;
+    if (cap.reused) {
+        const int fds[2] = {cap.out, cap.err};
+        const long long ends[2] = {cap.out_end, cap.err_end};
+        bool at0[2] = {false, false};
+        for (int i = 0; i < 2; ++i) {
+            const long long size =
+                ends[i] >= 0 ? ends[i] : static_cast<long long>(::lseek(fds[i], 0, SEEK_END));
+            if (size > (1LL << 20)) (void)native_ftruncate(fds[i], 0);
+            at0[i] = (ends[i] == 0);  // read back and empty: the offset never moved off 0
+        }
+        g_serve_cap.out_at0 = at0[0];
+        g_serve_cap.err_at0 = at0[1];
+        g_serve_cap.busy = false;
+    } else {
+        ::close(cap.out);
+        ::close(cap.err);
+        native_unlink(cap.base + "_out.tmp");
+        native_unlink(cap.base + "_err.tmp");
+    }
+    cap.out = cap.err = -1;
 }
 
 // ---- `cobra serve` resident-frame session — MAXPERF Stage 1b (contract_A §26) ----
@@ -673,20 +871,14 @@ static int serve_capture_dispatch(const std::vector<std::string>& a,
     std::cout.flush();
     std::fflush(stdout);
     std::fflush(stderr);
-    std::string cap_base = native_join_path(
-        keepif_scratch_dir(), "cecon_serve_" + std::to_string(native_process_id()));
-    int cap1 = native_open(cap_base + "_out.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
-    int cap2 = native_open(cap_base + "_err.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
-    int sav1 = ::dup(1), sav2 = ::dup(2);
-    if (cap1 < 0 || cap2 < 0 || sav1 < 0 || sav2 < 0) {
-        for (int f : {cap1, cap2, sav1, sav2}) if (f >= 0) ::close(f);
-        native_unlink(cap_base + "_out.tmp");
-        native_unlink(cap_base + "_err.tmp");
+    ServeCapPair cap;
+    const bool cap_ok = serve_capture_acquire(cap);
+    const int cap1 = cap.out, cap2 = cap.err;
+    if (!cap_ok) {
+        serve_capture_release(cap);
         setup_failed = true;
         return 1;
     }
-    native_unlink(cap_base + "_out.tmp");
-    native_unlink(cap_base + "_err.tmp");
     ::dup2(cap1, 1);
     ::dup2(cap2, 2);
 
@@ -711,16 +903,10 @@ static int serve_capture_dispatch(const std::vector<std::string>& a,
     std::cerr.flush();
     std::fflush(stdout);
     std::fflush(stderr);
-    ::dup2(sav1, 1);
-    ::dup2(sav2, 2);
-    ::close(sav1);
-    ::close(sav2);
-    out_bytes = discard_out ? std::string() : read_capture(cap1);
-    err_bytes = read_capture(cap2);
-    ::close(cap1);
-    ::close(cap2);
-    native_unlink(cap_base + "_out.tmp");
-    native_unlink(cap_base + "_err.tmp");
+    serve_capture_restore(cap);
+    out_bytes = discard_out ? std::string() : read_capture(cap1, &cap.out_end);
+    err_bytes = read_capture(cap2, &cap.err_end);
+    serve_capture_release(cap);
     keepif_cleanup();
     return rc;
 }
@@ -894,6 +1080,90 @@ static void run_frame_request(const json& req, ServeSession& session,
             return;
         }
         serve_write_response(id, have_id, 0, "", "", "");
+        return;
+    }
+
+    // getcell — ONE cell of the resident frame, answered inline on stdout.
+    //
+    // Why: `local x = v[1]` inside a do-file loop was answered by getcols, which
+    // writes the whole column out as an .hbin for PIET to mmap, read one value of,
+    // and unlink. On the AEA 226844 FDR loop that was a quarter of the worker's busy
+    // time (write_hbin + open) plus PIET's open and reap, 39,000 times per run.
+    //
+    // The value goes back as the payload's own bits, not a JSON number: a JSON
+    // number cannot carry the extended missing values (.a-.z are NaN payloads), and
+    // the reader a getcols projection would have gone through widens a narrow column
+    // with the same static_cast<double>(float) the F64Reader uses here, so the two
+    // routes hand PIET the identical double. A string cell is its level text ("" for
+    // a code with no level, which is what PIET's reader makes of it too).
+    //
+    // A string cell goes back as hex too ("sx"): Stata text is bytes, a cell may end
+    // inside a UTF-8 character (substr(name,1,4) on "José" is "Jos\xC3", BUG-1372),
+    // and the JSON serializer throws on invalid UTF-8 -- which, uncaught, killed the
+    // worker and with it the resident frame. Every failure below is an exit 2.
+    //
+    // Read-only like getcols: no resident change, nothing staged. Refusals (no
+    // resident frame, no such column, a malformed request) are exit 2; PIET then
+    // takes the getcols route, so an engine without this op costs a fallback only.
+    // {"op":"getcell","col":NAME,"row":ROW} -> {"dtype":"f64"|"factor","rows":N,
+    //  "in":bool[,"bits":"<16 hex>"|,"sx":"<hex bytes>"]}; ROW is 1-based.
+    if (op == "getcell") {
+        if (!session.active) {
+            serve_write_response(id, have_id, 2, "", "serve: getcell with no resident frame", "");
+            return;
+        }
+        if (!F.contains("col") || !F["col"].is_string() || !F.contains("row") ||
+            !F["row"].is_number_integer()) {
+            serve_write_response(id, have_id, 2, "",
+                                 "serve: getcell needs a string \"col\" and an integer \"row\"", "");
+            return;
+        }
+        const std::string name = F["col"].get<std::string>();
+        if (!session.resident.has(name)) {
+            serve_write_response(id, have_id, 2, "", "serve: getcell: no column '" + name + "'", "");
+            return;
+        }
+        std::string payload;
+        try {
+        const FrameColumn& c = session.resident.col(name);
+        const int64_t rows = session.resident.n_rows();
+        const long long row = F["row"].get<long long>();
+        json cell;
+        cell["dtype"] = c.is_factor ? "factor" : "f64";
+        cell["rows"] = rows;
+        const bool in = row >= 1 && row <= rows;
+        cell["in"] = in;
+        if (in) {
+            const std::size_t k = static_cast<std::size_t>(row - 1);
+            if (c.is_factor) {
+                const int32_t code = c.codes[k];
+                const std::string text =
+                    code >= 0 && static_cast<std::size_t>(code) < c.levels.size()
+                        ? c.levels[static_cast<std::size_t>(code)]
+                        : std::string();
+                static const char* kHex = "0123456789abcdef";
+                std::string hx;
+                hx.reserve(text.size() * 2);
+                for (unsigned char ch : text) {
+                    hx += kHex[ch >> 4];
+                    hx += kHex[ch & 15];
+                }
+                cell["sx"] = hx;
+            } else {
+                const double v = c.f64.reader()[k];
+                uint64_t bits = 0;
+                std::memcpy(&bits, &v, sizeof bits);
+                char hex[17];
+                std::snprintf(hex, sizeof hex, "%016llx", static_cast<unsigned long long>(bits));
+                cell["bits"] = hex;
+            }
+        }
+        payload = cell.dump() + "\n";
+        } catch (const std::exception& e) {
+            serve_write_response(id, have_id, 2, "", std::string("serve: getcell: ") + e.what(), "");
+            return;
+        }
+        serve_write_response(id, have_id, 0, payload, "", "");
         return;
     }
 
@@ -1314,20 +1584,14 @@ static void run_frame_request(const json& req, ServeSession& session,
     std::cout.flush();
     std::fflush(stdout);
     std::fflush(stderr);
-    std::string cap_base = native_join_path(
-        keepif_scratch_dir(), "cecon_serve_" + std::to_string(native_process_id()));
-    int cap1 = native_open(cap_base + "_out.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
-    int cap2 = native_open(cap_base + "_err.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
-    int sav1 = ::dup(1), sav2 = ::dup(2);
-    if (cap1 < 0 || cap2 < 0 || sav1 < 0 || sav2 < 0) {
-        for (int f : {cap1, cap2, sav1, sav2}) if (f >= 0) ::close(f);
-        native_unlink(cap_base + "_out.tmp");
-        native_unlink(cap_base + "_err.tmp");
+    ServeCapPair cap;
+    const bool cap_ok = serve_capture_acquire(cap);
+    const int cap1 = cap.out, cap2 = cap.err;
+    if (!cap_ok) {
+        serve_capture_release(cap);
         serve_write_response(id, have_id, 1, "", "serve: capture setup failed", "");
         return;
     }
-    native_unlink(cap_base + "_out.tmp");
-    native_unlink(cap_base + "_err.tmp");
     ::dup2(cap1, 1);
     ::dup2(cap2, 2);
 
@@ -1361,16 +1625,10 @@ static void run_frame_request(const json& req, ServeSession& session,
     std::cerr.flush();
     std::fflush(stdout);
     std::fflush(stderr);
-    ::dup2(sav1, 1);
-    ::dup2(sav2, 2);
-    ::close(sav1);
-    ::close(sav2);
-    std::string out_bytes = discard_out ? std::string() : read_capture(cap1);
-    std::string err_bytes = read_capture(cap2);
-    ::close(cap1);
-    ::close(cap2);
-    native_unlink(cap_base + "_out.tmp");
-    native_unlink(cap_base + "_err.tmp");
+    serve_capture_restore(cap);
+    std::string out_bytes = discard_out ? std::string() : read_capture(cap1, &cap.out_end);
+    std::string err_bytes = read_capture(cap2, &cap.err_end);
+    serve_capture_release(cap);
     keepif_cleanup();
 
     // Commit semantics: the resident swap happens ONLY on rc==0 with no error unwind.
@@ -1473,6 +1731,54 @@ static void run_frame_request(const json& req, ServeSession& session,
     serve_write_response(id, have_id, rc, out_bytes, err_bytes, frame_json, est_json);
 }
 
+// Request-line reader for the serve loop: fd 0 read in blocks, split on '\n'.
+// It replaces std::getline(std::cin, ...). sync_with_stdio is never disabled in this
+// codebase (run_serve's capture note says why), and with it on, libc++ reads std::cin
+// one character at a time, taking and releasing stdin's FILE lock around each getc
+// and ungetc. That cost 7.7 us per request line against 0.47 us for a block read
+// (measured 2026-11-20 on the request log of the AEA package openICPSR-226844, whose
+// FDR loop sends about half a million small requests). Nothing else in the engine
+// reads stdin, so no other reader can be starved of bytes this buffer holds.
+// Same lines as std::getline: '\n' is removed, nothing else is (a '\r' stays, and
+// the JSON parser treats it as whitespace, as before), and a last line with no
+// newline is still returned at end of input.
+class ServeLineReader {
+public:
+    bool next(std::string& line) {
+        for (;;) {
+            const size_t nl = buf_.find('\n', pos_);
+            if (nl != std::string::npos) {
+                line.assign(buf_, pos_, nl - pos_);
+                pos_ = nl + 1;
+                return true;
+            }
+            if (eof_) {
+                if (pos_ >= buf_.size()) return false;
+                line.assign(buf_, pos_, std::string::npos);
+                pos_ = buf_.size();
+                return true;
+            }
+            if (pos_ > 0) {
+                buf_.erase(0, pos_);
+                pos_ = 0;
+            }
+            char block[65536];
+            const auto n = ::read(0, block, static_cast<unsigned>(sizeof block));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) {
+                eof_ = true;
+                continue;
+            }
+            buf_.append(block, static_cast<size_t>(n));
+        }
+    }
+
+private:
+    std::string buf_;
+    size_t pos_ = 0;
+    bool eof_ = false;
+};
+
 static int run_serve(const std::string& serve_argv0) {
     // Handshake: ONE line the kernel reads before sending requests.
     std::cout << "{\"serve\":1,\"cobra_version\":\"" << COBRA_VERSION
@@ -1492,7 +1798,8 @@ static int run_serve(const std::string& serve_argv0) {
 
     std::string line;
     unsigned long long served = 0;  // relief throttle counter (below)
-    while (std::getline(std::cin, line)) {
+    ServeLineReader requests;
+    while (requests.next(line)) {
         phys_footprint_track();   // every request: a peak cannot be sampled from outside
         // Allocator hygiene (see the <malloc/malloc.h> include note): every 32nd
         // request, ask the allocator to mark its free-but-still-dirty pages
@@ -1654,24 +1961,17 @@ static int run_serve(const std::string& serve_argv0) {
         std::cout.flush();    // drain pending protocol bytes through BOTH buffering
         std::fflush(stdout);  // layers to the REAL stdout, pre-redirect
         std::fflush(stderr);
-        std::string cap_base = native_join_path(
-            keepif_scratch_dir(), "cecon_serve_" + std::to_string(native_process_id()));
-        int cap1 = native_open(cap_base + "_out.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
-        int cap2 = native_open(cap_base + "_err.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
-        int sav1 = ::dup(1), sav2 = ::dup(2);
-        if (cap1 < 0 || cap2 < 0 || sav1 < 0 || sav2 < 0) {
-            for (int f : {cap1, cap2, sav1, sav2})
-                if (f >= 0) ::close(f);
-            native_unlink(cap_base + "_out.tmp");
-            native_unlink(cap_base + "_err.tmp");
+        ServeCapPair cap;
+        const bool cap_ok = serve_capture_acquire(cap);
+        const int cap1 = cap.out, cap2 = cap.err;
+        if (!cap_ok) {
+            serve_capture_release(cap);
             std::cout << "{\"id\":" << (have_id ? std::to_string(id) : std::string("null"))
                       << ",\"exit\":1,\"stdout\":\"\",\"stderr\":"
                          "\"serve: capture setup failed\"}\n";
             std::cout.flush();
             continue;
         }
-        native_unlink(cap_base + "_out.tmp");
-        native_unlink(cap_base + "_err.tmp");
         ::dup2(cap1, 1);
         ::dup2(cap2, 2);
 
@@ -1711,18 +2011,10 @@ static int run_serve(const std::string& serve_argv0) {
         std::cerr.flush();
         std::fflush(stdout);
         std::fflush(stderr);
-        ::dup2(sav1, 1);
-        ::dup2(sav2, 2);
-        ::close(sav1);
-        ::close(sav2);
-        std::string out_bytes = discard_out ? std::string() : read_capture(cap1);
-        std::string err_bytes = read_capture(cap2);
-        ::close(cap1);
-        ::close(cap2);
-        // Windows refuses unlink-while-open, so the eager unlinks above are no-ops
-        // there — this post-close pass is the one that lands (ENOENT on POSIX, fine).
-        native_unlink(cap_base + "_out.tmp");
-        native_unlink(cap_base + "_err.tmp");
+        serve_capture_restore(cap);
+        std::string out_bytes = discard_out ? std::string() : read_capture(cap1, &cap.out_end);
+        std::string err_bytes = read_capture(cap2, &cap.err_end);
+        serve_capture_release(cap);
         keepif_cleanup();  // per-request temp unlink (one-shot relies on atexit at process end)
 
         // Response: ONE line, written to the REAL stdout only now.

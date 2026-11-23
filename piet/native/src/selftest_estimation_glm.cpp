@@ -370,15 +370,16 @@ void testW2bGlm() {
       const char* cmd;
       const char* reason;
     };
+    // Every family and link of glm is fitted since the vs-stata bank pinned them
+    // (2026-11-22: 3034ee28 binomial/cloglog, cc7f790e igaussian/log, ca470675
+    // gamma/power -1, 435c8f90 binomial with a denominator, e97edb52 gaussian/log);
+    // what is still refused: nbinomial ml (nbreg's alpha) and the resampling VCEs.
     const Case cases[] = {
-        // gamma's DEFAULT link is the reciprocal ([R] glm), not covered.
-        {"glm y x1 x2, family(gamma)", "refused:glm_link_reciprocal"},
-        {"glm y x1 x2, family(igaussian) link(log)", "refused:glm_family_igaussian"},
         {"glm cnt x1 x2, family(nbinomial ml) link(log)", "refused:glm_family_nbinomial_ml"},
         // vce(robust) is served since the vs-stata bank pinned it (8aa87f1b: the
         // per-observation sandwich); opg is a VCE still not implemented.
         {"glm y x1 x2, family(gamma) link(log) vce(opg)", "refused:glm_vce_opg"},
-        {"glm bin x1 x2, family(binomial) link(cloglog)", "refused:glm_link_cloglog"},
+        {"glm y x1 x2, family(gamma) link(log) vce(jackknife)", "refused:glm_vce_jackknife"},
     };
     for (const auto& c : cases) {
       Reply r = run(s, c.cmd);
@@ -416,13 +417,18 @@ void testW2bGlm() {
         {"glm y x1 x2, family(gaussian) link(power 1 2)", "198", "", "", ""},
         {"glm y x1 x2, family(foo) link(log)", "199", "refused:glm_family_unrecognized", "", ""},
         {"glm y x1 x2, family(gamma) link(foo)", "199", "refused:glm_link_unrecognized", "", ""},
-        {"glm y x1 x2, family(gamma) link(power -1)", "199", "refused:glm_link_reciprocal", "", ""},
-        {"glm y x1 x2, family(gamma) link(power 1)", "199", "refused:glm_link_power", "", ""},
-        {"glm bin x1 x2, family(b) link(c)", "199", "refused:glm_link_cloglog", "", ""},
-        {"glm bin x1 x2, family(binomial 3)", "199", "refused:glm_family_binomial_denominator", "", ""},
-        {"glm cnt x1 x2, family(poisson) link(identity)", "199",
-         "refused:glm_family_link_poisson_identity", "", ""},
-        {"glm y x1 x2, link(log)", "199", "refused:glm_family_link_gaussian_log", "", ""},
+        // (bank ca470675 `family(gamma) link(power -1)`: e(linkt) Reciprocal)
+        {"glm y x1 x2, family(gamma)", "0", "", "Gamma", "Reciprocal"},
+        {"glm y x1 x2, family(gamma) link(power -1)", "0", "", "Gamma", "Reciprocal"},
+        {"glm y x1 x2, family(gamma) link(power 1)", "0", "", "Gamma", "Power"},
+        {"glm y x1 x2, family(igaussian) link(log)", "0", "", "Inverse Gaussian", "Log"},
+        // (bank 3034ee28: e(linkt) "Complementary log\xE2\x80\x93log", an en dash)
+        {"glm bin x1 x2, family(b) link(c)", "0", "", "Bernoulli", "Complementary log\xE2\x80\x93log"},
+        // (bank 435c8f90 `family(binomial fatal)`: e(varfunct) Binomial)
+        {"glm bin x1 x2, family(binomial 3)", "0", "", "Binomial", "Logit"},
+        {"glm cnt x1 x2, family(poisson) link(identity)", "0", "", "Poisson", "Identity"},
+        // (bank e97edb52 `glm fatal beertax unemp, l(log)`: Gaussian/Log)
+        {"glm y x1 x2, link(log)", "0", "", "Gaussian", "Log"},
     };
     for (const auto& g : grammar) {
       Reply r = run(s, g.cmd);
@@ -449,6 +455,7 @@ void testW2bGlm() {
             "never a finite fit from a roundoff-level pivot. Got rc " + cl.rc + " " + cl.reason);
     // `eform` was this arm's example until glm implemented it (the exponentiated
     // table, vs-stata bank b7486d54); `irls` is a real glm option still refused.
+    // (vce(hac) is likewise still refused by name.)
     Reply o = run(s, "glm y x1 x2, family(gamma) link(log) irls");
     w2check(o.rc == "198" && o.msg.find("irls") != std::string::npos,
             "glm option vocabulary: a real glm option this build does not implement (`irls`) is "

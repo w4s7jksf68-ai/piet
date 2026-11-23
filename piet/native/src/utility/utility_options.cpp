@@ -16,18 +16,26 @@ const piet::eval::OptVocab& kVocabUnique = piet::eval::registerOptVocab(
 // `abbrev()` shortens the displayed names, `min()`/`max()` filter the rows this
 // build prints in full. None is read; each changes what the table SAYS.
 const piet::eval::OptVocab& kVocabDistinct = piet::eval::registerOptVocab(
-    {"distinct"}, {{"joint", "missing"}, {"abbrev", "min", "max"}});
+    {"distinct"}, {{"joint", "missing", "abbrev", "min", "max", "minimum", "maximum"}, {}});
 
 // `force` IS read: it is missings' own safety catch (see runMissings), not a
 // no-op. `generate()` names the column `missings tag` creates.
+// missings.ado's own options, and list's (report / breakdown / list pass `*` to
+// list): vs-stata stage 4 serves them all; `table` is still refused by name.
 const piet::eval::OptVocab& kVocabMissings = piet::eval::registerOptVocab(
     {"missings"},
-    {{"generate", "force"}, {"minimum", "observations", "percent", "sort"}});
+    {{"generate", "force", "minimum", "observations", "percent", "sort", "numeric", "string",
+      "sysmiss", "noheader", "format", "show", "identify",
+      "noobs", "clean", "separator", "abbreviate", "nolabel", "mean", "sum", "sepby", "divider",
+      "table", "display", "nocompress", "compress", "fast", "header", "notrim", "nodotz",
+      "absolute", "subvarname", "linesize", "labvar", "constant", "n", "relative", "ds",
+      "fvall", "footer"},
+     {"sepbyexp"}});
 
 // `any`/`all`/`none` select WHICH variables mdesc reports; `abbreviate()`
 // shortens the names. All four would change the table.
 const piet::eval::OptVocab& kVocabMdesc = piet::eval::registerOptVocab(
-    {"mdesc"}, {{}, {"abbreviate", "any", "all", "none"}});
+    {"mdesc"}, {{"abbreviate", "any", "all", "none"}, {}});
 
 // `decode` takes the text from the value label of the values variable.
 const piet::eval::OptVocab& kVocabLabmask = piet::eval::registerOptVocab(
@@ -66,8 +74,9 @@ const piet::eval::OptVocab& kVocabFilelist = piet::eval::registerOptVocab(
 // values were filled, `strict` errors instead of filling -- each changes what
 // lands in the data.
 const piet::eval::OptVocab& kVocabCarryforward = piet::eval::registerOptVocab(
-    {"carryforward"}, {{"gen", "generate", "replace", "by"},
-                       {"carryalong", "strict", "dynamic_condition", "cfindic"}});
+    {"carryforward"}, {{"gen", "generate", "replace", "by", "carryalong", "strict",
+                        "dynamic_condition", "cfindic", "back", "extmiss", "nonotes"},
+                       {}});
 
 // `excludeself` drops the row itself from its own window and `casewise` drops
 // rows missing on ANY of the requested variables -- both change which

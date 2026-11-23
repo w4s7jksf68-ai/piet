@@ -97,6 +97,30 @@ bool route_estimation(std::string& cmd,
   }
 
   // E2 computed PIET-side.
+  if (cmd == "prtest") {
+    blocks.push_back(ojson(handlers::runPrtest(parsed, session)));
+    return true;
+  }
+  if (cmd == "prtesti") {
+    blocks.push_back(ojson(handlers::runPrtesti(parsed, session)));
+    return true;
+  }
+
+  if (cmd == "ci") {
+    blocks.push_back(ojson(handlers::runCi(parsed, session)));
+    return true;
+  }
+
+  if (cmd == "ranksum") {
+    blocks.push_back(ojson(handlers::runRanksum(parsed, session)));
+    return true;
+  }
+
+  if (cmd == "ktau") {
+    blocks.push_back(ojson(handlers::runKtau(parsed, session)));
+    return true;
+  }
+
   if (cmd == "spearman") {
     blocks.push_back(ojson(handlers::runSpearman(parsed, session)));
     return true;
@@ -431,6 +455,12 @@ bool route_estimation(std::string& cmd,
     return true;
   }
 
+  if (cmd == "constraint") {
+    ojson r = handlers::runConstraint(parsed, session);
+    if (!(r.is_array() && r.empty())) blocks.push_back(r);
+    return true;
+  }
+
 
   if (cmd == "nl" || cmd == "gmm") {
     // BUG-336: this handler consumed its real options but never rejected UNKNOWN
@@ -438,7 +468,8 @@ bool route_estimation(std::string& cmd,
     // MEASURED from the handler body (runNlGmm reads instruments/onestep; vce/robust stay known so nl's OWN precise reject fires);
     // an EMPTY set here eats the options the handler honours -- that first attempt
     // broke 14 freeze fixtures, and the corpus was never the problem.
-    if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabNlGmm.known, kVocabNlGmm.unimplemented)) {
+    const eval::OptVocab& vocab = cmd == "gmm" ? kVocabGmm : kVocabNlGmm;
+    if (auto err = eval::rejectUnknownOptions(parsed.opts, vocab.known, vocab.unimplemented)) {
       blocks.push_back(ojson(*err));
       return true;
     }
@@ -545,6 +576,7 @@ bool route_estimation(std::string& cmd,
 
   if (cmd == "zip" || cmd == "zinb") {
     blocks.push_back(ojson(handlers::runZeroInflated(cmd, parsed, session)));
+    installMlEsampleAfterFit(blocks.back(), session);  // e(sample) (bank ce0a6a9f ESAMPLE 2229)
     return true;
   }
 
